@@ -350,6 +350,16 @@ pub struct Session {
     /// saved before this field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tab_title_provisional: bool,
+    /// Forward-only history trim anchor: the id of the first non-pinned
+    /// message the prompt builder sends (everything before it, except the
+    /// pinned first user message, is left out). It only ever moves forward,
+    /// in whole chunks, to a user text message (a turn boundary), so the
+    /// outgoing message prefix stays byte-stable between requests and a
+    /// provider prompt cache keeps hitting. Set from
+    /// `PromptBuildResult::history_anchor` after each build; `None` (or an id
+    /// that no longer exists) means "recompute from the start of the chat".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_anchor: Option<uuid::Uuid>,
 }
 
 /// Stamp `created_at` on a message that is already in `messages`, without
@@ -1120,6 +1130,29 @@ impl SessionState {
         }
     }
 
+    /// Persist the history trim anchor a prompt build resolved
+    /// (`PromptBuildResult::history_anchor`) onto `session_id`.
+    /// Call this after `PromptBuilder::build_prompt` in a separate write scope,
+    /// like `store_pages`. Returns true when the stored anchor changed.
+    pub fn set_history_anchor(&mut self, session_id: &str, anchor: Option<uuid::Uuid>) -> bool {
+        match self.sessions.get_mut(session_id) {
+            Some(session) if session.history_anchor != anchor => {
+                session.history_anchor = anchor;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `anchor` differs from the one stored on `session_id`, so a
+    /// caller can skip taking a write guard (and re-rendering) when nothing
+    /// moved.
+    pub fn history_anchor_changed(&self, session_id: &str, anchor: Option<uuid::Uuid>) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|s| s.history_anchor != anchor)
+    }
+
     /// Store newly-generated paginated pages into the queue.
     /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
     ///
@@ -1562,6 +1595,7 @@ impl SessionState {
             tab_title: None,
             name_user_set: false,
             tab_title_provisional: false,
+            history_anchor: None,
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -2033,6 +2067,7 @@ mod tests {
                 tab_title: None,
                 name_user_set: false,
             tab_title_provisional: false,
+            history_anchor: None,
             }
         }
 
@@ -2643,6 +2678,7 @@ mod tests {
                     total_tokens: 150,
                     thoughts_tokens: None,
                     cached_content_tokens: None,
+                    cache_creation_tokens: None,
                     cost: Some(0.0042),
                 }),
             });
@@ -2688,6 +2724,7 @@ mod tests {
                         total_tokens: 150,
                         thoughts_tokens: None,
                         cached_content_tokens: None,
+                        cache_creation_tokens: None,
                         cost: Some(cost),
                     }),
                 });
@@ -2876,6 +2913,7 @@ mod tests {
             tab_title: None,
             name_user_set: false,
             tab_title_provisional: false,
+            history_anchor: None,
             messages: vec![
                 Message {
                     id: msg1_id,

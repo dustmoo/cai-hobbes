@@ -139,10 +139,12 @@ impl<'a> PromptBuilder<'a> {
         PromptBuildResult {
             prompt: NeutralLlmPrompt {
                 system: Some(ctx.system),
+                system_volatile_offset: ctx.volatile_offset,
                 messages: linearised.messages,
                 tools: ctx.tools,
             },
             pages_to_store: linearised.pages_to_store,
+            history_anchor: linearised.history_anchor,
         }
     }
 

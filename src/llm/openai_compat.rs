@@ -1163,6 +1163,7 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                                     completion_tokens: c as i32,
                                     total_tokens: t as i32,
                                     cached_content_tokens: None,
+                                    cache_creation_tokens: None,
                                     thoughts_tokens: None,
                                     // Billed only for the real OpenAI API with a key;
                                     // local/keyless endpoints are free (Some(0.0)).

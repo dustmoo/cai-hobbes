@@ -45,11 +45,137 @@ pub(crate) fn signature_for_provider(
     }
 }
 
+/// After a trim, the history is brought down to this fraction of each limit
+/// (message count, and the char budget on finite windows). The gap between
+/// the limit (high water) and this mark is what makes trims rare: with the
+/// default 75-message limit a trim drops to ≤ 50 messages, so the next one is
+/// ~25 messages away instead of firing on every append.
+const HISTORY_LOW_WATER_NUM: usize = 2;
+const HISTORY_LOW_WATER_DEN: usize = 3;
+
+/// Outcome of `resolve_history_window`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HistoryWindow {
+    /// First session-message index included in the prompt (the pinned first
+    /// user message is added separately, wherever it sits).
+    pub start_index: usize,
+    /// Anchor to persist on the session: the id of the message at
+    /// `start_index`, or `None` when the window starts at the beginning.
+    pub anchor: Option<uuid::Uuid>,
+}
+
+/// Decide where the outgoing history starts, so trimming changes the request
+/// prefix rarely and in large steps.
+///
+/// Every message after the pinned first user message is a cache-relevant
+/// prefix byte: a window that slides by one message per request (the old
+/// `len - history_len` rule) invalidates the provider's prompt cache for the
+/// whole history on every request once a chat passes the limit. Instead:
+///
+/// - The window starts at the persisted `anchor` (or the start of the chat
+///   when it is absent or no longer exists — e.g. after a rewind — which then
+///   recomputes with the same rule).
+/// - It only moves when the included history exceeds a limit: more than
+///   `max_messages` messages, or (finite windows) more than `char_budget`
+///   estimated chars. That is the high-water mark.
+/// - It then jumps forward to the earliest turn boundary that brings both
+///   measures under the low-water mark (`HISTORY_LOW_WATER_*` of each limit),
+///   or as far as it may go when none does.
+/// - A cut is only ever made at a user text message (a turn start), so a
+///   tool_use/tool_result pair or a turn's thinking chain is never split, and
+///   never at or after the latest user text message (the in-progress turn).
+///   If no such boundary is ahead of the anchor, the window is kept as is.
+///
+/// Pure in its inputs: the same messages, anchor and limits always resolve
+/// the same window.
+pub(crate) fn resolve_history_window(
+    messages: &[crate::components::chat::Message],
+    anchor: Option<uuid::Uuid>,
+    first_pinned_idx: Option<usize>,
+    max_messages: usize,
+    char_budget: Option<usize>,
+) -> HistoryWindow {
+    let len = messages.len();
+    // A stale anchor (deleted message) falls back to the start of the chat.
+    let start = anchor
+        .and_then(|id| messages.iter().position(|m| m.id == id))
+        .unwrap_or(0);
+
+    // Per-message size estimate. Tool results are deliberately not counted at
+    // full size — Pass 2 fits those against the real window.
+    let msg_chars = |m: &crate::components::chat::Message| {
+        m.content.display_summary().len().max(100)
+    };
+    // suffix[i] = (messages, chars) included when the window starts at `i`,
+    // not counting the pinned first message (it is sent either way).
+    let mut suffix = vec![(0usize, 0usize); len + 1];
+    for i in (0..len).rev() {
+        let (count, chars) = suffix[i + 1];
+        suffix[i] = if Some(i) == first_pinned_idx {
+            (count, chars)
+        } else {
+            (count + 1, chars + msg_chars(&messages[i]))
+        };
+    }
+    let over = |i: usize, count_limit: usize, char_limit: Option<usize>| {
+        let (count, chars) = suffix[i];
+        count > count_limit || char_limit.is_some_and(|b| chars > b)
+    };
+
+    let max_messages = max_messages.max(1);
+    let keep = HistoryWindow {
+        start_index: start,
+        anchor: (start > 0).then(|| messages[start].id),
+    };
+    if start >= len || !over(start, max_messages, char_budget) {
+        return keep;
+    }
+
+    // Candidate cuts: user text messages strictly after the current start and
+    // strictly before the in-progress turn's user message.
+    let is_user_text = |m: &crate::components::chat::Message| {
+        m.author == "User" && matches!(m.content, MessageContent::Text { .. })
+    };
+    let current_turn_user_idx = messages.iter().rposition(is_user_text).unwrap_or(0);
+    let candidates: Vec<usize> = (start + 1..current_turn_user_idx)
+        .filter(|&i| Some(i) != first_pinned_idx && is_user_text(&messages[i]))
+        .collect();
+    let Some(&furthest) = candidates.last() else {
+        return keep;
+    };
+
+    let low_count = (max_messages * HISTORY_LOW_WATER_NUM / HISTORY_LOW_WATER_DEN).max(1);
+    let low_chars = char_budget.map(|b| b * HISTORY_LOW_WATER_NUM / HISTORY_LOW_WATER_DEN);
+    let cut = candidates
+        .iter()
+        .copied()
+        .find(|&i| !over(i, low_count, low_chars))
+        .unwrap_or(furthest);
+
+    tracing::info!(
+        from = start,
+        to = cut,
+        messages = len,
+        included_before = suffix[start].0,
+        included_after = suffix[cut].0,
+        max_messages,
+        ?char_budget,
+        "History window trimmed: anchor moved forward to a turn boundary"
+    );
+    HistoryWindow {
+        start_index: cut,
+        anchor: Some(messages[cut].id),
+    }
+}
+
 /// Result of the message linearisation pass (Pass 1).
 pub(crate) struct LinearisedMessages {
     pub messages: Vec<ChatMessage>,
     pub tool_result_positions: Vec<ToolResultPosition>,
     pub pages_to_store: Vec<(String, crate::session::PagedResult)>,
+    /// Trim anchor this build used — persisted by the caller via
+    /// `PromptBuildResult::history_anchor`.
+    pub history_anchor: Option<uuid::Uuid>,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -59,7 +185,8 @@ impl<'a> PromptBuilder<'a> {
     ///
     /// This handles:
     /// - First user message preservation
-    /// - Dynamic history length capping for finite context windows
+    /// - The forward-only history window (`resolve_history_window`), capped by
+    ///   message count and, for finite context windows, a char budget
     /// - Text → ChatMessage conversion
     /// - ToolCall → functionCall + functionResponse with TOON condensation
     /// - SkillCall → brief stub
@@ -84,12 +211,31 @@ impl<'a> PromptBuilder<'a> {
         let session_messages = &self.session.messages;
         let mut first_message_id = None;
 
-        // Start with the user-configured (or default) history length.
-        // If we know the provider's context window size, dynamically cap
-        // the history to what can actually fit after system + tool definitions
-        // consume their budget. This ensures a 32K model doesn't try to squeeze
-        // 75 messages into a window that can only hold ~8.
-        let history_len = if let Some(ctx_tokens) = provider_context {
+        // 1. Add the first user message to preserve the original intent.
+        let mut first_pinned_idx = None;
+        if let Some((idx, first_message)) =
+            session_messages.iter().enumerate().find(|(_, m)| m.author == "User")
+        {
+            if let MessageContent::Text { .. } = &first_message.content {
+                messages.push(first_message.clone().into());
+                first_message_id = Some(first_message.id);
+                first_pinned_idx = Some(idx);
+            }
+        }
+
+        // 2. Add the history window: everything from the persisted trim anchor
+        // on. If we know the provider's context window size, the history must
+        // also fit what is left after system + tool definitions + safety margin
+        // consume their budget (a 32K model can't hold 75 messages). Both limits
+        // only decide *when* the anchor jumps forward (see
+        // `resolve_history_window`); they never re-derive the start on every
+        // build, which is what kept the outgoing prefix (and the provider's
+        // prompt cache) changing on every request.
+        let history_char_budget = provider_context.map(|ctx_tokens| {
+            // `system` includes the per-turn TURN_CONTEXT, so this budget moves a
+            // little between requests. That only shifts the moment a trim fires:
+            // the anchor never moves back, and a trim lands well under the
+            // budget, so a jittering system size can't flip the window.
             let system_chars = system.len();
             let tool_def_chars: usize = tools.iter()
                 .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
@@ -99,48 +245,24 @@ impl<'a> PromptBuilder<'a> {
             let safety = (total_chars as f64 * tuning.context_safety_margin) as usize;
             let overhead = system_chars + tool_def_chars + safety;
             let history_budget_chars = total_chars.saturating_sub(overhead);
-            // Estimate average message size from actual recent messages;
-            // fall back to 500 chars/message if the session is empty.
-            let avg_msg_chars = if session_messages.is_empty() {
-                500
-            } else {
-                let sample: usize = session_messages.iter().rev().take(10)
-                    .map(|m| m.content.display_summary().len().max(100))
-                    .sum();
-                (sample / session_messages.len().min(10)).max(100)
-            };
-            let dynamic_max = (history_budget_chars / avg_msg_chars).max(1);
-            // Never exceed the user-configured value, but cap if the window is too small.
-            let capped = tuning.chat_history_length.min(dynamic_max);
             tracing::debug!(
                 ctx_tokens,
                 system_chars,
                 tool_def_chars,
                 overhead_chars = overhead,
                 history_budget_chars,
-                avg_msg_chars,
-                dynamic_max,
-                configured = tuning.chat_history_length,
-                effective = capped,
-                "Dynamic history length resolved"
+                "History char budget resolved"
             );
-            capped
-        } else {
-            // No known context window (e.g. Gemini with unlimited context) —
-            // use the configured value as-is.
-            tuning.chat_history_length
-        };
-
-        // 1. Add the first user message to preserve the original intent.
-        if let Some(first_message) = session_messages.iter().find(|m| m.author == "User") {
-            if let MessageContent::Text { .. } = &first_message.content {
-                messages.push(first_message.clone().into());
-                first_message_id = Some(first_message.id);
-            }
-        }
-
-        // 2. Add the last `history_len` messages.
-        let start_index = session_messages.len().saturating_sub(history_len);
+            history_budget_chars
+        });
+        let window = resolve_history_window(
+            session_messages,
+            self.session.history_anchor,
+            first_pinned_idx,
+            tuning.chat_history_length,
+            history_char_budget,
+        );
+        let start_index = window.start_index;
 
         // Identify the current turn's boundary: every message at or after the
         // most recent user text message belongs to the in-progress turn, and its
@@ -413,6 +535,7 @@ impl<'a> PromptBuilder<'a> {
             messages,
             tool_result_positions,
             pages_to_store,
+            history_anchor: window.anchor,
         }
     }
 }

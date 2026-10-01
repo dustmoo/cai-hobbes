@@ -300,6 +300,21 @@ impl Default for OpenAiCompatConfig {
     }
 }
 
+/// How long Anthropic keeps a prompt-cache entry alive after its last read.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCacheTtl {
+    /// 5 minutes (default). Cache writes bill at 1.25x the input price.
+    #[default]
+    FiveMinutes,
+    /// 1 hour. Cache writes bill at 2x the input price.
+    OneHour,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaudeConfig {
     #[serde(skip)]
@@ -310,6 +325,16 @@ pub struct ClaudeConfig {
     pub max_tokens: Option<u32>, // Claude requires explicit max_tokens
     #[serde(default)]
     pub extended_thinking: bool,
+    /// Anthropic prompt caching (`cache_control` markers). On by default,
+    /// including for settings.json files written before the field existed.
+    #[serde(default = "default_true")]
+    pub prompt_caching_enabled: bool,
+    #[serde(default)]
+    pub cache_ttl: ClaudeCacheTtl,
+    /// Debug flag (settings.json only, no UI): opt into Anthropic's cache
+    /// diagnostics beta so the API names where a cache miss diverged.
+    #[serde(default)]
+    pub cache_diagnostics: bool,
     #[serde(default = "default_claude_model_slots")]
     pub model_slots: Vec<String>, // Provider-scoped quick-switch slots
     /// Per-provider context tuning overrides (None = use global defaults)
@@ -326,6 +351,9 @@ impl Default for ClaudeConfig {
             summary_model: Some(ClaudeModel::Haiku4_5.canonical_slug().to_string()),
             max_tokens: default_claude_max_tokens(),
             extended_thinking: false,
+            prompt_caching_enabled: true,
+            cache_ttl: ClaudeCacheTtl::default(),
+            cache_diagnostics: false,
             model_slots: default_claude_model_slots(),
             context_tuning: ContextTuningPreset::default(),
         }

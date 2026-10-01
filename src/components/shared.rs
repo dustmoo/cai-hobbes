@@ -198,6 +198,9 @@ pub struct UsageData {
     pub thoughts_tokens: Option<i32>,
     #[serde(default)]
     pub cached_content_tokens: Option<i32>,
+    /// Tokens written to the provider's prompt cache this request (Anthropic).
+    #[serde(default)]
+    pub cache_creation_tokens: Option<i32>,
     /// Calculated cost in USD
     #[serde(default)]
     pub cost: Option<f64>,

@@ -739,6 +739,7 @@ impl LlmFormatConverter for GeminiConnector {
                         completion_tokens: usage.candidates_token_count.unwrap_or(0),
                         total_tokens: usage.total_token_count,
                         cached_content_tokens: usage.cached_content_token_count,
+                        cache_creation_tokens: None,
                         thoughts_tokens: usage.thoughts_token_count,
                         cost: Some(cost),
                     }));
@@ -1743,6 +1744,7 @@ impl LlmConnector for GeminiConnector {
                                                 total_tokens: usage.total_tokens,
                                                 cost: usage.cost,
                                                 cached_content_tokens: usage.cached_content_tokens,
+                                                cache_creation_tokens: None,
                                                 thoughts_tokens: usage.thoughts_tokens,
                                             });
                                     }
@@ -2178,6 +2180,7 @@ mod tests {
         // Create prompt data
         let prompt_data = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2265,6 +2268,7 @@ mod tests {
 
         let prompt_data = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2334,6 +2338,7 @@ mod tests {
 
         let prompt_data = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2407,6 +2412,7 @@ mod tests {
 
         let prompt_data = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -3010,6 +3016,7 @@ mod tests {
 
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages,
             tools: vec![],
         };
@@ -3084,6 +3091,7 @@ mod tests {
         // provider before a mid-chat switch to Gemini).
         let prompt_data = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![
                 crate::llm::ChatMessage {
                     role: crate::llm::ChatRole::Assistant,

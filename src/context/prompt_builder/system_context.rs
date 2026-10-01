@@ -6,8 +6,14 @@ use super::PromptBuilder;
 
 /// Result of system context assembly.
 pub(crate) struct SystemContextResult {
-    /// The complete system instruction string (persona + SYSTEM_CONTEXT XML block).
+    /// The complete system instruction string: the stable part (persona +
+    /// `<SYSTEM_CONTEXT>`) followed by the volatile part (`<TURN_CONTEXT>` +
+    /// turn instructions).
     pub system: String,
+    /// Byte offset into `system` where the volatile part begins (always a char
+    /// boundary, `< system.len()`). `None` when there is no volatile part.
+    /// Feeds `LlmPrompt.system_volatile_offset`.
+    pub volatile_offset: Option<usize>,
     /// The tools list, potentially filtered by active skill scope.
     pub tools: Vec<ToolDefinition>,
     /// The resolved context tuning for this prompt build.
@@ -120,7 +126,7 @@ impl<'a> PromptBuilder<'a> {
         // 1. Extract and format tools from the session context.
         let mut tools = Vec::new();
         if let Some(mcp_context) = &self.session.active_context.mcp_tools {
-            tools = dedupe_by_wire_name(
+            tools = sort_and_dedupe_tools(
                 mcp_context
                     .servers
                     .iter()
@@ -156,6 +162,11 @@ impl<'a> PromptBuilder<'a> {
             persona = format!("{}\n\nTOOL POLICY: {}", persona, instruction);
         }
 
+        // Instructions that depend on how the conversation currently ends. They
+        // are per-turn, so they render after `<TURN_CONTEXT>` (the volatile
+        // part), never inside the persona (the stable, cacheable part).
+        let mut turn_instructions = String::new();
+
         // Check if the last message is an empty placeholder from Hobbes (continuation scenario)
         let last_message = self.session.messages.last();
         let is_continuation_placeholder = last_message.is_some_and(|m| {
@@ -189,10 +200,10 @@ impl<'a> PromptBuilder<'a> {
 
             if last_message_was_tool {
                 let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again. When reporting specific values from tool outputs (like dates, IDs, or file paths), present them exactly as returned. Do not transform, reformat, or convert them (e.g. date conversion) unless explicitly requested by the user.";
-                persona.push_str(tool_completion_instruction);
+                turn_instructions.push_str(tool_completion_instruction);
             } else {
                 let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";
-                persona.push_str(continuation_instruction);
+                turn_instructions.push_str(continuation_instruction);
             }
         }
 
@@ -200,7 +211,7 @@ impl<'a> PromptBuilder<'a> {
         // round succeeds, an earlier failure is already handled.
         let failed_tools = latest_round_failed_tools(&self.session.messages);
         if !failed_tools.is_empty() {
-            persona.push_str(&format!(
+            turn_instructions.push_str(&format!(
                 "\n\nRECOVERY NOTE: The last tool call(s) failed ({}). Read the error, then try a different approach rather than repeating the identical call.",
                 failed_tools.join(", ")
             ));
@@ -209,10 +220,14 @@ impl<'a> PromptBuilder<'a> {
         active_context.system_persona = Some(persona);
 
         // Extract MCP server info BEFORE nulling mcp_tools - so LLM knows what each server is
+        // Sorted by name: `McpManager.servers` is a HashMap, and this array sits
+        // in the stable (cacheable) part of the system prompt.
         let mcp_servers_info: Option<Vec<serde_json::Value>> =
             active_context.mcp_tools.as_ref().map(|ctx| {
-                ctx.servers
-                    .iter()
+                let mut servers: Vec<_> = ctx.servers.iter().collect();
+                servers.sort_by(|a, b| a.name.cmp(&b.name));
+                servers
+                    .into_iter()
                     .map(|server| {
                         serde_json::json!({
                             "name": server.name,
@@ -307,16 +322,7 @@ impl<'a> PromptBuilder<'a> {
                         crate::components::shared::CapabilityContextPayload,
                     >(&sc.response)
                     {
-                        let tool_mappings: Vec<serde_json::Value> = payload
-                            .resolved_tools
-                            .iter()
-                            .map(|(capability, tool_name)| {
-                                json!({
-                                    "capability": capability,
-                                    "use_tool": tool_name
-                                })
-                            })
-                            .collect();
+                        let tool_mappings = sorted_tool_mappings(&payload.resolved_tools);
 
                         system_context_map.insert(
                             "active_skill".to_string(),
@@ -405,7 +411,7 @@ impl<'a> PromptBuilder<'a> {
                 &self.session.loaded_skills,
                 self.settings.skill_idle_turns,
             );
-            let skills_array: Vec<serde_json::Value> = self
+            let mut skills_array: Vec<serde_json::Value> = self
                 .session
                 .loaded_skills
                 .iter()
@@ -414,11 +420,7 @@ impl<'a> PromptBuilder<'a> {
                         crate::components::shared::CapabilityContextPayload,
                     >(payload_json)
                     .ok()?;
-                    let tool_mappings: Vec<serde_json::Value> = payload
-                        .resolved_tools
-                        .iter()
-                        .map(|(cap, tool)| json!({"capability": cap, "use_tool": tool}))
-                        .collect();
+                    let tool_mappings = sorted_tool_mappings(&payload.resolved_tools);
 
                     if idle_skill_names.contains(skill_name) {
                         tracing::debug!(
@@ -461,6 +463,8 @@ impl<'a> PromptBuilder<'a> {
                 })
                 .collect();
 
+            // `loaded_skills` is a HashMap; order the array by skill name.
+            skills_array.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
             if !skills_array.is_empty() {
                 system_context_map.insert(
                     "loaded_skills".to_string(),
@@ -671,26 +675,152 @@ impl<'a> PromptBuilder<'a> {
         // This compresses/omits low-priority sections to fit the system prompt
         // within ~20% of the provider's context budget.
         let provider_context = self.effective_context_window();
-        Self::compose_system_for_budget(&mut system_context_map, &persona, provider_context, &tuning);
+        // The budget runs over the combined map, before the stable/volatile
+        // split, so its priority tiers apply across both parts; the free text
+        // (persona + turn instructions + the TURN_CONTEXT header) counts too.
+        Self::compose_system_for_budget(
+            &mut system_context_map,
+            persona.len() + turn_instructions.len() + TURN_CONTEXT_NOTE.len(),
+            provider_context,
+            &tuning,
+        );
 
-        let context_json = serde_json::to_string_pretty(&system_context_map).unwrap_or_default();
+        // Layout (prompt-cache friendly — see `LlmPrompt.system_volatile_offset`):
+        //   <persona>\n\n<SYSTEM_CONTEXT>{stable keys}</SYSTEM_CONTEXT>
+        //   | volatile offset |
+        //   \n\n<TURN_CONTEXT>{volatile keys}</TURN_CONTEXT><turn instructions>
+        let (stable_map, volatile_map) = split_context_map(system_context_map);
 
         let mut system = persona;
-        if !context_json.is_empty() && context_json != "{}" {
-            system.push_str(&format!(
-                "\n\n<SYSTEM_CONTEXT>\n{}\n</SYSTEM_CONTEXT>",
-                context_json
-            ));
+        if let Some(block) = render_context_block("SYSTEM_CONTEXT", None, stable_map) {
+            system.push_str("\n\n");
+            system.push_str(&block);
         }
+        let stable_len = system.len();
+        if let Some(block) =
+            render_context_block("TURN_CONTEXT", Some(TURN_CONTEXT_NOTE), volatile_map)
+        {
+            system.push_str("\n\n");
+            system.push_str(&block);
+        }
+        system.push_str(&turn_instructions);
+        let volatile_offset = (system.len() > stable_len).then_some(stable_len);
 
         SystemContextResult {
             system,
+            volatile_offset,
             tools,
             tuning,
             provider_context,
             is_continuation_placeholder,
         }
     }
+}
+
+/// `SYSTEM_CONTEXT` keys that belong in the stable (prompt-cacheable) part of
+/// the system prompt. A key is stable only if it changes at most a handful of
+/// times per session and only on an explicit event (settings edit, MCP server
+/// (un)load, Composio profile switch, `/skill` run, skill catalog change).
+/// Every other key — including unknown `ActiveContext.extra` keys — goes to
+/// `<TURN_CONTEXT>`, so a new key defaults to the safe (uncached) side.
+const STABLE_CONTEXT_KEYS: &[&str] = &[
+    "user_name",
+    "user_instruction",
+    "force_tool_use_instruction",
+    "tools",
+    "mcp_servers",
+    "composio_context",
+    "active_skill",
+    "available_skills",
+];
+
+/// Header line of the `<TURN_CONTEXT>` block.
+const TURN_CONTEXT_NOTE: &str = "Live per-turn state (current time, working memory, conversation summary, loaded skills, today's plan). It has the same authority as SYSTEM_CONTEXT.";
+
+/// Recursively sort every JSON object's keys. The app's `serde_json` has
+/// `preserve_order` enabled (pulled in transitively), so a `Map` keeps
+/// insertion order — and objects built from a `HashMap` (`ActiveContext.extra`,
+/// summary entities) would iterate in a per-process random order. Sorting
+/// makes the rendered bytes a pure function of the content.
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(map).into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (k, mut v) in entries {
+                canonicalize_json(&mut v);
+                map.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(canonicalize_json),
+        _ => {}
+    }
+}
+
+/// Sort `{capability, use_tool}` mappings built from a `HashMap` (a skill
+/// payload's `resolved_tools` is re-deserialized — with a fresh random hasher —
+/// on every build, so its iteration order differs build to build).
+fn sorted_tool_mappings(
+    resolved_tools: &std::collections::HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    let mut pairs: Vec<(&String, &String)> = resolved_tools.iter().collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(capability, tool)| json!({"capability": capability, "use_tool": tool}))
+        .collect()
+}
+
+/// Render a context map as a tagged pretty-JSON block (empty map → `None`).
+fn render_context_block(
+    tag: &str,
+    header: Option<&str>,
+    mut map: serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    if map.is_empty() {
+        return None;
+    }
+    let mut value = serde_json::Value::Object(std::mem::take(&mut map));
+    canonicalize_json(&mut value);
+    let json = serde_json::to_string_pretty(&value).unwrap_or_default();
+    let header = header.map(|h| format!("{h}\n")).unwrap_or_default();
+    Some(format!("<{tag}>\n{header}{json}\n</{tag}>"))
+}
+
+/// Split the composed context map into (stable, volatile) by
+/// `STABLE_CONTEXT_KEYS`.
+fn split_context_map(
+    map: serde_json::Map<String, serde_json::Value>,
+) -> (
+    serde_json::Map<String, serde_json::Value>,
+    serde_json::Map<String, serde_json::Value>,
+) {
+    let mut stable = serde_json::Map::new();
+    let mut volatile = serde_json::Map::new();
+    for (k, v) in map {
+        if STABLE_CONTEXT_KEYS.contains(&k.as_str()) {
+            stable.insert(k, v);
+        } else {
+            volatile.insert(k, v);
+        }
+    }
+    (stable, volatile)
+}
+
+/// Order tools by provider-facing wire name (ties broken by server name), then
+/// drop wire-name duplicates. Tools render first in every request, so their
+/// order must not follow `McpManager.servers` (a `HashMap`) — a reorder would
+/// miss the provider's prompt cache for the whole request. Sorting before the
+/// dedupe also makes the kept duplicate deterministic.
+fn sort_and_dedupe_tools(mut tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
+    tools.sort_by_cached_key(|t| {
+        (
+            crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name),
+            t.server_name.clone(),
+        )
+    });
+    dedupe_by_wire_name(tools)
 }
 
 /// Drop tools whose provider-facing name repeats an earlier one, keeping the

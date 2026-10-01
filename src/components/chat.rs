@@ -674,7 +674,7 @@ pub fn ChatWindow(
                                 fetch_fresh_mcp_context(target_id.clone(), settings_read.clone())
                                     .await;
 
-                            let (prompt_data, pages) = {
+                            let (prompt_data, pages, history_anchor) = {
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder = PromptBuilder::new(session, &settings_read)
@@ -686,7 +686,7 @@ pub fn ChatWindow(
                                             ),
                                         );
                                     let result = builder.build_prompt("".to_string());
-                                    (result.prompt, result.pages_to_store)
+                                    (result.prompt, result.pages_to_store, result.history_anchor)
                                 } else {
                                     return;
                                 }
@@ -694,6 +694,16 @@ pub fn ChatWindow(
                             // Store paginated pages in a separate write scope (clean borrow separation)
                             if !pages.is_empty() {
                                 session_state.write().store_pages(pages);
+                            }
+                            // Persist a moved history trim anchor the same way, so the next build
+                            // starts from the same cut (keeps the prompt-cache prefix stable).
+                            if session_state
+                                .read()
+                                .history_anchor_changed(&target_id, history_anchor)
+                            {
+                                session_state
+                                    .write()
+                                    .set_history_anchor(&target_id, history_anchor);
                             }
 
                             let mcp_context = if fresh_mcp_context.servers.is_empty() {
@@ -827,8 +837,11 @@ pub fn ChatWindow(
                         }
                     }
 
-                    let (prompt_data, pages) = {
-                        let user_prompt = user_message.clone();
+                    let (prompt_data, pages, history_anchor) = {
+                        // The user message was pushed onto the session above
+                        // (with its attachments), so linearisation already
+                        // includes it. Passing it again would send it twice.
+                        let user_prompt = String::new();
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read)
@@ -838,7 +851,7 @@ pub fn ChatWindow(
                                     chrono::Local::now().date_naive(),
                                 ));
                             let result = builder.build_prompt(user_prompt);
-                            (result.prompt, result.pages_to_store)
+                            (result.prompt, result.pages_to_store, result.history_anchor)
                         } else {
                             tracing::error!("No active session found when building prompt");
                             return;
@@ -847,6 +860,16 @@ pub fn ChatWindow(
                     // Store paginated pages in a separate write scope (clean borrow separation)
                     if !pages.is_empty() {
                         session_state.write().store_pages(pages);
+                    }
+                    // Persist a moved history trim anchor the same way, so the next build
+                    // starts from the same cut (keeps the prompt-cache prefix stable).
+                    if session_state
+                        .read()
+                        .history_anchor_changed(&target_id, history_anchor)
+                    {
+                        session_state
+                            .write()
+                            .set_history_anchor(&target_id, history_anchor);
                     }
 
                     crate::session::SessionState::save_async(&session_state.read(), None);
@@ -911,7 +934,7 @@ pub fn ChatWindow(
                 let fresh_mcp_context =
                     fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
 
-                let (prompt_data, pages) = {
+                let (prompt_data, pages, history_anchor) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings).with_planner_today(
@@ -922,7 +945,7 @@ pub fn ChatWindow(
                             ),
                         );
                         let result = builder.build_prompt("".to_string());
-                        (result.prompt, result.pages_to_store)
+                        (result.prompt, result.pages_to_store, result.history_anchor)
                     } else {
                         tracing::error!(
                             "Active session lost during continuation flow - aborting prompt build"
@@ -942,6 +965,16 @@ pub fn ChatWindow(
                 // Store paginated pages in a separate write scope (clean borrow separation)
                 if !pages.is_empty() {
                     session_state.write().store_pages(pages);
+                }
+                // Persist a moved history trim anchor the same way, so the next build
+                // starts from the same cut (keeps the prompt-cache prefix stable).
+                if session_state
+                    .read()
+                    .history_anchor_changed(&target_id, history_anchor)
+                {
+                    session_state
+                        .write()
+                        .set_history_anchor(&target_id, history_anchor);
                 }
 
                 crate::session::SessionState::save_async(&session_state.read(), None);

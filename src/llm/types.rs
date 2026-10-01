@@ -87,6 +87,14 @@ impl ToolDefinition {
 pub struct LlmPrompt {
     /// System instruction (separate from messages per Gemini/Claude convention)
     pub system: Option<String>,
+    /// Byte offset into `system` where per-turn (volatile) content begins.
+    /// Everything before it is stable across turns of a session and safe to
+    /// prompt-cache; everything from it on changes turn to turn. `None` means
+    /// the whole system string is treated as stable. Connectors that don't
+    /// cache ignore it — `system` always carries the full text. Consumers must
+    /// clamp it to `system.len()` and to a char boundary before slicing.
+    #[serde(default)]
+    pub system_volatile_offset: Option<usize>,
     /// Conversation history + current user message
     pub messages: Vec<ChatMessage>,
     /// Available tools

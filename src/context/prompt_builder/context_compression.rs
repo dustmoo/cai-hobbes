@@ -9,9 +9,18 @@ impl<'a> PromptBuilder<'a> {
     /// 2. Skill (compress before omit): loaded_skills instruction_manuals
     /// 3. Context (trim): conversation_summary, entities
     /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction, planner_today
+    ///
+    /// `fixed_text_chars` is the size of the free text rendered around the map
+    /// (persona, turn instructions, block headers). The map is the combined
+    /// SYSTEM_CONTEXT + TURN_CONTEXT content, so the tiers apply across both
+    /// parts. Decisions depend on the total size, which includes volatile
+    /// content: a stable key (composio_context, mcp_servers, user_instruction)
+    /// is dropped only once the total crosses the budget, which changes the
+    /// cached prefix at that point. That is rare (the budget is ~20% of the
+    /// window) and unavoidable without breaking the priority order.
     pub(crate) fn compose_system_for_budget(
         system_context_map: &mut serde_json::Map<String, serde_json::Value>,
-        persona: &str,
+        fixed_text_chars: usize,
         max_context_tokens: Option<usize>,
         tuning: &crate::settings::ResolvedContextTuning,
     ) {
@@ -24,7 +33,7 @@ impl<'a> PromptBuilder<'a> {
         let map_size = serde_json::to_string(&serde_json::Value::Object(system_context_map.clone()))
             .map(|s| s.len())
             .unwrap_or(0);
-        let mut running_size = persona.len() + map_size;
+        let mut running_size = fixed_text_chars + map_size;
 
         if running_size <= system_budget_chars { return; }
 

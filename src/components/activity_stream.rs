@@ -55,8 +55,6 @@ pub enum StepKind {
     Error,
     /// A thinking summary, either attached to a tool call or standing alone.
     Thinking,
-    /// A permission request awaiting the user.
-    NeedsYou,
 }
 
 /// How a message participates in a turn's activity run.
@@ -581,9 +579,10 @@ pub struct StepRow {
     pub full_text: Option<String>,
 }
 
-/// Flatten a run of messages into rows, pinning permission requests to the top
-/// (a prompt waiting on the user is the only thing in the block that needs an
-/// answer, so it must not be buried mid-list).
+/// Flatten a run of messages into rows. Permission requests get no row: a
+/// prompt waiting on the user must stay visible however the block is
+/// collapsed, so [`ActivityStream`] renders them as standalone entries next to
+/// the block instead.
 /// `live_now` is `Some(now)` only while the block is live; it turns a trailing
 /// empty placeholder into the block's pulsing last row (offset measured from
 /// `now`, no duration) instead of leaving it to render as a second bubble.
@@ -592,7 +591,6 @@ pub fn build_rows(
     turn_start: chrono::DateTime<chrono::Utc>,
     live_now: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Vec<StepRow> {
-    let mut pinned = Vec::new();
     let mut rows = Vec::new();
     // The tail placeholder, if this block is live and ends on one.
     let live_tail = live_now
@@ -621,18 +619,6 @@ pub fn build_rows(
             continue;
         }
         match &m.content {
-            MessageContent::PermissionRequest(tc) => pinned.push(StepRow {
-                message_id: m.id,
-                key: format!("{}:perm", m.id),
-                kind: StepKind::NeedsYou,
-                label: step_label(tc),
-                offset_secs: offset,
-                duration_secs: None,
-                running: false,
-                tool_call: Some(tc.clone()),
-                usage: m.usage.clone(),
-                full_text: None,
-            }),
             MessageContent::ToolCall(tc) => {
                 if let Some(thought) = tc.thought_summary.as_ref().filter(|t| !t.trim().is_empty())
                 {
@@ -664,8 +650,7 @@ pub fn build_rows(
             _ => {}
         }
     }
-    pinned.extend(rows);
-    pinned
+    rows
 }
 
 fn thinking_row(id: Uuid, tag: &str, thought: &str, offset: i64) -> StepRow {
@@ -884,7 +869,19 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
     };
     let finished_usage_text = format_usage_summary(&token_mode, cost, tokens);
 
+    // Pending approvals are standalone entries, never rows inside the
+    // collapsible block: collapsing (or scrolling past) the block must not
+    // hide a prompt that is still blocking the turn.
+    let permission_requests: Vec<(ToolCall, chrono::DateTime<chrono::Utc>)> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::PermissionRequest(tc) => Some((tc.clone(), m.created_at)),
+            _ => None,
+        })
+        .collect();
+
     rsx! {
+        if !rows.is_empty() {
         div {
             class: "flex justify-start w-full",
             div {
@@ -1037,6 +1034,33 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                 }
             }
         }
+        }
+        for (tc, created_at) in permission_requests {
+            div {
+                key: "{tc.execution_id}:perm",
+                class: "flex justify-start w-full",
+                div {
+                    class: "flex flex-col max-w-full min-w-0",
+                    if crate::components::tool_call_display::is_skill_invoke_request(&tc) {
+                        crate::components::tool_call_display::SkillToolPermissionPrompt {
+                            tool_call: tc.clone(),
+                            session_id: props.session_id.clone(),
+                            profile_color: props.profile_color.clone(),
+                        }
+                    } else {
+                        PermissionPrompt {
+                            tool_call: tc.clone(),
+                            session_id: props.session_id.clone(),
+                        }
+                    }
+                    crate::components::shared::MessageCaption {
+                        label: "System".to_string(),
+                        created_at: created_at,
+                        show_time: props.show_time,
+                    }
+                }
+            }
+        }
         if props.is_live {
             Ticker { tick }
         }
@@ -1088,20 +1112,6 @@ struct ActivityRowProps {
 #[component]
 fn ActivityRow(props: ActivityRowProps) -> Element {
     let row = props.row.clone();
-    let is_permission = row.kind == StepKind::NeedsYou;
-
-    // Permission prompts keep their own full-fidelity UI (approve/deny plus
-    // trust-rule authoring); the stream only pins them to the top.
-    if is_permission {
-        let tc = row.tool_call.clone().unwrap_or_default();
-        return rsx! {
-            div {
-                class: "px-3 py-2",
-                PermissionPrompt { tool_call: tc, session_id: props.session_id.clone() }
-            }
-        };
-    }
-
     let duration_text = match row.duration_secs {
         Some(s) => format_elapsed(s),
         None if row.running => String::new(),
@@ -1193,9 +1203,6 @@ fn step_icon(kind: StepKind, running: bool) -> Element {
         },
         StepKind::Thinking => rsx! {
             Icon { width: 14, height: 14, class: "text-fg-muted".to_string(), icon: fi_icons::FiCpu }
-        },
-        StepKind::NeedsYou => rsx! {
-            Icon { width: 14, height: 14, fill: "#eab308".to_string(), icon: fi_icons::FiAlertCircle }
         },
         StepKind::Tool => rsx! {
             Icon {
@@ -1997,7 +2004,7 @@ mod tests {
     // ---- row building ----
 
     #[test]
-    fn permission_rows_are_pinned_first() {
+    fn permission_requests_get_no_collapsible_row() {
         let start = Utc::now();
         let mut a = tool_msg(tool("srv", "A", "{}", ToolCallStatus::Completed));
         a.created_at = start;
@@ -2007,9 +2014,8 @@ mod tests {
         );
         p.created_at = start + Duration::seconds(5);
         let rows = build_rows(&[a, p], start, None);
-        assert_eq!(rows[0].kind, StepKind::NeedsYou);
-        assert_eq!(rows[1].kind, StepKind::Tool);
-        assert_eq!(rows[0].offset_secs, 5);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, StepKind::Tool);
     }
 
     #[test]
