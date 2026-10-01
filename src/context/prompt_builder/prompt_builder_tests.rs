@@ -524,12 +524,17 @@ fn loaded_skill_payload(skill: &str, resolved_tool: &str) -> String {
     .unwrap()
 }
 
+/// Serialises the tests that write the process-wide skill-metadata mirror
+/// (`set_available_skills_for_test`) or need it to hold still across builds.
+static SKILL_MIRROR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Single test covering all gate states: the skill-metadata mirror is a
 /// process-wide OnceLock, so the states are exercised sequentially in one
 /// test to avoid cross-test races, and the mirror is cleared at the end.
 #[test]
 fn test_available_skills_gated_by_running_skill() {
     use crate::skills::registry::{set_available_skills_for_test, AvailableSkill};
+    let _mirror = SKILL_MIRROR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
     set_available_skills_for_test(vec![AvailableSkill {
         name: "research".to_string(),
@@ -1283,4 +1288,362 @@ fn unload_tool_withheld_when_nothing_loaded() {
         .loaded_skills
         .insert("news".to_string(), loaded_skill_payload("news", "x"));
     assert!(has_unload(&session));
+}
+
+// =========================================================================
+// Prompt-cache layout: stable SYSTEM_CONTEXT prefix | volatile TURN_CONTEXT
+// =========================================================================
+
+fn named_tool(name: &str) -> rmcp::model::Tool {
+    let mut t = invoke_skill_tool();
+    t.name = name.to_string().into();
+    t
+}
+
+fn mcp_server(name: &str, tools: &[&str]) -> crate::mcp::manager::McpServerContext {
+    crate::mcp::manager::McpServerContext {
+        name: name.to_string(),
+        description: format!("{name} server"),
+        tools: tools.iter().map(|t| named_tool(t)).collect(),
+    }
+}
+
+/// A completed `/skill` run whose payload resolves several tools, so a
+/// HashMap-ordered rendering of `resolved_tools` would show up as a diff.
+fn completed_skill_call_msg(skill: &str) -> Message {
+    let payload = crate::components::shared::CapabilityContextPayload {
+        skill: skill.to_string(),
+        instruction_manual: "Follow the release checklist.".to_string(),
+        environment: crate::components::shared::SkillEnvironment {
+            root_path: std::path::PathBuf::new(),
+            scripts: vec![],
+            resources: vec![],
+            user_args: String::new(),
+        },
+        resolved_tools: (0..8)
+            .map(|i| (format!("cap_{i}"), format!("skill-server_tool_{i}")))
+            .collect(),
+        warnings: vec![],
+    };
+    Message {
+        id: uuid::Uuid::new_v4(),
+        author: "User".to_string(),
+        content: MessageContent::SkillCall(crate::components::shared::SkillCall {
+            execution_id: "skill-exec".to_string(),
+            skill_name: skill.to_string(),
+            status: crate::components::shared::SkillCallStatus::Completed,
+            response: serde_json::to_string(&payload).unwrap(),
+            ..Default::default()
+        }),
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    }
+}
+
+fn cache_test_settings() -> Settings {
+    use crate::settings::ComposioProfile;
+    Settings {
+        user_name: Some("Dustin".to_string()),
+        composio_profiles: vec![ComposioProfile {
+            id: "profile-1".to_string(),
+            name: "Work".to_string(),
+            user_id: Some("u".to_string()),
+            api_key: Some("k".to_string()),
+            ..Default::default()
+        }],
+        active_composio_profile: Some("profile-1".to_string()),
+        ..Default::default()
+    }
+}
+
+/// A session with every stable section populated (MCP servers, active skill,
+/// loaded skill, user name via settings, composio via settings).
+fn cache_test_session(server_order_reversed: bool) -> Session {
+    let mut session = create_test_session();
+    let mut servers = vec![
+        mcp_server("alpha", &["zeta", "beta"]),
+        mcp_server("omega", &["read", "write"]),
+        mcp_server("hobbes-core", &["HOBBES_UPDATE_SCRATCHPAD"]),
+    ];
+    if server_order_reversed {
+        servers.reverse();
+        for s in &mut servers {
+            s.tools.reverse();
+        }
+    }
+    session.active_context.mcp_tools = Some(crate::mcp::manager::McpContext {
+        servers,
+        connected_toolkit_slugs: vec![],
+    });
+    session
+        .loaded_skills
+        .insert("news".to_string(), loaded_skill_payload("news", "unrelated"));
+    session
+        .loaded_skills
+        .insert("weather".to_string(), loaded_skill_payload("weather", "unrelated2"));
+    session
+}
+
+struct Turn {
+    scratchpad: &'static str,
+    summary: &'static str,
+    planner: &'static str,
+    ends_in_failed_tool: bool,
+}
+
+fn build_turn(turn: &Turn, settings: &Settings) -> (String, usize) {
+    let mut session = cache_test_session(false);
+    session.scratchpad = turn.scratchpad.to_string();
+    session.active_context.conversation_summary.summary = turn.summary.to_string();
+    let mut messages = vec![completed_skill_call_msg("release"), user_text_msg("go")];
+    if turn.ends_in_failed_tool {
+        let mut call = tool_call_msg("read", "boom".to_string(), None);
+        if let MessageContent::ToolCall(tc) = &mut call.content {
+            tc.server_name = "omega".to_string();
+            tc.status = ToolCallStatus::Error;
+        }
+        messages.push(call);
+    }
+    session.messages = messages;
+    let ctx = PromptBuilder::new(&session, settings)
+        .with_planner_today(Some(serde_json::json!({ "plan": turn.planner })))
+        .build_system_context();
+    let offset = ctx.volatile_offset.expect("there is always per-turn state");
+    (ctx.system, offset)
+}
+
+fn assert_offset_valid(system: &str, offset: usize) {
+    assert!(offset <= system.len(), "offset {offset} > len {}", system.len());
+    assert!(system.is_char_boundary(offset), "offset {offset} not on a char boundary");
+}
+
+#[test]
+fn stable_prefix_is_byte_identical_across_turns() {
+    use crate::skills::registry::{set_available_skills_for_test, AvailableSkill};
+    let _mirror = SKILL_MIRROR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    set_available_skills_for_test(vec![AvailableSkill {
+        name: "research".to_string(),
+        description: "Deep research".to_string(),
+        argument_hint: None,
+        disable_model_invocation: false,
+    }]);
+    let settings = cache_test_settings();
+
+    let a = Turn {
+        scratchpad: "SCRATCH_ALPHA",
+        summary: "SUMMARY_ONE",
+        planner: "PLAN_ONE",
+        ends_in_failed_tool: false,
+    };
+    let b = Turn {
+        scratchpad: "SCRATCH_BETA",
+        summary: "SUMMARY_TWO",
+        planner: "PLAN_TWO",
+        ends_in_failed_tool: true,
+    };
+    let (sys_a, off_a) = build_turn(&a, &settings);
+    // Rebuild a few times: HashMap-ordered content (skill tool mappings,
+    // loaded skills) gets a fresh random order on every build.
+    for _ in 0..4 {
+        let (again, off) = build_turn(&a, &settings);
+        assert_eq!(&again[..off], &sys_a[..off_a]);
+    }
+    let (sys_b, off_b) = build_turn(&b, &settings);
+    set_available_skills_for_test(vec![]);
+
+    assert_offset_valid(&sys_a, off_a);
+    assert_offset_valid(&sys_b, off_b);
+    assert_eq!(
+        &sys_a[..off_a],
+        &sys_b[..off_b],
+        "stable part must not change between turns"
+    );
+
+    let stable = &sys_a[..off_a];
+    for stable_section in [
+        "<SYSTEM_CONTEXT>",
+        "mcp_servers",
+        "composio_context",
+        "\"user_name\": \"Dustin\"",
+        "active_skill",
+        "Follow the release checklist.",
+        "available_skills",
+    ] {
+        assert!(stable.contains(stable_section), "stable part lacks {stable_section}");
+    }
+
+    for (sys, off, turn) in [(&sys_a, off_a, &a), (&sys_b, off_b, &b)] {
+        let (stable, volatile) = sys.split_at(off);
+        for token in [turn.scratchpad, turn.summary, turn.planner, "loaded_skills"] {
+            assert!(!stable.contains(token), "{token} leaked into the stable part");
+            assert!(volatile.contains(token), "{token} missing from the volatile part");
+        }
+        assert!(volatile.starts_with("\n\n<TURN_CONTEXT>\n"), "{volatile}");
+    }
+    let volatile_b = &sys_b[off_b..];
+    assert!(volatile_b.contains("TOOL COMPLETION INSTRUCTION"));
+    assert!(volatile_b.contains("RECOVERY NOTE"));
+    assert!(!sys_b[..off_b].contains("INSTRUCTION:"));
+    assert!(!sys_b[..off_b].contains("RECOVERY NOTE"));
+    assert!(
+        volatile_b.find("</TURN_CONTEXT>").unwrap()
+            < volatile_b.find("TOOL COMPLETION INSTRUCTION").unwrap(),
+        "turn instructions follow the TURN_CONTEXT block"
+    );
+}
+
+#[test]
+fn current_time_only_appears_after_the_offset() {
+    let settings = cache_test_settings();
+    let session = cache_test_session(false);
+    let result = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
+    let system = result.prompt.system.unwrap();
+    let offset = result
+        .prompt
+        .system_volatile_offset
+        .expect("offset is wired into LlmPrompt");
+    assert_offset_valid(&system, offset);
+    assert!(!system[..offset].contains("current_time"));
+    assert!(!system[..offset].contains("iso_8601"));
+    assert!(system[offset..].contains("current_time"));
+}
+
+#[test]
+fn offset_lands_on_a_char_boundary_with_multibyte_content() {
+    let settings = Settings {
+        persona: "Tu es Hobbes 🦀 — très direct.".to_string(),
+        user_name: Some("Düstîn 🎯".to_string()),
+        ..Default::default()
+    };
+    let mut session = cache_test_session(false);
+    session.scratchpad = "ünïcödé 🧠 notes".to_string();
+    let ctx = PromptBuilder::new(&session, &settings).build_system_context();
+    let offset = ctx.volatile_offset.unwrap();
+    assert_offset_valid(&ctx.system, offset);
+    assert!(ctx.system[..offset].starts_with("Tu es Hobbes 🦀"));
+    assert!(ctx.system[..offset].ends_with("</SYSTEM_CONTEXT>"));
+    assert!(ctx.system[offset..].contains("🧠"));
+}
+
+#[test]
+fn tools_and_servers_are_sorted_regardless_of_input_order() {
+    let settings = cache_test_settings();
+    let build = |reversed: bool| {
+        let session = cache_test_session(reversed);
+        PromptBuilder::new(&session, &settings).build_system_context()
+    };
+    let forward = build(false);
+    let reversed = build(true);
+
+    let wire = |tools: &[crate::llm::types::ToolDefinition]| -> Vec<String> {
+        tools
+            .iter()
+            .map(|t| crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name))
+            .collect()
+    };
+    let forward_names = wire(&forward.tools);
+    assert_eq!(forward_names, wire(&reversed.tools));
+    let mut sorted = forward_names.clone();
+    sorted.sort();
+    assert_eq!(forward_names, sorted, "tools sorted by wire name");
+    assert_eq!(forward.tools.len(), 5);
+
+    let off_f = forward.volatile_offset.unwrap();
+    let off_r = reversed.volatile_offset.unwrap();
+    let stable = &forward.system[..off_f];
+    assert_eq!(stable, &reversed.system[..off_r], "mcp_servers order is stable");
+    let pos = |name: &str| stable.find(&format!("\"name\": \"{name}\"")).unwrap();
+    assert!(pos("alpha") < pos("hobbes-core") && pos("hobbes-core") < pos("omega"));
+}
+
+/// Gemini / OpenAI-compatible connectors send the whole `system` string: every
+/// section the old single-block layout carried must still be in it.
+#[test]
+fn full_system_still_carries_every_section() {
+    let settings = cache_test_settings();
+    let (system, offset) = build_turn(
+        &Turn {
+            scratchpad: "SCRATCH",
+            summary: "SUMMARY",
+            planner: "PLAN",
+            ends_in_failed_tool: true,
+        },
+        &settings,
+    );
+    assert!(system.starts_with(&settings.persona));
+    for section in [
+        "TOOL POLICY:",
+        "<SYSTEM_CONTEXT>",
+        "</SYSTEM_CONTEXT>",
+        "mcp_servers",
+        "composio_context",
+        "user_name",
+        "active_skill",
+        "<TURN_CONTEXT>",
+        "</TURN_CONTEXT>",
+        "same authority as SYSTEM_CONTEXT",
+        "current_time",
+        "scratchpad",
+        "SCRATCH",
+        "conversation_summary",
+        "SUMMARY",
+        "planner_today",
+        "PLAN",
+        "loaded_skills",
+        "TOOL COMPLETION INSTRUCTION",
+        "RECOVERY NOTE",
+    ] {
+        assert!(system.contains(section), "full system lacks {section}");
+    }
+    // The persona (and its TOOL POLICY) stays in the stable part.
+    assert!(system[..offset].contains("TOOL POLICY:"));
+}
+
+#[test]
+fn continuation_instruction_is_volatile() {
+    let settings = Settings::default();
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg("hi"),
+        assistant_text_msg("hello"),
+        assistant_text_msg(""),
+    ];
+    let ctx = PromptBuilder::new(&session, &settings).build_system_context();
+    let offset = ctx.volatile_offset.unwrap();
+    assert!(ctx.system[offset..].contains("CONTINUATION INSTRUCTION"));
+    assert!(!ctx.system[..offset].contains("CONTINUATION INSTRUCTION"));
+}
+
+/// The budget sees the combined size: a stable enrichment key is dropped when
+/// the *volatile* content pushes the total over budget, and the free text
+/// around the map counts.
+#[test]
+fn budget_applies_across_stable_and_volatile_parts() {
+    let tuning = Settings::default().effective_context_tuning_for(LlmProvider::Gemini);
+    let budget_chars = (1000.0 * tuning.system_prompt_budget_ratio * tuning.chars_per_token) as usize;
+    let base = || {
+        let mut map = serde_json::Map::new();
+        map.insert("composio_context".to_string(), serde_json::json!({"info": "x"}));
+        map.insert("current_time".to_string(), serde_json::json!({"iso_8601": "t"}));
+        map
+    };
+
+    let mut small = base();
+    PromptBuilder::compose_system_for_budget(&mut small, 0, Some(1000), &tuning);
+    assert!(small.contains_key("composio_context"), "fits: nothing dropped");
+
+    let mut big_volatile = base();
+    big_volatile.insert(
+        "scratchpad".to_string(),
+        serde_json::json!({"content": "s".repeat(budget_chars)}),
+    );
+    PromptBuilder::compose_system_for_budget(&mut big_volatile, 0, Some(1000), &tuning);
+    assert!(!big_volatile.contains_key("composio_context"));
+    assert!(big_volatile.contains_key("scratchpad"), "scratchpad is never dropped");
+
+    let mut big_text = base();
+    PromptBuilder::compose_system_for_budget(&mut big_text, budget_chars, Some(1000), &tuning);
+    assert!(!big_text.contains_key("composio_context"), "fixed text counts");
 }

@@ -237,6 +237,30 @@ impl ClaudeModel {
         }
     }
 
+    /// USD price per 1M prompt-cache write tokens: 1.25x base input for the
+    /// 5-minute TTL, 2x for the 1-hour TTL.
+    pub fn cache_write_price_per_mtok(&self, ttl: super::config::ClaudeCacheTtl) -> f64 {
+        let mult = match ttl {
+            super::config::ClaudeCacheTtl::FiveMinutes => 1.25,
+            super::config::ClaudeCacheTtl::OneHour => 2.0,
+        };
+        self.input_price_per_mtok() * mult
+    }
+
+    /// Whether a `{"role": "system"}` entry is accepted mid-conversation
+    /// (as the last message). Sonnet 5 and everything older reject it.
+    pub fn supports_mid_conversation_system(&self) -> bool {
+        matches!(
+            self,
+            ClaudeModel::Opus5_5
+                | ClaudeModel::Opus5
+                | ClaudeModel::Opus4_8
+                | ClaudeModel::Fable5
+                | ClaudeModel::Fable5_1
+                | ClaudeModel::Sonnet5_5
+        )
+    }
+
     /// Models that think on every request. `thinking: {type: "disabled"}` is
     /// rejected with a 400, so the connector must replay their signed
     /// thinking blocks even when the user's thinking toggle is off, and must

@@ -333,6 +333,7 @@ fn parse_usage(response: &Value) -> Option<UsageData> {
         completion_tokens: output,
         total_tokens: total,
         cached_content_tokens: None,
+        cache_creation_tokens: None,
         thoughts_tokens: None,
         cost: Some(0.0),
     })
@@ -931,6 +932,7 @@ mod tests {
     fn system_prompt_maps_to_instructions_not_a_message() {
         let prompt = LlmPrompt {
             system: Some("be terse".to_string()),
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
@@ -953,6 +955,7 @@ mod tests {
     fn tools_are_flattened_no_nested_function_object() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![],
             tools: vec![ToolDefinition {
                 name: "send".to_string(),
@@ -976,6 +979,7 @@ mod tests {
     fn tool_call_and_result_become_correlated_items() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![
                 ChatMessage {
                     role: ChatRole::Assistant,
@@ -1021,6 +1025,7 @@ mod tests {
     fn reasoning_requested_only_when_thinking_enabled() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![],
             tools: vec![],
         };

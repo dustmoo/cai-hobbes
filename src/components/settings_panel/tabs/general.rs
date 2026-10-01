@@ -1636,6 +1636,69 @@ pub(in super::super) fn GeneralTab(
                                             }
                                         }
                                     }
+                                    // Prompt Caching
+                                    {
+                                        let caching = local_settings.read().claude_config.prompt_caching_enabled;
+                                        let one_hour = local_settings.read().claude_config.cache_ttl
+                                            == crate::llm::config::ClaudeCacheTtl::OneHour;
+                                        rsx! {
+                                            div {
+                                                class: "mb-4",
+                                                div {
+                                                    class: "flex items-center justify-between",
+                                                    label { class: "block text-sm font-medium text-fg-muted", "Prompt Caching" }
+                                                    button {
+                                                        class: if caching {
+                                                            "px-3 py-1 rounded-md text-sm font-medium bg-btn-primary text-fg"
+                                                        } else {
+                                                            "px-3 py-1 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
+                                                        },
+                                                        onclick: move |_| {
+                                                            let cur = local_settings.read().claude_config.prompt_caching_enabled;
+                                                            local_settings.write().claude_config.prompt_caching_enabled = !cur;
+                                                        },
+                                                        if caching { "On" } else { "Off" }
+                                                    }
+                                                }
+                                                p {
+                                                    class: "text-xs text-fg-muted mt-1",
+                                                    "Reuses the unchanged start of each request (tools, instructions, earlier conversation) at a fraction of the input price. Choose 1 hour if you often pause longer than 5 minutes between messages."
+                                                }
+                                                if caching {
+                                                    div {
+                                                        class: "mt-3 flex items-center justify-between",
+                                                        label { class: "block text-sm font-medium text-fg-muted", "Cache Duration" }
+                                                        div {
+                                                            class: "flex gap-2",
+                                                            button {
+                                                                class: if !one_hour {
+                                                                    "px-3 py-1 rounded-md text-sm font-medium bg-btn-primary text-fg"
+                                                                } else {
+                                                                    "px-3 py-1 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
+                                                                },
+                                                                onclick: move |_| {
+                                                                    local_settings.write().claude_config.cache_ttl = crate::llm::config::ClaudeCacheTtl::FiveMinutes;
+                                                                },
+                                                                "5 minutes"
+                                                            }
+                                                            button {
+                                                                class: if one_hour {
+                                                                    "px-3 py-1 rounded-md text-sm font-medium bg-btn-primary text-fg"
+                                                                } else {
+                                                                    "px-3 py-1 rounded-md text-sm font-medium bg-input text-fg-muted hover:text-fg"
+                                                                },
+                                                                onclick: move |_| {
+                                                                    local_settings.write().claude_config.cache_ttl = crate::llm::config::ClaudeCacheTtl::OneHour;
+                                                                },
+                                                                "1 hour"
+                                                            }
+                                                        }
+                                                    }
+                                                    p { class: "text-xs text-fg-muted mt-1", "Cache writes cost 1.25x the input price (5 minutes) or 2x (1 hour); reads cost a small fraction." }
+                                                }
+                                            }
+                                        }
+                                    }
                                     // Model Quick-Switch Slots
                                     div {
                                         class: "mb-4 pt-4 border-t border-subtle",

@@ -22,6 +22,8 @@ pub struct UsageLogEntry {
     pub thoughts_tokens: Option<i32>,
     #[serde(default)]
     pub cached_content_tokens: Option<i32>,
+    #[serde(default)]
+    pub cache_creation_tokens: Option<i32>,
     /// Calculated cost in USD
     #[serde(default)]
     pub cost: Option<f64>,
@@ -201,6 +203,7 @@ mod tests {
             total_tokens: 150,
             thoughts_tokens: Some(10),
             cached_content_tokens: None,
+            cache_creation_tokens: None,
             cost: Some(0.0023),
         });
 
@@ -222,6 +225,7 @@ mod tests {
             total_tokens: 150,
             thoughts_tokens: None,
             cached_content_tokens: None,
+            cache_creation_tokens: None,
             cost: Some(0.01),
         });
 
@@ -234,6 +238,7 @@ mod tests {
             total_tokens: 300,
             thoughts_tokens: None,
             cached_content_tokens: None,
+            cache_creation_tokens: None,
             cost: Some(0.05),
         });
 
@@ -253,6 +258,7 @@ mod tests {
             total_tokens: 55,
             thoughts_tokens: Some(5),
             cached_content_tokens: Some(10),
+            cache_creation_tokens: None,
             cost: Some(0.001),
         });
 
@@ -280,6 +286,7 @@ mod tests {
                 total_tokens: 15_000,
                 thoughts_tokens: Some(1_000),
                 cached_content_tokens: Some(2_000),
+                cache_creation_tokens: None,
                 cost: Some(0.0123),
             });
         }
@@ -314,6 +321,7 @@ mod tests {
                 total_tokens: 15,
                 thoughts_tokens: None,
                 cached_content_tokens: None,
+                cache_creation_tokens: None,
                 cost: Some(0.0001),
             });
         }

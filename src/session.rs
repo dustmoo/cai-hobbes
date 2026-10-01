@@ -2643,6 +2643,7 @@ mod tests {
                     total_tokens: 150,
                     thoughts_tokens: None,
                     cached_content_tokens: None,
+                    cache_creation_tokens: None,
                     cost: Some(0.0042),
                 }),
             });
@@ -2688,6 +2689,7 @@ mod tests {
                         total_tokens: 150,
                         thoughts_tokens: None,
                         cached_content_tokens: None,
+                        cache_creation_tokens: None,
                         cost: Some(cost),
                     }),
                 });

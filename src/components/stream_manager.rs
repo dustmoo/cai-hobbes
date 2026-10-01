@@ -1750,6 +1750,7 @@ impl StreamManagerContext {
                                 total_tokens: usage.total_tokens,
                                 thoughts_tokens: usage.thoughts_tokens,
                                 cached_content_tokens: usage.cached_content_tokens,
+                                cache_creation_tokens: usage.cache_creation_tokens,
                                 cost: usage.cost,
                             });
                     }

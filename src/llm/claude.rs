@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use super::claude_models::ClaudeModel;
-use super::config::ClaudeConfig;
+use super::config::{ClaudeCacheTtl, ClaudeConfig};
 use super::convert::{LlmFormatConverter, StreamEvent};
 use super::types::{ChatRole, ContentBlock, LlmPrompt};
 use super::LlmConnector;
@@ -16,6 +16,71 @@ use crate::mcp::manager::McpContext;
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 /// Required `anthropic-version` header value.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// The `cache_control` marker value for the configured TTL. Every marker in a
+/// request must use the same TTL (a 1h entry may not follow a 5m one).
+fn cache_control_marker(ttl: ClaudeCacheTtl) -> Value {
+    match ttl {
+        ClaudeCacheTtl::FiveMinutes => json!({ "type": "ephemeral" }),
+        ClaudeCacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
+    }
+}
+
+/// Split the system prompt into (stable, volatile) at the prompt builder's
+/// volatile offset, clamped to the string length and a char boundary.
+fn split_system(system: &str, offset: Option<usize>) -> (&str, &str) {
+    let mut at = offset.unwrap_or(system.len()).min(system.len());
+    while !system.is_char_boundary(at) {
+        at -= 1;
+    }
+    system.split_at(at)
+}
+
+/// Put a marker on the last non-thinking content block of the message at or
+/// before `from` (thinking blocks can't carry `cache_control`). Returns the
+/// index of the message that received it.
+fn mark_last_block(messages: &mut [Value], from: usize, marker: &Value) -> Option<usize> {
+    for idx in (0..=from.min(messages.len().checked_sub(1)?)).rev() {
+        let Some(blocks) = messages[idx]["content"].as_array_mut() else {
+            continue;
+        };
+        if let Some(block) = blocks.iter_mut().rev().find(|b| b["type"] != "thinking") {
+            block["cache_control"] = marker.clone();
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Build the final `UsageData`. Anthropic's `input_tokens` excludes both cache
+/// reads and cache writes, which bill at their own rates. `prompt_tokens` is
+/// reported as the TOTAL prompt size (input + writes + reads) so it matches
+/// the Gemini semantics the UI assumes (cached tokens are a subset of prompt).
+fn claude_usage(
+    model: &ClaudeModel,
+    ttl: ClaudeCacheTtl,
+    input: i32,
+    completion: i32,
+    cache_read: Option<i32>,
+    cache_write: Option<i32>,
+) -> UsageData {
+    let read = cache_read.unwrap_or(0);
+    let write = cache_write.unwrap_or(0);
+    let cost = (input as f64 / 1_000_000.0) * model.input_price_per_mtok()
+        + (read as f64 / 1_000_000.0) * model.cache_read_price_per_mtok()
+        + (write as f64 / 1_000_000.0) * model.cache_write_price_per_mtok(ttl)
+        + (completion as f64 / 1_000_000.0) * model.output_price_per_mtok();
+    let prompt = input + read + write;
+    UsageData {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: prompt + completion,
+        cached_content_tokens: cache_read,
+        cache_creation_tokens: cache_write,
+        thoughts_tokens: None,
+        cost: Some(cost),
+    }
+}
 
 pub struct ClaudeConnector {
     config: ClaudeConfig,
@@ -173,27 +238,23 @@ impl LlmConnector for ClaudeConnector {
                 }
             };
 
+        let cache_ttl = self.config.cache_ttl;
         let emit_usage = |prompt: i32,
                           completion: i32,
                           cached: Option<i32>,
+                          created: Option<i32>,
                           tx: &mpsc::UnboundedSender<StreamMessage>| {
-            if prompt == 0 && completion == 0 {
+            if prompt == 0 && completion == 0 && cached.is_none() && created.is_none() {
                 return;
             }
-            // Anthropic's `input_tokens` excludes cache reads, which bill
-            // separately at the model's cache-read rate.
-            let cost = (prompt as f64 / 1_000_000.0) * model_for_cost.input_price_per_mtok()
-                + (cached.unwrap_or(0) as f64 / 1_000_000.0)
-                    * model_for_cost.cache_read_price_per_mtok()
-                + (completion as f64 / 1_000_000.0) * model_for_cost.output_price_per_mtok();
-            let _ = tx.send(StreamMessage::Usage(UsageData {
-                prompt_tokens: prompt,
-                completion_tokens: completion,
-                total_tokens: prompt + completion,
-                cached_content_tokens: cached,
-                thoughts_tokens: None,
-                cost: Some(cost),
-            }));
+            let _ = tx.send(StreamMessage::Usage(claude_usage(
+                &model_for_cost,
+                cache_ttl,
+                prompt,
+                completion,
+                cached,
+                created,
+            )));
         };
 
         // Retry transient failures (network errors, 429, 529, 5xx) with backoff —
@@ -262,6 +323,7 @@ impl LlmConnector for ClaudeConnector {
                         crate::llm::strip_thought_signatures(&mut stripped_messages);
                         let stripped_prompt = LlmPrompt {
                             system: prompt_data.system.clone(),
+                            system_volatile_offset: prompt_data.system_volatile_offset,
                             messages: stripped_messages,
                             tools: prompt_data.tools.clone(),
                         };
@@ -308,6 +370,7 @@ impl LlmConnector for ClaudeConnector {
             let mut usage_prompt: i32 = 0;
             let mut usage_completion: i32 = 0;
             let mut usage_cached: Option<i32> = None;
+            let mut usage_created: Option<i32> = None;
             // Only Text/Thinking are streamed to the UI mid-flight; tool calls and
             // usage are buffered and emitted at the end. So this gates retry safely.
             let mut has_sent_data = false;
@@ -403,10 +466,19 @@ impl LlmConnector for ClaudeConnector {
                                 if u.cached_content_tokens.is_some() {
                                     usage_cached = u.cached_content_tokens;
                                 }
+                                if u.cache_creation_tokens.is_some() {
+                                    usage_created = u.cache_creation_tokens;
+                                }
                             }
                             StreamEvent::Done => {
                                 flush_tool_calls(&mut pending_tool_calls, &tx);
-                                emit_usage(usage_prompt, usage_completion, usage_cached, &tx);
+                                emit_usage(
+                                    usage_prompt,
+                                    usage_completion,
+                                    usage_cached,
+                                    usage_created,
+                                    &tx,
+                                );
                                 return;
                             }
                             StreamEvent::Error { message } => {
@@ -425,7 +497,13 @@ impl LlmConnector for ClaudeConnector {
 
             // Stream ended without an explicit message_stop — flush what we have.
             flush_tool_calls(&mut pending_tool_calls, &tx);
-            emit_usage(usage_prompt, usage_completion, usage_cached, &tx);
+            emit_usage(
+                usage_prompt,
+                usage_completion,
+                usage_cached,
+                usage_created,
+                &tx,
+            );
             return;
         }
     }
@@ -725,6 +803,59 @@ impl LlmFormatConverter for ClaudeConnector {
             messages.push(json!({ "role": role, "content": content }));
         }
 
+        // Prompt caching: tools → system → messages is the render order, so
+        // volatile per-turn content must live at the very end of `messages`
+        // or it would invalidate everything after it.
+        let mut system_blocks: Vec<serde_json::Value> = Vec::new();
+        if self.config.prompt_caching_enabled {
+            let marker = cache_control_marker(self.config.cache_ttl);
+            let (stable, volatile) = split_system(
+                prompt.system.as_deref().unwrap_or(""),
+                prompt.system_volatile_offset,
+            );
+            if !stable.trim().is_empty() {
+                system_blocks.push(json!({
+                    "type": "text",
+                    "text": stable,
+                    "cache_control": marker,
+                }));
+            }
+
+            let last_is_user = messages.last().is_some_and(|m| m["role"] == "user");
+            let volatile = volatile.trim();
+            let history_end = messages.len().checked_sub(1);
+            // Breakpoint on the last history block (before any volatile tail
+            // is attached), so each request reads the prior conversation.
+            let marked =
+                history_end.and_then(|end| mark_last_block(&mut messages[..=end], end, &marker));
+            if !volatile.is_empty() {
+                if last_is_user && model.supports_mid_conversation_system() {
+                    messages.push(json!({ "role": "system", "content": volatile }));
+                } else if last_is_user {
+                    if let Some(blocks) = messages
+                        .last_mut()
+                        .and_then(|m| m["content"].as_array_mut())
+                    {
+                        blocks.push(json!({ "type": "text", "text": volatile }));
+                    }
+                } else {
+                    // Assistant-last (or empty): the volatile text rides in a
+                    // new user message after the cached history.
+                    messages.push(json!({
+                        "role": "user",
+                        "content": [{ "type": "text", "text": volatile }],
+                    }));
+                }
+            }
+            // A second breakpoint on the previous user turn keeps long tool
+            // loops inside the API's 20-block lookback window.
+            if let Some(m) = marked {
+                if let Some(prev_user) = (0..m).rev().find(|&i| messages[i]["role"] == "user") {
+                    mark_last_block(&mut messages[..=prev_user], prev_user, &marker);
+                }
+            }
+        }
+
         let mut request = json!({
             "model": self.config.model,
             "max_tokens": self.effective_max_tokens(),
@@ -733,7 +864,11 @@ impl LlmFormatConverter for ClaudeConnector {
         });
 
         // System prompt is a top-level field on Anthropic (not a message).
-        if let Some(system) = &prompt.system {
+        if self.config.prompt_caching_enabled {
+            if !system_blocks.is_empty() {
+                request["system"] = json!(system_blocks);
+            }
+        } else if let Some(system) = &prompt.system {
             if !system.is_empty() {
                 request["system"] = json!(system);
             }
@@ -807,12 +942,16 @@ impl LlmFormatConverter for ClaudeConnector {
                     let usage = &val["message"]["usage"];
                     let input = usage["input_tokens"].as_i64().unwrap_or(0) as i32;
                     let cached = usage["cache_read_input_tokens"].as_i64().map(|v| v as i32);
-                    if input > 0 || cached.is_some() {
+                    let created = usage["cache_creation_input_tokens"]
+                        .as_i64()
+                        .map(|v| v as i32);
+                    if input > 0 || cached.is_some() || created.is_some() {
                         events.push(StreamEvent::Usage(UsageData {
                             prompt_tokens: input,
                             completion_tokens: 0,
                             total_tokens: input,
                             cached_content_tokens: cached,
+                            cache_creation_tokens: created,
                             thoughts_tokens: None,
                             cost: None,
                         }));
@@ -879,12 +1018,17 @@ impl LlmFormatConverter for ClaudeConnector {
                 }
                 Some("message_delta") => {
                     let output = val["usage"]["output_tokens"].as_i64().unwrap_or(0) as i32;
-                    if output > 0 {
+                    let created = val["usage"]["cache_creation_input_tokens"]
+                        .as_i64()
+                        .filter(|&v| v > 0)
+                        .map(|v| v as i32);
+                    if output > 0 || created.is_some() {
                         events.push(StreamEvent::Usage(UsageData {
                             prompt_tokens: 0,
                             completion_tokens: output,
                             total_tokens: output,
                             cached_content_tokens: None,
+                            cache_creation_tokens: created,
                             thoughts_tokens: None,
                             cost: None,
                         }));
@@ -935,6 +1079,7 @@ mod tests {
         ClaudeConnector::new(ClaudeConfig {
             model: "claude-opus-4-8".to_string(),
             max_tokens: Some(4096),
+            prompt_caching_enabled: false,
             ..Default::default()
         })
     }
@@ -943,6 +1088,7 @@ mod tests {
     fn request_puts_system_at_top_level_not_in_messages() {
         let prompt = LlmPrompt {
             system: Some("You are Hobbes.".to_string()),
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
@@ -976,6 +1122,7 @@ mod tests {
     fn tool_result_maps_to_user_turn_block() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::Tool,
                 content: vec![ContentBlock::ToolResult {
@@ -998,6 +1145,7 @@ mod tests {
     fn tools_use_prefixed_names_and_input_schema() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![],
             tools: vec![ToolDefinition {
                 name: "list_files".to_string(),
@@ -1084,6 +1232,7 @@ mod tests {
         });
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::Assistant,
                 content: vec![
@@ -1124,6 +1273,7 @@ mod tests {
     fn thinking_param_sent_only_when_enabled() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -1141,6 +1291,7 @@ mod tests {
     fn thinking_block_serialized_only_with_signature() {
         let with_sig = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::Assistant,
                 content: vec![
@@ -1166,6 +1317,7 @@ mod tests {
         // Without a signature, the thinking block is omitted (would 400).
         let no_sig = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages: vec![ChatMessage {
                 role: ChatRole::Assistant,
                 content: vec![
@@ -1326,6 +1478,7 @@ mod tests {
 
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
             messages,
             tools: vec![],
         };
@@ -1347,5 +1500,294 @@ mod tests {
         // signature field on tool_use, so nothing to strip there beyond the
         // neutral ContentBlock::ToolCall.signature we already cleared).
         assert!(blocks.iter().any(|b| b["type"] == "tool_use"));
+    }
+
+    // ── Prompt caching ──
+
+    fn cache_connector(model: &str, enabled: bool, ttl: ClaudeCacheTtl) -> ClaudeConnector {
+        ClaudeConnector::new(ClaudeConfig {
+            model: model.to_string(),
+            max_tokens: Some(4096),
+            prompt_caching_enabled: enabled,
+            cache_ttl: ttl,
+            ..Default::default()
+        })
+    }
+
+    fn text_msg(role: ChatRole, text: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: vec![ContentBlock::Text { text: text.into() }],
+        }
+    }
+
+    fn cache_prompt(system: &str, offset: Option<usize>, messages: Vec<ChatMessage>) -> LlmPrompt {
+        LlmPrompt {
+            system: Some(system.to_string()),
+            system_volatile_offset: offset,
+            messages,
+            tools: vec![],
+        }
+    }
+
+    fn count_markers(v: &Value) -> usize {
+        match v {
+            Value::Object(m) => {
+                usize::from(m.contains_key("cache_control"))
+                    + m.values().map(count_markers).sum::<usize>()
+            }
+            Value::Array(a) => a.iter().map(count_markers).sum(),
+            _ => 0,
+        }
+    }
+
+    fn history() -> Vec<ChatMessage> {
+        vec![
+            text_msg(ChatRole::User, "first"),
+            text_msg(ChatRole::Assistant, "reply"),
+            text_msg(ChatRole::User, "second"),
+        ]
+    }
+
+    #[test]
+    fn caching_off_keeps_plain_string_system_and_no_markers() {
+        let p = cache_prompt("STABLE|VOLATILE", Some(6), history());
+        let req = cache_connector("claude-opus-5-5", false, ClaudeCacheTtl::OneHour)
+            .to_native_request(&p, true);
+        assert_eq!(req["system"], "STABLE|VOLATILE");
+        assert_eq!(count_markers(&req), 0);
+        assert_eq!(req["messages"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn caching_on_without_offset_caches_whole_system_and_last_block() {
+        let p = cache_prompt("all stable", None, history());
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&p, true);
+        let sys = req["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["text"], "all stable");
+        assert_eq!(sys[0]["cache_control"], json!({ "type": "ephemeral" }));
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        // Previous user turn guards the lookback window.
+        assert_eq!(msgs[0]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
+        assert!(count_markers(&req) <= 4);
+    }
+
+    #[test]
+    fn volatile_goes_to_trailing_system_message_on_supporting_models() {
+        let p = cache_prompt("STABLE\nVOLATILE", Some(7), history());
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&p, true);
+        assert_eq!(req["system"].as_array().unwrap()[0]["text"], "STABLE\n");
+        assert!(!req["system"].to_string().contains("VOLATILE"));
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3]["role"], "system");
+        assert_eq!(msgs[3]["content"], "VOLATILE");
+        // Marker sits on the last history block, never on the volatile tail.
+        assert_eq!(msgs[2]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(msgs[3].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn volatile_becomes_trailing_text_block_on_unsupported_models() {
+        for model in ["claude-sonnet-5", "claude-opus-4-6", "claude-mystery-9"] {
+            let p = cache_prompt("STABLEVOLATILE", Some(6), history());
+            let req = cache_connector(model, true, ClaudeCacheTtl::FiveMinutes)
+                .to_native_request(&p, true);
+            assert!(!req["system"].to_string().contains("VOLATILE"), "{model}");
+            let msgs = req["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 3, "{model}");
+            let blocks = msgs[2]["content"].as_array().unwrap();
+            assert_eq!(blocks.len(), 2, "{model}");
+            assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+            assert_eq!(blocks[1]["text"], "VOLATILE");
+            assert!(blocks[1].get("cache_control").is_none());
+        }
+    }
+
+    #[test]
+    fn assistant_last_gets_a_trailing_user_message_for_volatile() {
+        let msgs = vec![
+            text_msg(ChatRole::User, "q"),
+            text_msg(ChatRole::Assistant, "partial"),
+        ];
+        let p = cache_prompt("STABLEVOLATILE", Some(6), msgs);
+        // Even on a mid-system-capable model: last message isn't user-role.
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&p, true);
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2]["role"], "user");
+        assert_eq!(msgs[2]["content"][0]["text"], "VOLATILE");
+        assert_eq!(msgs[1]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert!(msgs[2]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn tool_result_tail_gets_volatile_after_the_result_block() {
+        let msgs = vec![
+            text_msg(ChatRole::User, "q"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![ContentBlock::ToolCall {
+                    id: "t1".into(),
+                    name: "x".into(),
+                    arguments: json!({}),
+                    signature: None,
+                }],
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    call_id: "t1".into(),
+                    name: "x".into(),
+                    content: json!("ok"),
+                }],
+            },
+        ];
+        let p = cache_prompt("SV", Some(1), msgs);
+        let req = cache_connector("claude-sonnet-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&p, true);
+        let blocks = req["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks[0]["type"], "tool_result");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], "V");
+    }
+
+    #[test]
+    fn offset_past_end_or_mid_codepoint_does_not_panic() {
+        let past = cache_prompt("abc", Some(999), history());
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&past, true);
+        assert_eq!(req["system"][0]["text"], "abc");
+        assert_eq!(req["messages"].as_array().unwrap().len(), 3);
+
+        // "é" is 2 bytes; offset 2 is inside the second char of "aé" + "b".
+        let mid = cache_prompt("aéb", Some(2), history());
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&mid, true);
+        assert_eq!(req["system"][0]["text"], "a");
+        assert_eq!(req["messages"][3]["content"], "éb");
+    }
+
+    #[test]
+    fn empty_stable_part_skips_the_system_block() {
+        let p = cache_prompt("VOLATILE ONLY", Some(0), history());
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&p, true);
+        assert!(req.get("system").is_none());
+        assert_eq!(req["messages"][3]["content"], "VOLATILE ONLY");
+    }
+
+    #[test]
+    fn markers_skip_thinking_blocks_and_stay_within_four() {
+        let msgs = vec![
+            text_msg(ChatRole::User, "q"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: vec![
+                    ContentBlock::Text { text: "a".into() },
+                    ContentBlock::Thinking {
+                        text: "hm".into(),
+                        signature: Some("sig".into()),
+                    },
+                ],
+            },
+        ];
+        let p = cache_prompt("S", None, msgs);
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes)
+            .to_native_request(&p, true);
+        let blocks = req["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(blocks[1]["type"], "thinking");
+        assert!(blocks[1].get("cache_control").is_none());
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert!(count_markers(&req) <= 4);
+    }
+
+    #[test]
+    fn one_hour_ttl_propagates_to_every_marker() {
+        let p = cache_prompt("STABLEVOLATILE", Some(6), history());
+        let req = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::OneHour)
+            .to_native_request(&p, true);
+        let n = count_markers(&req);
+        assert!((2..=4).contains(&n));
+        assert_eq!(req.to_string().matches("\"ttl\":\"1h\"").count(), n);
+    }
+
+    #[test]
+    fn mid_conversation_system_support_matrix() {
+        for ok in [
+            "claude-opus-5-5",
+            "claude-opus-5",
+            "claude-opus-4-8",
+            "claude-fable-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+        ] {
+            assert!(
+                ClaudeModel::from_slug(ok).supports_mid_conversation_system(),
+                "{ok}"
+            );
+        }
+        for no in [
+            "claude-sonnet-5",
+            "claude-opus-4-7",
+            "claude-haiku-4-5",
+            "nonsense",
+        ] {
+            assert!(
+                !ClaudeModel::from_slug(no).supports_mid_conversation_system(),
+                "{no}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_cache_creation_tokens_from_message_start() {
+        let c = connector();
+        let chunk = r#"data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":500,"cache_read_input_tokens":200,"output_tokens":1}}}"#;
+        let events = c.parse_stream_chunk(chunk);
+        match &events[0] {
+            StreamEvent::Usage(u) => {
+                assert_eq!(u.prompt_tokens, 10);
+                assert_eq!(u.cache_creation_tokens, Some(500));
+                assert_eq!(u.cached_content_tokens, Some(200));
+            }
+            _ => panic!("expected usage"),
+        }
+    }
+
+    #[test]
+    fn cost_includes_cache_writes_and_reports_total_prompt() {
+        // Opus 5.5: $4 in, $20 out, $0.20 read.
+        let m = ClaudeModel::Opus5_5;
+        let u = claude_usage(
+            &m,
+            ClaudeCacheTtl::FiveMinutes,
+            1_000_000,
+            0,
+            Some(1_000_000),
+            Some(1_000_000),
+        );
+        // 4.0 + 0.2 + 5.0 (1.25x)
+        assert!((u.cost.unwrap() - 9.2).abs() < 1e-9);
+        assert_eq!(u.prompt_tokens, 3_000_000);
+        assert_eq!(u.cached_content_tokens, Some(1_000_000));
+        assert_eq!(u.cache_creation_tokens, Some(1_000_000));
+        let h = claude_usage(&m, ClaudeCacheTtl::OneHour, 0, 0, None, Some(1_000_000));
+        assert!((h.cost.unwrap() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn old_claude_config_json_defaults_to_caching_on_five_minutes() {
+        let cfg: ClaudeConfig =
+            serde_json::from_str(r#"{"model":"claude-opus-5-5","summary_model":null}"#).unwrap();
+        assert!(cfg.prompt_caching_enabled);
+        assert_eq!(cfg.cache_ttl, ClaudeCacheTtl::FiveMinutes);
     }
 }

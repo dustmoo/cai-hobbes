@@ -556,6 +556,7 @@ mod tests {
             total_tokens: total,
             thoughts_tokens: None,
             cached_content_tokens: None,
+            cache_creation_tokens: None,
             cost: Some(cost),
         })
     }
