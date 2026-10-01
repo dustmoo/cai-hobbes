@@ -114,6 +114,12 @@ struct PtySession {
     /// sentinel. Held across the (bounded) read, so a waiter waits at most
     /// one call's timeout.
     op_lock: tokio::sync::Mutex<()>,
+    /// Pty slave path and shell pid, for `stty -a -f` / foreground-group
+    /// diagnostics on a stuck command.
+    tty_path: Option<std::path::PathBuf>,
+    shell_pid: Option<u32>,
+    /// `stty -a` of the pty right after init — what "normal" looks like.
+    initial_tty: std::sync::Mutex<Option<String>>,
 }
 
 /// One `read_until_sentinel` outcome: the command finished, or the deadline
@@ -122,7 +128,8 @@ struct PtySession {
 /// (ANSI/CR stripping shrinks the text back under the cap), so the trim
 /// reports itself.
 enum ReadOutcome {
-    Done(String, i32, bool),
+    /// output, exit code, front-trimmed, watchdog aborted an incomplete command
+    Done(String, i32, bool, bool),
     Pending(Vec<u8>, bool),
 }
 
@@ -516,6 +523,153 @@ pub(crate) fn strip_continuation_prompts(s: &str) -> String {
     out
 }
 
+// ── Stuck-state diagnostics (pure, unit-tested) ─────────────────────────────
+
+/// How much of the raw pty buffer a diagnosis quotes.
+const DIAG_TAIL_BYTES: usize = 500;
+/// Quiet time (no pty output) at a PS2 prompt before the watchdog aborts.
+const PS2_WATCHDOG_SECS: u64 = 2;
+
+/// Last `n` bytes of `buf` as an escaped, single-line string — control bytes
+/// (BEL from an overflowing tty line, ESC, CR) stay visible instead of vanishing.
+pub(crate) fn raw_tail(buf: &[u8], n: usize) -> String {
+    let start = buf.len().saturating_sub(n);
+    String::from_utf8_lossy(&buf[start..])
+        .chars()
+        .flat_map(char::escape_debug)
+        .collect()
+}
+
+/// If the buffer ENDS at a zsh secondary prompt (`dquote> `, `heredoc> `, …)
+/// the shell is waiting for more of a command whose quote/heredoc/construct
+/// never closed. Returns the (last) prompt token.
+pub(crate) fn ps2_prompt_at_end(raw: &str) -> Option<&'static str> {
+    let last = raw.rsplit(['\n', '\r']).next()?;
+    let body = last.strip_suffix("> ").or_else(|| last.strip_suffix('>'))?;
+    let word = body.rsplit(' ').next()?;
+    CONTINUATION_TOKENS.iter().copied().find(|t| *t == word)
+}
+
+/// Job-control notices that mean a child is parked on the terminal.
+pub(crate) fn job_control_notices(raw: &str) -> Vec<&'static str> {
+    ["suspended (tty input)", "suspended (tty output)"]
+        .into_iter()
+        .filter(|n| raw.contains(n))
+        .collect()
+}
+
+/// The flags set in `stty -a` output (`lflags: icanon -echo …` → icanon=true,
+/// echo=false). Only the macOS `xflags:` lines are read.
+fn stty_flags(stty: &str) -> HashMap<String, bool> {
+    let mut flags = HashMap::new();
+    for line in stty.lines() {
+        let Some((head, rest)) = line.split_once(':') else { continue };
+        if !matches!(head.trim(), "lflags" | "iflags" | "oflags" | "cflags") {
+            continue;
+        }
+        for tok in rest.split_whitespace() {
+            match tok.strip_prefix('-') {
+                Some(name) => flags.insert(name.to_string(), false),
+                None => flags.insert(tok.to_string(), true),
+            };
+        }
+    }
+    flags
+}
+
+/// Human-readable differences between two `stty -a` dumps, e.g.
+/// `-icanon (was icanon)`. Empty when the modes match.
+pub(crate) fn tty_mode_diff(initial: &str, current: &str) -> Vec<String> {
+    let (a, b) = (stty_flags(initial), stty_flags(current));
+    let mut out: Vec<String> = b
+        .iter()
+        .filter_map(|(name, on)| match a.get(name) {
+            Some(was) if was != on => Some(format!(
+                "{}{name} (was {}{name})",
+                if *on { "" } else { "-" },
+                if *was { "" } else { "-" }
+            )),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// `stty -a` for a pty slave, from outside the shell.
+fn stty_snapshot(tty: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new("stty")
+        .arg("-a")
+        .arg("-f")
+        .arg(tty)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Name likely stuck states for a command that has produced no sentinel.
+fn diagnose_stuck(session: &PtySession, acc: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(&acc[acc.len().saturating_sub(4096)..]).into_owned();
+    let mut findings: Vec<String> = Vec::new();
+    if let Some(tok) = ps2_prompt_at_end(&raw) {
+        findings.push(format!(
+            "shell is at a `{tok}>` continuation prompt: the command text left a quote, \
+             heredoc or construct open, so the shell is still waiting for its end"
+        ));
+    }
+    for n in job_control_notices(&raw) {
+        findings.push(format!(
+            "a job reports `{n}`: a background child is blocked on the terminal"
+        ));
+    }
+    if raw.contains('\x07') {
+        findings.push(
+            "BEL bytes in the output: the tty line discipline may be dropping an over-long \
+             input line (limit ~1024 bytes)"
+                .to_string(),
+        );
+    }
+    if let Some(path) = &session.tty_path {
+        let initial = session.initial_tty.lock().ok().and_then(|g| g.clone());
+        if let (Some(initial), Some(now)) = (initial, stty_snapshot(path)) {
+            let diff = tty_mode_diff(&initial, &now);
+            if !diff.is_empty() {
+                findings.push(format!(
+                    "tty modes differ from the shell's initial termios: {}",
+                    diff.join(", ")
+                ));
+            }
+        }
+    }
+    let fg = session
+        ._master
+        .lock()
+        .ok()
+        .and_then(|m| m.process_group_leader());
+    if let (Some(fg), Some(sh)) = (fg, session.shell_pid) {
+        if fg as u32 != sh {
+            findings.push(format!(
+                "the tty's foreground process group is {fg}, not the shell ({sh}): a child \
+                 owns the terminal"
+            ));
+        }
+    }
+    let mut out = String::from("\n[diagnostics]\n");
+    if findings.is_empty() {
+        out.push_str("- no known stuck state detected (the command may simply still be running)\n");
+    }
+    for f in findings {
+        out.push_str(&format!("- {f}\n"));
+    }
+    out.push_str(&format!(
+        "- last {DIAG_TAIL_BYTES} bytes of raw pty output: \"{}\"",
+        raw_tail(acc, DIAG_TAIL_BYTES)
+    ));
+    out
+}
+
 /// session.project_id → planner Project.path → Settings.project_folder →
 /// $HOME. Each step must exist on disk to win.
 pub fn resolve_session_cwd(
@@ -534,6 +688,24 @@ pub fn resolve_session_cwd(
         .or_else(|| settings.project_folder.as_deref().and_then(dir_ok))
         .or_else(|| dirs::home_dir().map(|h| h.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "/".to_string())
+}
+
+/// Write `command` to a private temp file whose first line deletes the file,
+/// returning its path. `None` (caller types the command directly) if the file
+/// can't be written.
+fn write_command_file(nonce: &str, command: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!("hobbes-cmd-{nonce}.zsh"));
+    let body = format!(
+        "command rm -f -- {}\n{command}\n",
+        shell_quote(&path.to_string_lossy())
+    );
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let mut f = opts.open(&path).ok()?;
+    f.write_all(body.as_bytes()).ok()?;
+    Some(path)
 }
 
 // ── Shell lifecycle ─────────────────────────────────────────────────────────
@@ -608,6 +780,8 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
         }
     });
 
+    let tty_path = pair.master.tty_name();
+    let shell_pid = child.process_id();
     let session = PtySession {
         writer: std::sync::Mutex::new(writer),
         child: std::sync::Mutex::new(child),
@@ -615,6 +789,9 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
         ring,
         running: std::sync::Mutex::new(None),
         op_lock: tokio::sync::Mutex::new(()),
+        tty_path,
+        shell_pid,
+        initial_tty: std::sync::Mutex::new(None),
     };
 
     // Neuter prompts/echo so the sentinel protocol sees clean output, then
@@ -629,7 +806,7 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
     // never reaches a response.
     session.write_line(&format!(
         "unsetopt ZLE PROMPT_SP PROMPT_CR 2>/dev/null; PS1=''; PROMPT=''; RPROMPT=''; \
-         PS2=''; PS3=''; PS4=''; \
+         unsetopt BANG_HIST 2>/dev/null; PS2='%_> '; PS3=''; PS4=''; \
          stty -echo 2>/dev/null; export TERM=dumb; \
          [ -f /etc/zprofile ] && source /etc/zprofile >/dev/null 2>&1; \
          [ -f \"$HOME/.zprofile\" ] && source \"$HOME/.zprofile\" >/dev/null 2>&1; \
@@ -638,6 +815,14 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
          printf '\\n{init_sentinel} %d\\n' $?"
     ))?;
     Ok(session)
+}
+
+fn incomplete_note(incomplete: bool) -> &'static str {
+    if incomplete {
+        "\n[command was incomplete (unbalanced quote/heredoc) — interrupted with Ctrl-C]"
+    } else {
+        ""
+    }
 }
 
 impl PtySession {
@@ -692,8 +877,11 @@ impl TerminalClient {
         // normal EXEC path below will surface the problem, and late init
         // residue is cut by `drop_foreign_sentinel_prefix` at finalize time.
         let _ = self
-            .read_until_sentinel(&fresh, &init_sentinel, 2, Vec::new(), false)
+            .read_until_sentinel(&fresh, &init_sentinel, 2, Vec::new(), false, None)
             .await;
+        if let Some(path) = &fresh.tty_path {
+            *fresh.initial_tty.lock().map_err(|_| "state poisoned")? = stty_snapshot(path);
+        }
         Ok(fresh)
     }
 
@@ -750,6 +938,17 @@ impl TerminalClient {
             _ => command.to_string(),
         };
         let sentinel_line = format!("printf '\\n{sentinel} %d\\n' $?");
+        // The command text never goes through the tty as typed input: a pty in
+        // canonical mode drops everything past ~1024 bytes of one line, and an
+        // interactive shell applies `!` history expansion and PS2 continuation
+        // to it — each swallowed the sentinel and hung the call. Source it
+        // from a private file instead (the file removes itself first thing).
+        let script = write_command_file(&nonce, &wrapped);
+        let typed = match &script {
+            Some(path) => format!(". {}", shell_quote(&path.to_string_lossy())),
+            None => wrapped.clone(),
+        };
+        let wrapped = typed;
 
         // Claim the shell BEFORE writing: if this future is dropped mid-read
         // (turn cancelled), the marker stays, so the next EXEC is refused and
@@ -780,17 +979,26 @@ impl TerminalClient {
         }
 
         match self
-            .read_until_sentinel(&session, &sentinel, timeout_secs, Vec::new(), false)
+            .read_until_sentinel(
+                &session,
+                &sentinel,
+                timeout_secs,
+                Vec::new(),
+                false,
+                Some(&sentinel_line),
+            )
             .await?
         {
-            ReadOutcome::Done(output, code, trimmed) => {
+            ReadOutcome::Done(output, code, trimmed, incomplete) => {
                 *session.running.lock().map_err(|_| "state poisoned")? = None;
                 Ok(format!(
-                    "{}\n(exit code: {code})",
-                    finalize_output(&output, &wrapped, &sentinel_line, trimmed)
+                    "{}{}\n(exit code: {code})",
+                    finalize_output(&output, &wrapped, &sentinel_line, trimmed),
+                    incomplete_note(incomplete)
                 ))
             }
             ReadOutcome::Pending(carry, carry_trimmed) => {
+                let diag = diagnose_stuck(&session, &carry);
                 if let Some(r) = session
                     .running
                     .lock()
@@ -802,7 +1010,7 @@ impl TerminalClient {
                 }
                 Ok(format!(
                     "Command still running after {timeout_secs}s. Use HOBBES_TERMINAL_TAIL \
-                     to keep reading output, or HOBBES_TERMINAL_RESET to kill the shell."
+                     to keep reading output, or HOBBES_TERMINAL_RESET to kill the shell.{diag}"
                 ))
             }
         }
@@ -842,17 +1050,26 @@ impl TerminalClient {
             return Ok("No command is running; nothing new to read.".to_string());
         };
         match self
-            .read_until_sentinel(&session, &sentinel, timeout_secs, carry, carry_trimmed)
+            .read_until_sentinel(
+                &session,
+                &sentinel,
+                timeout_secs,
+                carry,
+                carry_trimmed,
+                Some(&sentinel_line),
+            )
             .await?
         {
-            ReadOutcome::Done(output, code, trimmed) => {
+            ReadOutcome::Done(output, code, trimmed, incomplete) => {
                 *session.running.lock().map_err(|_| "state poisoned")? = None;
                 Ok(format!(
-                    "{}\n(command finished — exit code: {code})",
-                    finalize_output(&output, &wrapped, &sentinel_line, trimmed)
+                    "{}{}\n(command finished — exit code: {code})",
+                    finalize_output(&output, &wrapped, &sentinel_line, trimmed),
+                    incomplete_note(incomplete)
                 ))
             }
             ReadOutcome::Pending(carry, carry_trimmed) => {
+                let diag = diagnose_stuck(&session, &carry);
                 if let Some(r) = session
                     .running
                     .lock()
@@ -863,9 +1080,10 @@ impl TerminalClient {
                     r.carry_trimmed = carry_trimmed;
                 }
                 Ok(
-                    "Still running. Use HOBBES_TERMINAL_TAIL again to keep reading, or \
-                     HOBBES_TERMINAL_RESET to kill the shell."
-                        .to_string(),
+                    format!(
+                        "Still running. Use HOBBES_TERMINAL_TAIL again to keep reading, or \
+                         HOBBES_TERMINAL_RESET to kill the shell.{diag}"
+                    ),
                 )
             }
         }
@@ -884,19 +1102,23 @@ impl TerminalClient {
         timeout_secs: u64,
         mut acc: Vec<u8>,
         mut trimmed: bool,
+        watchdog_sentinel_line: Option<&str>,
     ) -> Result<ReadOutcome, String> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let (lock, notify) = &*session.ring;
+        let mut last_data = tokio::time::Instant::now();
+        let mut aborted = false;
         loop {
             let (chunk, closed) = {
                 let mut r = lock.lock().map_err(|_| "pty ring poisoned")?;
                 (std::mem::take(&mut r.buf), r.closed)
             };
             if !chunk.is_empty() {
+                last_data = tokio::time::Instant::now();
                 acc.extend_from_slice(&chunk);
                 trimmed |= trim_front(&mut acc, ACC_CAP_BYTES);
                 if let Some(hit) = split_at_sentinel(&acc, sentinel) {
-                    return Ok(ReadOutcome::Done(hit.0, hit.1, trimmed));
+                    return Ok(ReadOutcome::Done(hit.0, hit.1, trimmed, aborted));
                 }
             }
             if closed {
@@ -912,7 +1134,28 @@ impl TerminalClient {
             }
             // A wake lost to the drain-then-wait race is caught by the next
             // loop's drain (Notify stores one permit).
-            let _ = tokio::time::timeout(remaining, notify.notified()).await;
+            // Watchdog: a shell parked at a PS2 prompt will never reach the
+            // sentinel. Interrupt the half-typed command (^C also flushes the
+            // tty input queue), then type a fresh sentinel line.
+            if let (false, Some(line)) = (aborted, watchdog_sentinel_line) {
+                let quiet = last_data.elapsed() >= std::time::Duration::from_secs(PS2_WATCHDOG_SECS);
+                if quiet && ps2_prompt_at_end(&String::from_utf8_lossy(&acc)).is_some() {
+                    aborted = true;
+                    {
+                        let mut w = session.writer.lock().map_err(|_| "pty writer poisoned")?;
+                        let _ = w.write_all(&[0x03]).and_then(|_| w.flush());
+                    }
+                    // zsh only abandons the half-read command once it sees
+                    // a line after the interrupt (verified on a bare pty).
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                    session.write_line("")?;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    session.write_line(line)?;
+                    continue;
+                }
+            }
+            let tick = remaining.min(std::time::Duration::from_millis(500));
+            let _ = tokio::time::timeout(tick, notify.notified()).await;
         }
     }
 
@@ -1511,7 +1754,7 @@ mod tests {
     async fn exec_finishes(client: &TerminalClient, ctx: &TerminalCtx, cmd: &str) -> String {
         let args = serde_json::json!({"command": cmd, "timeout_secs": 8});
         let out = client.exec(ctx, &args).await.unwrap();
-        assert!(!out.contains("still running"), "`{cmd}` hung: {out}");
+        assert!(!out.starts_with("Command still running"), "`{cmd}` hung: {out}");
         out
     }
 
@@ -1630,5 +1873,282 @@ mod tests {
         let _ = std::fs::remove_file(&log);
         assert!(text.contains("NO_TTY"), "child had a tty: {text:?}");
         assert!(text.contains(&format!("ALIVE_{tag}")), "child killed by RESET: {text:?}");
+    }
+
+    // ── Replay of the strings that hung the live app (src/mcp/repro/) ────────
+
+    const HANG1: &str = include_str!("repro/hang1.txt");
+    const HANG2: &str = include_str!("repro/hang2.txt");
+
+    /// Fake `claude` that mimics a TUI CLI: opens /dev/tty, flips it raw, then
+    /// sleeps. `mode` is the shell snippet run on the tty.
+    fn fake_claude_dir(tag: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hobbes-fakeclaude-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("claude");
+        std::fs::write(&f, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    async fn replay(tag: &str, body: &str, cmd: &str) {
+        if !std::path::Path::new("/Users/dustmoo/Sites/cai-hobbes-pm-keepalive").is_dir() {
+            eprintln!("worktrees absent; skipping replay");
+            return;
+        }
+        let client = TerminalClient::new();
+        let ctx = bg_ctx(tag);
+        let dir = fake_claude_dir(tag, body);
+        exec_finishes(&client, &ctx, &format!("export PATH={dir}:$PATH")).await;
+        let started = std::time::Instant::now();
+        // The string itself ends in `sleep 8`, so allow well past that.
+        let args = serde_json::json!({"command": cmd, "timeout_secs": 25});
+        let out = client.exec(&ctx, &args).await.unwrap();
+        assert!(!out.starts_with("Command still running"), "`{cmd}` hung: {out}");
+        eprintln!("[{tag}] returned in {:?}: {out:?}", started.elapsed());
+        // Let the fake children flip the tty, then make sure the shell is sane.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let out = exec_finishes(&client, &ctx, "echo alive-after; stty -a | head -2").await;
+        assert!(out.contains("alive-after"), "{out}");
+        client.shutdown_all().await;
+    }
+
+    const FAKE_RAW: &str = "exec 3<>/dev/tty; stty raw -echo <&3; sleep 20";
+    const FAKE_READ: &str = "stty raw -echo </dev/tty 2>/dev/null; cat </dev/tty >/dev/null; sleep 20";
+    const FAKE_NOTTY_REDIRECT: &str = "sleep 1; stty raw -echo </dev/tty 2>/dev/null; sleep 20";
+
+    #[tokio::test]
+    async fn replay_hang1_raw_tty() {
+        replay("rp1a", FAKE_RAW, HANG1).await;
+    }
+
+    #[tokio::test]
+    async fn replay_hang1_tty_reader() {
+        replay("rp1b", FAKE_READ, HANG1).await;
+    }
+
+    #[tokio::test]
+    async fn replay_hang2_raw_tty() {
+        replay("rp2a", FAKE_RAW, HANG2).await;
+    }
+
+    #[tokio::test]
+    async fn replay_hang2_tty_reader() {
+        replay("rp2b", FAKE_READ, HANG2).await;
+    }
+
+    #[tokio::test]
+    async fn replay_hang2_late_tty_mode_change() {
+        replay("rp2c", FAKE_NOTTY_REDIRECT, HANG2).await;
+    }
+
+    /// The real binary, once, with the SHAPE of both hung strings (>1 KB prompt
+    /// line, `echo "pid $!"`, two back-to-back launches) but a benign prompt so
+    /// no agent touches another worktree. `cargo test --release -- --ignored replay_real`.
+    #[tokio::test]
+    #[ignore]
+    async fn replay_real_claude_shapes() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("rp-real");
+        let pad = "Reply with the single word ok. ".repeat(40);
+        let launch = |n: u8| {
+            format!(
+                "nohup claude -p \"{pad}\" --allowedTools \"Read\" </dev/null > /tmp/hobbes-real-{n}.log 2>&1 & disown"
+            )
+        };
+        let cmd = format!("{}\n{}\necho \"pid $!\"\nsleep 3; pgrep -f 'Reply with the single word ok' | wc -l", launch(1), launch(2));
+        let args = serde_json::json!({"command": cmd, "timeout_secs": 25});
+        let out = client.exec(&ctx, &args).await.unwrap();
+        eprintln!("real: {out:?}");
+        assert!(!out.starts_with("Command still running"), "{out}");
+        client.shutdown_all().await;
+    }
+
+    /// `$!` inside double quotes under zsh -f (BANG_HIST on).
+    #[tokio::test]
+    async fn echo_pid_bang_in_quotes() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("rp-bang");
+        let out = exec_finishes(&client, &ctx, "sleep 30 &\necho \"pid $!\"").await;
+        assert!(out.contains("pid "), "{out}");
+        client.shutdown_all().await;
+    }
+
+    /// One logical line longer than the tty's canonical limit (MAX_CANON 1024).
+    #[tokio::test]
+    async fn overlong_single_line() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("rp-long");
+        let pad = "x".repeat(1500);
+        let out = exec_finishes(&client, &ctx, &format!("echo start-{pad}-end")).await;
+        assert!(out.contains("-end"), "{}", &out[out.len().saturating_sub(120)..]);
+        client.shutdown_all().await;
+    }
+
+    // ── Stuck-state detectors ────────────────────────────────────────────────
+
+    #[test]
+    fn ps2_prompt_detected_only_at_buffer_end() {
+        assert_eq!(ps2_prompt_at_end("out\r\ndquote> "), Some("dquote"));
+        assert_eq!(ps2_prompt_at_end("quote> "), Some("quote"));
+        assert_eq!(ps2_prompt_at_end("x\nheredoc> "), Some("heredoc"));
+        assert_eq!(ps2_prompt_at_end("a\ncmdsubst> "), Some("cmdsubst"));
+        assert_eq!(ps2_prompt_at_end("a\nbquote> "), Some("bquote"));
+        assert_eq!(ps2_prompt_at_end("a\ncmdand dquote> "), Some("dquote"));
+        // Mid-buffer or ordinary text is not a prompt.
+        assert_eq!(ps2_prompt_at_end("dquote> \nreal output\n"), None);
+        assert_eq!(ps2_prompt_at_end("a > b"), None);
+        assert_eq!(ps2_prompt_at_end("hello"), None);
+    }
+
+    #[test]
+    fn job_control_notices_are_named() {
+        let raw = "[1]  + 123 suspended (tty input)  claude -p x\n[2]  + 9 suspended (tty output) y";
+        assert_eq!(
+            job_control_notices(raw),
+            vec!["suspended (tty input)", "suspended (tty output)"]
+        );
+        assert!(job_control_notices("[1] 123 done").is_empty());
+    }
+
+    const STTY_COOKED: &str = "speed 9600 baud; 40 rows; 120 columns;\n\
+        lflags: icanon isig iexten -echo echoe echok -echonl echoke\n\
+        iflags: icrnl ixon\noflags: opost onlcr\ncflags: cread cs8\ncchars: eof = ^D;\n";
+    const STTY_RAW: &str = "speed 9600 baud; 40 rows; 120 columns;\n\
+        lflags: -icanon -isig -iexten -echo echoe echok -echonl echoke\n\
+        iflags: -icrnl ixon\noflags: opost onlcr\ncflags: cread cs8\ncchars: eof = ^D;\n";
+
+    #[test]
+    fn tty_mode_diff_names_changed_flags() {
+        assert!(tty_mode_diff(STTY_COOKED, STTY_COOKED).is_empty());
+        let d = tty_mode_diff(STTY_COOKED, STTY_RAW);
+        assert_eq!(
+            d,
+            vec![
+                "-icanon (was icanon)",
+                "-icrnl (was icrnl)",
+                "-iexten (was iexten)",
+                "-isig (was isig)"
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_tail_keeps_control_bytes_visible_and_bounded() {
+        let t = raw_tail(b"abc\x07\x07\r\nxyz", 6);
+        assert_eq!(t, "\\u{7}\\r\\nxyz");
+        assert!(raw_tail(&[b'a'; 2000], DIAG_TAIL_BYTES).len() == DIAG_TAIL_BYTES);
+    }
+
+    /// Commands are no longer typed into the tty: an over-long line, `"$!"`
+    /// (BANG_HIST) and an unterminated quote all complete (the last as a
+    /// syntax error) instead of swallowing the sentinel.
+    #[tokio::test]
+    async fn typed_input_hazards_no_longer_hang() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("hz");
+        let long = format!("echo s-{}-e", "x".repeat(3000));
+        let out = exec_finishes(&client, &ctx, &long).await;
+        assert!(out.contains("-e\n"), "{}", &out[out.len().saturating_sub(80)..]);
+        let out = exec_finishes(&client, &ctx, "sleep 30 &\necho \"pid $!\"").await;
+        assert!(out.contains("pid "), "{out}");
+        let out = exec_finishes(&client, &ctx, "echo \"unterminated").await;
+        assert!(!out.contains("exit code: 0"), "{out}");
+        let out = exec_finishes(&client, &ctx, "echo fine").await;
+        assert!(out.contains("fine"), "{out}");
+        client.shutdown_all().await;
+    }
+
+    /// The watchdog: a shell parked at a PS2 prompt gets ^C + a fresh sentinel.
+    #[tokio::test]
+    async fn watchdog_breaks_out_of_ps2_prompt() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("wd");
+        let session = client.session_for(&ctx).await.unwrap();
+        let sentinel = "__HOBBES_DONE_wdtest__";
+        let sentinel_line = format!("printf '\\n{sentinel} %d\\n' $?");
+        // Typed directly (as the old code did): the quote swallows the sentinel line.
+        session
+            .write_line(&format!("echo \"never closed\n{sentinel_line}"))
+            .unwrap();
+        let outcome = client
+            .read_until_sentinel(&session, sentinel, 15, Vec::new(), false, Some(&sentinel_line))
+            .await
+            .unwrap();
+        match outcome {
+            ReadOutcome::Done(_, _, _, incomplete) => assert!(incomplete),
+            ReadOutcome::Pending(acc, _) => panic!("watchdog never fired: {:?}", raw_tail(&acc, 200)),
+        }
+        // Shell is usable again.
+        let out = exec_finishes(&client, &ctx, "echo recovered").await;
+        assert!(out.contains("recovered"), "{out}");
+        client.shutdown_all().await;
+    }
+
+    /// Without the watchdog the stuck PS2 prompt is named, with the raw tail.
+    #[tokio::test]
+    async fn pending_diagnostics_name_ps2_prompt() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("dg1");
+        let session = client.session_for(&ctx).await.unwrap();
+        session.write_line("echo \"open").unwrap();
+        let outcome = client
+            .read_until_sentinel(&session, "__HOBBES_DONE_never__", 2, Vec::new(), false, None)
+            .await
+            .unwrap();
+        let ReadOutcome::Pending(acc, _) = outcome else { panic!("should be pending") };
+        let diag = diagnose_stuck(&session, &acc);
+        assert!(diag.contains("`dquote>` continuation prompt"), "{diag}");
+        assert!(diag.contains("raw pty output"), "{diag}");
+        client.shutdown_all().await;
+    }
+
+    /// A child that flips the tty raw is named on timeout, and TAIL repeats it.
+    #[tokio::test]
+    async fn timeout_diagnostics_report_tty_mode_change_and_raw_tail() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("dg2");
+        let args = serde_json::json!({
+            "command": "echo before-stall; stty raw -echo; sleep 6",
+            "timeout_secs": 2
+        });
+        let out = client.exec(&ctx, &args).await.unwrap();
+        assert!(out.contains("still running"), "{out}");
+        assert!(out.contains("[diagnostics]"), "{out}");
+        assert!(out.contains("tty modes differ"), "{out}");
+        assert!(out.contains("-icanon"), "{out}");
+        assert!(out.contains("before-stall"), "raw tail missing: {out}");
+        let out = client.tail(&ctx, &serde_json::json!({"timeout_secs": 1})).await.unwrap();
+        assert!(out.contains("tty modes differ"), "{out}");
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn job_control_notice_is_named_on_timeout() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("dg3");
+        let session = client.session_for(&ctx).await.unwrap();
+        let diag = diagnose_stuck(&session, b"[1]  + 4242 suspended (tty input)  claude -p x\n");
+        assert!(diag.contains("suspended (tty input)"), "{diag}");
+        client.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn watchdog_breaks_out_of_heredoc() {
+        let client = TerminalClient::new();
+        let ctx = bg_ctx("wd2");
+        let session = client.session_for(&ctx).await.unwrap();
+        let sentinel = "__HOBBES_DONE_wdhd__";
+        let sentinel_line = format!("printf '\\n{sentinel} %d\\n' $?");
+        session
+            .write_line(&format!("cat <<EOF\nbody\n{sentinel_line}"))
+            .unwrap();
+        let outcome = client
+            .read_until_sentinel(&session, sentinel, 15, Vec::new(), false, Some(&sentinel_line))
+            .await
+            .expect("watchdog read");
+        assert!(matches!(outcome, ReadOutcome::Done(_, _, _, true)));
+        client.shutdown_all().await;
     }
 }
