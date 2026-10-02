@@ -164,6 +164,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                         let active_class = if session.id == active_id { "bg-section" } else { "" };
                         let session_id = session.id.clone();
                         let session_name = session.display_title();
+                        let session_emoji = session.display_emoji().map(str::to_string);
                         let session_summary = session.summary.clone();
                         let session_date = format_session_date(&session.last_updated);
 
@@ -184,7 +185,16 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                     }
                                 },
                                 div {
-                                    class: "min-w-0",
+                                    class: "min-w-0 flex items-start gap-1.5",
+                                    // Fixed-width emoji column (same glyph treatment as
+                                    // the tab sidebar) so titles stay aligned for
+                                    // chats that have no emoji yet.
+                                    span {
+                                        class: "w-5 shrink-0 text-center text-[13px] leading-5",
+                                        if let Some(e) = &session_emoji { "{e}" }
+                                    }
+                                    div {
+                                        class: "min-w-0 flex-1",
                                     if editing_session_id.read().as_ref() == Some(&session_id) {
                                         input {
                                             class: "w-full bg-input text-fg rounded p-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500",
@@ -205,13 +215,14 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                         }
                                     } else {
                                         div {
-                                            class: "text-sm text-fg truncate", "{session_name}"
+                                            class: "text-sm text-fg break-words", title: "{session_name}", "{session_name}"
                                         }
                                         if !session_summary.is_empty() {
                                             div {
                                                 class: "text-xs text-fg-muted truncate", "{session_summary}"
                                             }
                                         }
+                                    }
                                     }
                                 },
                                 div {

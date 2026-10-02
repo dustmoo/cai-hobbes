@@ -43,6 +43,8 @@ pub const META_LIFETIME_TOKENS: &str = "lifetime_tokens";
 /// written; `SessionState::load` deletes any surviving row.
 pub const META_TOOL_CALL_HISTORY: &str = "tool_call_history";
 const META_JSON_MIGRATED: &str = "migrated_from_json";
+/// Set once `search_text` carries each row's AI topic title (`tab_title`).
+const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
 
 fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
     FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -189,6 +191,10 @@ pub fn init() -> Result<(), String> {
         tracing::error!("One-time JSON→SQLite import failed (will retry next launch): {e}");
     }
 
+    if let Err(e) = backfill_search_tab_titles(&conn) {
+        tracing::warn!("search_text tab_title backfill failed (will retry next launch): {e}");
+    }
+
     seed_seq_from_db(&conn);
 
     let _ = CONN.set(Mutex::new(conn));
@@ -209,6 +215,23 @@ pub(crate) fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -
 }
 
 // ── One-time migration ──────────────────────────────────────────────────────
+
+/// One-time: prepend each row's AI topic title to `search_text`, matching what
+/// `build_row` now writes, so History search finds chats by the title the
+/// drawer shows without parsing every row's `data` per search. Leaves `data`
+/// and its hash untouched.
+fn backfill_search_tab_titles(conn: &Connection) -> rusqlite::Result<()> {
+    if meta_get_conn(conn, META_SEARCH_TAB_TITLE)?.is_some() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE sessions
+         SET search_text = lower(json_extract(data, '$.tab_title')) || char(10) || search_text
+         WHERE trim(coalesce(json_extract(data, '$.tab_title'), '')) <> ''",
+        [],
+    )?;
+    meta_set_conn(conn, META_SEARCH_TAB_TITLE, "1", 0)
+}
 
 fn migrate_from_json_files(conn: &Connection) -> Result<(), String> {
     import_json_files(conn, get_legacy_json_path(), get_legacy_archive_path()).map(|_| ())
@@ -356,6 +379,11 @@ pub fn build_row(session: &Session, seq: i64) -> Result<SessionRow, serde_json::
     let mut search_text =
         String::with_capacity(session.name.len() + summary.len() + 64);
     search_text.push_str(&session.name.to_lowercase());
+    // The AI topic title is what the History drawer shows, so search it too.
+    if let Some(title) = session.tab_title.as_deref().filter(|t| !t.trim().is_empty()) {
+        search_text.push('\n');
+        search_text.push_str(&title.to_lowercase());
+    }
     search_text.push('\n');
     search_text.push_str(&summary.to_lowercase());
     for m in &session.messages {
@@ -687,6 +715,11 @@ impl SessionMeta {
         }
     }
 
+    /// The emoji to show in front of the title, if the chat has a real one.
+    pub fn display_emoji(&self) -> Option<&str> {
+        self.tab_emoji.as_deref().map(str::trim).filter(|e| !e.is_empty())
+    }
+
     fn from_row(id: String, name: String, last_updated: String, message_count: i64, summary: String, data: Option<String>) -> Self {
         let (tab_title, tab_emoji, name_user_set) = data
             .as_deref()
@@ -706,7 +739,29 @@ impl SessionMeta {
 /// Paginated, newest-first metadata listing. `query` (lowercased substring)
 /// matches name, summary, or message text. Returns (page, total_matches).
 pub fn list_metadata(query: Option<&str>, offset: i64, limit: i64) -> (Vec<SessionMeta>, i64) {
-    let result = with_conn(|conn| {
+    let result = with_conn(|conn| list_metadata_conn(conn, query, offset, limit));
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("list_metadata failed: {e}");
+            (Vec::new(), 0)
+        }
+    }
+}
+
+/// `list_metadata` against an explicit connection (so tests can use an
+/// in-memory DB). Besides name/summary/message text, the query also matches
+/// the AI topic (`tab_title`), read straight from the row's `data` JSON so it
+/// works for rows saved before `tab_title` was part of anything else and
+/// needs no migration or backfill. `OR` short-circuits, so the JSON is only
+/// parsed for rows the cheaper columns did not already match.
+fn list_metadata_conn(
+    conn: &Connection,
+    query: Option<&str>,
+    offset: i64,
+    limit: i64,
+) -> rusqlite::Result<(Vec<SessionMeta>, i64)> {
+    {
         let (where_clause, pattern) = match query {
             Some(q) if !q.is_empty() => {
                 let escaped = q.to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
@@ -747,13 +802,6 @@ pub fn list_metadata(query: Option<&str>, offset: i64, limit: i64) -> (Vec<Sessi
             let mut stmt = conn.prepare(&list_sql)?;
             let rows = stmt.query_map(params![pattern], map_row)?;
             Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total))
-        }
-    });
-    match result {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!("list_metadata failed: {e}");
-            (Vec::new(), 0)
         }
     }
 }
@@ -1272,6 +1320,72 @@ pub mod test_support {
 
     pub fn journal_complete_for_test(conn: &Connection, session_id: &str) -> bool {
         journal_starts_with_creation_conn(conn, session_id).unwrap()
+    }
+}
+
+#[cfg(test)]
+mod list_metadata_tests {
+    use super::test_support::*;
+    use super::*;
+
+    fn session(name: &str, user_set: bool, title: Option<&str>, emoji: Option<&str>) -> Session {
+        let mut state = crate::session::SessionState::default();
+        let id = state.create_session_raw(None);
+        let mut s = state.sessions.remove(&id).unwrap();
+        s.name = name.to_string();
+        s.name_user_set = user_set;
+        s.tab_title = title.map(str::to_string);
+        s.tab_emoji = emoji.map(str::to_string);
+        s
+    }
+
+    #[test]
+    fn search_matches_ai_topic_title() {
+        with_test_db(|conn| {
+            upsert(conn, &session("Sep 16 - 03:45 PM", false, Some("Quarterly Budget Review"), Some("💰")));
+            upsert(conn, &session("Sep 17 - 09:00 AM", false, None, None));
+            let (metas, total) = list_metadata_conn(conn, Some("budget"), 0, 10).unwrap();
+            assert_eq!(total, 1);
+            assert_eq!(metas[0].display_title(), "Quarterly Budget Review");
+            assert_eq!(metas[0].display_emoji(), Some("💰"));
+            let (_, none) = list_metadata_conn(conn, Some("nonexistent"), 0, 10).unwrap();
+            assert_eq!(none, 0);
+        });
+    }
+
+    #[test]
+    fn backfill_adds_ai_topic_title_to_search_text_once() {
+        with_test_db(|conn| {
+            upsert(conn, &session("Sep 16 - 03:45 PM", false, Some("Quarterly Budget Review"), Some("💰")));
+            upsert(conn, &session("Sep 17 - 09:00 AM", false, None, None));
+            // Simulate rows written before build_row carried the title.
+            conn.execute("UPDATE sessions SET search_text = lower(name)", []).unwrap();
+            conn.execute("DELETE FROM meta WHERE key = ?1", params![META_SEARCH_TAB_TITLE]).unwrap();
+            assert_eq!(list_metadata_conn(conn, Some("budget"), 0, 10).unwrap().1, 0);
+
+            backfill_search_tab_titles(conn).unwrap();
+            assert_eq!(list_metadata_conn(conn, Some("budget"), 0, 10).unwrap().1, 1);
+            // Untitled rows are left alone, and a second run is a no-op.
+            backfill_search_tab_titles(conn).unwrap();
+            let titled: String = conn
+                .query_row(
+                    "SELECT search_text FROM sessions WHERE json_extract(data, '$.tab_title') IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(titled.matches("quarterly budget review").count(), 1);
+        });
+    }
+
+    #[test]
+    fn display_emoji_ignores_blank() {
+        let mut m = SessionMeta::from_row("a".into(), "n".into(), String::new(), 0, String::new(), None);
+        assert_eq!(m.display_emoji(), None);
+        m.tab_emoji = Some("  ".into());
+        assert_eq!(m.display_emoji(), None);
+        m.tab_emoji = Some("🐯".into());
+        assert_eq!(m.display_emoji(), Some("🐯"));
     }
 }
 
