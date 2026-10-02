@@ -1,4 +1,5 @@
 mod context_compression;
+mod ledger;
 mod message_history;
 mod system_context;
 pub(crate) mod types;
@@ -28,6 +29,9 @@ pub struct PromptBuilder<'a> {
     /// the builder stays free of planner state; `None` (the default) when the
     /// planner or its context injection is disabled.
     pub(crate) planner_today: Option<serde_json::Value>,
+    /// Clock for a new request tail; `None` (the default) reads the local
+    /// clock. Tests pin it so a build is a pure function of its inputs.
+    pub(crate) now: Option<chrono::DateTime<chrono::Local>>,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -36,6 +40,7 @@ impl<'a> PromptBuilder<'a> {
             session,
             settings,
             planner_today: None,
+            now: None,
         }
     }
 
@@ -43,6 +48,13 @@ impl<'a> PromptBuilder<'a> {
     /// `todo::handlers::planner_today_context`.
     pub fn with_planner_today(mut self, planner_today: Option<serde_json::Value>) -> Self {
         self.planner_today = planner_today;
+        self
+    }
+
+    /// Pin the clock a new request tail records (tests).
+    #[cfg(test)]
+    pub fn with_now(mut self, now: chrono::DateTime<chrono::Local>) -> Self {
+        self.now = Some(now);
         self
     }
 
@@ -88,28 +100,16 @@ impl<'a> PromptBuilder<'a> {
         // Phase 1: Build system context (persona, tools, skills, scratchpad, etc.)
         let ctx = self.build_system_context();
 
-        // Phase 2: Linearise message history (Pass 1)
-        let last_message = self.session.messages.last();
-        let mut linearised = self.linearise_messages(
-            &ctx.system,
-            &ctx.tools,
-            ctx.provider_context,
-            &ctx.tuning,
-            ctx.is_continuation_placeholder,
-            last_message,
-        );
-
-        // 3. Add current user message
-        if !user_message.is_empty() {
-            linearised.messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: vec![ContentBlock::Text { text: user_message }],
-            });
-        }
+        // Phase 2: Linearise message history (Pass 1), with the turn context
+        // ledger spliced in and the request tail at the end.
+        let mut linearised = self.linearise_messages(&ctx, user_message);
 
         // 3b. A request asking for a new completion must not end on an
         // assistant turn. Appending here (at the tail) keeps every
-        // `tool_result_positions` index from Pass 1 valid.
+        // `tool_result_positions` and `turn_scoped` index from Pass 1 valid.
+        // The request tail (a System message carrying the CONTINUATION /
+        // TOOL COMPLETION instruction) is always last, so this only fires
+        // when no tail rendered.
         Self::ensure_ends_with_user_turn(&mut linearised.messages);
 
         // Phase 3: Apply Pass 2 budget & pagination
@@ -138,15 +138,18 @@ impl<'a> PromptBuilder<'a> {
 
         PromptBuildResult {
             prompt: NeutralLlmPrompt {
+                // Stable for the whole session: the live context and the
+                // per-request tail are messages now.
                 system: Some(ctx.system),
-                system_volatile_offset: ctx.volatile_offset,
-                turn_scoped: Vec::new(),
-                history_rewritten: false,
+                system_volatile_offset: None,
+                turn_scoped: linearised.turn_scoped,
+                history_rewritten: linearised.history_rewritten,
                 messages: linearised.messages,
                 tools: ctx.tools,
             },
             pages_to_store: linearised.pages_to_store,
             history_anchor: linearised.history_anchor,
+            ledger_entries: linearised.ledger_entries,
         }
     }
 

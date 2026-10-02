@@ -1,19 +1,22 @@
 use crate::components::shared::MessageContent;
 use crate::llm::types::ToolDefinition;
-use chrono::Local;
 use serde_json::json;
 use super::PromptBuilder;
 
 /// Result of system context assembly.
 pub(crate) struct SystemContextResult {
-    /// The complete system instruction string: the stable part (persona +
-    /// `<SYSTEM_CONTEXT>`) followed by the volatile part (`<TURN_CONTEXT>` +
-    /// turn instructions).
+    /// The system instruction string: persona + `<SYSTEM_CONTEXT>`. It holds
+    /// only stable content — everything that changes during a session goes
+    /// through the turn context ledger (`ledger.rs`) as messages.
     pub system: String,
-    /// Byte offset into `system` where the volatile part begins (always a char
-    /// boundary, `< system.len()`). `None` when there is no volatile part.
-    /// Feeds `LlmPrompt.system_volatile_offset`.
-    pub volatile_offset: Option<usize>,
+    /// The composed per-session live context (scratchpad, planner_today,
+    /// loaded_skills, conversation_summary, tool snapshots, other extras),
+    /// keyed like the old `<TURN_CONTEXT>` block. The ledger decides which of
+    /// these reach the model and when.
+    pub volatile: serde_json::Map<String, serde_json::Value>,
+    /// Per-request turn instructions (TOOL COMPLETION / CONTINUATION /
+    /// RECOVERY), without leading blank lines. Rendered into the request tail.
+    pub turn_instructions: String,
     /// The tools list, potentially filtered by active skill scope.
     pub tools: Vec<ToolDefinition>,
     /// The resolved context tuning for this prompt build.
@@ -163,8 +166,8 @@ impl<'a> PromptBuilder<'a> {
         }
 
         // Instructions that depend on how the conversation currently ends. They
-        // are per-turn, so they render after `<TURN_CONTEXT>` (the volatile
-        // part), never inside the persona (the stable, cacheable part).
+        // are per-request, so they render in the request tail (see
+        // `ledger.rs`), never inside the persona (the stable, cacheable part).
         let mut turn_instructions = String::new();
 
         // Check if the last message is an empty placeholder from Hobbes (continuation scenario)
@@ -178,8 +181,12 @@ impl<'a> PromptBuilder<'a> {
             // We check this indirectly — the caller passes user_message,
             // but we need to detect continuation/recovery mode here.
             // Use the placeholder detection as a signal.
+            // A conversation ending on the assistant's own prose is a
+            // continuation too (the instruction used to ride on a separate
+            // nudge message; the request tail carries it now).
             is_continuation_placeholder || last_message.is_some_and(|m| {
                 matches!(&m.content, MessageContent::ToolCall(_))
+                    || (m.author == "Hobbes" && matches!(&m.content, MessageContent::Text { .. }))
             })
         };
 
@@ -277,12 +284,11 @@ impl<'a> PromptBuilder<'a> {
             );
         }
 
+        // How the live context reaches the model (see `ledger.rs`). Static
+        // text, so it lives in the stable part.
         system_context_map.insert(
-            "current_time".to_string(),
-            json!({
-                "iso_8601": Local::now().to_rfc3339(),
-                "timezone": "Local"
-            }),
+            "context_protocol".to_string(),
+            json!(CONTEXT_PROTOCOL_NOTE),
         );
 
         // Check for fully configured Composio profiles and inject context
@@ -400,12 +406,13 @@ impl<'a> PromptBuilder<'a> {
                 .collect();
 
             // Step 3: Build the loaded_skills array for the system context map.
-            // Full manual → turn-active skills; stub only → inactive skills.
-            // If no active skills were detected, fall back to injecting all skills fully.
-            // Skills idle for `settings.skill_idle_turns` user turns are stubbed regardless
-            // (see `idle_loaded_skills`), so a one-off load stops costing its manual
-            // on every later turn.
-            let use_lazy = !turn_active_skill_names.is_empty();
+            // Every loaded skill carries its full manual unless it has gone
+            // idle for `settings.skill_idle_turns` user turns (see
+            // `idle_loaded_skills`), so a one-off load stops costing its manual
+            // on later turns. The value reaches the model through the context
+            // ledger, which appends it once per change: a per-request
+            // turn-active stub/manual toggle would re-append the manual each
+            // time recent tool use shifted, so it is not applied here.
             idle_skill_names = idle_loaded_skills(
                 &self.session.messages,
                 &self.session.loaded_skills,
@@ -437,29 +444,16 @@ impl<'a> PromptBuilder<'a> {
                         }));
                     }
 
-                    let is_active = !use_lazy || turn_active_skill_names.contains(skill_name);
-                    if is_active {
-                        tracing::debug!(
-                            "Loaded skill '{}': full instruction_manual injected ({} chars)",
-                            skill_name, payload.instruction_manual.len()
-                        );
-                        Some(json!({
-                            "name": skill_name,
-                            "instruction_manual": payload.instruction_manual,
-                            "resolved_tools": tool_mappings,
-                            "warnings": payload.warnings,
-                        }))
-                    } else {
-                        tracing::debug!(
-                            "Loaded skill '{}': stub only (not active this turn)",
-                            skill_name
-                        );
-                        Some(json!({
-                            "name": skill_name,
-                            "resolved_tools": tool_mappings,
-                            "note": "Skill loaded but not active this turn. Full instructions available if needed.",
-                        }))
-                    }
+                    tracing::debug!(
+                        "Loaded skill '{}': full instruction_manual injected ({} chars)",
+                        skill_name, payload.instruction_manual.len()
+                    );
+                    Some(json!({
+                        "name": skill_name,
+                        "instruction_manual": payload.instruction_manual,
+                        "resolved_tools": tool_mappings,
+                        "warnings": payload.warnings,
+                    }))
                 })
                 .collect();
 
@@ -471,10 +465,10 @@ impl<'a> PromptBuilder<'a> {
                     serde_json::Value::Array(skills_array),
                 );
                 tracing::info!(
-                    "Loaded skills injected: {} total, {} active (lazy={})",
+                    "Loaded skills injected: {} total, {} turn-active, {} idle",
                     self.session.loaded_skills.len(),
                     turn_active_skill_names.len(),
-                    use_lazy
+                    idle_skill_names.len()
                 );
             }
         }
@@ -675,40 +669,32 @@ impl<'a> PromptBuilder<'a> {
         // This compresses/omits low-priority sections to fit the system prompt
         // within ~20% of the provider's context budget.
         let provider_context = self.effective_context_window();
-        // The budget runs over the combined map, before the stable/volatile
+        // The budget runs over the combined map, before the stable/live
         // split, so its priority tiers apply across both parts; the free text
-        // (persona + turn instructions + the TURN_CONTEXT header) counts too.
+        // (persona + turn instructions + the tail header) counts too.
         Self::compose_system_for_budget(
             &mut system_context_map,
-            persona.len() + turn_instructions.len() + TURN_CONTEXT_NOTE.len(),
+            persona.len() + turn_instructions.len() + super::ledger::TAIL_HEADER.len(),
             provider_context,
             &tuning,
         );
 
-        // Layout (prompt-cache friendly — see `LlmPrompt.system_volatile_offset`):
-        //   <persona>\n\n<SYSTEM_CONTEXT>{stable keys}</SYSTEM_CONTEXT>
-        //   | volatile offset |
-        //   \n\n<TURN_CONTEXT>{volatile keys}</TURN_CONTEXT><turn instructions>
-        let (stable_map, volatile_map) = split_context_map(system_context_map);
+        // Layout: <persona>\n\n<SYSTEM_CONTEXT>{stable keys}</SYSTEM_CONTEXT>.
+        // The live keys go to the context ledger (`ledger.rs`) and the turn
+        // instructions to the request tail, both as messages, so the system
+        // string is byte-stable across the session.
+        let (stable_map, volatile) = split_context_map(system_context_map);
 
         let mut system = persona;
         if let Some(block) = render_context_block("SYSTEM_CONTEXT", None, stable_map) {
             system.push_str("\n\n");
             system.push_str(&block);
         }
-        let stable_len = system.len();
-        if let Some(block) =
-            render_context_block("TURN_CONTEXT", Some(TURN_CONTEXT_NOTE), volatile_map)
-        {
-            system.push_str("\n\n");
-            system.push_str(&block);
-        }
-        system.push_str(&turn_instructions);
-        let volatile_offset = (system.len() > stable_len).then_some(stable_len);
 
         SystemContextResult {
             system,
-            volatile_offset,
+            volatile,
+            turn_instructions: turn_instructions.trim_start().to_string(),
             tools,
             tuning,
             provider_context,
@@ -722,7 +708,8 @@ impl<'a> PromptBuilder<'a> {
 /// times per session and only on an explicit event (settings edit, MCP server
 /// (un)load, Composio profile switch, `/skill` run, skill catalog change).
 /// Every other key — including unknown `ActiveContext.extra` keys — goes to
-/// `<TURN_CONTEXT>`, so a new key defaults to the safe (uncached) side.
+/// the context ledger as its own key, so a new key defaults to the safe side
+/// (recorded when it changes, at a user-turn boundary).
 const STABLE_CONTEXT_KEYS: &[&str] = &[
     "user_name",
     "user_instruction",
@@ -732,17 +719,18 @@ const STABLE_CONTEXT_KEYS: &[&str] = &[
     "composio_context",
     "active_skill",
     "available_skills",
+    "context_protocol",
 ];
 
-/// Header line of the `<TURN_CONTEXT>` block.
-const TURN_CONTEXT_NOTE: &str = "Live per-turn state (current time, working memory, conversation summary, loaded skills, today's plan). It has the same authority as SYSTEM_CONTEXT.";
+/// Explains the ledger and tail messages to the model (stable).
+const CONTEXT_PROTOCOL_NOTE: &str = "Live state is not in this block. It arrives inside the conversation with the same authority as SYSTEM_CONTEXT: a message starting with [Context update: <key>] gives the current value of that key (working memory, today's plan, loaded skills) and replaces any earlier value of the same key; [History trimmed] marks omitted earlier messages and restates the current values; [Turn context] carries the current time and instructions for that request only.";
 
 /// Recursively sort every JSON object's keys. The app's `serde_json` has
 /// `preserve_order` enabled (pulled in transitively), so a `Map` keeps
 /// insertion order — and objects built from a `HashMap` (`ActiveContext.extra`,
 /// summary entities) would iterate in a per-process random order. Sorting
 /// makes the rendered bytes a pure function of the content.
-fn canonicalize_json(value: &mut serde_json::Value) {
+pub(crate) fn canonicalize_json(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             let mut entries: Vec<(String, serde_json::Value)> =
@@ -773,7 +761,7 @@ fn sorted_tool_mappings(
 }
 
 /// Render a context map as a tagged pretty-JSON block (empty map → `None`).
-fn render_context_block(
+pub(crate) fn render_context_block(
     tag: &str,
     header: Option<&str>,
     mut map: serde_json::Map<String, serde_json::Value>,
@@ -974,7 +962,7 @@ mod recovery_note_tests {
         let settings = Settings::default();
         PromptBuilder::new(session, &settings)
             .build_system_context()
-            .system
+            .turn_instructions
     }
 
     #[test]

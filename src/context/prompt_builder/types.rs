@@ -38,6 +38,10 @@ pub struct PromptBuildResult {
     /// The caller writes it back with `SessionState::set_history_anchor` when it
     /// differs from the stored one, so the next build starts from the same cut.
     pub history_anchor: Option<uuid::Uuid>,
+    /// Turn context ledger entries this build created (boundary updates, the
+    /// request tail, a trim snapshot). The caller appends them with
+    /// `SessionState::append_ledger_entries`, so later builds replay them.
+    pub ledger_entries: Vec<crate::session::LedgerEntry>,
 }
 
 /// Recursively unwrap JSON values that are stringified JSON.

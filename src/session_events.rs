@@ -136,6 +136,11 @@ pub enum SessionEvent {
     /// Save & Resend flow journals the edit *before* the rewind for
     /// provenance; either ordering projects to the same state.)
     MessageEdited { message_id: uuid::Uuid, content: String },
+    /// A prompt build appended an entry to `Session.context_ledger` (a
+    /// context update at a user-turn boundary, a request's turn-scoped tail,
+    /// or part of a history-trim snapshot). Builds that predate the ledger
+    /// skip this kind, like any unknown kind.
+    LedgerEntryAdded { entry: crate::session::LedgerEntry },
 }
 
 impl SessionEvent {
@@ -166,6 +171,7 @@ impl SessionEvent {
             SessionEvent::ComposioProfileSet { .. } => "ComposioProfileSet",
             SessionEvent::SessionForked { .. } => "SessionForked",
             SessionEvent::MessageEdited { .. } => "MessageEdited",
+            SessionEvent::LedgerEntryAdded { .. } => "LedgerEntryAdded",
         }
     }
 }
@@ -225,6 +231,7 @@ fn blank_session() -> Session {
         name_user_set: false,
         tab_title_provisional: false,
         history_anchor: None,
+        context_ledger: Vec::new(),
     }
 }
 
@@ -267,6 +274,7 @@ pub fn project(base: Option<Session>, events: &[LoadedSessionEvent]) -> Session 
         apply_event(&mut session, &loaded.event);
         session.last_updated = loaded.ts;
     }
+    session.prune_orphaned_ledger();
     session
 }
 
@@ -350,6 +358,9 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
             if let Some(partial) = partial_message {
                 upsert_message(session, partial);
             }
+            if !removed_message_ids.is_empty() {
+                session.prune_orphaned_ledger();
+            }
         }
         E::MemoryOptimized { summary } => {
             // active_context replacement is deliberately not replayed — see
@@ -375,6 +386,14 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         }
         E::ComposioProfileSet { profile } => session.composio_profile = profile.clone(),
         E::SessionForked { .. } => {} // provenance marker — no state effect
+        E::LedgerEntryAdded { entry } => {
+            // Same rule as `SessionState::append_ledger_entries`: an id is
+            // recorded once. Orphans are pruned once the fold is done
+            // (`project`), since an anchor's own event may land later.
+            if !session.context_ledger.iter().any(|e| e.id == entry.id) {
+                session.context_ledger.push(entry.clone());
+            }
+        }
         E::MessageEdited { message_id, content } => {
             use crate::components::shared::MessageContent;
             match session.messages.iter_mut().find(|m| &m.id == message_id) {
@@ -420,7 +439,15 @@ pub fn rewind_session_state(
                 SessionEvent::RewoundTo { seq, message_id: message_id.to_string() },
             );
             let events = store::load_events(session_id, 0);
-            let projected = project(None, &events);
+            let mut projected = project(None, &events);
+            // The history trim anchor isn't journaled; keep it while its
+            // message survived the rewind, so the window (and the trim
+            // snapshot rendered for it) stays put instead of resetting.
+            projected.history_anchor = state
+                .sessions
+                .get(session_id)
+                .and_then(|s| s.history_anchor)
+                .filter(|a| projected.messages.iter().any(|m| m.id == *a));
             let old_len = state
                 .sessions
                 .get(session_id)

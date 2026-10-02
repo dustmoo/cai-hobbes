@@ -1722,8 +1722,13 @@ pub fn planner_today_context_with_events(
     // Per-actor minutes ride as their own compact keys below; keep the
     // capacity line itself in its familiar shape.
     cap.agent_minutes = 0;
-    let person_done_minutes = model::person_minutes_on(&planner.focus_sessions, today);
-    let agent_done_minutes = model::agent_minutes_on(&planner.focus_sessions, today);
+    // Live minutes are rounded down to the fleet's 15-minute step: this block
+    // reaches the model through the turn context ledger, which records it
+    // again whenever its rendering changes, and an open focus session would
+    // otherwise change it every minute.
+    let step = crate::fleet::briefs::CTX_MINUTES_STEP;
+    let person_done_minutes = model::person_minutes_on(&planner.focus_sessions, today) / step * step;
+    let agent_done_minutes = model::agent_minutes_on(&planner.focus_sessions, today) / step * step;
 
     let todos: Vec<String> = views::in_view(&planner.todos, TodoView::Today, today)
         .into_iter()
@@ -1804,7 +1809,7 @@ pub fn planner_today_context_with_events(
             "[{}] {} — {} elapsed{}",
             t.id,
             truncate_title(&t.title),
-            model::format_minutes(t.elapsed_minutes(now)),
+            model::format_minutes(t.elapsed_minutes(now) / step * step),
             t.estimate_minutes
                 .map(|m| format!(" of {} estimated", model::format_minutes(m)))
                 .unwrap_or_default()

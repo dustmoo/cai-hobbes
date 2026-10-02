@@ -39,6 +39,7 @@ fn create_test_session() -> Session {
         name_user_set: false,
         tab_title_provisional: false,
         history_anchor: None,
+        context_ledger: Vec::new(),
     }
 }
 
@@ -177,12 +178,14 @@ fn test_oversized_entities_stripped_from_system_context() {
     };
 
     let builder = PromptBuilder::new(&session, &settings);
-    let prompt = builder.build_prompt("Hello".to_string());
-
-    let full_text = prompt
-        .prompt
-        .system
-        .expect("Should have system instruction");
+    let ctx = builder.build_system_context();
+    // The summary is live context (shown in a trim snapshot); check the
+    // composed value alongside the stable system string.
+    let full_text = format!(
+        "{}\n{}",
+        ctx.system,
+        ctx.volatile.get("conversation_summary").expect("summary composed")
+    );
 
     // user_name should be preserved (explicitly exempted from size check)
     assert!(
@@ -739,16 +742,16 @@ fn planner_today_block_is_injected_when_attached() {
     let prompt = PromptBuilder::new(&session, &settings)
         .with_planner_today(block)
         .build_prompt("Hi".to_string());
-    let system = prompt.prompt.system.unwrap();
-    assert!(system.contains("planner_today"));
+    let text = model_text(&prompt);
+    assert!(text.contains("[Context update: planner_today."));
     assert!(
-        system.contains("HOBBES_PLAN_DAY"),
+        text.contains("HOBBES_PLAN_DAY"),
         "instruction names the tools"
     );
 
     // Without the attachment (the default) nothing is injected.
     let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
-    assert!(!prompt.prompt.system.unwrap().contains("planner_today"));
+    assert!(!model_text(&prompt).contains("planner_today"));
 }
 
 #[test]
@@ -1067,15 +1070,18 @@ fn continuation_after_a_reply_still_ends_on_a_user_turn() {
     let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
 
     let last = prompt.prompt.messages.last().expect("messages built");
-    assert_eq!(
+    assert_ne!(
         last.role,
-        ChatRole::User,
+        ChatRole::Assistant,
         "a continuation must not leave the request ending on an assistant turn"
     );
-    assert!(
-        matches!(&last.content[0], ContentBlock::Text { text } if text.contains("Continue")),
-        "the trailing turn is the continuation nudge"
-    );
+    // The request tail (rendered as a user turn by every connector) carries
+    // the continuation instruction, so no separate nudge is appended.
+    assert!(tail_text(&prompt).contains("CONTINUATION INSTRUCTION"));
+    assert!(!prompt.prompt.messages.iter().any(|m| m
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Text { text } if text == CONTINUATION_NUDGE))));
 }
 
 /// The nudge is only for the broken shape: a turn that ends on its tool call
@@ -1091,8 +1097,9 @@ fn continuation_after_a_tool_call_needs_no_nudge() {
     let settings = Settings::default();
     let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
 
-    let last = prompt.prompt.messages.last().expect("messages built");
-    assert_eq!(last.role, ChatRole::Tool, "the tool result is the last turn");
+    let msgs = &prompt.prompt.messages;
+    assert_eq!(msgs[msgs.len() - 2].role, ChatRole::Tool, "the tool result precedes the tail");
+    assert!(tail_text(&prompt).contains("TOOL COMPLETION INSTRUCTION"));
     assert!(
         !prompt.prompt.messages.iter().any(|m| m
             .content
@@ -1111,12 +1118,18 @@ fn a_live_send_ends_on_the_users_own_message() {
     let settings = Settings::default();
     let prompt = PromptBuilder::new(&session, &settings).build_prompt("next thing".to_string());
 
-    let last = prompt.prompt.messages.last().expect("messages built");
+    let last = prompt
+        .prompt
+        .messages
+        .iter()
+        .rfind(|m| m.role != ChatRole::System)
+        .expect("messages built");
     assert_eq!(last.role, ChatRole::User);
     assert!(
         matches!(&last.content[0], ContentBlock::Text { text } if text == "next thing"),
         "the user's own message is the final turn, not a nudge"
     );
+    assert!(tail_text(&prompt).starts_with(super::ledger::TAIL_HEADER));
 }
 
 /// Thinking survives on every assistant message of the current tool loop
@@ -1233,20 +1246,12 @@ fn idle_skill_is_injected_as_stub_not_manual() {
     msgs.extend(user_turns(SKILL_IDLE_USER_TURNS - 1));
     session.messages = msgs.clone();
 
-    let fresh = PromptBuilder::new(&session, &settings)
-        .build_prompt(String::new())
-        .prompt
-        .system
-        .unwrap();
+    let fresh = model_text(&PromptBuilder::new(&session, &settings).build_prompt(String::new()));
     assert!(fresh.contains("Do the thing."), "fresh skill keeps its manual");
 
     msgs.extend(user_turns(1));
     session.messages = msgs;
-    let idle = PromptBuilder::new(&session, &settings)
-        .build_prompt(String::new())
-        .prompt
-        .system
-        .unwrap();
+    let idle = model_text(&PromptBuilder::new(&session, &settings).build_prompt(String::new()));
     assert!(!idle.contains("Do the thing."), "idle skill's manual is dropped");
     assert!(idle.contains("HOBBES_INVOKE_SKILL with this name to reload"));
     assert!(idle.contains("unrelated"), "stub keeps the tool list");
@@ -1394,7 +1399,7 @@ struct Turn {
     ends_in_failed_tool: bool,
 }
 
-fn build_turn(turn: &Turn, settings: &Settings) -> (String, usize) {
+fn build_turn(turn: &Turn, settings: &Settings) -> PromptBuildResult {
     let mut session = cache_test_session(false);
     session.scratchpad = turn.scratchpad.to_string();
     session.active_context.conversation_summary.summary = turn.summary.to_string();
@@ -1407,21 +1412,63 @@ fn build_turn(turn: &Turn, settings: &Settings) -> (String, usize) {
         }
         messages.push(call);
     }
+    // The live context is recorded at the user-turn boundary; a turn that
+    // goes on to a (failed) tool call is built again from there, as the live
+    // flow does.
+    let tool_call = (messages.len() == 3).then(|| messages.pop().unwrap());
     session.messages = messages;
-    let ctx = PromptBuilder::new(&session, settings)
-        .with_planner_today(Some(serde_json::json!({ "plan": turn.planner })))
-        .build_system_context();
-    let offset = ctx.volatile_offset.expect("there is always per-turn state");
-    (ctx.system, offset)
+    let build = |session: &Session| {
+        PromptBuilder::new(session, settings)
+            .with_planner_today(Some(serde_json::json!({ "plan": turn.planner })))
+            .build_prompt(String::new())
+    };
+    let result = build(&session);
+    let Some(call) = tool_call else { return result };
+    session.context_ledger.extend(result.ledger_entries);
+    session.messages.push(call);
+    build(&session)
 }
 
-fn assert_offset_valid(system: &str, offset: usize) {
-    assert!(offset <= system.len(), "offset {offset} > len {}", system.len());
-    assert!(system.is_char_boundary(offset), "offset {offset} not on a char boundary");
+/// Texts of the `ChatRole::System` messages (ledger entries and tails).
+fn system_texts(result: &PromptBuildResult) -> Vec<String> {
+    result
+        .prompt
+        .messages
+        .iter()
+        .filter(|m| m.role == ChatRole::System)
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Everything the model reads as instructions: the system string plus the
+/// System messages.
+fn model_text(result: &PromptBuildResult) -> String {
+    let mut out = result.prompt.system.clone().unwrap_or_default();
+    for t in system_texts(result) {
+        out.push('\n');
+        out.push_str(&t);
+    }
+    out
+}
+
+/// The request tail: the last message, listed in `turn_scoped`.
+fn tail_text(result: &PromptBuildResult) -> String {
+    let msgs = &result.prompt.messages;
+    let last = msgs.len() - 1;
+    assert_eq!(msgs[last].role, ChatRole::System, "the tail is the last message");
+    assert!(result.prompt.turn_scoped.contains(&last), "the tail is turn-scoped");
+    match &msgs[last].content[..] {
+        [ContentBlock::Text { text }] => text.clone(),
+        other => panic!("tail is one text block: {other:?}"),
+    }
 }
 
 #[test]
-fn stable_prefix_is_byte_identical_across_turns() {
+fn system_is_byte_identical_across_turns() {
     use crate::skills::registry::{set_available_skills_for_test, AvailableSkill};
     let _mirror = SKILL_MIRROR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_available_skills_for_test(vec![AvailableSkill {
@@ -1444,25 +1491,26 @@ fn stable_prefix_is_byte_identical_across_turns() {
         planner: "PLAN_TWO",
         ends_in_failed_tool: true,
     };
-    let (sys_a, off_a) = build_turn(&a, &settings);
+    let res_a = build_turn(&a, &settings);
+    let sys_a = res_a.prompt.system.clone().unwrap();
     // Rebuild a few times: HashMap-ordered content (skill tool mappings,
     // loaded skills) gets a fresh random order on every build.
     for _ in 0..4 {
-        let (again, off) = build_turn(&a, &settings);
-        assert_eq!(&again[..off], &sys_a[..off_a]);
+        let again = build_turn(&a, &settings);
+        assert_eq!(again.prompt.system.as_deref(), Some(sys_a.as_str()));
+        // Ledger entries are byte-identical too (the tail's clock differs).
+        let n = system_texts(&res_a).len() - 1;
+        assert_eq!(system_texts(&again)[..n], system_texts(&res_a)[..n]);
     }
-    let (sys_b, off_b) = build_turn(&b, &settings);
+    let res_b = build_turn(&b, &settings);
     set_available_skills_for_test(vec![]);
 
-    assert_offset_valid(&sys_a, off_a);
-    assert_offset_valid(&sys_b, off_b);
     assert_eq!(
-        &sys_a[..off_a],
-        &sys_b[..off_b],
-        "stable part must not change between turns"
+        res_b.prompt.system.as_deref(),
+        Some(sys_a.as_str()),
+        "the system string must not change between turns"
     );
-
-    let stable = &sys_a[..off_a];
+    assert_eq!(res_a.prompt.system_volatile_offset, None);
     for stable_section in [
         "<SYSTEM_CONTEXT>",
         "mcp_servers",
@@ -1471,48 +1519,43 @@ fn stable_prefix_is_byte_identical_across_turns() {
         "active_skill",
         "Follow the release checklist.",
         "available_skills",
+        "context_protocol",
     ] {
-        assert!(stable.contains(stable_section), "stable part lacks {stable_section}");
+        assert!(sys_a.contains(stable_section), "system lacks {stable_section}");
     }
+    assert!(!sys_a.contains("TURN_CONTEXT"));
 
-    for (sys, off, turn) in [(&sys_a, off_a, &a), (&sys_b, off_b, &b)] {
-        let (stable, volatile) = sys.split_at(off);
-        for token in [turn.scratchpad, turn.summary, turn.planner, "loaded_skills"] {
-            assert!(!stable.contains(token), "{token} leaked into the stable part");
-            assert!(volatile.contains(token), "{token} missing from the volatile part");
+    for (res, turn) in [(&res_a, &a), (&res_b, &b)] {
+        let sys = res.prompt.system.as_deref().unwrap();
+        let live = system_texts(res).join("\n");
+        for token in [turn.scratchpad, turn.planner, "loaded_skills"] {
+            assert!(!sys.contains(token), "{token} leaked into the system string");
+            assert!(live.contains(token), "{token} missing from the ledger");
         }
-        assert!(volatile.starts_with("\n\n<TURN_CONTEXT>\n"), "{volatile}");
+        // The summary stands in for trimmed history; nothing is trimmed here.
+        assert!(!model_text(res).contains(turn.summary), "summary shown before a trim");
     }
-    let volatile_b = &sys_b[off_b..];
-    assert!(volatile_b.contains("TOOL COMPLETION INSTRUCTION"));
-    assert!(volatile_b.contains("RECOVERY NOTE"));
-    assert!(!sys_b[..off_b].contains("INSTRUCTION:"));
-    assert!(!sys_b[..off_b].contains("RECOVERY NOTE"));
-    assert!(
-        volatile_b.find("</TURN_CONTEXT>").unwrap()
-            < volatile_b.find("TOOL COMPLETION INSTRUCTION").unwrap(),
-        "turn instructions follow the TURN_CONTEXT block"
-    );
+    let tail_b = tail_text(&res_b);
+    assert!(tail_b.starts_with(super::ledger::TAIL_HEADER));
+    assert!(tail_b.contains("TOOL COMPLETION INSTRUCTION"));
+    assert!(tail_b.contains("RECOVERY NOTE"));
+    assert!(!sys_a.contains("INSTRUCTION:"));
+    assert!(!sys_a.contains("RECOVERY NOTE"));
 }
 
 #[test]
-fn current_time_only_appears_after_the_offset() {
+fn clock_lives_in_the_tail_not_the_system() {
     let settings = cache_test_settings();
     let session = cache_test_session(false);
     let result = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
-    let system = result.prompt.system.unwrap();
-    let offset = result
-        .prompt
-        .system_volatile_offset
-        .expect("offset is wired into LlmPrompt");
-    assert_offset_valid(&system, offset);
-    assert!(!system[..offset].contains("current_time"));
-    assert!(!system[..offset].contains("iso_8601"));
-    assert!(system[offset..].contains("current_time"));
+    let system = result.prompt.system.clone().unwrap();
+    assert!(!system.contains("current_time"));
+    assert!(!system.contains("Current time"));
+    assert!(tail_text(&result).contains("Current time: "));
 }
 
 #[test]
-fn offset_lands_on_a_char_boundary_with_multibyte_content() {
+fn multibyte_live_context_renders_in_messages() {
     let settings = Settings {
         persona: "Tu es Hobbes 🦀 — très direct.".to_string(),
         user_name: Some("Düstîn 🎯".to_string()),
@@ -1520,16 +1563,19 @@ fn offset_lands_on_a_char_boundary_with_multibyte_content() {
     };
     let mut session = cache_test_session(false);
     session.scratchpad = "ünïcödé 🧠 notes".to_string();
-    let ctx = PromptBuilder::new(&session, &settings).build_system_context();
-    let offset = ctx.volatile_offset.unwrap();
-    assert_offset_valid(&ctx.system, offset);
-    assert!(ctx.system[..offset].starts_with("Tu es Hobbes 🦀"));
-    assert!(ctx.system[..offset].ends_with("</SYSTEM_CONTEXT>"));
-    assert!(ctx.system[offset..].contains("🧠"));
+    session.messages = vec![user_text_msg("salut")];
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    let system = result.prompt.system.clone().unwrap();
+    assert!(system.starts_with("Tu es Hobbes 🦀"));
+    assert!(system.ends_with("</SYSTEM_CONTEXT>"));
+    assert!(!system.contains("🧠"));
+    assert!(system_texts(&result).iter().any(|t| t.contains("🧠")));
 }
 
 #[test]
 fn tools_and_servers_are_sorted_regardless_of_input_order() {
+    // available_skills renders from the process-wide skill mirror.
+    let _mirror = SKILL_MIRROR_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let settings = cache_test_settings();
     let build = |reversed: bool| {
         let session = cache_test_session(reversed);
@@ -1551,20 +1597,19 @@ fn tools_and_servers_are_sorted_regardless_of_input_order() {
     assert_eq!(forward_names, sorted, "tools sorted by wire name");
     assert_eq!(forward.tools.len(), 5);
 
-    let off_f = forward.volatile_offset.unwrap();
-    let off_r = reversed.volatile_offset.unwrap();
-    let stable = &forward.system[..off_f];
-    assert_eq!(stable, &reversed.system[..off_r], "mcp_servers order is stable");
+    let stable = &forward.system;
+    assert_eq!(stable, &reversed.system, "mcp_servers order is stable");
     let pos = |name: &str| stable.find(&format!("\"name\": \"{name}\"")).unwrap();
     assert!(pos("alpha") < pos("hobbes-core") && pos("hobbes-core") < pos("omega"));
 }
 
-/// Gemini / OpenAI-compatible connectors send the whole `system` string: every
-/// section the old single-block layout carried must still be in it.
+/// Every section the old single-block layout carried still reaches the
+/// model: stable ones in the system string, live ones as ledger entries,
+/// per-request ones in the tail.
 #[test]
-fn full_system_still_carries_every_section() {
+fn request_still_carries_every_section() {
     let settings = cache_test_settings();
-    let (system, offset) = build_turn(
+    let result = build_turn(
         &Turn {
             scratchpad: "SCRATCH",
             summary: "SUMMARY",
@@ -1573,37 +1618,32 @@ fn full_system_still_carries_every_section() {
         },
         &settings,
     );
+    let system = result.prompt.system.clone().unwrap();
     assert!(system.starts_with(&settings.persona));
+    assert!(system.contains("TOOL POLICY:"));
+    let text = model_text(&result);
     for section in [
-        "TOOL POLICY:",
         "<SYSTEM_CONTEXT>",
         "</SYSTEM_CONTEXT>",
         "mcp_servers",
         "composio_context",
         "user_name",
         "active_skill",
-        "<TURN_CONTEXT>",
-        "</TURN_CONTEXT>",
-        "same authority as SYSTEM_CONTEXT",
-        "current_time",
-        "scratchpad",
+        "Current time:",
+        "[Context update: scratchpad.",
         "SCRATCH",
-        "conversation_summary",
-        "SUMMARY",
-        "planner_today",
+        "[Context update: planner_today.",
         "PLAN",
-        "loaded_skills",
+        "[Context update: loaded_skills.",
         "TOOL COMPLETION INSTRUCTION",
         "RECOVERY NOTE",
     ] {
-        assert!(system.contains(section), "full system lacks {section}");
+        assert!(text.contains(section), "request lacks {section}");
     }
-    // The persona (and its TOOL POLICY) stays in the stable part.
-    assert!(system[..offset].contains("TOOL POLICY:"));
 }
 
 #[test]
-fn continuation_instruction_is_volatile() {
+fn continuation_instruction_is_in_the_tail() {
     let settings = Settings::default();
     let mut session = create_test_session();
     session.messages = vec![
@@ -1612,9 +1652,10 @@ fn continuation_instruction_is_volatile() {
         assistant_text_msg(""),
     ];
     let ctx = PromptBuilder::new(&session, &settings).build_system_context();
-    let offset = ctx.volatile_offset.unwrap();
-    assert!(ctx.system[offset..].contains("CONTINUATION INSTRUCTION"));
-    assert!(!ctx.system[..offset].contains("CONTINUATION INSTRUCTION"));
+    assert!(ctx.turn_instructions.starts_with("CONTINUATION INSTRUCTION"));
+    assert!(!ctx.system.contains("CONTINUATION INSTRUCTION"));
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    assert!(tail_text(&result).contains("CONTINUATION INSTRUCTION"));
 }
 
 /// The budget sees the combined size: a stable enrichment key is dropped when
@@ -1682,13 +1723,17 @@ fn is_user_text(m: &Message) -> bool {
     m.author == "User" && matches!(m.content, MessageContent::Text { .. })
 }
 
-/// Outgoing messages minus a trailing continuation nudge — the nudge is
-/// request-only scaffolding at the tail, never part of a cached prefix.
-fn outgoing_history(result: &PromptBuildResult) -> Vec<ChatMessage> {
+/// Outgoing messages minus request-only scaffolding at the tail: a trailing
+/// continuation nudge, and — for providers that only get the current
+/// request's tail — that tail. Claude replays every tail, so its tails stay.
+fn outgoing_history(result: &PromptBuildResult, all_tails: bool) -> Vec<ChatMessage> {
     let mut msgs = result.prompt.messages.clone();
     if msgs.last().is_some_and(|m| {
         matches!(&m.content[..], [ContentBlock::Text { text }] if text == CONTINUATION_NUDGE)
     }) {
+        msgs.pop();
+    }
+    if !all_tails && result.prompt.turn_scoped.last() == Some(&(msgs.len() - 1)) {
         msgs.pop();
     }
     msgs
@@ -1701,9 +1746,34 @@ struct GrowthReport {
 }
 
 /// Append `stream` to `session` one message at a time, building (and
-/// persisting the anchor, as `chat.rs` does) after every append. Asserts the
-/// cache-stability invariants on every step and returns trim statistics.
+/// persisting the anchor and ledger entries, as `chat.rs` does) after every
+/// append. Asserts the cache-stability invariants on every step and returns
+/// trim statistics.
 fn grow_and_check(session: &mut Session, settings: &Settings, stream: Vec<Message>) -> GrowthReport {
+    grow_and_check_with(session, settings, stream, true)
+}
+
+/// Blank every tool result's content: on a finite window Pass 2 re-budgets
+/// historical results as a turn grows (a trim may only happen at the next
+/// user turn), so only the message structure is prefix-stable there.
+fn without_tool_results(mut msgs: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    for m in &mut msgs {
+        for b in &mut m.content {
+            if let ContentBlock::ToolResult { content, .. } = b {
+                *content = serde_json::Value::Null;
+            }
+        }
+    }
+    msgs
+}
+
+fn grow_and_check_with(
+    session: &mut Session,
+    settings: &Settings,
+    stream: Vec<Message>,
+    exact_tool_results: bool,
+) -> GrowthReport {
+    let all_tails = settings.provider_for_session(session) == LlmProvider::Claude;
     let mut prev: Option<Vec<ChatMessage>> = None;
     let mut report = GrowthReport { builds: 0, trims: 0, max_included: 0 };
     for msg in stream {
@@ -1711,8 +1781,12 @@ fn grow_and_check(session: &mut Session, settings: &Settings, stream: Vec<Messag
         let anchor_before = session.history_anchor;
         let result = PromptBuilder::new(session, settings).build_prompt(String::new());
         session.history_anchor = result.history_anchor;
+        session.context_ledger.extend(result.ledger_entries.iter().cloned());
         report.builds += 1;
-        let current = outgoing_history(&result);
+        let mut current = outgoing_history(&result, all_tails);
+        if !exact_tool_results {
+            current = without_tool_results(current);
+        }
 
         let start = session
             .history_anchor
@@ -1722,7 +1796,13 @@ fn grow_and_check(session: &mut Session, settings: &Settings, stream: Vec<Messag
 
         if session.history_anchor != anchor_before {
             report.trims += 1;
+            assert!(result.prompt.history_rewritten, "a trim is flagged as a rewrite");
             let latest_user = session.messages.iter().rposition(is_user_text).unwrap();
+            assert_eq!(
+                latest_user,
+                session.messages.len() - 1,
+                "a trim happens only at a user-turn boundary"
+            );
             assert!(
                 is_user_text(&session.messages[start]),
                 "a trim must cut at a user text message (turn start)"
@@ -1734,15 +1814,18 @@ fn grow_and_check(session: &mut Session, settings: &Settings, stream: Vec<Messag
                     .is_none_or(|old| old < start),
                 "the anchor only moves forward"
             );
-        } else if let Some(prev) = &prev {
-            assert!(
-                current.len() >= prev.len() && current[..prev.len()] == prev[..],
-                "without a trim, build {} must extend the previous request exactly \
-                 (prev {} msgs, now {} msgs)",
-                report.builds,
-                prev.len(),
-                current.len()
-            );
+        } else {
+            assert!(!result.prompt.history_rewritten);
+            if let Some(prev) = &prev {
+                assert!(
+                    current.len() >= prev.len() && current[..prev.len()] == prev[..],
+                    "without a trim, build {} must extend the previous request exactly \
+                     (prev {} msgs, now {} msgs)",
+                    report.builds,
+                    prev.len(),
+                    current.len()
+                );
+            }
         }
         prev = Some(current);
     }
@@ -1795,7 +1878,7 @@ fn small_window_trims_in_chunks_and_still_fits() {
 
     let stream = realistic_stream(40, 4_000);
     let total = stream.len();
-    let report = grow_and_check(&mut session, &settings, stream);
+    let report = grow_and_check_with(&mut session, &settings, stream, false);
     assert!(report.trims >= 2, "the char budget should force trims on 16K");
     assert!(
         report.trims * 5 < total,
@@ -1859,12 +1942,15 @@ fn deleted_history_anchor_recovers() {
     let _ = grow_and_check(&mut session, &settings, realistic_stream(40, 200));
     let anchor = session.history_anchor.expect("a long chat has an anchor");
 
-    // Delete the anchor message itself.
+    // Delete the anchor message itself, then start a new turn.
     session.messages.retain(|m| m.id != anchor);
-    let recovered = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    session.prune_orphaned_ledger();
+    session.messages.push(user_text_msg("after the rewind"));
+    let now = chrono::Local::now();
+    let recovered = PromptBuilder::new(&session, &settings).with_now(now).build_prompt(String::new());
     let mut fresh = session.clone();
     fresh.history_anchor = None;
-    let from_scratch = PromptBuilder::new(&fresh, &settings).build_prompt(String::new());
+    let from_scratch = PromptBuilder::new(&fresh, &settings).with_now(now).build_prompt(String::new());
 
     assert_eq!(recovered.history_anchor, from_scratch.history_anchor);
     assert_eq!(recovered.prompt.messages, from_scratch.prompt.messages);
@@ -1941,5 +2027,602 @@ fn live_send_includes_the_user_message_once() {
         .filter(|m| m.content.iter().any(|b| matches!(b, crate::llm::ContentBlock::Text { text } if text == "second ask")))
         .count();
     assert_eq!(count, 1);
-    assert_eq!(msgs.last().map(|m| m.role.clone()), Some(crate::llm::ChatRole::User));
+    let last_turn = msgs.iter().rfind(|m| m.role != crate::llm::ChatRole::System);
+    assert_eq!(last_turn.map(|m| m.role.clone()), Some(crate::llm::ChatRole::User));
+}
+
+// =========================================================================
+// Turn context ledger (Phase 4): append-only live context, tails, trims
+// =========================================================================
+
+use crate::session::{LedgerEntry, LedgerKind};
+use super::ledger::{TAIL_HEADER, TRIM_NOTE_KEY};
+
+fn placeholder_msg() -> Message {
+    assistant_text_msg("")
+}
+
+fn fixed_clock(n: i64) -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::Local.with_ymd_and_hms(2026, 10, 2, 9, 0, 0).unwrap() + chrono::Duration::seconds(n)
+}
+
+fn text_of(m: &ChatMessage) -> String {
+    m.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn is_tail(m: &ChatMessage) -> bool {
+    m.role == ChatRole::System && text_of(m).starts_with(TAIL_HEADER)
+}
+
+/// Drives a session the way `chat.rs` + `stream_manager` do: push the user
+/// message and an empty placeholder, build, persist the anchor and ledger
+/// entries; a tool call upgrades the placeholder and a new placeholder is
+/// pushed for the continuation; the final reply fills the placeholder.
+struct ChatSim {
+    session: Session,
+    settings: Settings,
+    planner: serde_json::Value,
+    clock: i64,
+    prev: Option<Vec<ChatMessage>>,
+    builds: usize,
+    trims: usize,
+    /// Per build: whether it was at a user-turn boundary, and the keys of
+    /// the `Ledger` and `Trim` entries it wrote.
+    entry_log: Vec<(bool, Vec<String>, Vec<String>)>,
+    /// available_skills renders from the process-wide skill mirror; hold it
+    /// still while the sim compares builds byte for byte.
+    _mirror: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ChatSim {
+    fn new(provider: LlmProvider, history_len: usize) -> Self {
+        let mut session = create_test_session();
+        session.llm_provider = Some(provider);
+        let settings = Settings {
+            chat_history_length: history_len,
+            ..Default::default()
+        };
+        Self {
+            session,
+            settings,
+            planner: serde_json::json!({"todos": ["write the ledger"]}),
+            clock: 0,
+            prev: None,
+            builds: 0,
+            trims: 0,
+            entry_log: Vec::new(),
+            _mirror: SKILL_MIRROR_LOCK.lock().unwrap_or_else(|p| p.into_inner()),
+        }
+    }
+
+    fn all_tails(&self) -> bool {
+        self.settings.provider_for_session(&self.session) == LlmProvider::Claude
+    }
+
+    fn build(&mut self) -> PromptBuildResult {
+        self.clock += 7;
+        let boundary = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|m| !matches!(&m.content, MessageContent::Text { content, .. } if content.is_empty() && m.author == "Hobbes"))
+            .is_some_and(is_user_text);
+        let result = PromptBuilder::new(&self.session, &self.settings)
+            .with_planner_today(Some(self.planner.clone()))
+            .with_now(fixed_clock(self.clock))
+            .build_prompt(String::new());
+        // Same state, same bytes: a second build of the unchanged session
+        // (before persisting) renders identically.
+        let again = PromptBuilder::new(&self.session, &self.settings)
+            .with_planner_today(Some(self.planner.clone()))
+            .with_now(fixed_clock(self.clock))
+            .build_prompt(String::new());
+        assert_eq!(again.prompt.messages, result.prompt.messages, "build is deterministic");
+        assert_eq!(again.prompt.system, result.prompt.system);
+
+        let anchor_before = self.session.history_anchor;
+        self.session.history_anchor = result.history_anchor;
+        self.session.context_ledger.extend(result.ledger_entries.iter().cloned());
+        self.builds += 1;
+        let keys = |kind: LedgerKind| -> Vec<String> {
+            result
+                .ledger_entries
+                .iter()
+                .filter(|e| e.kind == kind)
+                .map(|e| e.key.clone())
+                .collect()
+        };
+        self.entry_log.push((boundary, keys(LedgerKind::Ledger), keys(LedgerKind::Trim)));
+
+        let current = outgoing_history(&result, self.all_tails());
+        if result.history_anchor != anchor_before {
+            self.trims += 1;
+            assert!(result.prompt.history_rewritten, "a trim is flagged");
+            assert!(boundary, "a trim happens only at a user-turn boundary");
+        } else {
+            assert!(!result.prompt.history_rewritten);
+            if let Some(prev) = &self.prev {
+                assert!(
+                    current.len() >= prev.len() && current[..prev.len()] == prev[..],
+                    "build {} must extend the previous request exactly",
+                    self.builds
+                );
+            }
+        }
+        for &i in &result.prompt.turn_scoped {
+            assert!(is_tail(&result.prompt.messages[i]), "turn_scoped lists tails only");
+        }
+        let tails = result.prompt.messages.iter().filter(|m| is_tail(m)).count();
+        assert_eq!(tails, result.prompt.turn_scoped.len(), "every tail is turn-scoped");
+        self.prev = Some(current);
+        result
+    }
+
+    /// One user turn with `tool_calls` rounds, then the reply.
+    fn turn(&mut self, t: usize, tool_calls: usize) -> Vec<PromptBuildResult> {
+        let mut out = Vec::new();
+        self.session.messages.push(user_text_msg(&format!("request {t}")));
+        self.session.messages.push(placeholder_msg());
+        out.push(self.build());
+        for k in 0..tool_calls {
+            let call = tool_call_msg(&format!("TOOL_{k}"), format!("{{\"t\":{t},\"k\":{k}}}"), None);
+            let last = self.session.messages.last_mut().unwrap();
+            last.content = call.content;
+            self.session.messages.push(placeholder_msg());
+            out.push(self.build());
+        }
+        let last = self.session.messages.last_mut().unwrap();
+        last.content = assistant_text_msg(&format!("Reply {t}.")).content;
+        out
+    }
+
+    /// Turn-end bookkeeping the background services do: a tool snapshot per
+    /// call of the finished turn and a fresh conversation summary.
+    fn after_turn(&mut self, t: usize) {
+        let ids: Vec<String> = self
+            .session
+            .messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::ToolCall(tc) => Some(tc.execution_id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in ids {
+            self.session
+                .active_context
+                .extra
+                .entry(format!("tool_snapshot_{id}"))
+                .or_insert_with(|| serde_json::json!({"snapshot_of": id}));
+        }
+        self.session.active_context.conversation_summary.summary = format!("SUMMARY_T{t}");
+    }
+}
+
+#[test]
+fn long_chat_is_append_only_except_on_trims() {
+    let mut sim = ChatSim::new(LlmProvider::Claude, 12);
+    let mut first_trim_turn = None;
+    // Keys whose value changed before each turn's boundary.
+    let mut expected: Vec<Vec<&str>> = Vec::new();
+    for t in 0..30 {
+        // Live context changes between turns: the planner every 3rd turn,
+        // the scratchpad every 4th (cleared every 8th), the summary always
+        // (it must never produce an entry on its own).
+        let mut changed = Vec::new();
+        if t % 3 == 0 {
+            sim.planner = serde_json::json!({"todos": [format!("task {t}")]});
+            changed.push("planner_today");
+        }
+        if t > 0 && t % 4 == 0 {
+            sim.session.scratchpad = if t % 8 == 0 { String::new() } else { format!("notes {t}") };
+            changed.push("scratchpad");
+        }
+        expected.push(changed);
+
+        let trims_before = sim.trims;
+        let results = sim.turn(t, t % 3);
+        let boundary = &results[0];
+        if sim.trims > trims_before {
+            first_trim_turn.get_or_insert(t);
+            // The trim snapshot renders after the pinned first message (and
+            // its own ledger entries / tail), before the window.
+            let msgs = &boundary.prompt.messages;
+            assert_eq!(text_of(&msgs[0]), "request 0");
+            let note = msgs
+                .iter()
+                .position(|m| text_of(m).starts_with("[History trimmed"))
+                .expect("trim note rendered");
+            assert!(msgs[1..note].iter().all(|m| m.role == ChatRole::System));
+            let summary = format!("SUMMARY_T{}", t - 1);
+            assert!(
+                msgs[note..].iter().any(|m| text_of(m).contains(&summary)),
+                "the summary current at the trim is in the snapshot"
+            );
+        }
+        if first_trim_turn.is_none() {
+            for r in &results {
+                assert!(!model_text(r).contains("SUMMARY_T"), "no summary before a trim");
+                assert!(!model_text(r).contains("snapshot_of"), "no in-window snapshots");
+            }
+        }
+        sim.after_turn(t);
+    }
+    assert!(sim.trims >= 2, "a 30-turn chat with a 12-message window trims ({})", sim.trims);
+    assert!(sim.trims < 15, "trims come in chunks ({})", sim.trims);
+
+    // Entries are written only at user-turn boundaries, and only for keys
+    // that changed: every recorded key changed, and every change is recorded
+    // (as an update, or restated in that boundary's trim snapshot).
+    let boundaries: Vec<&(bool, Vec<String>, Vec<String>)> = sim.entry_log.iter().filter(|e| e.0).collect();
+    assert_eq!(boundaries.len(), 30);
+    for (boundary, ledger_keys, trim_keys) in &sim.entry_log {
+        assert!(*boundary || (ledger_keys.is_empty() && trim_keys.is_empty()), "mid-turn entries");
+    }
+    for (t, (_, ledger_keys, trim_keys)) in boundaries.iter().enumerate() {
+        for k in ledger_keys {
+            assert!(expected[t].contains(&k.as_str()), "turn {t}: {k} recorded but unchanged");
+        }
+        for k in &expected[t] {
+            // Cleared at a trim that also cut away the old value: the model
+            // no longer sees it, so there is nothing to clear.
+            let cleared_by_trim = *k == "scratchpad" && t % 8 == 0 && !trim_keys.is_empty();
+            if cleared_by_trim && !ledger_keys.iter().any(|x| x == k) {
+                continue;
+            }
+            assert!(
+                ledger_keys.iter().chain(trim_keys.iter()).any(|x| x == k),
+                "turn {t}: {k} changed but was not recorded"
+            );
+        }
+    }
+    // A cleared scratchpad gets an explicit "cleared" entry.
+    assert!(sim
+        .session
+        .context_ledger
+        .iter()
+        .any(|e| e.kind == LedgerKind::Ledger && e.key == "scratchpad" && e.body.is_empty()));
+}
+
+#[test]
+fn trim_snapshot_restates_live_context_and_trimmed_snapshots() {
+    let mut sim = ChatSim::new(LlmProvider::Claude, 12);
+    sim.session.scratchpad = "keep me".to_string();
+    let mut trimmed_at = None;
+    for t in 0..20 {
+        let before = sim.trims;
+        let results = sim.turn(t, 2);
+        if sim.trims > before {
+            trimmed_at = Some((t, results[0].prompt.messages.clone()));
+            break;
+        }
+        sim.after_turn(t);
+    }
+    let (t, msgs) = trimmed_at.expect("the chat trims");
+    let note = msgs.iter().position(|m| text_of(m).starts_with("[History trimmed")).unwrap();
+    let snapshot: Vec<String> = msgs[note..]
+        .iter()
+        .take_while(|m| m.role == ChatRole::System)
+        .map(text_of)
+        .collect();
+    let joined = snapshot.join("\n");
+    assert!(joined.contains(&format!("SUMMARY_T{}", t - 1)));
+    assert!(joined.contains("snapshot_of"), "snapshots of trimmed calls are restated");
+    // Snapshots whose calls are still in the window are not.
+    let window_start = sim
+        .session
+        .messages
+        .iter()
+        .position(|m| Some(m.id) == sim.session.history_anchor)
+        .unwrap();
+    for m in &sim.session.messages[window_start..] {
+        if let MessageContent::ToolCall(tc) = &m.content {
+            assert!(!joined.contains(&tc.execution_id), "in-window snapshot restated");
+        }
+    }
+    // Keys whose last value predates the window are restated; the first
+    // turn's planner entry is anchored at the pinned message and stays
+    // visible, so the planner needs no restating unless it changed.
+    assert!(!joined.contains("[Context update: planner_today."));
+    // The next build replays the same snapshot (deterministic, no rewrite).
+    let next = sim.build();
+    assert!(!next.prompt.history_rewritten);
+    assert_eq!(next.prompt.messages[..msgs.len()], msgs[..]);
+    // The trim entries are persisted and tied to the window anchor.
+    assert!(sim.session.context_ledger.iter().any(|e| e.kind == LedgerKind::Trim
+        && e.key == TRIM_NOTE_KEY
+        && e.trim_anchor == sim.session.history_anchor));
+}
+
+#[test]
+fn tails_persist_reuse_on_retry_and_render_per_provider() {
+    for provider in [LlmProvider::Claude, LlmProvider::Gemini, LlmProvider::OpenAiCompat] {
+        let mut sim = ChatSim::new(provider, 75);
+        for t in 0..3 {
+            sim.turn(t, 2);
+        }
+        // A continuation round of a new turn: its build is what gets retried.
+        sim.session.messages.push(user_text_msg("one more"));
+        sim.session.messages.push(placeholder_msg());
+        sim.build();
+        let call = tool_call_msg("TOOL_X", "{}".to_string(), None);
+        sim.session.messages.last_mut().unwrap().content = call.content;
+        sim.session.messages.push(placeholder_msg());
+        let last = sim.build();
+        let tails_in_ledger =
+            sim.session.context_ledger.iter().filter(|e| e.kind == LedgerKind::Tail).count();
+        assert_eq!(tails_in_ledger, sim.builds, "{provider:?}: one tail per request");
+        let rendered = last.prompt.messages.iter().filter(|m| is_tail(m)).count();
+        if provider == LlmProvider::Claude {
+            assert_eq!(rendered, sim.builds, "Claude replays every tail");
+        } else {
+            assert_eq!(rendered, 1, "{provider:?} gets only the current tail");
+        }
+        assert_eq!(last.prompt.turn_scoped.len(), rendered);
+        assert_eq!(*last.prompt.turn_scoped.last().unwrap(), last.prompt.messages.len() - 1);
+
+        // A retry of the last build (same state, tail already persisted)
+        // reuses the tail unchanged and writes nothing new — even with a
+        // different clock.
+        let retry = PromptBuilder::new(&sim.session, &sim.settings)
+            .with_planner_today(Some(sim.planner.clone()))
+            .with_now(fixed_clock(99_999))
+            .build_prompt(String::new());
+        assert!(retry.ledger_entries.is_empty(), "{provider:?}: a retry writes nothing");
+        assert_eq!(retry.prompt.messages, last.prompt.messages);
+    }
+}
+
+#[test]
+fn boundary_retry_writes_no_new_entries() {
+    let mut sim = ChatSim::new(LlmProvider::Claude, 75);
+    sim.session.messages.push(user_text_msg("hello"));
+    sim.session.messages.push(placeholder_msg());
+    let first = sim.build();
+    assert!(first.ledger_entries.iter().any(|e| e.key == "planner_today"));
+    // The planner changes before the retry: the retry still reuses what the
+    // first attempt recorded (the change lands at the next user turn).
+    sim.planner = serde_json::json!({"todos": ["something else"]});
+    let retry = PromptBuilder::new(&sim.session, &sim.settings)
+        .with_planner_today(Some(sim.planner.clone()))
+        .with_now(fixed_clock(5_000))
+        .build_prompt(String::new());
+    assert!(retry.ledger_entries.is_empty());
+    assert_eq!(retry.prompt.messages, first.prompt.messages);
+}
+
+#[test]
+fn snapshots_and_summary_wait_for_a_trim() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::Claude);
+    let call = tool_call_msg("read", "r".to_string(), None);
+    let in_window_id = match &call.content {
+        MessageContent::ToolCall(tc) => tc.execution_id.clone(),
+        _ => unreachable!(),
+    };
+    session.messages = vec![user_text_msg("one"), call, assistant_text_msg("done"), user_text_msg("two")];
+    session.active_context.extra.insert(
+        format!("tool_snapshot_{in_window_id}"),
+        serde_json::json!({"facts": "IN_WINDOW"}),
+    );
+    session.active_context.extra.insert(
+        "tool_snapshot_gone-call".to_string(),
+        serde_json::json!({"facts": "NOT_IN_MESSAGES"}),
+    );
+    session.active_context.conversation_summary.summary = "THE_SUMMARY".to_string();
+    let settings = Settings::default();
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    let text = model_text(&result);
+    assert!(!text.contains("IN_WINDOW"), "the call is in the history already");
+    assert!(text.contains("NOT_IN_MESSAGES"), "a snapshot with no call in history is live");
+    assert!(!text.contains("THE_SUMMARY"), "untrimmed history needs no summary");
+}
+
+#[test]
+fn rewinds_drop_orphaned_ledger_entries() {
+    let mut sim = ChatSim::new(LlmProvider::Claude, 75);
+    for t in 0..3 {
+        sim.turn(t, 1);
+        sim.planner = serde_json::json!({"todos": [format!("t{t}")]});
+    }
+    let session = &mut sim.session;
+    let second_user = session.messages.iter().filter(|m| is_user_text(m)).nth(1).unwrap().id;
+    let anchors_after: std::collections::HashSet<uuid::Uuid> = {
+        let idx = session.messages.iter().position(|m| m.id == second_user).unwrap();
+        session.messages[idx..].iter().map(|m| m.id).collect()
+    };
+    assert!(session.context_ledger.iter().any(|e| anchors_after.contains(&e.after_message_id)));
+    let mut rewound = session.clone();
+    rewound.truncate_from_message(&second_user.to_string());
+    assert!(!rewound.context_ledger.is_empty(), "entries before the rewind survive");
+    assert!(rewound
+        .context_ledger
+        .iter()
+        .all(|e| !anchors_after.contains(&e.after_message_id)));
+
+    // remove_message_in_session drops the entries anchored at that message.
+    let mut state = crate::session::SessionState::default();
+    let last_id = session.messages.last().unwrap().id;
+    let tool_id = session.messages[session.messages.len() - 2].id;
+    state.sessions.insert(session.id.clone(), session.clone());
+    state.remove_message_in_session(&session.id, &tool_id);
+    let s = &state.sessions[&session.id];
+    assert!(s.context_ledger.iter().all(|e| e.after_message_id != tool_id));
+    assert!(s.messages.iter().any(|m| m.id == last_id));
+
+    // Journal replay: LedgerEntryAdded rebuilds the ledger and a RewoundTo
+    // prunes it the same way.
+    use crate::session_events::{project, SessionEvent};
+    use crate::session_store::LoadedSessionEvent;
+    let mut events = vec![SessionEvent::SessionCreated { id: "s".into(), name: "n".into() }];
+    let mut entry_count = 0;
+    for m in &session.messages {
+        events.push(if m.author == "User" {
+            SessionEvent::UserMessage { message: m.clone() }
+        } else {
+            SessionEvent::AssistantMessage { message: m.clone() }
+        });
+        for e in session.context_ledger.iter().filter(|e| e.after_message_id == m.id) {
+            events.push(SessionEvent::LedgerEntryAdded { entry: e.clone() });
+            entry_count += 1;
+        }
+    }
+    let loaded = |events: &[SessionEvent]| -> Vec<LoadedSessionEvent> {
+        events
+            .iter()
+            .enumerate()
+            .map(|(i, e)| LoadedSessionEvent { seq: i as i64, ts: Utc::now(), event: e.clone() })
+            .collect()
+    };
+    let replayed = project(None, &loaded(&events));
+    assert_eq!(replayed.context_ledger.len(), entry_count);
+    assert_eq!(replayed.context_ledger, session.context_ledger);
+    events.push(SessionEvent::RewoundTo { seq: 0, message_id: second_user.to_string() });
+    let replayed = project(None, &loaded(&events));
+    assert_eq!(replayed.context_ledger, rewound.context_ledger);
+    let kind = SessionEvent::LedgerEntryAdded { entry: session.context_ledger[0].clone() };
+    assert_eq!(kind.kind(), "LedgerEntryAdded");
+}
+
+#[test]
+fn session_without_ledger_deserializes() {
+    let mut sim = ChatSim::new(LlmProvider::Claude, 75);
+    sim.turn(0, 1);
+    let session = sim.session.clone();
+    let mut json = serde_json::to_value(&session).unwrap();
+    assert!(json.get("context_ledger").is_some());
+    json.as_object_mut().unwrap().remove("context_ledger");
+    let old: Session = serde_json::from_value(json).expect("old session JSON loads");
+    assert!(old.context_ledger.is_empty());
+    let round: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+    assert_eq!(round.context_ledger, session.context_ledger);
+    // An empty ledger is not serialized at all.
+    let fresh = serde_json::to_value(create_test_session()).unwrap();
+    assert!(fresh.get("context_ledger").is_none());
+    // A ledger entry serialized by this build parses (and a minimal one too).
+    let minimal: LedgerEntry = serde_json::from_value(serde_json::json!({
+        "id": uuid::Uuid::nil(),
+        "after_message_id": uuid::Uuid::nil(),
+        "kind": "ledger",
+        "key": "scratchpad",
+    }))
+    .unwrap();
+    assert!(minimal.body.is_empty() && minimal.trim_anchor.is_none());
+}
+
+#[test]
+fn enforce_context_budget_keeps_turn_scoped_on_the_tails() {
+    let mut sim = ChatSim::new(LlmProvider::Claude, 75);
+    for t in 0..6 {
+        sim.turn(t, 2);
+    }
+    let mut prompt = sim.build().prompt;
+    let tails_before: Vec<String> =
+        prompt.turn_scoped.iter().map(|&i| text_of(&prompt.messages[i])).collect();
+    let dropped = prompt.enforce_context_budget(1_200, 6, 4.0);
+    assert!(dropped > 0, "the tiny budget forces a drop");
+    let tails_after: Vec<String> =
+        prompt.turn_scoped.iter().map(|&i| text_of(&prompt.messages[i])).collect();
+    assert!(!tails_after.is_empty());
+    assert!(tails_after.len() < tails_before.len());
+    assert_eq!(tails_after[..], tails_before[tails_before.len() - tails_after.len()..]);
+    for &i in &prompt.turn_scoped {
+        assert!(is_tail(&prompt.messages[i]));
+    }
+}
+
+/// A realistic fixture: today's plan with fleet briefs, a scratchpad, a
+/// rolling summary, 20 tool snapshots and a loaded skill. Reports what the
+/// old per-request `<TURN_CONTEXT>` cost versus what a request now sends
+/// fresh (its tail), with the live context recorded once into history.
+#[test]
+fn turn_context_size_drops_sharply() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::Claude);
+    session.scratchpad = "Working notes: ".to_string() + &"key fact about the project; ".repeat(40);
+    session.active_context.conversation_summary.summary =
+        "The user and Hobbes have been working through the prompt caching rollout. ".repeat(20);
+    session.active_context.conversation_summary.current_task = "Ship the ledger".to_string();
+    session
+        .loaded_skills
+        .insert("news".to_string(), loaded_skill_payload("news", "unrelated"));
+    let mut messages = vec![user_text_msg("start")];
+    for k in 0..20 {
+        let call = tool_call_msg(&format!("TOOL_{k}"), "{\"ok\":true}".to_string(), None);
+        if let MessageContent::ToolCall(tc) = &call.content {
+            session.active_context.extra.insert(
+                format!("tool_snapshot_{}", tc.execution_id),
+                serde_json::json!({
+                    "tool": format!("TOOL_{k}"),
+                    "summary": "Fetched the records the user asked for and noted the counts. ".repeat(6),
+                }),
+            );
+        }
+        messages.push(call);
+    }
+    messages.push(assistant_text_msg("Done."));
+    messages.push(user_text_msg("next"));
+    messages.push(placeholder_msg());
+    session.messages = messages;
+    let planner = serde_json::json!({
+        "date": "2026-10-02",
+        "capacity": "6h planned · 2h done",
+        "todos": (0..25).map(|i| format!("[t{i}] Follow up on the vendor contract item {i} — 45m, due 2026-10-0{}", i % 9 + 1)).collect::<Vec<_>>(),
+        "blocks": (0..10).map(|i| format!("{:02}:00–{:02}:30 Focus block for the quarterly planning item {i}", 8 + i, 8 + i)).collect::<Vec<_>>(),
+        "fleet": (0..8).map(|i| format!("cai-hobbes-{i} — 1h 30m — Implemented the next slice of the caching work and updated the tests for it; blocked: review")).collect::<Vec<_>>(),
+        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. ".repeat(4),
+    });
+    let settings = Settings::default();
+    let builder = PromptBuilder::new(&session, &settings).with_planner_today(Some(planner));
+
+    // Before: every live key plus the clock rendered as <TURN_CONTEXT>, and
+    // the turn instructions, resent on every request.
+    let ctx = builder.build_system_context();
+    let mut old_map = ctx.volatile.clone();
+    old_map.insert(
+        "current_time".to_string(),
+        serde_json::json!({"iso_8601": fixed_clock(0).to_rfc3339(), "timezone": "Local"}),
+    );
+    let old_turn_context = super::system_context::render_context_block(
+        "TURN_CONTEXT",
+        Some("Live per-turn state (current time, working memory, conversation summary, loaded skills, today's plan). It has the same authority as SYSTEM_CONTEXT."),
+        old_map,
+    )
+    .unwrap();
+    let before = old_turn_context.len() + 2 + ctx.turn_instructions.len();
+
+    // After: the system string is fully stable; per request only the tail is
+    // new (ledger entries are appended once per change and then cached).
+    let result = builder.with_now(fixed_clock(0)).build_prompt(String::new());
+    let tail = tail_text(&result);
+    let ledger_chars: usize = result
+        .ledger_entries
+        .iter()
+        .filter(|e| e.kind == LedgerKind::Ledger)
+        .map(|e| super::ledger::render_entry(e).len())
+        .sum();
+    let chars_per_token = 4;
+    eprintln!(
+        "TURN_CONTEXT per request: before {} chars (~{} tokens); after {} chars (~{} tokens) tail; \
+         live context recorded once at the boundary: {} chars (~{} tokens); \
+         stable system {} chars",
+        before,
+        before / chars_per_token,
+        tail.len(),
+        tail.len() / chars_per_token,
+        ledger_chars,
+        ledger_chars / chars_per_token,
+        result.prompt.system.as_deref().map_or(0, str::len),
+    );
+    assert!(tail.len() * 20 < before, "per-request fresh context drops sharply");
+    assert!(!result.prompt.system.as_deref().unwrap().contains("planner_today"));
 }

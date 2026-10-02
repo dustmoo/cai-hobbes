@@ -257,6 +257,17 @@ impl LlmPrompt {
 
             // Remove oldest messages
             self.messages.drain(..drop_count);
+            // Keep `turn_scoped` pointing at the same messages: indices of
+            // dropped messages go, the rest shift down by the drop and up by
+            // one for the marker inserted below.
+            self.turn_scoped = self
+                .turn_scoped
+                .iter()
+                .filter(|&&i| i >= drop_count)
+                .map(|&i| i - drop_count + 1)
+                .collect();
+            // Dropping from the front rewrites earlier history.
+            self.history_rewritten = true;
 
             // Inject a context-trimmed marker as the first message.
             // Framed explicitly as a system annotation so the model does not

@@ -674,7 +674,7 @@ pub fn ChatWindow(
                                 fetch_fresh_mcp_context(target_id.clone(), settings_read.clone())
                                     .await;
 
-                            let (prompt_data, pages, history_anchor) = {
+                            let (prompt_data, pages, history_anchor, ledger_entries) = {
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder = PromptBuilder::new(session, &settings_read)
@@ -686,7 +686,12 @@ pub fn ChatWindow(
                                             ),
                                         );
                                     let result = builder.build_prompt("".to_string());
-                                    (result.prompt, result.pages_to_store, result.history_anchor)
+                                    (
+                                        result.prompt,
+                                        result.pages_to_store,
+                                        result.history_anchor,
+                                        result.ledger_entries,
+                                    )
                                 } else {
                                     return;
                                 }
@@ -704,6 +709,14 @@ pub fn ChatWindow(
                                 session_state
                                     .write()
                                     .set_history_anchor(&target_id, history_anchor);
+                            }
+                            // Persist the turn context ledger entries the build created (boundary
+                            // updates, the request tail, a trim snapshot) so later builds replay
+                            // them unchanged.
+                            if !ledger_entries.is_empty() {
+                                session_state
+                                    .write()
+                                    .append_ledger_entries(&target_id, ledger_entries);
                             }
 
                             let mcp_context = if fresh_mcp_context.servers.is_empty() {
@@ -837,7 +850,7 @@ pub fn ChatWindow(
                         }
                     }
 
-                    let (prompt_data, pages, history_anchor) = {
+                    let (prompt_data, pages, history_anchor, ledger_entries) = {
                         // The user message was pushed onto the session above
                         // (with its attachments), so linearisation already
                         // includes it. Passing it again would send it twice.
@@ -851,7 +864,12 @@ pub fn ChatWindow(
                                     chrono::Local::now().date_naive(),
                                 ));
                             let result = builder.build_prompt(user_prompt);
-                            (result.prompt, result.pages_to_store, result.history_anchor)
+                            (
+                                result.prompt,
+                                result.pages_to_store,
+                                result.history_anchor,
+                                result.ledger_entries,
+                            )
                         } else {
                             tracing::error!("No active session found when building prompt");
                             return;
@@ -870,6 +888,14 @@ pub fn ChatWindow(
                         session_state
                             .write()
                             .set_history_anchor(&target_id, history_anchor);
+                    }
+                    // Persist the turn context ledger entries the build created (boundary
+                    // updates, the request tail, a trim snapshot) so later builds replay
+                    // them unchanged.
+                    if !ledger_entries.is_empty() {
+                        session_state
+                            .write()
+                            .append_ledger_entries(&target_id, ledger_entries);
                     }
 
                     crate::session::SessionState::save_async(&session_state.read(), None);
@@ -934,7 +960,7 @@ pub fn ChatWindow(
                 let fresh_mcp_context =
                     fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
 
-                let (prompt_data, pages, history_anchor) = {
+                let (prompt_data, pages, history_anchor, ledger_entries) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings).with_planner_today(
@@ -945,7 +971,12 @@ pub fn ChatWindow(
                             ),
                         );
                         let result = builder.build_prompt("".to_string());
-                        (result.prompt, result.pages_to_store, result.history_anchor)
+                        (
+                            result.prompt,
+                            result.pages_to_store,
+                            result.history_anchor,
+                            result.ledger_entries,
+                        )
                     } else {
                         tracing::error!(
                             "Active session lost during continuation flow - aborting prompt build"
@@ -975,6 +1006,14 @@ pub fn ChatWindow(
                     session_state
                         .write()
                         .set_history_anchor(&target_id, history_anchor);
+                }
+                // Persist the turn context ledger entries the build created (boundary
+                // updates, the request tail, a trim snapshot) so later builds replay
+                // them unchanged.
+                if !ledger_entries.is_empty() {
+                    session_state
+                        .write()
+                        .append_ledger_entries(&target_id, ledger_entries);
                 }
 
                 crate::session::SessionState::save_async(&session_state.read(), None);

@@ -38,20 +38,480 @@ fn split_system(system: &str, offset: Option<usize>) -> (&str, &str) {
     system.split_at(at)
 }
 
-/// Put a marker on the last non-thinking content block of the message at or
-/// before `from` (thinking blocks can't carry `cache_control`). Returns the
-/// index of the message that received it.
-fn mark_last_block(messages: &mut [Value], from: usize, marker: &Value) -> Option<usize> {
+/// Put a marker on the last cacheable content block of the message at or
+/// before `from`. Not cacheable: thinking blocks (can't carry
+/// `cache_control`), turn-scoped text blocks listed in `skip` as
+/// `(message, block)` indices, and `role: "system"` messages (string
+/// content, and a `clear_at` one rejects `cache_control` with a 400).
+/// Returns the index of the message that received the marker.
+fn mark_last_block(
+    messages: &mut [Value],
+    from: usize,
+    marker: &Value,
+    skip: &std::collections::HashSet<(usize, usize)>,
+) -> Option<usize> {
     for idx in (0..=from.min(messages.len().checked_sub(1)?)).rev() {
+        if messages[idx]["role"] == "system" || messages[idx].get("clear_at").is_some() {
+            continue;
+        }
         let Some(blocks) = messages[idx]["content"].as_array_mut() else {
             continue;
         };
-        if let Some(block) = blocks.iter_mut().rev().find(|b| b["type"] != "thinking") {
+        if let Some((_, block)) = blocks
+            .iter_mut()
+            .enumerate()
+            .rev()
+            .find(|(b, block)| block["type"] != "thinking" && !skip.contains(&(idx, *b)))
+        {
             block["cache_control"] = marker.clone();
             return Some(idx);
         }
     }
     None
+}
+
+// ── Mid-conversation system messages ──
+//
+// `ChatRole::System` messages in `LlmPrompt.messages` are ledger entries
+// (persisted per-turn context, replayed unchanged) or turn-scoped tails
+// (indices in `LlmPrompt.turn_scoped`). On models that support it they go
+// out as `role: "system"` messages. The API's placement rules: a system
+// message must follow a `user` message, must be the last entry or be
+// followed by an `assistant` turn, and can't be `messages[0]`. Two adjacent
+// system messages break both halves, so within a run of adjacent entries
+// only the last group can be a system message; the rest ride as text blocks
+// on the preceding user message. Every decision depends only on the run's
+// own entries and on whether a `user` message follows it, so the same
+// persisted sequence always renders to the same bytes.
+
+/// Beta for turn-scoped system messages (`clear_at: "next_user_message"`).
+const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+/// Beta for `thinking.block_binding.prefix_mismatch_behavior`.
+const BLOCK_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+/// Separator between merged ledger entries.
+const LEDGER_JOIN: &str = "\n\n";
+
+/// Set once the API refuses `clear_at` (or its beta): tails then go out as
+/// plain system messages for the rest of the process.
+static CLEAR_AT_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set once the API refuses `thinking.block_binding` (or its beta).
+static DROP_BLOCK_REFUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Model slugs that refused `role: "system"` messages despite the support
+/// table (e.g. Claude Sonnet 5, where the sources conflict).
+fn system_role_refused() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Sessions that had a deliberate history rewrite. `drop_block` applies to
+/// one request only, so the docs say to keep sending it for the rest of the
+/// session; that also keeps the `thinking` parameter stable afterwards.
+fn rewritten_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Record a rewrite for `session_id` (when `rewritten`) and report whether
+/// the session has had one at any point.
+fn note_rewrite(session_id: &str, rewritten: bool) -> bool {
+    let Ok(mut set) = rewritten_sessions().lock() else {
+        return rewritten;
+    };
+    if rewritten {
+        set.insert(session_id.to_string());
+    }
+    set.contains(session_id)
+}
+
+/// Per-request rendering switches: what the model supports and which betas
+/// the API hasn't refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestOpts {
+    /// Send `ChatRole::System` messages as `role: "system"`.
+    system_role: bool,
+    /// Give turn-scoped system messages `clear_at: "next_user_message"`.
+    clear_at: bool,
+    /// May send `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`.
+    drop_block: bool,
+    /// The session had a rewrite earlier: keep sending `drop_block`.
+    sticky_drop_block: bool,
+}
+
+impl RequestOpts {
+    fn without(mut self, refused: Features) -> Self {
+        if refused.clear_at {
+            self.clear_at = false;
+        }
+        if refused.drop_block {
+            self.drop_block = false;
+        }
+        if refused.system_role {
+            self.system_role = false;
+        }
+        self
+    }
+}
+
+/// Optional request features, as found in a built request body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Features {
+    clear_at: bool,
+    drop_block: bool,
+    system_role: bool,
+}
+
+impl Features {
+    fn any(self) -> bool {
+        self.clear_at || self.drop_block || self.system_role
+    }
+}
+
+fn features_in(request: &Value) -> Features {
+    let msgs: &[Value] = request["messages"].as_array().map_or(&[], |v| v.as_slice());
+    Features {
+        clear_at: msgs.iter().any(|m| m.get("clear_at").is_some()),
+        drop_block: request["thinking"].get("block_binding").is_some(),
+        system_role: msgs.iter().any(|m| m["role"] == "system"),
+    }
+}
+
+/// Betas a built request body needs. Derived from the body itself so a
+/// replay of the body (keep-alive) can never disagree with it.
+fn request_betas(request: &Value) -> Vec<&'static str> {
+    let f = features_in(request);
+    let mut betas = Vec::new();
+    if f.clear_at {
+        betas.push(CLEAR_AT_BETA);
+    }
+    if f.drop_block {
+        betas.push(BLOCK_BINDING_BETA);
+    }
+    betas
+}
+
+/// Which of the features `sent` a 400 refuses. Signature errors are left to
+/// the foreign-signature retry (their text names `block_binding` too).
+fn refused_features(status: u16, body: &str, sent: Features) -> Features {
+    let mut out = Features::default();
+    if status != 400 || crate::llm::is_claude_thought_signature_error(status, body) {
+        return out;
+    }
+    let lower = body.to_ascii_lowercase();
+    out.clear_at = sent.clear_at
+        && (lower.contains("clear_at") || lower.contains("mid-conversation-system-clear-at"));
+    out.drop_block = sent.drop_block
+        && (lower.contains("block_binding")
+            || lower.contains("prefix_mismatch_behavior")
+            || lower.contains("thinking-binding-controls"));
+    out.system_role = sent.system_role
+        && lower.contains("role")
+        && lower.contains("system")
+        && ["not supported", "unsupported", "not allowed", "must follow", "must be followed", "cannot be"]
+            .iter()
+            .any(|p| lower.contains(p));
+    if !out.any() {
+        // Unnamed unknown-field / unknown-beta refusal: drop every beta
+        // feature this request carried.
+        let generic = ["extra inputs are not permitted", "unknown field", "unrecognized", "anthropic-beta"]
+            .iter()
+            .any(|p| lower.contains(p));
+        if generic {
+            out.clear_at = sent.clear_at;
+            out.drop_block = sent.drop_block;
+        }
+    }
+    out
+}
+
+/// Remember a refusal process-wide; logs once per feature.
+fn record_refusal(model: &str, refused: Features) {
+    use std::sync::atomic::Ordering;
+    if refused.clear_at && !CLEAR_AT_REFUSED.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            "Claude API refused clear_at ({CLEAR_AT_BETA}); turn-scoped context goes out without it from now on"
+        );
+    }
+    if refused.drop_block && !DROP_BLOCK_REFUSED.swap(true, Ordering::SeqCst) {
+        tracing::warn!(
+            "Claude API refused thinking.block_binding ({BLOCK_BINDING_BETA}); history rewrites go out without drop_block from now on"
+        );
+    }
+    if refused.system_role {
+        if let Ok(mut set) = system_role_refused().lock() {
+            if set.insert(model.to_string()) {
+                tracing::warn!(
+                    model,
+                    "Claude API refused a role \"system\" message; sending mid-conversation context as user text for this model"
+                );
+            }
+        }
+    }
+}
+
+/// One system entry of a run: (text, turn_scoped).
+type SystemEntry = (String, bool);
+
+/// Messages after placement, plus the `(message, block)` indices of
+/// turn-scoped text blocks (markers must never land on them).
+struct RenderedMessages {
+    messages: Vec<Value>,
+    turn_scoped_blocks: std::collections::HashSet<(usize, usize)>,
+}
+
+/// Place a run of adjacent system entries after `out`. See the section
+/// comment for the rules.
+fn place_system_run(
+    out: &mut Vec<Value>,
+    turn_scoped_blocks: &mut std::collections::HashSet<(usize, usize)>,
+    mut run: Vec<SystemEntry>,
+    followed_by_user: bool,
+    opts: &RequestOpts,
+) {
+    let Some(last) = run.last() else {
+        return;
+    };
+    let prev_is_user = out.last().is_some_and(|m| m["role"] == "user");
+    let legal = opts.system_role && prev_is_user && !followed_by_user;
+    // The trailing group that becomes a system message: a turn-scoped tail
+    // alone (never merged with a ledger entry), else the trailing ledger
+    // entries merged into one.
+    let split = if !legal {
+        run.len()
+    } else if last.1 {
+        run.len() - 1
+    } else {
+        run.len() - run.iter().rev().take_while(|e| !e.1).count()
+    };
+    let as_system = run.split_off(split);
+    if !run.is_empty() {
+        if !prev_is_user {
+            out.push(json!({ "role": "user", "content": [] }));
+        }
+        let m = out.len() - 1;
+        if let Some(blocks) = out[m]["content"].as_array_mut() {
+            for (text, turn_scoped) in run {
+                if turn_scoped {
+                    turn_scoped_blocks.insert((m, blocks.len()));
+                }
+                blocks.push(json!({ "type": "text", "text": text }));
+            }
+        }
+    }
+    if let Some(first) = as_system.first() {
+        let turn_scoped = first.1;
+        let text = as_system
+            .iter()
+            .map(|e| e.0.as_str())
+            .collect::<Vec<_>>()
+            .join(LEDGER_JOIN);
+        let mut msg = json!({ "role": "system", "content": text });
+        if turn_scoped && opts.clear_at {
+            msg["clear_at"] = json!("next_user_message");
+        }
+        out.push(msg);
+    }
+}
+
+/// Convert one neutral message's blocks to Anthropic content blocks.
+fn render_blocks(msg: &super::types::ChatMessage, thinking_enabled: bool) -> Vec<Value> {
+    let mut content: Vec<Value> = Vec::new();
+    for block in &msg.content {
+        match block {
+            ContentBlock::Text { text } => {
+                if !text.is_empty() {
+                    content.push(json!({ "type": "text", "text": text }));
+                }
+            }
+            ContentBlock::Thinking { text, signature } => {
+                // Anthropic requires a thinking block to be replayed with
+                // its signature and to appear first in the assistant turn
+                // (history is already ordered thinking-first). Only include
+                // when thinking is enabled AND we have a non-empty signature
+                // — a thinking block without a valid signature returns a 400.
+                // An empty `thinking` text is still replayed: always-on
+                // models return signed blocks with no text, and dropping
+                // them from a tool loop is itself a 400.
+                // Otherwise omit (safe: we never end on an assistant turn, so
+                // the "must start with thinking" rule never applies here).
+                if thinking_enabled {
+                    if let Some(sig) = signature {
+                        if !sig.is_empty() {
+                            content.push(json!({
+                                "type": "thinking",
+                                "thinking": text,
+                                "signature": sig,
+                            }));
+                        }
+                    }
+                }
+            }
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+                ..
+            } => {
+                // `input` must be a JSON object.
+                let input = if arguments.is_object() {
+                    arguments.clone()
+                } else if let Some(s) = arguments.as_str() {
+                    serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
+                } else {
+                    json!({})
+                };
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": input,
+                }));
+            }
+            ContentBlock::ToolResult {
+                call_id,
+                content: c,
+                ..
+            } => {
+                let result_str = if c.is_string() {
+                    c.as_str().unwrap_or("").to_string()
+                } else {
+                    serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string())
+                };
+                content.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": result_str,
+                }));
+            }
+            ContentBlock::Image { mime_type, data } => {
+                content.push(json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": data,
+                    }
+                }));
+            }
+        }
+    }
+    content
+}
+
+/// Build the Anthropic `messages` array: block conversion, then placement of
+/// `ChatRole::System` runs. Tool results ride inside user-turn content.
+fn render_messages(prompt: &LlmPrompt, thinking_enabled: bool, opts: &RequestOpts) -> RenderedMessages {
+    let mut out: Vec<Value> = Vec::with_capacity(prompt.messages.len());
+    let mut turn_scoped_blocks = std::collections::HashSet::new();
+    let mut run: Vec<SystemEntry> = Vec::new();
+    for (i, msg) in prompt.messages.iter().enumerate() {
+        let content = render_blocks(msg, thinking_enabled);
+        if content.is_empty() {
+            continue;
+        }
+        // System content is text-only; anything else keeps the old
+        // fold-into-a-user-turn behaviour.
+        if msg.role == ChatRole::System && content.iter().all(|b| b["type"] == "text") {
+            let text = content
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join(LEDGER_JOIN);
+            run.push((text, prompt.turn_scoped.contains(&i)));
+            continue;
+        }
+        let role = match msg.role {
+            ChatRole::Assistant => "assistant",
+            ChatRole::User | ChatRole::System | ChatRole::Tool => "user",
+        };
+        if !run.is_empty() {
+            place_system_run(
+                &mut out,
+                &mut turn_scoped_blocks,
+                std::mem::take(&mut run),
+                role == "user",
+                opts,
+            );
+        }
+        out.push(json!({ "role": role, "content": content }));
+    }
+    place_system_run(&mut out, &mut turn_scoped_blocks, run, false, opts);
+    RenderedMessages {
+        messages: out,
+        turn_scoped_blocks,
+    }
+}
+
+/// Attach the old-path volatile system suffix after the history. Returns
+/// where it went so the fingerprints can exclude it.
+fn append_volatile(messages: &mut Vec<Value>, volatile: &str, system_role: bool) -> VolatileTail {
+    let last_role = messages
+        .last()
+        .map(|m| m["role"].as_str().unwrap_or("").to_string());
+    match last_role.as_deref() {
+        Some("user") if system_role => {
+            messages.push(json!({ "role": "system", "content": volatile }));
+            VolatileTail::SystemMessage
+        }
+        Some("user") | Some("system") => {
+            // A system message can't follow another one; a trailing system
+            // message always follows a user message (placement rule), so the
+            // volatile text rides on that user message instead.
+            let Some(idx) = (0..messages.len()).rev().find(|&i| messages[i]["role"] == "user") else {
+                return VolatileTail::None;
+            };
+            match messages[idx]["content"].as_array_mut() {
+                Some(blocks) => {
+                    blocks.push(json!({ "type": "text", "text": volatile }));
+                    VolatileTail::TextBlock(idx)
+                }
+                None => VolatileTail::None,
+            }
+        }
+        _ => {
+            // Assistant-last (or empty): the volatile text rides in a new
+            // user message after the cached history.
+            messages.push(json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": volatile }],
+            }));
+            VolatileTail::UserMessage
+        }
+    }
+}
+
+/// Log a non-empty `input_transformations` at info (counts and types only).
+fn log_input_transformations(v: Option<&Value>) {
+    if let Some(summary) = v.and_then(summarize_transformations) {
+        tracing::info!("Claude input_transformations: {summary}");
+    }
+}
+
+/// Log-safe summary of a response's `input_transformations`: counts by
+/// type and reason, never paths or content.
+fn summarize_transformations(v: &Value) -> Option<String> {
+    let entries = v.as_array().filter(|a| !a.is_empty())?;
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for e in entries {
+        let key = format!(
+            "{}/{}",
+            e["type"].as_str().unwrap_or("?"),
+            e["reason"].as_str().unwrap_or("-")
+        );
+        *counts.entry(key).or_default() += 1;
+    }
+    Some(format!(
+        "{} entries: {}",
+        entries.len(),
+        counts
+            .iter()
+            .map(|(k, n)| format!("{k} x{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// Build the final `UsageData`. Anthropic's `input_tokens` excludes both cache
@@ -105,8 +565,9 @@ enum VolatileTail {
     None,
     /// A trailing `role: "system"` message.
     SystemMessage,
-    /// A text block appended to the final user message.
-    TextBlock,
+    /// A text block appended to the user message at this index (the last
+    /// message, or the one before a trailing system message).
+    TextBlock(usize),
     /// A new trailing user message (history ended on an assistant turn).
     UserMessage,
 }
@@ -172,11 +633,13 @@ fn hash_block<H: std::hash::Hasher>(block: &Value, h: &mut H) {
 }
 
 /// Fingerprint of one message, `cache_control` stripped. `drop_last_block`
-/// leaves out the trailing volatile text block.
+/// leaves out the trailing volatile text block. Turn-scoped tails are real
+/// persisted history now, so they (and their `clear_at`) are hashed.
 fn hash_message(m: &Value, drop_last_block: bool) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     m["role"].as_str().hash(&mut h);
+    m.get("clear_at").and_then(Value::as_str).hash(&mut h);
     match m["content"].as_array() {
         Some(blocks) => {
             let n = blocks.len() - usize::from(drop_last_block && !blocks.is_empty());
@@ -234,13 +697,12 @@ fn fingerprint_request(request: &Value, tail: VolatileTail) -> RequestFingerprin
         VolatileTail::SystemMessage | VolatileTail::UserMessage => {
             &all[..all.len().saturating_sub(1)]
         }
-        VolatileTail::None | VolatileTail::TextBlock => all,
+        VolatileTail::None | VolatileTail::TextBlock(_) => all,
     };
-    let last = stable.len().saturating_sub(1);
     let messages: Vec<u64> = stable
         .iter()
         .enumerate()
-        .map(|(i, m)| hash_message(m, tail == VolatileTail::TextBlock && i == last))
+        .map(|(i, m)| hash_message(m, tail == VolatileTail::TextBlock(i)))
         .collect();
     let shapes = stable.iter().map(message_shape).collect();
 
@@ -274,6 +736,13 @@ enum Divergence {
     },
     /// New messages equal the old ones shifted by `k`.
     FrontTrim(usize),
+    /// Head kept (pinned first message), `dropped` messages removed from
+    /// index `at`, `inserted` new entries (a trim snapshot) in their place.
+    MidTrim {
+        at: usize,
+        dropped: usize,
+        inserted: usize,
+    },
     /// New history is a strict prefix of the old one.
     Truncated {
         new_len: usize,
@@ -297,10 +766,21 @@ impl std::fmt::Display for Divergence {
                 shape.blocks.join(",")
             ),
             Self::FrontTrim(k) => write!(f, "front-trim by {k} messages kind=front-trim"),
+            Self::MidTrim {
+                at,
+                dropped,
+                inserted,
+            } => write!(
+                f,
+                "messages[{at}..] trimmed: dropped {dropped}, inserted {inserted} kind=mid-trim (head kept)"
+            ),
             Self::Truncated { new_len } => {
                 write!(f, "history truncated to {new_len} messages")
             }
-            Self::None => write!(f, "no component changed (TTL expiry or server-side)"),
+            Self::None => write!(
+                f,
+                "no component changed, history append-only (TTL expiry or server-side) kind=append"
+            ),
         }
     }
 }
@@ -311,6 +791,27 @@ fn front_trim_shift(prev: &[u64], new: &[u64]) -> Option<usize> {
     (1..prev.len()).find(|&k| {
         let m = (prev.len() - k).min(new.len());
         m >= new.len().min(2) && m > 0 && prev[k..k + m] == new[..m]
+    })
+}
+
+/// Most entries a trim snapshot is expected to insert.
+const MAX_TRIM_INSERT: usize = 4;
+
+/// A trim that kept the head: from the first divergence `at`, the old
+/// messages from `at + dropped` equal the new ones from `at + inserted` over
+/// their overlap, with `dropped > inserted` (a same-size swap reads as an
+/// in-place edit). Returns `(dropped, inserted)`.
+fn mid_trim_shift(prev: &[u64], new: &[u64], at: usize) -> Option<(usize, usize)> {
+    if at == 0 {
+        return None;
+    }
+    (0..=MAX_TRIM_INSERT).find_map(|j| {
+        let n = new.get(at + j..)?;
+        (j + 1..prev.len().saturating_sub(at)).find_map(|k| {
+            let p = &prev[at + k..];
+            let m = p.len().min(n.len());
+            (m > 0 && m >= n.len().min(2) && p[..m] == n[..m]).then_some((k, j))
+        })
     })
 }
 
@@ -332,9 +833,16 @@ fn find_divergence(prev: &RequestFingerprint, new: &RequestFingerprint) -> Diver
     match (0..shared).find(|&i| prev.messages[i] != new.messages[i]) {
         Some(i) => match front_trim_shift(&prev.messages, &new.messages) {
             Some(k) => Divergence::FrontTrim(k),
-            None => Divergence::InPlaceEdit {
-                index: i,
-                shape: new.shapes[i].clone(),
+            None => match mid_trim_shift(&prev.messages, &new.messages, i) {
+                Some((dropped, inserted)) => Divergence::MidTrim {
+                    at: i,
+                    dropped,
+                    inserted,
+                },
+                None => Divergence::InPlaceEdit {
+                    index: i,
+                    shape: new.shapes[i].clone(),
+                },
             },
         },
         None if new.messages.len() < prev.messages.len() => Divergence::Truncated {
@@ -432,15 +940,16 @@ fn store_request(
     }
 }
 
-/// Depth-first search for a `diagnostics` key anywhere in a streamed event.
-/// The response shape is unconfirmed, so it is located rather than assumed.
-fn find_diagnostics(v: &Value) -> Option<&Value> {
+/// Depth-first search for a non-null `key` anywhere in a streamed event.
+/// Response shapes for beta fields are unconfirmed, so they are located
+/// rather than assumed.
+fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
     match v {
         Value::Object(m) => m
-            .get("diagnostics")
+            .get(key)
             .filter(|d| !d.is_null())
-            .or_else(|| m.values().find_map(find_diagnostics)),
-        Value::Array(a) => a.iter().find_map(find_diagnostics),
+            .or_else(|| m.values().find_map(|x| find_key(x, key))),
+        Value::Array(a) => a.iter().find_map(|x| find_key(x, key)),
         _ => None,
     }
 }
@@ -450,6 +959,9 @@ fn find_diagnostics(v: &Value) -> Option<&Value> {
 struct LineMeta {
     message_id: Option<String>,
     diagnostics: Option<Value>,
+    /// `input_transformations` (thinking-binding beta): arrives on
+    /// `message_start`, and again on `message_delta` after a server fallback.
+    input_transformations: Option<Value>,
 }
 
 /// Pull `message.id` (from `message_start`) and any `diagnostics` value out
@@ -457,7 +969,10 @@ struct LineMeta {
 /// never parsed twice.
 fn scan_line_meta(line: &str) -> LineMeta {
     let mut meta = LineMeta::default();
-    if !line.contains("\"message_start\"") && !line.contains("\"diagnostics\"") {
+    if !line.contains("\"message_start\"")
+        && !line.contains("\"diagnostics\"")
+        && !line.contains("\"input_transformations\"")
+    {
         return meta;
     }
     let Some(json_str) = line.trim().strip_prefix("data:") else {
@@ -469,7 +984,8 @@ fn scan_line_meta(line: &str) -> LineMeta {
     if val["type"] == "message_start" {
         meta.message_id = val["message"]["id"].as_str().map(str::to_string);
     }
-    meta.diagnostics = find_diagnostics(&val).cloned();
+    meta.diagnostics = find_key(&val, "diagnostics").cloned();
+    meta.input_transformations = find_key(&val, "input_transformations").cloned();
     meta
 }
 
@@ -542,12 +1058,32 @@ impl ClaudeConnector {
 
     /// `anthropic-beta` header value: every beta this request opts into,
     /// comma-joined, or `None` when there are none.
-    fn anthropic_beta_header(&self) -> Option<String> {
+    /// The request-feature betas come from the built body itself.
+    fn anthropic_beta_header(&self, request: &Value) -> Option<String> {
         let mut betas: Vec<&str> = Vec::new();
         if self.config.cache_diagnostics {
             betas.push(CACHE_DIAGNOSIS_BETA);
         }
+        betas.extend(request_betas(request));
         (!betas.is_empty()).then(|| betas.join(","))
+    }
+
+    /// Rendering switches for a request: model support plus whatever the
+    /// API hasn't refused this process. With a `session_id`, records a
+    /// history rewrite so later requests of that session keep `drop_block`.
+    fn request_opts(&self, session_id: Option<&str>, history_rewritten: bool) -> RequestOpts {
+        use std::sync::atomic::Ordering;
+        let model = ClaudeModel::from_slug(&self.config.model);
+        let refused = system_role_refused()
+            .lock()
+            .map(|s| s.contains(&self.config.model))
+            .unwrap_or(false);
+        RequestOpts {
+            system_role: model.supports_mid_conversation_system() && !refused,
+            clear_at: !CLEAR_AT_REFUSED.load(Ordering::SeqCst),
+            drop_block: !DROP_BLOCK_REFUSED.load(Ordering::SeqCst),
+            sticky_drop_block: session_id.is_some_and(|id| note_rewrite(id, history_rewritten)),
+        }
     }
 
     /// Add the `diagnostics` request field when the debug flag is on.
@@ -559,8 +1095,12 @@ impl ClaudeConnector {
 
     /// Build the request, fingerprint it (before the `diagnostics` field is
     /// added) and match it to the previous request of this conversation.
-    fn prepare_request(&self, prompt: &LlmPrompt) -> (Value, Option<CacheDiagState>, bool) {
-        let (mut request, tail) = self.build_request(prompt, true);
+    fn prepare_request(
+        &self,
+        prompt: &LlmPrompt,
+        opts: &RequestOpts,
+    ) -> (Value, Option<CacheDiagState>, bool) {
+        let (mut request, tail) = self.build_request_with(prompt, true, opts);
         let turn_start = keepalive::is_turn_start(&request, tail);
         if !self.config.prompt_caching_enabled {
             self.apply_cache_diagnostics(&mut request, None);
@@ -667,11 +1207,21 @@ impl ClaudeConnector {
 
 impl ClaudeConnector {
     /// Build the native request plus a note of which volatile tail (if any)
-    /// was appended, so the cache fingerprints can exclude it.
+    /// was appended, so the cache fingerprints can exclude it. Uses the
+    /// process-wide feature state, with no session (so no sticky drop_block).
     fn build_request(
         &self,
         prompt: &LlmPrompt,
         streaming: bool,
+    ) -> (serde_json::Value, VolatileTail) {
+        self.build_request_with(prompt, streaming, &self.request_opts(None, false))
+    }
+
+    fn build_request_with(
+        &self,
+        prompt: &LlmPrompt,
+        streaming: bool,
+        opts: &RequestOpts,
     ) -> (serde_json::Value, VolatileTail) {
         // Extended thinking is only sent when enabled AND the model supports it.
         // Gated here so thinking blocks in history are serialized consistently.
@@ -682,106 +1232,10 @@ impl ClaudeConnector {
         let thinking_enabled = model.thinking_always_on()
             || (self.config.extended_thinking && model.supports_thinking());
 
-        // Build the Anthropic `messages` array. Claude only allows "user" and
-        // "assistant" roles; tool results ride inside user-turn content blocks.
-        let mut messages: Vec<serde_json::Value> = Vec::new();
-
-        for msg in &prompt.messages {
-            let mut content: Vec<serde_json::Value> = Vec::new();
-
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        if !text.is_empty() {
-                            content.push(json!({ "type": "text", "text": text }));
-                        }
-                    }
-                    ContentBlock::Thinking { text, signature } => {
-                        // Anthropic requires a thinking block to be replayed with
-                        // its signature and to appear first in the assistant turn
-                        // (history is already ordered thinking-first). Only include
-                        // when thinking is enabled AND we have a non-empty signature
-                        // — a thinking block without a valid signature returns a 400.
-                        // An empty `thinking` text is still replayed: always-on
-                        // models return signed blocks with no text, and dropping
-                        // them from a tool loop is itself a 400.
-                        // Otherwise omit (safe: we never end on an assistant turn, so
-                        // the "must start with thinking" rule never applies here).
-                        if thinking_enabled {
-                            if let Some(sig) = signature {
-                                if !sig.is_empty() {
-                                    content.push(json!({
-                                        "type": "thinking",
-                                        "thinking": text,
-                                        "signature": sig,
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                    ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                        ..
-                    } => {
-                        // `input` must be a JSON object.
-                        let input = if arguments.is_object() {
-                            arguments.clone()
-                        } else if let Some(s) = arguments.as_str() {
-                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
-                        } else {
-                            json!({})
-                        };
-                        content.push(json!({
-                            "type": "tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": input,
-                        }));
-                    }
-                    ContentBlock::ToolResult {
-                        call_id,
-                        content: c,
-                        ..
-                    } => {
-                        let result_str = if c.is_string() {
-                            c.as_str().unwrap_or("").to_string()
-                        } else {
-                            serde_json::to_string(c).unwrap_or_else(|_| "{}".to_string())
-                        };
-                        content.push(json!({
-                            "type": "tool_result",
-                            "tool_use_id": call_id,
-                            "content": result_str,
-                        }));
-                    }
-                    ContentBlock::Image { mime_type, data } => {
-                        content.push(json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": mime_type,
-                                "data": data,
-                            }
-                        }));
-                    }
-                }
-            }
-
-            if content.is_empty() {
-                continue;
-            }
-
-            // Map neutral role → Anthropic role. Tool results and any System-role
-            // messages are folded into the "user" turn.
-            let role = match msg.role {
-                ChatRole::Assistant => "assistant",
-                ChatRole::User | ChatRole::System | ChatRole::Tool => "user",
-            };
-
-            messages.push(json!({ "role": role, "content": content }));
-        }
+        let RenderedMessages {
+            mut messages,
+            turn_scoped_blocks,
+        } = render_messages(prompt, thinking_enabled, opts);
 
         // Prompt caching: tools → system → messages is the render order, so
         // volatile per-turn content must live at the very end of `messages`
@@ -802,40 +1256,21 @@ impl ClaudeConnector {
                 }));
             }
 
-            let last_is_user = messages.last().is_some_and(|m| m["role"] == "user");
             let volatile = volatile.trim();
-            let history_end = messages.len().checked_sub(1);
-            // Breakpoint on the last history block (before any volatile tail
-            // is attached), so each request reads the prior conversation.
-            let marked =
-                history_end.and_then(|end| mark_last_block(&mut messages[..=end], end, &marker));
+            // Breakpoint on the last cacheable history block (before any
+            // volatile tail is attached; never a turn-scoped tail or a
+            // system message), so each request reads the prior conversation.
+            let marked = messages.len().checked_sub(1).and_then(|end| {
+                mark_last_block(&mut messages, end, &marker, &turn_scoped_blocks)
+            });
             if !volatile.is_empty() {
-                if last_is_user && model.supports_mid_conversation_system() {
-                    messages.push(json!({ "role": "system", "content": volatile }));
-                    tail = VolatileTail::SystemMessage;
-                } else if last_is_user {
-                    if let Some(blocks) = messages
-                        .last_mut()
-                        .and_then(|m| m["content"].as_array_mut())
-                    {
-                        blocks.push(json!({ "type": "text", "text": volatile }));
-                        tail = VolatileTail::TextBlock;
-                    }
-                } else {
-                    // Assistant-last (or empty): the volatile text rides in a
-                    // new user message after the cached history.
-                    messages.push(json!({
-                        "role": "user",
-                        "content": [{ "type": "text", "text": volatile }],
-                    }));
-                    tail = VolatileTail::UserMessage;
-                }
+                tail = append_volatile(&mut messages, volatile, opts.system_role);
             }
             // A second breakpoint on the previous user turn keeps long tool
             // loops inside the API's 20-block lookback window.
             if let Some(m) = marked {
                 if let Some(prev_user) = (0..m).rev().find(|&i| messages[i]["role"] == "user") {
-                    mark_last_block(&mut messages[..=prev_user], prev_user, &marker);
+                    mark_last_block(&mut messages, prev_user, &marker, &turn_scoped_blocks);
                 }
             }
         }
@@ -870,6 +1305,15 @@ impl ClaudeConnector {
             } else {
                 json!({ "type": "adaptive" })
             };
+            // A deliberate history rewrite leaves replayed thinking blocks
+            // bound to a prefix that no longer exists: ask the API to drop
+            // them instead of failing (beta; on older accounts any value
+            // opts the request into the check). Kept for the rest of the
+            // session, as the drop applies to one request only.
+            if opts.drop_block && (prompt.history_rewritten || opts.sticky_drop_block) {
+                request["thinking"]["block_binding"] =
+                    json!({ "prefix_mismatch_behavior": "drop_block" });
+            }
         }
 
         // Tools — sent with prompt_builder-consistent prefixed names so the
@@ -912,9 +1356,16 @@ impl ClaudeConnector {
 struct KeepaliveGuard(Option<String>);
 
 impl KeepaliveGuard {
-    fn finish(&mut self, body: &str, input: i32, read: Option<i32>, created: Option<i32>) {
+    fn finish(
+        &mut self,
+        body: &str,
+        betas: Option<&str>,
+        input: i32,
+        read: Option<i32>,
+        created: Option<i32>,
+    ) {
         if let Some(id) = self.0.take() {
-            keepalive::finish_request(&id, body, input, read, created);
+            keepalive::finish_request(&id, body, betas, input, read, created);
         }
     }
 }
@@ -948,8 +1399,13 @@ impl LlmConnector for ClaudeConnector {
             }
         };
 
-        let (native_request, mut cache_state, turn_start) = self.prepare_request(&prompt_data);
-        let beta_header = self.anthropic_beta_header();
+        let mut opts = self.request_opts(session_id.as_deref(), prompt_data.history_rewritten);
+        let (native_request, mut cache_state, turn_start) =
+            self.prepare_request(&prompt_data, &opts);
+        // Derived from each body sent: a feature fallback or the signature
+        // retry rebuilds the body, and the header follows it.
+        let mut beta_header = self.anthropic_beta_header(&native_request);
+        let mut sent_features = features_in(&native_request);
         // Keep-alive bookkeeping needs the session; every exit path below
         // either `finish`es or `abort`s the request via this guard.
         let mut ka_guard = KeepaliveGuard(None);
@@ -1046,8 +1502,23 @@ impl LlmConnector for ClaudeConnector {
         // This never fires after stream data has been emitted, since it only
         // triggers on the pre-stream status check below.
         let mut signature_retry_used = false;
+        // The prompt the signature retry rebuilt from, so a later feature
+        // fallback rebuilds the same (stripped) history.
+        let mut stripped_prompt: Option<LlmPrompt> = None;
 
-        for attempt in 0..=MAX_RETRIES {
+        // Beta-feature fallback (`clear_at`, `block_binding`, `role:
+        // "system"`): a 400 that refuses one disables it process-wide and
+        // resends the same prompt without it. Each retry turns at least one
+        // more feature off, so this is bounded; it doesn't spend the
+        // transient-failure budget.
+        const MAX_FEATURE_RETRIES: u32 = 3;
+        let mut feature_retries: u32 = 0;
+
+        for raw_attempt in 0..=MAX_RETRIES + MAX_FEATURE_RETRIES {
+            let attempt = raw_attempt - feature_retries;
+            if attempt > MAX_RETRIES {
+                return;
+            }
             let backoff = std::time::Duration::from_millis(500u64 * (1u64 << attempt));
 
             let mut http_request = client
@@ -1084,9 +1555,30 @@ impl LlmConnector for ClaudeConnector {
                 // below, so it's safe to read the body eagerly here and check
                 // for the foreign-signature shape before falling through to
                 // the generic error report.
-                if code == 400 && !signature_retry_used {
+                if code == 400 {
                     let body = response.text().await.unwrap_or_default();
-                    if attempt < MAX_RETRIES
+                    let refused = refused_features(code, &body, sent_features);
+                    if refused.any() && feature_retries < MAX_FEATURE_RETRIES {
+                        feature_retries += 1;
+                        record_refusal(&self.config.model, refused);
+                        tracing::warn!(
+                            provider = "claude",
+                            model = %self.config.model,
+                            ?refused,
+                            "Claude refused a request feature; retrying without it"
+                        );
+                        opts = opts.without(refused);
+                        let current = stripped_prompt.as_ref().unwrap_or(&prompt_data);
+                        let (rebuilt, rebuilt_state, _) = self.prepare_request(current, &opts);
+                        cache_state = rebuilt_state;
+                        beta_header = self.anthropic_beta_header(&rebuilt);
+                        sent_features = features_in(&rebuilt);
+                        body_str = serde_json::to_string(&rebuilt)
+                            .expect("Failed to serialize Claude request body");
+                        continue;
+                    }
+                    if !signature_retry_used
+                        && attempt < MAX_RETRIES
                         && crate::llm::is_claude_thought_signature_error(code, &body)
                     {
                         signature_retry_used = true;
@@ -1097,19 +1589,20 @@ impl LlmConnector for ClaudeConnector {
                         );
                         let mut stripped_messages = prompt_data.messages.clone();
                         crate::llm::strip_thought_signatures(&mut stripped_messages);
-                        let stripped_prompt = LlmPrompt {
-                            system: prompt_data.system.clone(),
-                            system_volatile_offset: prompt_data.system_volatile_offset,
-                            turn_scoped: Vec::new(),
-                            history_rewritten: false,
+                        // Stripping clears blocks in place, so `turn_scoped`
+                        // indices still line up.
+                        let stripped = LlmPrompt {
                             messages: stripped_messages,
-                            tools: prompt_data.tools.clone(),
+                            ..prompt_data.clone()
                         };
                         let (stripped_native, stripped_state, _) =
-                            self.prepare_request(&stripped_prompt);
+                            self.prepare_request(&stripped, &opts);
                         cache_state = stripped_state;
+                        beta_header = self.anthropic_beta_header(&stripped_native);
+                        sent_features = features_in(&stripped_native);
                         body_str = serde_json::to_string(&stripped_native)
                             .expect("Failed to serialize Claude request body");
+                        stripped_prompt = Some(stripped);
                         continue;
                     }
                     let _ = tx.send(StreamMessage::Error {
@@ -1155,6 +1648,7 @@ impl LlmConnector for ClaudeConnector {
             // lines that carry them.
             let mut response_message_id: Option<String> = None;
             let mut response_diagnostics: Option<Value> = None;
+            let mut response_transformations: Option<Value> = None;
             // Only Text/Thinking are streamed to the UI mid-flight; tool calls and
             // usage are buffered and emitted at the end. So this gates retry safely.
             let mut has_sent_data = false;
@@ -1200,6 +1694,9 @@ impl LlmConnector for ClaudeConnector {
                     }
                     if meta.diagnostics.is_some() {
                         response_diagnostics = meta.diagnostics;
+                    }
+                    if meta.input_transformations.is_some() {
+                        response_transformations = meta.input_transformations;
                     }
 
                     for event in self.parse_stream_chunk(&line) {
@@ -1264,7 +1761,14 @@ impl LlmConnector for ClaudeConnector {
                             }
                             StreamEvent::Done => {
                                 flush_tool_calls(&mut pending_tool_calls, &tx);
-                                ka_guard.finish(&body_str, usage_prompt, usage_cached, usage_created);
+                                log_input_transformations(response_transformations.as_ref());
+                                ka_guard.finish(
+                                    &body_str,
+                                    beta_header.as_deref(),
+                                    usage_prompt,
+                                    usage_cached,
+                                    usage_created,
+                                );
                                 self.finish_cache_diag(
                                     cache_state.take(),
                                     usage_created,
@@ -1297,7 +1801,14 @@ impl LlmConnector for ClaudeConnector {
 
             // Stream ended without an explicit message_stop — flush what we have.
             flush_tool_calls(&mut pending_tool_calls, &tx);
-            ka_guard.finish(&body_str, usage_prompt, usage_cached, usage_created);
+            log_input_transformations(response_transformations.as_ref());
+            ka_guard.finish(
+                &body_str,
+                beta_header.as_deref(),
+                usage_prompt,
+                usage_cached,
+                usage_created,
+            );
             self.finish_cache_diag(
                 cache_state.take(),
                 usage_created,
@@ -2582,8 +3093,12 @@ mod tests {
             ..Default::default()
         });
         let off = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
-        assert_eq!(on.anthropic_beta_header().as_deref(), Some("cache-diagnosis-2026-04-07"));
-        assert_eq!(off.anthropic_beta_header(), None);
+        let plain = json!({ "messages": [] });
+        assert_eq!(
+            on.anthropic_beta_header(&plain).as_deref(),
+            Some("cache-diagnosis-2026-04-07")
+        );
+        assert_eq!(off.anthropic_beta_header(&plain), None);
 
         let (mut req, _) = on.build_request(&cache_prompt("s", None, grown(1)), true);
         on.apply_cache_diagnostics(&mut req, Some("msg_abc"));
@@ -2603,7 +3118,8 @@ mod tests {
             cache_diagnostics: true,
             ..Default::default()
         });
-        let (req, state, _) = on.prepare_request(&cache_prompt("prepare-test", None, grown(3)));
+        let (req, state, _) =
+            on.prepare_request(&cache_prompt("prepare-test", None, grown(3)), &ALL_ON);
         assert!(req.get("diagnostics").is_some());
         assert!(state.is_some());
     }
@@ -2632,5 +3148,506 @@ mod tests {
         let cfg: ClaudeConfig =
             serde_json::from_str(r#"{"model":"claude-opus-5-5","summary_model":null}"#).unwrap();
         assert!(!cfg.cache_diagnostics);
+    }
+
+    // ── Mid-conversation system messages / turn context ledger ──
+
+    const ALL_ON: RequestOpts = RequestOpts {
+        system_role: true,
+        clear_at: true,
+        drop_block: true,
+        sticky_drop_block: false,
+    };
+
+    /// Process-independent opts for `c`'s model (never reads the refusal
+    /// flags, so tests can't interfere with each other).
+    fn opts_for(c: &ClaudeConnector) -> RequestOpts {
+        RequestOpts {
+            system_role: ClaudeModel::from_slug(&c.config.model).supports_mid_conversation_system(),
+            ..ALL_ON
+        }
+    }
+
+    fn build(c: &ClaudeConnector, p: &LlmPrompt, opts: RequestOpts) -> Value {
+        c.build_request_with(p, true, &opts).0
+    }
+
+    fn sys_msg(text: &str) -> ChatMessage {
+        text_msg(ChatRole::System, text)
+    }
+
+    fn call_msg(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                id: id.into(),
+                name: "x".into(),
+                arguments: json!({}),
+                signature: None,
+            }],
+        }
+    }
+
+    fn result_msg(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: ChatRole::Tool,
+            content: vec![ContentBlock::ToolResult {
+                call_id: id.into(),
+                name: "x".into(),
+                content: json!("ok"),
+            }],
+        }
+    }
+
+    /// user → ledger L1, L2 → tail T1 → assistant tool call → tool result →
+    /// tail T2. Turn-scoped indices: 3 and 6.
+    fn ledger_turn() -> LlmPrompt {
+        LlmPrompt {
+            turn_scoped: vec![3, 6],
+            ..cache_prompt(
+                "persona",
+                None,
+                vec![
+                    text_msg(ChatRole::User, "hi"),
+                    sys_msg("L1"),
+                    sys_msg("L2"),
+                    sys_msg("T1"),
+                    call_msg("c1"),
+                    result_msg("c1"),
+                    sys_msg("T2"),
+                ],
+            )
+        }
+    }
+
+    /// The first request of the same turn: user → L1, L2 → T1.
+    fn ledger_turn_first_request() -> LlmPrompt {
+        let mut p = ledger_turn();
+        p.messages.truncate(4);
+        p.turn_scoped = vec![3];
+        p
+    }
+
+    /// Every block or message whose text starts with "T" (a tail) must be
+    /// free of `cache_control`.
+    fn assert_no_marker_on_tails(req: &Value) {
+        for m in req["messages"].as_array().unwrap() {
+            if m["role"] == "system" {
+                assert!(m.get("cache_control").is_none(), "{m}");
+                assert_eq!(count_markers(m), 0, "{m}");
+            }
+            if let Some(blocks) = m["content"].as_array() {
+                for b in blocks {
+                    if b["text"].as_str().is_some_and(|t| t.starts_with('T')) {
+                        assert!(b.get("cache_control").is_none(), "{b}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn strip_markers(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .filter(|(k, _)| *k != "cache_control")
+                    .map(|(k, x)| (k.clone(), strip_markers(x)))
+                    .collect(),
+            ),
+            Value::Array(a) => Value::Array(a.iter().map(strip_markers).collect()),
+            other => other.clone(),
+        }
+    }
+
+    #[test]
+    fn ledger_turn_renders_system_messages_on_opus_5_5() {
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let req = build(&c, &ledger_turn(), opts_for(&c));
+        let expected_messages = json!([
+            { "role": "user", "content": [
+                { "type": "text", "text": "hi" },
+                { "type": "text", "text": "L1" },
+                { "type": "text", "text": "L2" },
+            ]},
+            { "role": "system", "content": "T1", "clear_at": "next_user_message" },
+            { "role": "assistant", "content": [
+                { "type": "tool_use", "id": "c1", "name": "x", "input": {} },
+            ]},
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "c1", "content": "ok" },
+            ]},
+            { "role": "system", "content": "T2", "clear_at": "next_user_message" },
+        ]);
+        assert_eq!(strip_markers(&req["messages"]), expected_messages);
+        // Breakpoints: the tool result (last cacheable block before the
+        // tail) and the previous user turn's last ledger block.
+        assert_eq!(req["messages"][3]["content"][0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(req["messages"][0]["content"][2]["cache_control"]["type"], "ephemeral");
+        assert_no_marker_on_tails(&req);
+        assert_eq!(count_markers(&req), 3);
+        assert_eq!(
+            c.anthropic_beta_header(&req).as_deref(),
+            Some("mid-conversation-system-clear-at-2026-08-21")
+        );
+    }
+
+    #[test]
+    fn ledger_turn_falls_back_to_user_text_on_unsupported_models() {
+        for model in ["claude-sonnet-5", "claude-mystery-9"] {
+            let c = cache_connector(model, true, ClaudeCacheTtl::FiveMinutes);
+            let req = build(&c, &ledger_turn(), opts_for(&c));
+            let expected_messages = json!([
+                { "role": "user", "content": [
+                    { "type": "text", "text": "hi" },
+                    { "type": "text", "text": "L1" },
+                    { "type": "text", "text": "L2" },
+                    { "type": "text", "text": "T1" },
+                ]},
+                { "role": "assistant", "content": [
+                    { "type": "tool_use", "id": "c1", "name": "x", "input": {} },
+                ]},
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "c1", "content": "ok" },
+                    { "type": "text", "text": "T2" },
+                ]},
+            ]);
+            assert_eq!(strip_markers(&req["messages"]), expected_messages, "{model}");
+            // Markers skip the turn-scoped text blocks.
+            assert_eq!(req["messages"][2]["content"][0]["cache_control"]["type"], "ephemeral");
+            assert_eq!(req["messages"][0]["content"][2]["cache_control"]["type"], "ephemeral");
+            assert_no_marker_on_tails(&req);
+            assert!(!req.to_string().contains("clear_at"), "{model}");
+            assert_eq!(c.anthropic_beta_header(&req), None, "{model}");
+        }
+    }
+
+    #[test]
+    fn adjacent_ledger_entries_merge_into_one_system_message() {
+        let c = cache_connector("claude-sonnet-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let p = cache_prompt(
+            "persona",
+            None,
+            vec![
+                text_msg(ChatRole::User, "hi"),
+                sys_msg("L1"),
+                sys_msg("L2"),
+                text_msg(ChatRole::Assistant, "ok"),
+                text_msg(ChatRole::User, "next"),
+            ],
+        );
+        let req = build(&c, &p, opts_for(&c));
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1], json!({ "role": "system", "content": "L1\n\nL2" }));
+        assert_eq!(c.anthropic_beta_header(&req), None);
+    }
+
+    #[test]
+    fn tail_is_never_merged_with_a_ledger_entry() {
+        // tail then ledger, both before an assistant turn: the ledger entry
+        // is the trailing group; the tail rides as text.
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let p = LlmPrompt {
+            turn_scoped: vec![1],
+            ..cache_prompt(
+                "persona",
+                None,
+                vec![
+                    text_msg(ChatRole::User, "hi"),
+                    sys_msg("T1"),
+                    sys_msg("L1"),
+                    text_msg(ChatRole::Assistant, "ok"),
+                ],
+            )
+        };
+        let req = build(&c, &p, opts_for(&c));
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["content"][1]["text"], "T1");
+        assert_eq!(msgs[1], json!({ "role": "system", "content": "L1" }));
+        assert_no_marker_on_tails(&req);
+    }
+
+    #[test]
+    fn illegal_placements_become_user_text() {
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        // Followed by a user message (trim snapshot after the pinned head).
+        let p = cache_prompt(
+            "persona",
+            None,
+            vec![
+                text_msg(ChatRole::User, "pinned"),
+                sys_msg("SNAPSHOT"),
+                text_msg(ChatRole::User, "kept"),
+            ],
+        );
+        let msgs = build(&c, &p, opts_for(&c))["messages"].clone();
+        assert_eq!(msgs.as_array().unwrap().len(), 2);
+        assert_eq!(msgs[0]["content"][1]["text"], "SNAPSHOT");
+        assert!(!msgs.to_string().contains("\"system\""));
+
+        // After an assistant turn: a new user message.
+        let p = LlmPrompt {
+            turn_scoped: vec![2],
+            ..cache_prompt(
+                "persona",
+                None,
+                vec![
+                    text_msg(ChatRole::User, "q"),
+                    text_msg(ChatRole::Assistant, "a"),
+                    sys_msg("T1"),
+                ],
+            )
+        };
+        let req = build(&c, &p, opts_for(&c));
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2], json!({ "role": "user", "content": [{ "type": "text", "text": "T1" }] }));
+        assert_no_marker_on_tails(&req);
+
+        // messages[0] can never be a system message.
+        let p = cache_prompt("persona", None, vec![sys_msg("L0"), text_msg(ChatRole::Assistant, "a")]);
+        let msgs = build(&c, &p, opts_for(&c))["messages"].clone();
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["text"], "L0");
+    }
+
+    #[test]
+    fn clear_at_fallback_sends_plain_system_tails() {
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let refused = Features {
+            clear_at: true,
+            ..Default::default()
+        };
+        let opts = opts_for(&c).without(refused);
+        let req = build(&c, &ledger_turn(), opts);
+        assert!(!req.to_string().contains("clear_at"));
+        assert_eq!(req["messages"][1], json!({ "role": "system", "content": "T1" }));
+        assert_eq!(req["messages"][4], json!({ "role": "system", "content": "T2" }));
+        assert_eq!(c.anthropic_beta_header(&req), None);
+        assert_no_marker_on_tails(&req);
+
+        // Refusing the role itself renders like an unsupported model.
+        let no_role = opts_for(&c).without(Features {
+            system_role: true,
+            ..Default::default()
+        });
+        let req = build(&c, &ledger_turn(), no_role);
+        assert!(!req["messages"].to_string().contains("\"system\""));
+    }
+
+    #[test]
+    fn refused_feature_detector() {
+        let all = Features {
+            clear_at: true,
+            drop_block: true,
+            system_role: true,
+        };
+        let body = |msg: &str| {
+            json!({ "type": "error", "error": { "type": "invalid_request_error", "message": msg } })
+                .to_string()
+        };
+        let clear = refused_features(400, &body("messages.4.clear_at: Extra inputs are not permitted"), all);
+        assert_eq!(clear, Features { clear_at: true, ..Default::default() });
+        let beta = refused_features(400, &body("Unexpected value(s) `mid-conversation-system-clear-at-2026-08-21` for the `anthropic-beta` header."), all);
+        assert!(beta.clear_at && !beta.drop_block);
+        let bind = refused_features(400, &body("thinking.block_binding: Extra inputs are not permitted"), all);
+        assert_eq!(bind, Features { drop_block: true, ..Default::default() });
+        let role = refused_features(400, &body("role 'system' is not supported on this model"), all);
+        assert_eq!(role, Features { system_role: true, ..Default::default() });
+        // Generic unknown field: every beta feature sent, never the role.
+        let generic = refused_features(400, &body("messages.4: Extra inputs are not permitted"), all);
+        assert_eq!(generic, Features { clear_at: true, drop_block: true, system_role: false });
+        // Only features actually sent are ever refused.
+        assert!(!refused_features(400, &body("thinking.block_binding: Extra inputs are not permitted"), Features::default()).any());
+        // Not a 400, unrelated 400s, and signature errors don't count.
+        assert!(!refused_features(429, &body("clear_at"), all).any());
+        assert!(!refused_features(400, &body("max_tokens: must be positive"), all).any());
+        let sig = body("messages.5.content.0: Invalid `signature` in `thinking` block. The block is bound to a different conversation. Remove the block, or set `thinking.block_binding.prefix_mismatch_behavior` to \"drop_block\".");
+        assert!(!refused_features(400, &sig, all).any());
+        assert!(crate::llm::is_claude_thought_signature_error(400, &sig));
+    }
+
+    #[test]
+    fn drop_block_only_on_rewrites_with_adaptive_thinking() {
+        let opus = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let rewritten = LlmPrompt {
+            history_rewritten: true,
+            ..cache_prompt("persona", None, history())
+        };
+        let req = build(&opus, &rewritten, opts_for(&opus));
+        assert_eq!(
+            req["thinking"],
+            json!({
+                "type": "adaptive",
+                "display": "summarized",
+                "block_binding": { "prefix_mismatch_behavior": "drop_block" },
+            })
+        );
+        assert_eq!(
+            opus.anthropic_beta_header(&req).as_deref(),
+            Some("thinking-binding-controls-2026-08-01")
+        );
+
+        // No rewrite: nothing; sticky (session had one): still sent.
+        let plain = cache_prompt("persona", None, history());
+        assert!(build(&opus, &plain, opts_for(&opus))["thinking"].get("block_binding").is_none());
+        let sticky = RequestOpts {
+            sticky_drop_block: true,
+            ..opts_for(&opus)
+        };
+        assert!(build(&opus, &plain, sticky)["thinking"].get("block_binding").is_some());
+
+        // Refused, or thinking off: never.
+        let refused = opts_for(&opus).without(Features {
+            drop_block: true,
+            ..Default::default()
+        });
+        let req = build(&opus, &rewritten, refused);
+        assert!(req["thinking"].get("block_binding").is_none());
+        assert_eq!(opus.anthropic_beta_header(&req), None);
+        let no_thinking = cache_connector("claude-sonnet-4-6", true, ClaudeCacheTtl::FiveMinutes);
+        let req = build(&no_thinking, &rewritten, opts_for(&no_thinking));
+        assert!(req.get("thinking").is_none());
+        assert_eq!(no_thinking.anthropic_beta_header(&req), None);
+
+        // Both betas comma-joined.
+        let mut both = ledger_turn();
+        both.history_rewritten = true;
+        let req = build(&opus, &both, opts_for(&opus));
+        assert_eq!(
+            opus.anthropic_beta_header(&req).as_deref(),
+            Some("mid-conversation-system-clear-at-2026-08-21,thinking-binding-controls-2026-08-01")
+        );
+    }
+
+    #[test]
+    fn sticky_drop_block_is_per_session() {
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let id = "sticky-drop-block-test-session";
+        assert!(!c.request_opts(Some(id), false).sticky_drop_block);
+        assert!(c.request_opts(Some(id), true).sticky_drop_block);
+        assert!(c.request_opts(Some(id), false).sticky_drop_block);
+        assert!(!c.request_opts(Some("another-sticky-test-session"), false).sticky_drop_block);
+        assert!(!c.request_opts(None, false).sticky_drop_block);
+    }
+
+    #[test]
+    fn rendering_is_deterministic_and_append_only() {
+        for model in ["claude-opus-5-5", "claude-sonnet-5", "claude-mystery-9"] {
+            let c = cache_connector(model, true, ClaudeCacheTtl::FiveMinutes);
+            let o = opts_for(&c);
+            let a = serde_json::to_string(&build(&c, &ledger_turn(), o)).unwrap();
+            let b = serde_json::to_string(&build(&c, &ledger_turn(), o)).unwrap();
+            assert_eq!(a, b, "{model}");
+
+            // The first request's messages reappear unchanged (markers aside)
+            // as a prefix of the next request in the same turn.
+            let first = strip_markers(&build(&c, &ledger_turn_first_request(), o)["messages"]);
+            let next = strip_markers(&build(&c, &ledger_turn(), o)["messages"]);
+            let first = first.as_array().unwrap();
+            assert_eq!(first[..], next.as_array().unwrap()[..first.len()], "{model}");
+        }
+    }
+
+    #[test]
+    fn volatile_suffix_still_works_alongside_a_trailing_system_message() {
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let mut p = ledger_turn_first_request();
+        p.system = Some("STABLEVOLATILE".into());
+        p.system_volatile_offset = Some(6);
+        let (req, tail) = c.build_request_with(&p, true, &opts_for(&c));
+        let msgs = req["messages"].as_array().unwrap();
+        // A system message can't follow the T1 system message: the volatile
+        // text rides on the user message before it.
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1]["role"], "system");
+        assert_eq!(msgs[0]["content"][3]["text"], "VOLATILE");
+        assert_eq!(tail, VolatileTail::TextBlock(0));
+        assert!(msgs[0]["content"][3].get("cache_control").is_none());
+        // The fingerprint excludes it.
+        let mut q = p.clone();
+        q.system = Some("STABLEDIFFERENT".into());
+        let (req_q, tail_q) = c.build_request_with(&q, true, &opts_for(&c));
+        assert_eq!(fingerprint_request(&req, tail), fingerprint_request(&req_q, tail_q));
+    }
+
+    #[test]
+    fn fingerprints_include_tails() {
+        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let fp = |p: &LlmPrompt| {
+            let (req, tail) = c.build_request_with(p, true, &opts_for(&c));
+            fingerprint_request(&req, tail)
+        };
+        let base = fp(&ledger_turn());
+        let mut edited = ledger_turn();
+        edited.messages[3] = sys_msg("T1-rebuilt");
+        let edited = fp(&edited);
+        assert_ne!(base.messages, edited.messages);
+        match find_divergence(&base, &edited) {
+            Divergence::InPlaceEdit { index, shape } => {
+                assert_eq!(index, 1);
+                assert_eq!(shape.role, "system");
+            }
+            other => panic!("expected in-place edit, got {other:?}"),
+        }
+        // clear_at toggling is visible too.
+        let plain = {
+            let o = opts_for(&c).without(Features { clear_at: true, ..Default::default() });
+            let (req, tail) = c.build_request_with(&ledger_turn(), true, &o);
+            fingerprint_request(&req, tail)
+        };
+        assert_ne!(base.messages, plain.messages);
+        // A plain append reads as kind=append.
+        let first = fp(&ledger_turn_first_request());
+        let d = find_divergence(&first, &base);
+        assert_eq!(d, Divergence::None);
+        assert!(d.to_string().contains("kind=append"));
+    }
+
+    #[test]
+    fn divergence_tells_mid_trim_from_front_trim_and_edit() {
+        let c = cache_connector("claude-opus-4-8", true, ClaudeCacheTtl::FiveMinutes);
+        let prev = fp_of(&c, &cache_prompt("sys", None, grown(7)));
+        // Pinned head kept, messages 1..=3 replaced by one snapshot entry,
+        // then the rest plus a new turn.
+        let mut trimmed = grown(9);
+        trimmed.splice(1..4, [text_msg(ChatRole::User, "snapshot")]);
+        let new = fp_of(&c, &cache_prompt("sys", None, trimmed));
+        let d = find_divergence(&prev, &new);
+        assert_eq!(
+            d,
+            Divergence::MidTrim {
+                at: 1,
+                dropped: 3,
+                inserted: 1
+            }
+        );
+        assert!(d.to_string().contains("kind=mid-trim"));
+
+        // A same-size replacement stays an in-place edit.
+        let mut edited = grown(7);
+        edited[2] = text_msg(ChatRole::User, "edited");
+        let d = find_divergence(&prev, &fp_of(&c, &cache_prompt("sys", None, edited)));
+        assert!(matches!(d, Divergence::InPlaceEdit { index: 2, .. }), "{d:?}");
+
+        // A real front-trim still reads as one.
+        let front = fp_of(&c, &cache_prompt("sys", None, grown(10).split_off(2)));
+        assert_eq!(find_divergence(&prev, &front), Divergence::FrontTrim(2));
+    }
+
+    #[test]
+    fn input_transformations_are_found_and_summarized_without_paths() {
+        let start = r#"data: {"type":"message_start","message":{"id":"msg_9","input_transformations":[{"type":"thinking_dropped","path":"messages.1.content.0","reason":"prefix_binding_mismatch"},{"type":"thinking_dropped","path":"messages.3.content.0","reason":"prefix_binding_mismatch"},{"type":"thinking_mismatch_allowed","path":"messages.5.content.0","reason":"prefix_binding_mismatch"}]}}"#;
+        let meta = scan_line_meta(start);
+        let t = meta.input_transformations.expect("found");
+        let s = summarize_transformations(&t).unwrap();
+        assert_eq!(
+            s,
+            "3 entries: thinking_dropped/prefix_binding_mismatch x2, thinking_mismatch_allowed/prefix_binding_mismatch x1"
+        );
+        assert!(!s.contains("messages."));
+        assert_eq!(summarize_transformations(&json!([])), None);
+        let delta = r#"data: {"type":"message_delta","input_transformations":[{"type":"thinking_dropped","reason":"model_binding_mismatch"}]}"#;
+        assert!(scan_line_meta(delta).input_transformations.is_some());
     }
 }

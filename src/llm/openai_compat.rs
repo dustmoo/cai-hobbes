@@ -892,6 +892,18 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                 ChatRole::Tool => "tool",
             };
 
+            // Mid-conversation system message (ledger entry / turn tail):
+            // many local servers' chat templates reject a system message
+            // that isn't first, so it goes as user-role context text. Real
+            // OpenAI accepts system messages anywhere and keeps the role.
+            if msg.role == ChatRole::System && !messages.is_empty() && !self.is_real_openai() {
+                let joined = text_parts.join("\n");
+                if !joined.is_empty() {
+                    crate::llm::convert::push_context_as_user(&mut messages, &joined, "text");
+                }
+                continue;
+            }
+
             // Build the message based on what we found
             if let Some((call_id, _name, content_str)) = tool_result {
                 // Tool result message — OpenAI requires role=tool + tool_call_id
@@ -1634,5 +1646,93 @@ impl OpenAiCompatConnector {
             If this persists, check **Settings → LLM Configuration**.",
             status, body
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::ChatMessage;
+
+    fn connector(endpoint: &str) -> OpenAiCompatConnector {
+        OpenAiCompatConnector::new(OpenAiCompatConfig {
+            endpoint: endpoint.to_string(),
+            model: "local-model".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn text(role: ChatRole, t: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    fn prompt(system: Option<&str>, messages: Vec<ChatMessage>) -> LlmPrompt {
+        LlmPrompt {
+            system: system.map(str::to_string),
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
+            messages,
+            tools: vec![],
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_becomes_user_context_on_local_servers() {
+        let c = connector("http://localhost:1234/v1");
+        let p = prompt(
+            Some("persona"),
+            vec![
+                text(ChatRole::User, "hi"),
+                text(ChatRole::System, "L1"),
+                text(ChatRole::System, "T1"),
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "x".into(),
+                        arguments: json!({}),
+                        signature: None,
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        call_id: "c1".into(),
+                        name: "x".into(),
+                        content: json!("ok"),
+                    }],
+                },
+                text(ChatRole::System, "T2"),
+            ],
+        );
+        let req = c.to_native_request(&p, true);
+        let msgs = req["messages"].as_array().unwrap();
+        // Only the top-level persona is role system.
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool", "user"]);
+        assert_eq!(msgs[0]["content"], "persona");
+        // Merged into the preceding user turn (strict-alternation templates).
+        assert_eq!(msgs[1]["content"], "hi\n\n[Context]\nL1\n\n[Context]\nT1");
+        // After a tool result: a separate user message.
+        assert_eq!(msgs[4]["content"], "[Context]\nT2");
+        // Deterministic.
+        assert_eq!(req, c.to_native_request(&p, true));
+    }
+
+    #[test]
+    fn system_first_or_on_real_openai_keeps_the_system_role() {
+        let local = connector("http://localhost:1234/v1");
+        let p = prompt(None, vec![text(ChatRole::System, "L0"), text(ChatRole::User, "hi")]);
+        let req = local.to_native_request(&p, true);
+        assert_eq!(req["messages"][0], json!({ "role": "system", "content": "L0" }));
+
+        let openai = connector("https://api.openai.com/v1");
+        let p = prompt(Some("persona"), vec![text(ChatRole::User, "hi"), text(ChatRole::System, "T1")]);
+        let req = openai.to_native_request(&p, true);
+        assert_eq!(req["messages"][2], json!({ "role": "system", "content": "T1" }));
     }
 }
