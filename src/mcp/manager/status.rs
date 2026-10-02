@@ -119,7 +119,7 @@ impl McpManager {
 
             let skipped = profile_dynamic_tools.len() - deduped_tools.len();
             if skipped > 0 {
-                tracing::info!(
+                tracing::debug!(
                     "Dynamic tools: {} total, {} skipped (already in force-loaded set), {} injected",
                     profile_dynamic_tools.len(), skipped, deduped_tools.len()
                 );

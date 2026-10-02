@@ -215,7 +215,7 @@ impl StreamManagerContext {
 
         match (matches_global, instance) {
             (false, Some(inst)) => {
-                tracing::info!(
+                tracing::debug!(
                     session_id,
                     connector = %inst.name,
                     provider = inst.provider().display_name(),
@@ -242,7 +242,7 @@ impl StreamManagerContext {
             .write()
             .insert(message_id, session_id.clone());
         self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnStarted);
-        tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
+        tracing::debug!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
@@ -263,7 +263,7 @@ impl StreamManagerContext {
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
-            tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
+            tracing::debug!(message_id = %message_id, "Stream master task SPAWNED.");
             // Keep the built prompt and MCP context so we can re-send a trimmed
             // version if the provider rejects the prompt as too large
             // (adapt-to-error self-calibration, handled in the Error arm).
@@ -579,22 +579,20 @@ impl StreamManagerContext {
                             if thought_signature_for_this_turn.is_none() {
                                 thought_signature_for_this_turn =
                                     tool_call.thought_signature.clone();
-                                tracing::info!(
-                                    "Captured thought_signature from tool call '{}': '{}'",
-                                    tool_call.tool_name,
-                                    tool_call
-                                        .thought_signature
-                                        .as_ref()
-                                        .map(|s| if s.len() > 30 { &s[..30] } else { s })
-                                        .unwrap_or("None")
+                                tracing::debug!(
+                                    "Captured thought_signature from tool call '{}'",
+                                    tool_call.tool_name
                                 );
                             }
                         } else if thought_signature_for_this_turn.is_some() {
                             // Propagate captured signature to this tool call
                             tool_call.thought_signature = thought_signature_for_this_turn.clone();
-                            tracing::info!("Propagated thought_signature to tool call '{}' from earlier in turn", tool_call.tool_name);
-                        } else {
+                            tracing::debug!("Propagated thought_signature to tool call '{}' from earlier in turn", tool_call.tool_name);
+                        } else if stream_provider == crate::settings::LlmProvider::Gemini {
+                            // Only Gemini requires signatures on function calls.
                             tracing::warn!("Tool call '{}' has NO thought_signature and none available to propagate!", tool_call.tool_name);
+                        } else {
+                            tracing::debug!("Tool call '{}' has no thought_signature (not required by {:?})", tool_call.tool_name, stream_provider);
                         }
 
                         // Stamp provenance: record which provider minted the
@@ -878,7 +876,7 @@ impl StreamManagerContext {
                                                     .await
                                                 {
                                                     Ok(url) => {
-                                                        tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
+                                                        tracing::info!("Successfully initiated Composio auth flow ({})", crate::log_utils::redact_url(&url));
                                                         (
                                                             ToolCallStatus::AuthRequired,
                                                             url,
@@ -1725,7 +1723,10 @@ impl StreamManagerContext {
             }
 
             // The turn is truly over — no tool calls, no watch word recovery, no error recovery.
-            tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
+            // This is the single INFO line per turn (model + token counts),
+            // emitted once usage is known, below.
+            tracing::debug!(message_id = %message_id, "LLM stream COMPLETE.");
+            let mut turn_usage_logged = false;
 
             // Record usage to the standalone usage log (audit ledger).
             // This captures the final usage data for the turn, avoiding the
@@ -1739,6 +1740,18 @@ impl StreamManagerContext {
                 {
                     if let Some(usage) = &msg.usage {
                         let model = self.effective_model(&session_id);
+                        tracing::info!(
+                            message_id = %message_id,
+                            "Turn complete: model={} prompt={} completion={} thoughts={:?} cached={:?} cache_write={:?} total={}",
+                            model,
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.thoughts_tokens,
+                            usage.cached_content_tokens,
+                            usage.cache_creation_tokens,
+                            usage.total_tokens
+                        );
+                        turn_usage_logged = true;
                         self.usage_log
                             .write()
                             .record(crate::usage_log::UsageLogEntry {
@@ -1759,6 +1772,14 @@ impl StreamManagerContext {
                             });
                     }
                 }
+            }
+
+            if !turn_usage_logged {
+                tracing::info!(
+                    message_id = %message_id,
+                    "Turn complete: model={} (no usage reported)",
+                    self.effective_model(&session_id)
+                );
             }
 
             {
@@ -1791,13 +1812,13 @@ impl StreamManagerContext {
                 &session_id,
                 crate::fleet::bridge::HobbesSignal::TurnCompleted,
             );
-            tracing::info!(message_id = %message_id, "Completion signal SENT.");
+            tracing::debug!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
             self.active_stream_handles.write().remove(&message_id);
             self.content_generated.write().remove(&message_id); // Cleanup
             self.stream_session_map.write().remove(&message_id);
-            tracing::info!(message_id = %message_id, "Active stream handle removed.");
+            tracing::debug!(message_id = %message_id, "Active stream handle removed.");
         });
 
         // Store the handle so we can abort it if needed

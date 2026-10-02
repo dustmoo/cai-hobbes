@@ -80,7 +80,11 @@ pub enum Fetcher {
 impl std::fmt::Debug for Fetcher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Fetcher::Ics { url } => f.debug_struct("Ics").field("url", url).finish(),
+            // The feed URL is a credential; show only scheme + host.
+            Fetcher::Ics { url } => f
+                .debug_struct("Ics")
+                .field("url", &crate::log_utils::redact_url(url))
+                .finish(),
             Fetcher::Composio { calendar_id, .. } => f
                 .debug_struct("Composio")
                 .field("calendar_id", calendar_id)

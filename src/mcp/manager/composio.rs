@@ -245,14 +245,14 @@ impl McpManager {
         let profile_id = profile.id.clone();
 
         tracing::info!(
-            "Initializing native Composio client for profile '{}' (ID: {}). API Key: {}... Entity: {:?}, User: {:?}, has_server_uuid: {}",
+            "Initializing native Composio client for profile '{}' (ID: {}). entity set: {}, user set: {}, has_server_uuid: {}",
             profile.name,
             profile_id,
-            api_key.get(..8).unwrap_or(""),
-            entity_id,
-            user_id,
+            entity_id.is_some(),
+            user_id.is_some(),
             has_server_uuid
         );
+        tracing::debug!("Composio profile '{}': entity={:?}, user={:?}", profile.name, entity_id, user_id);
 
         let composio_client = Arc::new(ComposioClient::new(
             api_key,

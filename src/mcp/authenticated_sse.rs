@@ -196,7 +196,7 @@ impl SseClient for AuthenticatedSseClient {
             let body_str = String::from_utf8_lossy(&body_bytes).to_string();
             tracing::error!(
                 "Expected SSE stream from Composio but got JSON: {}",
-                body_str
+                crate::log_utils::truncate_for_log(&body_str, crate::log_utils::LOG_BODY_MAX_CHARS)
             );
             return Err(SseTransportError::UnexpectedContentType(Some(format!(
                 "Expected text/event-stream from Composio, got application/json: {}",

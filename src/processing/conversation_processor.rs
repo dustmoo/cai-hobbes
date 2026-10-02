@@ -70,6 +70,9 @@ impl ConversationProcessor {
 
         // 3. Call the LLM to refine the summary
         let connector = self.llm_connector.read().clone();
+        // Rate-limit key: the connector instance stands in for its endpoint
+        // (a settings change builds a new connector, resetting the window).
+        let rate_key = format!("conversation_summary_err:{:p}", Arc::as_ptr(&connector) as *const ());
         match connector
             .summarize_conversation(previous_summary, recent_history)
             .await
@@ -85,7 +88,13 @@ impl ConversationProcessor {
                 }
             },
             Err(e) => {
-                tracing::error!("Failed to summarize conversation: {}", e);
+                // A dead summarizer endpoint fails on every turn; ERROR at most
+                // once per endpoint per 10 minutes, DEBUG otherwise.
+                if crate::log_utils::allow_every(&rate_key, std::time::Duration::from_secs(600)) {
+                    tracing::error!("Failed to summarize conversation: {} (repeats suppressed for 10 min)", e);
+                } else {
+                    tracing::debug!("Failed to summarize conversation: {}", e);
+                }
                 None
             }
         }

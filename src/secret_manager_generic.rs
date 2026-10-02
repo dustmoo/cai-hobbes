@@ -156,6 +156,9 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
+        // Missing indexed entries (stale index rows) are common and harmless;
+        // count them and log one summary instead of a WARN each.
+        let mut index_failures = 0usize;
         // Feature: Dynamic Tool Credentials via Index Key
         if let Ok(entry) = Entry::new(SERVICE_NAME, "composio_custom_keys_index") {
             if let Ok(index_csv) = entry.get_password() {
@@ -170,11 +173,8 @@ impl SecretManagerTrait for SecretManager {
                                     tracing::debug!("Loaded custom tool secret: {}", key);
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to load indexed secret '{}': {}",
-                                        key,
-                                        e
-                                    );
+                                    index_failures += 1;
+                                    tracing::debug!("Failed to load indexed secret '{}': {}", key, e);
                                 }
                             }
                         }
@@ -199,17 +199,21 @@ impl SecretManagerTrait for SecretManager {
                                     tracing::debug!("Loaded indexed key: {}", key);
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to load indexed key '{}': {}",
-                                        key,
-                                        e
-                                    );
+                                    index_failures += 1;
+                                    tracing::debug!("Failed to load indexed key '{}': {}", key, e);
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if index_failures > 0 {
+            tracing::info!(
+                "{} indexed keychain secret(s) could not be loaded (details at DEBUG)",
+                index_failures
+            );
         }
 
         tracing::info!(

@@ -1501,7 +1501,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                 tracing::info!("Connected without needing auth!");
                                             }
                                             Err(SmitheryOAuthError::AuthRequired(auth_url)) => {
-                                                tracing::info!("Opening OAuth authorization URL: {}", auth_url);
+                                                tracing::info!("Opening OAuth authorization URL at {}", crate::log_utils::redact_url(&auth_url));
 
                                                 // Open browser for user to authorize
                                                 if let Err(e) = crate::mcp::oauth_flow::open_browser(&auth_url, None).await {

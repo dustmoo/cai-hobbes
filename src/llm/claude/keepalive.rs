@@ -559,11 +559,14 @@ async fn send_ping(real_body: &str, betas: Option<&str>, s: &PingSettings) -> Op
             return Some(parse_usage(&serde_json::from_str(&text).ok()?));
         }
         if status.as_u16() == 400 && max_tokens == 0 {
-            tracing::warn!("cache keep-alive: max_tokens 0 rejected, falling back to 1: {text}");
+            tracing::warn!(
+                "cache keep-alive: max_tokens 0 rejected, falling back to 1: {}",
+                crate::log_utils::truncate_for_log(&text, crate::log_utils::LOG_BODY_MAX_CHARS)
+            );
             ZERO_TOKENS_REJECTED.store(true, Ordering::SeqCst);
             continue;
         }
-        tracing::warn!("cache keep-alive: HTTP {status}: {text}");
+        tracing::warn!("cache keep-alive: HTTP {status}: {}", crate::log_utils::truncate_for_log(&text, crate::log_utils::LOG_BODY_MAX_CHARS));
         return None;
     }
     None

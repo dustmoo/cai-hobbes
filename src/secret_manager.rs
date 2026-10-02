@@ -95,6 +95,9 @@ impl SecretManager {
             }
         }
 
+        // Missing indexed entries (stale index rows) are common and harmless;
+        // count them and log one summary instead of a WARN each.
+        let mut index_failures = 0usize;
         // Load custom tool credentials from the index (BYOA)
         match keychain_ffi::find_generic_password_with_context(
             "composio_custom_keys_index",
@@ -113,11 +116,8 @@ impl SecretManager {
                                 tracing::debug!("Loaded custom tool secret with context: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to load indexed secret '{}' with context: {}",
-                                    key,
-                                    e
-                                );
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed secret '{}' with context: {}", key, e);
                             }
                         }
                     }
@@ -143,11 +143,8 @@ impl SecretManager {
                                 tracing::debug!("Loaded indexed key with context: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to load indexed key '{}' with context: {}",
-                                    key,
-                                    e
-                                );
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed key '{}' with context: {}", key, e);
                             }
                         }
                     }
@@ -156,6 +153,13 @@ impl SecretManager {
                     tracing::debug!("No index found for {}.", index_key);
                 }
             }
+        }
+
+        if index_failures > 0 {
+            tracing::info!(
+                "{} indexed keychain secret(s) could not be loaded (details at DEBUG)",
+                index_failures
+            );
         }
 
         self.migrate_legacy_keys();
@@ -246,6 +250,9 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
+        // Missing indexed entries (stale index rows) are common and harmless;
+        // count them and log one summary instead of a WARN each.
+        let mut index_failures = 0usize;
         // Feature: Dynamic Tool Credentials via Index Key
         // We maintain a comma-separated list of custom keys in `composio_custom_keys_index`.
         match keychain_ffi::find_generic_password("composio_custom_keys_index") {
@@ -260,7 +267,8 @@ impl SecretManagerTrait for SecretManager {
                                 tracing::debug!("Loaded custom tool secret: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to load indexed secret '{}': {}", key, e);
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed secret '{}': {}", key, e);
                             }
                         }
                     }
@@ -286,7 +294,8 @@ impl SecretManagerTrait for SecretManager {
                                 tracing::debug!("Loaded indexed key: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to load indexed key '{}': {}", key, e);
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed key '{}': {}", key, e);
                             }
                         }
                     }
@@ -295,6 +304,13 @@ impl SecretManagerTrait for SecretManager {
                     tracing::debug!("No index found for {}.", index_key);
                 }
             }
+        }
+
+        if index_failures > 0 {
+            tracing::info!(
+                "{} indexed keychain secret(s) could not be loaded (details at DEBUG)",
+                index_failures
+            );
         }
 
         self.migrate_legacy_keys();

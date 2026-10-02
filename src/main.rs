@@ -31,6 +31,7 @@ mod keychain_ffi;
 #[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
 mod llm;
+mod log_utils;
 mod mcp;
 mod menu;
 mod permissions;
@@ -223,57 +224,162 @@ fn flash_timer_toast(msg: String) {
     });
 }
 
-/// Debug builds (cargo run): DEBUG+ to log file, INFO+ to stderr.
-/// File goes to ~/Library/Application Support/com.hobbes.app/hobbes.log (daily rotation).
-#[cfg(debug_assertions)]
-fn init_logger() {
+/// Keeps the non-blocking file writer alive. Dropped by `flush_logs()` on the
+/// quit path so the last buffered lines reach disk.
+static LOG_FILE_GUARD: std::sync::OnceLock<std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>> =
+    std::sync::OnceLock::new();
+
+/// Flush and close the log file writer. Called on quit; later log lines are
+/// dropped by the (now closed) channel, which is fine at that point.
+fn flush_logs() {
+    if let Some(slot) = LOG_FILE_GUARD.get() {
+        if let Ok(mut guard) = slot.lock() {
+            drop(guard.take());
+        }
+    }
+}
+
+/// Log directory: `<config dir>/com.hobbes.app/logs/` on macOS/Linux
+/// (`~/Library/Application Support/com.hobbes.app/logs`), and
+/// `%LOCALAPPDATA%\com.hobbes.app\logs` on Windows.
+fn log_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = dirs::data_local_dir();
+    #[cfg(not(target_os = "windows"))]
+    let base = dirs::config_dir();
+    base.map(|b| b.join("com.hobbes.app").join("logs"))
+}
+
+/// Daily-rotated `hobbes.<date>.log`, 7 files kept, written on a lossy
+/// background thread. Returns `None` (no file layer) if the directory can't
+/// be created or opened — logging must never take the app down.
+fn build_file_writer() -> Option<(tracing_appender::non_blocking::NonBlocking, std::path::PathBuf)> {
+    use tracing_appender::rolling::{Builder, Rotation};
+    let dir = log_dir()?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let appender = Builder::new()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("hobbes")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(&dir)
+        .ok()?;
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(8_192)
+        .thread_name("hobbes-log")
+        .finish(appender);
+    let _ = LOG_FILE_GUARD.set(std::sync::Mutex::new(Some(guard)));
+    Some((writer, dir))
+}
+
+/// Route panics through tracing so they land in the log file, then run the
+/// previous (default) hook so stderr output is unchanged.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        tracing::error!(
+            "PANIC on thread '{}' at {}: {}",
+            std::thread::current().name().unwrap_or("<unnamed>"),
+            location,
+            msg
+        );
+        previous(info);
+    }));
+}
+
+/// Shared setup for both build types. `default_filter` applies to the file
+/// (and to stderr in release); `HOBBES_LOG` overrides it.
+fn init_logger_with(default_filter: &str, build_type: &str, stderr: Option<tracing_subscriber::filter::LevelFilter>) {
+    use std::io::IsTerminal;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
 
-    let log_dir = dirs::config_dir()
-        .unwrap_or_default()
-        .join("com.hobbes.app");
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "hobbes.log");
-    let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
-    // SAFETY: Leak the guard to keep the non-blocking writer alive for the process lifetime.
-    // Box::leak is preferred over mem::forget — it communicates "intentional static lifetime"
-    // rather than "we forgot to drop this" and avoids the clippy mem_forget lint.
-    Box::leak(Box::new(file_guard));
+    let (filter_str, filter_warning) =
+        log_utils::choose_log_filter(std::env::var("HOBBES_LOG").ok().as_deref(), default_filter);
+    let make_filter = || {
+        tracing_subscriber::EnvFilter::builder()
+            .parse(&filter_str)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter))
+    };
 
-    let (non_blocking_stderr, stderr_guard) = tracing_appender::non_blocking(std::io::stderr());
-    Box::leak(Box::new(stderr_guard));
+    let file = build_file_writer();
+    let file_dir = file.as_ref().map(|(_, d)| d.display().to_string());
+    let file_layer = file.map(|(writer, _)| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_filter(make_filter())
+    });
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hobbes=debug"));
+    // Release: stderr only when explicitly asked for or attached to a
+    // terminal (a Finder-launched app's stderr goes nowhere useful).
+    // Debug: always, at the given level.
+    let want_stderr = match stderr {
+        Some(_) => true,
+        None => {
+            std::env::var("HOBBES_LOG_STDERR").map(|v| v == "1").unwrap_or(false)
+                || std::io::stderr().is_terminal()
+        }
+    };
+    let stderr_layer = want_stderr.then(|| {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal());
+        match stderr {
+            Some(level) => layer.with_filter(level).boxed(),
+            None => layer.with_filter(make_filter()).boxed(),
+        }
+    });
 
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking_file)
-        .with_ansi(false)
-        .with_filter(env_filter);
-
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking_stderr)
-        .with_ansi(true)
-        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
-
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(file_layer)
         .with(stderr_layer)
-        .init();
+        .try_init();
+
+    install_panic_hook();
+
+    if let Some(w) = filter_warning {
+        tracing::warn!("{}", w);
+    }
+    tracing::info!(
+        "Hobbes {} ({} build) logging started; filter = \"{}\"; log dir = {}",
+        env!("CARGO_PKG_VERSION"),
+        build_type,
+        filter_str,
+        file_dir.as_deref().unwrap_or("<none: file logging unavailable>")
+    );
 }
 
-/// Release builds: INFO+ to stderr only, no log file created.
+/// Debug builds (cargo run / dx serve): DEBUG+ for this crate to the log
+/// file, INFO+ to stderr.
+#[cfg(debug_assertions)]
+fn init_logger() {
+    init_logger_with(
+        &log_utils::default_debug_filter(),
+        "debug",
+        Some(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+}
+
+/// Release (Pro) builds: INFO+ for this crate, WARN+ for dependencies, to the
+/// rolling log file; stderr only with `HOBBES_LOG_STDERR=1` or a terminal.
 #[cfg(not(debug_assertions))]
 fn init_logger() {
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
-    // SAFETY: Leak the guard to keep the non-blocking writer alive for the process lifetime.
-    Box::leak(Box::new(guard));
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(non_blocking)
-        .with_ansi(true)
-        .init();
+    init_logger_with(&log_utils::default_release_filter(), "release", None);
 }
 
 fn main() {
@@ -281,8 +387,10 @@ fn main() {
     dotenv().ok();
     tracing::debug!("Attempted to load .env file from the environment.");
     // Logger setup — cargo run (debug) vs built app (release):
-    // Debug: DEBUG+ to log file, INFO+ to stderr (avoids iTerm beach-ball)
-    // Release: INFO+ to stderr only, no file created
+    // Debug: DEBUG+ (this crate) to log file, INFO+ to stderr
+    // Release: INFO+ (this crate) / WARN+ (deps) to a rolling file in
+    // <config>/com.hobbes.app/logs; stderr only if HOBBES_LOG_STDERR=1 or a tty.
+    // HOBBES_LOG overrides the filter in both.
     init_logger();
 
     // Initialize the SQLite session store. On first launch after the JSON→
@@ -1589,7 +1697,7 @@ fn app() -> Element {
     // This use_effect subscribes to changes in active_composio_profile
     {
         // Track key profile properties to detect changes (API key, base URL, etc.)
-        let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
+        let mut prev_profile_signature: Signal<Option<log_utils::ProfileSignature>> = use_signal(|| None);
 
         use_effect(move || {
             // Don't reinitialize before secrets are loaded — the profile's api_key
@@ -1598,25 +1706,27 @@ fn app() -> Element {
                 return;
             }
 
-            // Create a signature of the active profile properties we care about
-            let current_signature = settings.read().get_active_profile().map(|p| {
-                format!(
-                    "{}:{}:{}:{}:{}",
-                    p.name,
-                    p.api_key.as_deref().unwrap_or(""),
-                    p.base_url.as_deref().unwrap_or(""),
-                    p.entity_id.as_deref().unwrap_or(""),
-                    p.user_id.as_deref().unwrap_or("")
-                )
-            });
+            // Create a signature of the active profile properties we care about.
+            // Holds the API key, so it is compared only — never logged
+            // (`describe_profile_change` prints field names, not values).
+            let current_signature: Option<log_utils::ProfileSignature> =
+                settings.read().get_active_profile().map(|p| {
+                    [
+                        p.name.clone(),
+                        p.api_key.clone().unwrap_or_default(),
+                        p.base_url.clone().unwrap_or_default(),
+                        p.entity_id.clone().unwrap_or_default(),
+                        p.user_id.clone().unwrap_or_default(),
+                    ]
+                });
 
             let previous = prev_profile_signature.peek().clone();
 
             // Only reinitialize if the profile signature actually changed
             if current_signature != previous {
                 tracing::info!(
-                    "Active Composio profile properties changed, reinitializing client: {:?}",
-                    current_signature
+                    "Active Composio profile properties changed, reinitializing client: {}",
+                    log_utils::describe_profile_change(previous.as_ref(), current_signature.as_ref())
                 );
 
                 // Invalidate caches - profile changed
@@ -2275,6 +2385,8 @@ fn app() -> Element {
             if let Err(e) = settings_manager.peek().save(&settings.peek()) {
                 tracing::error!("Final settings save on quit failed: {}", e);
             }
+            tracing::info!("Quitting Hobbes");
+            flush_logs();
             window_clone.close();
             return;
         }

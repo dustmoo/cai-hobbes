@@ -445,7 +445,7 @@ impl McpManager {
                 if let Some(new_server_url) = result.new_server_url {
                     tracing::info!(
                         "New MCP server created/updated: {}. Syncing client base URL.",
-                        new_server_url
+                        crate::log_utils::redact_url(&new_server_url)
                     );
 
                     // SYNC FIX: Update client internal URL

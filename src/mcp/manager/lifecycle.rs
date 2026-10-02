@@ -574,7 +574,7 @@ impl McpManager {
                     tracing::info!(
                         "Connecting to network MCP server '{}' at {}",
                         server_name,
-                        uri
+                        crate::log_utils::redact_url(&uri)
                     );
                     // For SSE servers, auth tokens should be provided via env vars by the CLI
                     // or directly in the server config as needed
@@ -1207,7 +1207,7 @@ impl McpManager {
                 tracing::info!(
                     "Connecting to network MCP server '{}' at {}",
                     server_name,
-                    uri
+                    crate::log_utils::redact_url(&uri)
                 );
                 // For SSE servers, auth tokens should be provided via env vars
                 // or directly in the server config as needed
@@ -1232,7 +1232,11 @@ impl McpManager {
                 };
 
                 // Debug log for URI
-                tracing::info!("Final Composio URI (use_post={}): {}", use_post, final_uri);
+                tracing::debug!(
+                    "Final Composio URI (use_post={}): {}",
+                    use_post,
+                    crate::log_utils::redact_url(&final_uri)
+                );
 
                 // For Composio POST requests, we need both POST method AND correct headers/body
                 // authenticated_sse handles the headers/body logic when use_post is true

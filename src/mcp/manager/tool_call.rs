@@ -790,7 +790,7 @@ impl McpManager {
                     if tool.name == "COMPOSIO_DISCOVER_APPS" {
                         // Extract query from args
                         let query = args.get("query").and_then(|v| v.as_str());
-                        tracing::info!("COMPOSIO_DISCOVER_APPS: query='{:?}'", query);
+                        tracing::debug!("COMPOSIO_DISCOVER_APPS: query='{:?}'", query);
 
                         // Operational Authority: Use list_connected_toolkits (MCP-first,
                         // cross-referenced with user-scoped toolkit_account_map) rather than
@@ -1022,7 +1022,7 @@ impl McpManager {
                                     .get("arguments")
                                     .cloned()
                                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                                tracing::info!(
+                                tracing::debug!(
                                     "COMPOSIO_EXECUTE_TOOL: executing '{}'",
                                     target_tool_name
                                 );

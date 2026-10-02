@@ -69,7 +69,8 @@ impl ImageClient {
             .filter(|k| !k.is_empty())
             .ok_or_else(|| "Image Generation requires the Gemini API Key to be configured in Settings -> Credentials.".to_string())?;
 
-        tracing::info!("Generating image via Gemini model '{}' for prompt: {}", model, prompt);
+        tracing::info!("Generating image via Gemini model '{}'", model);
+        tracing::debug!("Image prompt length: {} chars", prompt.chars().count());
 
         // The model name from the API comes as "models/gemini-2.5-flash-image"
         // The REST URL expects: /v1beta/models/{slug}:generateContent
@@ -134,20 +135,24 @@ impl ImageClient {
         let client = reqwest::Client::new();
         let response = client
             .post(&url)
-            .header("x-goog-api-key", api_key)
+            .header(crate::llm::gemini::GEMINI_API_KEY_HEADER, api_key)
             .header("Content-Type", "application/json")
             .json(&body)
             .send()
             .await
-            .map_err(|e| format!("Image generation network error: {}", e))?;
+            .map_err(|e| format!("Image generation network error: {}", crate::log_utils::net_err(e)))?;
 
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            return Err(format!("Gemini image API error ({}): {}", status, error_text));
+            return Err(format!(
+                "Gemini image API error ({}): {}",
+                status,
+                crate::log_utils::truncate_for_log(&error_text, crate::log_utils::LOG_BODY_MAX_CHARS)
+            ));
         }
 
-        let resp_json: Value = response.json().await.map_err(|e| format!("Failed to parse image response: {}", e))?;
+        let resp_json: Value = response.json().await.map_err(|e| format!("Failed to parse image response: {}", crate::log_utils::net_err(e)))?;
 
         // Extract parts from the response
         let parts = resp_json

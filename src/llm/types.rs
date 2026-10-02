@@ -204,10 +204,21 @@ impl LlmPrompt {
                 let total_available = self.tools.len();
                 let kept_count = total_available - to_remove.len();
 
-                tracing::warn!(
-                    "Tool budget exceeded: {} tool tokens vs {} available. Dropping {} of {} tool definitions: {:?}",
-                    tool_cost, target_tool_budget, to_remove.len(), total_available, dropped_tool_names
-                );
+                // Fires every turn while the condition holds: INFO once per
+                // context-window size, DEBUG after that.
+                if crate::log_utils::first_time(&format!("tool_budget_exceeded:{}", max_context_tokens)) {
+                    tracing::info!(
+                        "Tool budget exceeded: {} tool tokens vs {} available. Dropping {} of {} tool definitions: {}",
+                        tool_cost, target_tool_budget, to_remove.len(), total_available,
+                        crate::log_utils::cap_list(&dropped_tool_names, 5)
+                    );
+                } else {
+                    tracing::debug!(
+                        "Tool budget exceeded: dropping {} of {} tool definitions: {}",
+                        to_remove.len(), total_available,
+                        crate::log_utils::cap_list(&dropped_tool_names, 5)
+                    );
+                }
 
                 let to_remove_count = to_remove.len();
 
@@ -248,13 +259,21 @@ impl LlmPrompt {
         let (drop_count, _estimated_tokens) = messages_to_drop(self, budget, protected_window, chars_per_token);
 
         if drop_count > 0 {
-            tracing::warn!(
-                "Context budget exceeded: estimated {} tokens, budget {} (max {} - safety margin). Dropping {} oldest messages.",
-                crate::context::token_estimator::estimate_prompt_tokens_with_ratio(self, chars_per_token),
-                budget,
-                max_context_tokens,
-                drop_count
-            );
+            if crate::log_utils::first_time(&format!("context_budget_exceeded:{}", max_context_tokens)) {
+                tracing::info!(
+                    "Context budget exceeded: estimated {} tokens, budget {} (max {} - safety margin). Dropping {} oldest messages.",
+                    crate::context::token_estimator::estimate_prompt_tokens_with_ratio(self, chars_per_token),
+                    budget,
+                    max_context_tokens,
+                    drop_count
+                );
+            } else {
+                tracing::debug!(
+                    "Context budget exceeded (budget {}): dropping {} oldest messages.",
+                    budget,
+                    drop_count
+                );
+            }
 
             // Remove oldest messages
             self.messages.drain(..drop_count);

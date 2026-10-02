@@ -14,6 +14,29 @@ use crate::mcp::manager::McpContext;
 
 use crate::session::Tool;
 
+/// Header the Gemini API reads the key from. Sent as a header rather than a
+/// `?key=` query param so the key never lands in a URL — reqwest echoes URLs
+/// in its error `Display`, and those errors get logged.
+pub(crate) const GEMINI_API_KEY_HEADER: &str = "x-goog-api-key";
+
+/// Attach the Gemini API key to a request as a sensitive header (redacted
+/// from reqwest's `Debug` output).
+pub(crate) fn with_gemini_key(rb: reqwest::RequestBuilder, api_key: &str) -> reqwest::RequestBuilder {
+    match reqwest::header::HeaderValue::from_str(api_key) {
+        Ok(mut v) => {
+            v.set_sensitive(true);
+            rb.header(GEMINI_API_KEY_HEADER, v)
+        }
+        // Invalid header bytes: let reqwest surface the error at send time.
+        Err(_) => rb.header(GEMINI_API_KEY_HEADER, api_key),
+    }
+}
+
+/// Boxed, URL-free form of a reqwest error.
+fn boxed_net_err(e: reqwest::Error) -> Box<dyn std::error::Error + Send + Sync> {
+    crate::log_utils::net_err(e).into()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingConfig {
@@ -763,7 +786,7 @@ impl LlmFormatConverter for GeminiConnector {
                     }
                 } else {
                     // Possible partial JSON or other SSE noise
-                    tracing::trace!("Failed to parse Gemini chunk: {}. Chunk: {}", e, json_str);
+                    tracing::trace!("Failed to parse Gemini chunk: {} ({} bytes)", e, json_str.len());
                 }
             }
         }
@@ -1083,7 +1106,8 @@ impl GeminiConnector {
     /// Derives the API version dynamically from the model via struct-based authority.
     /// If model name already includes "models/" prefix (from API), use it directly.
     /// Otherwise, prepend "models/" for backward compatibility.
-    fn build_model_endpoint(&self, model: &str, action: &str, api_key: &str) -> String {
+    /// The API key is NOT part of the URL — attach it with `with_gemini_key`.
+    fn build_model_endpoint(&self, model: &str, action: &str) -> String {
         let gemini_model = GeminiModel::from_slug(model);
         let api_version = gemini_model.api_version();
         let model_path = if model.starts_with("models/") {
@@ -1092,8 +1116,8 @@ impl GeminiConnector {
             format!("models/{}", model)
         };
         format!(
-            "{}/{}/{}:{}?key={}",
-            self.base_url, api_version, model_path, action, api_key
+            "{}/{}/{}:{}",
+            self.base_url, api_version, model_path, action
         )
     }
 
@@ -1143,14 +1167,13 @@ impl GeminiConnector {
         };
 
         let url =
-            self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
+            self.build_model_endpoint(&self.config.summary_model, "generateContent");
 
-        let response = client
-            .post(&url)
+        let response = with_gemini_key(client.post(&url), &api_key)
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(boxed_net_err)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1158,7 +1181,7 @@ impl GeminiConnector {
                 .text()
                 .await
                 .unwrap_or_else(|_| "Failed to read error body".to_string());
-            tracing::error!("Gemini API Error [{}]: {}", status, body_text);
+            tracing::error!("Gemini API Error [{}]: {}", status, crate::log_utils::truncate_for_log(&body_text, crate::log_utils::LOG_BODY_MAX_CHARS));
             return Err(Box::new(std::io::Error::other(format!(
                 "API request failed with status {}: {}",
                 status, body_text
@@ -1168,15 +1191,15 @@ impl GeminiConnector {
         let response_json: GeminiResponse = response
             .json()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(boxed_net_err)?;
 
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
-                tracing::trace!("Raw LLM tool selection response: {}", part.text);
+                tracing::trace!("Raw LLM tool selection response: {} chars", part.text.len());
 
                 match parse_selection_response(&part.text) {
                     Ok(selection) => {
-                        tracing::info!(
+                        tracing::debug!(
                             "Tool selection complete: {} tools selected - {}",
                             selection.selected_tools.len(),
                             selection.reasoning
@@ -1218,14 +1241,13 @@ impl GeminiConnector {
         }
 
         // Use the helper for standardizing
-        let url = self.build_model_endpoint(&model, "generateContent", &api_key);
+        let url = self.build_model_endpoint(&model, "generateContent");
 
-        let response = client
-            .post(&url)
+        let response = with_gemini_key(client.post(&url), &api_key)
             .json(&request)
             .send()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(boxed_net_err)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1250,7 +1272,7 @@ impl GeminiConnector {
         let response_json: GeminiResponse = response
             .json()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(boxed_net_err)?;
 
         Ok(response_json)
     }
@@ -1411,7 +1433,7 @@ impl LlmConnector for GeminiConnector {
 
         // --- Logging Block ---
         {
-            if tracing::enabled!(tracing::Level::DEBUG) {
+            if crate::log_utils::debug_dumps_enabled() {
                 if let Ok(request_json) = serde_json::to_string_pretty(&request_body) {
                     let debug_dir = std::env::temp_dir().join("hobbes_debug_logs");
                     if std::fs::create_dir_all(&debug_dir).is_ok() {
@@ -1422,7 +1444,7 @@ impl LlmConnector for GeminiConnector {
             }
         }
 
-        let url = self.build_model_endpoint(&model, "streamGenerateContent", &api_key) + "&alt=sse";
+        let url = self.build_model_endpoint(&model, "streamGenerateContent") + "?alt=sse";
 
         // Belt-and-braces guard (retries at most once): a mid-chat provider
         // switch can leave a `thoughtSignature` minted by a different
@@ -1433,12 +1455,20 @@ impl LlmConnector for GeminiConnector {
         let mut signature_retry_used = false;
 
         for attempt in 0..MAX_RETRIES {
-            let response = match client.post(&url).json(&request_body).send().await {
+            let response = match with_gemini_key(client.post(&url), &api_key)
+                .json(&request_body)
+                .send()
+                .await
+            {
                 Ok(r) => r,
                 Err(e) => {
                     if attempt + 1 == MAX_RETRIES {
                         let _ = tx.send(StreamMessage::Error {
-                            message: format!("Network error after {} attempts: {}", MAX_RETRIES, e),
+                            message: format!(
+                                "Network error after {} attempts: {}",
+                                MAX_RETRIES,
+                                crate::log_utils::net_err(e)
+                            ),
                         });
                         return;
                     }
@@ -1477,7 +1507,7 @@ impl LlmConnector for GeminiConnector {
                         status,
                         attempt + 1,
                         2u64.pow(attempt),
-                        &body_text[..body_text.len().min(200)]
+                        crate::log_utils::truncate_for_log(&body_text, crate::log_utils::LOG_BODY_MAX_CHARS)
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
                     continue;
@@ -1597,13 +1627,10 @@ impl LlmConnector for GeminiConnector {
                                         signature,
                                     } => {
                                         // GAP 1: Diagnostic logging for thought_signature
-                                        if let Some(ref sig) = signature {
-                                            tracing::info!("Received function call '{}' with thought_signature: '{}'",
-                                                fc_name,
-                                                if sig.len() > 50 { &sig[..50] } else { sig }
-                                            );
+                                        if signature.is_some() {
+                                            tracing::debug!("Received function call '{}' with thought_signature", fc_name);
                                         } else {
-                                            tracing::warn!("Received function call '{}' WITHOUT thought_signature field", fc_name);
+                                            tracing::debug!("Received function call '{}' WITHOUT thought_signature field", fc_name);
                                         }
 
                                         // GAP 3: ALWAYS accumulate the function call into current_attempt_parts,
@@ -1963,14 +1990,13 @@ Recent Messages:
 
         tracing::info!("Using summary model: {}", self.config.summary_model);
         let url =
-            self.build_model_endpoint(&self.config.summary_model, "generateContent", &api_key);
+            self.build_model_endpoint(&self.config.summary_model, "generateContent");
 
-        let response = client
-            .post(&url)
+        let response = with_gemini_key(client.post(&url), &api_key)
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(boxed_net_err)?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1985,7 +2011,7 @@ Recent Messages:
                     error_response.error.message
                 );
             } else {
-                tracing::error!("Gemini API Error [{}]: {}", status, body_text);
+                tracing::error!("Gemini API Error [{}]: {}", status, crate::log_utils::truncate_for_log(&body_text, crate::log_utils::LOG_BODY_MAX_CHARS));
             }
             // Return a structured error instead of panicking or returning a generic reqwest::Error
             return Err(Box::new(std::io::Error::other(format!(
@@ -1997,12 +2023,12 @@ Recent Messages:
         let response_json: GeminiResponse = response
             .json()
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            .map_err(boxed_net_err)?;
 
         if let Some(candidate) = response_json.candidates.first() {
             if let Some(part) = candidate.content.parts.first() {
                 // The model's response is expected to be a JSON string.
-                tracing::trace!("Raw LLM summary response: {}", part.text);
+                tracing::trace!("Raw LLM summary response: {} chars", part.text.len());
 
                 // Attempt to parse the text directly as JSON.
                 if let Ok(json_value) = serde_json::from_str(&part.text) {
@@ -2900,18 +2926,29 @@ mod tests {
             cache_ttl_seconds: 300,
         };
         let connector = GeminiConnector::new(config);
-        let url =
-            connector.build_model_endpoint("gemini-3-pro-preview", "generateContent", "test-key");
-        assert!(
-            url.contains("/v1beta/models/gemini-3-pro-preview:generateContent"),
-            "URL should contain correct model path: {}",
-            url
+        let url = connector.build_model_endpoint("gemini-3-pro-preview", "generateContent");
+        assert_eq!(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-pro-preview:generateContent",
+            "URL must carry model path and no query string"
         );
-        assert!(
-            url.starts_with("https://generativelanguage.googleapis.com/"),
-            "URL should use correct base: {}",
-            url
+        assert!(!url.contains("key"), "API key must not be in the URL: {}", url);
+    }
+
+    #[test]
+    fn gemini_api_key_goes_in_header_not_url() {
+        let client = reqwest::Client::new();
+        let url = "https://generativelanguage.googleapis.com/v1beta/models/m:streamGenerateContent?alt=sse";
+        let req = with_gemini_key(client.post(url), "AIzaTESTKEY")
+            .build()
+            .expect("request builds");
+        assert_eq!(
+            req.headers().get(GEMINI_API_KEY_HEADER).and_then(|v| v.to_str().ok()),
+            Some("AIzaTESTKEY")
         );
+        assert!(req.headers().get(GEMINI_API_KEY_HEADER).unwrap().is_sensitive());
+        assert!(!req.url().as_str().contains("AIzaTESTKEY"));
+        assert_eq!(req.url().query(), Some("alt=sse"));
     }
 
     #[test]

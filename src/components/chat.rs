@@ -1836,7 +1836,6 @@ pub fn MessageBubble(
                                     ..
                                 } = stream_msg
                                 {
-                                    tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
                                     if !chunk.is_empty() {
                                         content.write().push_str(&chunk);
                                     }
