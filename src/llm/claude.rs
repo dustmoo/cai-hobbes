@@ -3452,6 +3452,12 @@ mod tests {
         assert!(beta.clear_at && !beta.drop_block);
         let bind = refused_features(400, &body("thinking.block_binding: Extra inputs are not permitted"), all);
         assert_eq!(bind, Features { drop_block: true, ..Default::default() });
+        // Exact wording the live API returned without the beta headers
+        // (scripts/probe_turn_context.py, 2026-10-02).
+        let live_clear = refused_features(400, &body("messages.1.clear_at: Extra inputs are not permitted"), all);
+        assert_eq!(live_clear, Features { clear_at: true, ..Default::default() });
+        let live_bind = refused_features(400, &body("thinking.adaptive.block_binding: Extra inputs are not permitted"), all);
+        assert_eq!(live_bind, Features { drop_block: true, ..Default::default() });
         let role = refused_features(400, &body("role 'system' is not supported on this model"), all);
         assert_eq!(role, Features { system_role: true, ..Default::default() });
         // Generic unknown field: every beta feature sent, never the role.

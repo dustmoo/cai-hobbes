@@ -35,10 +35,25 @@ BINDING_BETA = "thinking-binding-controls-2026-08-01"
 CACHE = {"type": "ephemeral"}
 
 
+PARAGRAPHS = [
+    "Hobbes is a desktop assistant that keeps a daily plan. The plan lists todos "
+    "with estimates, calendar events, and focus blocks, and it is reviewed each morning.",
+    "A todo has a title, a project, an estimate in minutes, and a status. Done todos "
+    "stay visible until the end of the day so the review can count them.",
+    "Calendar events count against daily capacity when the user enables that setting. "
+    "Focus blocks reserve time for deep work and can be moved during the day.",
+    "The weekly review looks at what was planned, what was finished, and what slipped, "
+    "and suggests a smaller plan when the same todos keep moving to the next day.",
+]
+
+
 def filler(n_words: int, seed: str) -> str:
-    words = ["hobbes", "plans", "the", "day", "while", "the", "cache", "stays",
-             "warm", "and", "the", "ledger", "grows", "slowly"]
-    return " ".join(f"{seed}{words[i % len(words)]}{i % 97}" for i in range(n_words))
+    """Plain-English reference text (nonsense tokens triggered refusals)."""
+    out, i = [], 0
+    while sum(len(p.split()) for p in out) < n_words:
+        out.append(f"({seed}{i}) " + PARAGRAPHS[i % len(PARAGRAPHS)])
+        i += 1
+    return "\n".join(out)
 
 
 SYSTEM = [{
@@ -53,7 +68,7 @@ LEDGER = ("[Context update: planner_today. Replaces earlier values.]\n"
 
 def tail(n: int) -> str:
     return (f"[Turn context]\n{{\"current_time\":\"2026-10-02T10:0{n}:00-07:00\"}}\n"
-            "TURN NOTE: answer in one short sentence. " + filler(120, f"t{n}"))
+            "TURN NOTE: answer in one short sentence.\n" + filler(120, f"t{n}"))
 
 
 def thinking(binding: str | None = None) -> dict:
@@ -83,6 +98,7 @@ def post(body: dict, key: str, betas: list[str]) -> dict:
         with urllib.request.urlopen(req, timeout=180) as resp:
             j = json.loads(resp.read().decode())
             return {"status": resp.status, "stop_reason": j.get("stop_reason"),
+                    "stop_details": j.get("stop_details"),
                     "usage": j.get("usage"), "content": j.get("content"),
                     "input_transformations": j.get("input_transformations")}
     except urllib.error.HTTPError as e:
@@ -91,6 +107,8 @@ def post(body: dict, key: str, betas: list[str]) -> dict:
 
 def summarize(name: str, r: dict) -> None:
     print(f"\n{name}: HTTP {r['status']} stop_reason={r.get('stop_reason')}")
+    if r.get("stop_details"):
+        print("  stop_details: " + json.dumps(r["stop_details"]))
     if "error" in r:
         print("  error: " + r["error"])
         return
@@ -125,8 +143,8 @@ def main() -> int:
     # 1. Turn 1: ledger on the user turn, tail as clear_at system message.
     t1 = {"role": "system", "content": tail(1), "clear_at": "next_user_message"}
     a = run("A turn1 clear_at", dict(base, messages=[user1, t1]), [CLEAR_AT_BETA])
-    if a["status"] != 200:
-        print("\nTurn 1 failed; later calls depend on it. Stopping.")
+    if a["status"] != 200 or a.get("stop_reason") == "refusal":
+        print("\nTurn 1 failed or was refused; later calls depend on it. Stopping.")
         return 1
     assistant1 = {"role": "assistant", "content": clean(a["content"])}
     user2 = {"role": "user", "content": [
