@@ -106,27 +106,6 @@ fn system_role_refused() -> &'static std::sync::Mutex<std::collections::HashSet<
     S.get_or_init(Default::default)
 }
 
-/// Sessions that had a deliberate history rewrite. `drop_block` applies to
-/// one request only, so the docs say to keep sending it for the rest of the
-/// session; that also keeps the `thinking` parameter stable afterwards.
-fn rewritten_sessions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
-    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::OnceLock::new();
-    S.get_or_init(Default::default)
-}
-
-/// Record a rewrite for `session_id` (when `rewritten`) and report whether
-/// the session has had one at any point.
-fn note_rewrite(session_id: &str, rewritten: bool) -> bool {
-    let Ok(mut set) = rewritten_sessions().lock() else {
-        return rewritten;
-    };
-    if rewritten {
-        set.insert(session_id.to_string());
-    }
-    set.contains(session_id)
-}
-
 /// Per-request rendering switches: what the model supports and which betas
 /// the API hasn't refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,8 +116,6 @@ struct RequestOpts {
     clear_at: bool,
     /// May send `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`.
     drop_block: bool,
-    /// The session had a rewrite earlier: keep sending `drop_block`.
-    sticky_drop_block: bool,
 }
 
 impl RequestOpts {
@@ -1069,9 +1046,8 @@ impl ClaudeConnector {
     }
 
     /// Rendering switches for a request: model support plus whatever the
-    /// API hasn't refused this process. With a `session_id`, records a
-    /// history rewrite so later requests of that session keep `drop_block`.
-    fn request_opts(&self, session_id: Option<&str>, history_rewritten: bool) -> RequestOpts {
+    /// API hasn't refused this process.
+    fn request_opts(&self) -> RequestOpts {
         use std::sync::atomic::Ordering;
         let model = ClaudeModel::from_slug(&self.config.model);
         let refused = system_role_refused()
@@ -1082,7 +1058,6 @@ impl ClaudeConnector {
             system_role: model.supports_mid_conversation_system() && !refused,
             clear_at: !CLEAR_AT_REFUSED.load(Ordering::SeqCst),
             drop_block: !DROP_BLOCK_REFUSED.load(Ordering::SeqCst),
-            sticky_drop_block: session_id.is_some_and(|id| note_rewrite(id, history_rewritten)),
         }
     }
 
@@ -1208,13 +1183,13 @@ impl ClaudeConnector {
 impl ClaudeConnector {
     /// Build the native request plus a note of which volatile tail (if any)
     /// was appended, so the cache fingerprints can exclude it. Uses the
-    /// process-wide feature state, with no session (so no sticky drop_block).
+    /// process-wide feature state.
     fn build_request(
         &self,
         prompt: &LlmPrompt,
         streaming: bool,
     ) -> (serde_json::Value, VolatileTail) {
-        self.build_request_with(prompt, streaming, &self.request_opts(None, false))
+        self.build_request_with(prompt, streaming, &self.request_opts())
     }
 
     fn build_request_with(
@@ -1305,12 +1280,17 @@ impl ClaudeConnector {
             } else {
                 json!({ "type": "adaptive" })
             };
-            // A deliberate history rewrite leaves replayed thinking blocks
-            // bound to a prefix that no longer exists: ask the API to drop
-            // them instead of failing (beta; on older accounts any value
-            // opts the request into the check). Kept for the rest of the
-            // session, as the drop applies to one request only.
-            if opts.drop_block && (prompt.history_rewritten || opts.sticky_drop_block) {
+            // A replayed thinking block whose prefix no longer matches (a
+            // history trim, any other edit) would fail the request: ask the
+            // API to drop it instead (beta; on older accounts any value opts
+            // the request into the check, and the drop shows up in
+            // `input_transformations`). Sent on every request for models
+            // that bind their blocks, never keyed on the rewrite: the
+            // `thinking` object is part of the messages cache key, so
+            // switching it on for a trim and keeping it on through an
+            // in-memory flag (lost on restart) flipped it between otherwise
+            // identical requests and dropped the whole messages cache.
+            if opts.drop_block && model.binds_thinking_to_conversation() {
                 request["thinking"]["block_binding"] =
                     json!({ "prefix_mismatch_behavior": "drop_block" });
             }
@@ -1399,7 +1379,7 @@ impl LlmConnector for ClaudeConnector {
             }
         };
 
-        let mut opts = self.request_opts(session_id.as_deref(), prompt_data.history_rewritten);
+        let mut opts = self.request_opts();
         let (native_request, mut cache_state, turn_start) =
             self.prepare_request(&prompt_data, &opts);
         // Derived from each body sent: a feature fallback or the signature
@@ -3156,7 +3136,6 @@ mod tests {
         system_role: true,
         clear_at: true,
         drop_block: true,
-        sticky_drop_block: false,
     };
 
     /// Process-independent opts for `c`'s model (never reads the refusal
@@ -3287,7 +3266,7 @@ mod tests {
         assert_eq!(count_markers(&req), 3);
         assert_eq!(
             c.anthropic_beta_header(&req).as_deref(),
-            Some("mid-conversation-system-clear-at-2026-08-21")
+            Some("mid-conversation-system-clear-at-2026-08-21,thinking-binding-controls-2026-08-01")
         );
     }
 
@@ -3423,7 +3402,11 @@ mod tests {
         assert!(!req.to_string().contains("clear_at"));
         assert_eq!(req["messages"][1], json!({ "role": "system", "content": "T1" }));
         assert_eq!(req["messages"][4], json!({ "role": "system", "content": "T2" }));
-        assert_eq!(c.anthropic_beta_header(&req), None);
+        // Only the thinking-binding beta (sent on every Opus 5.5 request) is left.
+        assert_eq!(
+            c.anthropic_beta_header(&req).as_deref(),
+            Some("thinking-binding-controls-2026-08-01")
+        );
         assert_no_marker_on_tails(&req);
 
         // Refusing the role itself renders like an unsupported model.
@@ -3474,36 +3457,33 @@ mod tests {
     }
 
     #[test]
-    fn drop_block_only_on_rewrites_with_adaptive_thinking() {
+    fn drop_block_on_every_request_for_models_that_bind_thinking() {
         let opus = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
+        let plain = cache_prompt("persona", None, history());
         let rewritten = LlmPrompt {
             history_rewritten: true,
-            ..cache_prompt("persona", None, history())
+            ..plain.clone()
         };
-        let req = build(&opus, &rewritten, opts_for(&opus));
-        assert_eq!(
-            req["thinking"],
-            json!({
-                "type": "adaptive",
-                "display": "summarized",
-                "block_binding": { "prefix_mismatch_behavior": "drop_block" },
-            })
-        );
-        assert_eq!(
-            opus.anthropic_beta_header(&req).as_deref(),
-            Some("thinking-binding-controls-2026-08-01")
-        );
+        let expected = json!({
+            "type": "adaptive",
+            "display": "summarized",
+            "block_binding": { "prefix_mismatch_behavior": "drop_block" },
+        });
+        // Same `thinking` object with or without a rewrite: it is part of
+        // the messages cache key, so it must not change between requests.
+        for prompt in [&plain, &rewritten] {
+            let req = build(&opus, prompt, opts_for(&opus));
+            assert_eq!(req["thinking"], expected);
+            assert_eq!(
+                opus.anthropic_beta_header(&req).as_deref(),
+                Some("thinking-binding-controls-2026-08-01")
+            );
+        }
+        let fable = cache_connector("claude-fable-5-1", true, ClaudeCacheTtl::FiveMinutes);
+        assert!(build(&fable, &plain, opts_for(&fable))["thinking"].get("block_binding").is_some());
 
-        // No rewrite: nothing; sticky (session had one): still sent.
-        let plain = cache_prompt("persona", None, history());
-        assert!(build(&opus, &plain, opts_for(&opus))["thinking"].get("block_binding").is_none());
-        let sticky = RequestOpts {
-            sticky_drop_block: true,
-            ..opts_for(&opus)
-        };
-        assert!(build(&opus, &plain, sticky)["thinking"].get("block_binding").is_some());
-
-        // Refused, or thinking off: never.
+        // Refused, a model that doesn't bind its blocks, or thinking off:
+        // never, rewrite or not.
         let refused = opts_for(&opus).without(Features {
             drop_block: true,
             ..Default::default()
@@ -3511,30 +3491,26 @@ mod tests {
         let req = build(&opus, &rewritten, refused);
         assert!(req["thinking"].get("block_binding").is_none());
         assert_eq!(opus.anthropic_beta_header(&req), None);
+        let unbound = ClaudeConnector::new(ClaudeConfig {
+            model: "claude-opus-4-8".into(),
+            extended_thinking: true,
+            prompt_caching_enabled: true,
+            ..Default::default()
+        });
+        let req = build(&unbound, &rewritten, opts_for(&unbound));
+        assert_eq!(req["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(unbound.anthropic_beta_header(&req), None);
         let no_thinking = cache_connector("claude-sonnet-4-6", true, ClaudeCacheTtl::FiveMinutes);
         let req = build(&no_thinking, &rewritten, opts_for(&no_thinking));
         assert!(req.get("thinking").is_none());
         assert_eq!(no_thinking.anthropic_beta_header(&req), None);
 
         // Both betas comma-joined.
-        let mut both = ledger_turn();
-        both.history_rewritten = true;
-        let req = build(&opus, &both, opts_for(&opus));
+        let req = build(&opus, &ledger_turn(), opts_for(&opus));
         assert_eq!(
             opus.anthropic_beta_header(&req).as_deref(),
             Some("mid-conversation-system-clear-at-2026-08-21,thinking-binding-controls-2026-08-01")
         );
-    }
-
-    #[test]
-    fn sticky_drop_block_is_per_session() {
-        let c = cache_connector("claude-opus-5-5", true, ClaudeCacheTtl::FiveMinutes);
-        let id = "sticky-drop-block-test-session";
-        assert!(!c.request_opts(Some(id), false).sticky_drop_block);
-        assert!(c.request_opts(Some(id), true).sticky_drop_block);
-        assert!(c.request_opts(Some(id), false).sticky_drop_block);
-        assert!(!c.request_opts(Some("another-sticky-test-session"), false).sticky_drop_block);
-        assert!(!c.request_opts(None, false).sticky_drop_block);
     }
 
     #[test]
@@ -3655,5 +3631,209 @@ mod tests {
         assert_eq!(summarize_transformations(&json!([])), None);
         let delta = r#"data: {"type":"message_delta","input_transformations":[{"type":"thinking_dropped","reason":"model_binding_mismatch"}]}"#;
         assert!(scan_line_meta(delta).input_transformations.is_some());
+    }
+
+    // ── Prompt builder → request JSON: the cache prefix across a trim ──
+
+    mod trim_prefix {
+        use super::*;
+        use crate::components::chat::Message;
+        use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+        use crate::context::prompt_builder::PromptBuilder;
+        use crate::session::Session;
+        use crate::settings::{LlmProvider, ProviderInstance, ProviderInstanceConfig, Settings};
+
+        const CONNECTOR_ID: &str = "trim-prefix-claude";
+
+        fn settings() -> Settings {
+            Settings {
+                // Small, so a short synthetic chat crosses the trim threshold.
+                chat_history_length: 12,
+                llm_connectors: vec![ProviderInstance {
+                    id: CONNECTOR_ID.into(),
+                    name: "Claude".into(),
+                    config: ProviderInstanceConfig::Claude(ClaudeConfig {
+                        model: "claude-opus-5-5".into(),
+                        max_tokens: Some(4096),
+                        prompt_caching_enabled: true,
+                        ..Default::default()
+                    }),
+                }],
+                active_connector_id: Some(CONNECTOR_ID.into()),
+                ..Default::default()
+            }
+        }
+
+        fn session() -> Session {
+            Session {
+                id: "trim-prefix-session".into(),
+                name: "trim".into(),
+                messages: vec![],
+                active_context: Default::default(),
+                last_updated: chrono::Utc::now(),
+                accumulated_cost: 0.0,
+                accumulated_tokens: 0,
+                accumulated_turns: 0,
+                memory_optimization_summary: None,
+                composio_profile: None,
+                llm_connector_id: Some(CONNECTOR_ID.into()),
+                llm_provider: None,
+                chat_model: None,
+                project_id: None,
+                project_tag_user_set: false,
+                loaded_skills: Default::default(),
+                scratchpad: "notes that live in the ledger".into(),
+                current_ai_turn_count: 0,
+                watch_word_recovery_count: 0,
+                scheduled_timers: Vec::new(),
+                tool_call_history: Vec::new(),
+                tab_emoji: None,
+                tab_title: None,
+                name_user_set: false,
+                tab_title_provisional: false,
+                history_anchor: None,
+                context_ledger: Vec::new(),
+            }
+        }
+
+        fn message(author: &str, content: MessageContent) -> Message {
+            Message {
+                id: uuid::Uuid::new_v4(),
+                author: author.into(),
+                content,
+                attachments: vec![],
+                comments: vec![],
+                created_at: chrono::Utc::now(),
+                usage: None,
+            }
+        }
+
+        fn text(author: &str, body: String, thinking: Option<String>) -> Message {
+            let signed = thinking.is_some();
+            message(
+                author,
+                MessageContent::Text {
+                    content: body,
+                    thought_signature: signed.then(|| format!("sig-{}", uuid::Uuid::new_v4())),
+                    thought_summary: thinking,
+                    signature_provider: signed.then_some(LlmProvider::Claude),
+                },
+            )
+        }
+
+        fn tool_call(turn: usize, step: usize) -> Message {
+            message(
+                "Hobbes",
+                MessageContent::ToolCall(ToolCall {
+                    execution_id: uuid::Uuid::new_v4().to_string(),
+                    server_name: "srv".into(),
+                    tool_name: "lookup".into(),
+                    arguments: format!("{{\"turn\":{turn},\"step\":{step}}}"),
+                    status: ToolCallStatus::Completed,
+                    response: format!("{{\"turn\":{turn},\"step\":{step},\"ok\":true}}"),
+                    thought_signature: Some(format!("sig-{}", uuid::Uuid::new_v4())),
+                    thought_summary: Some(format!("Thinking about step {step} of turn {turn}.")),
+                    signature_provider: Some(LlmProvider::Claude),
+                    ..Default::default()
+                }),
+            )
+        }
+
+        /// The empty message a reply streams into; pushed before every build
+        /// as the live send and continuation flows do.
+        fn placeholder() -> Message {
+            text("Hobbes", String::new(), None)
+        }
+
+        fn has_thinking(req: &Value) -> bool {
+            req["messages"].as_array().unwrap().iter().any(|m| {
+                m["content"]
+                    .as_array()
+                    .is_some_and(|b| b.iter().any(|b| b["type"] == "thinking"))
+            })
+        }
+
+        struct Sent {
+            request: Value,
+            trimmed: bool,
+            continuation: bool,
+        }
+
+        /// Regression (Opus 5.5 session, request after a trim read only the
+        /// tools + system cache): the boundary build kept thinking on the
+        /// previous turn's final reply and the next continuation stripped it,
+        /// so the trim request's messages were not a prefix of the next one.
+        #[test]
+        fn trim_request_is_a_prefix_of_the_next_continuation() {
+            let settings = settings();
+            let connector = ClaudeConnector::new(match &settings.llm_connectors[0].config {
+                ProviderInstanceConfig::Claude(c) => c.clone(),
+                _ => unreachable!(),
+            });
+            let opts = opts_for(&connector);
+            let now = chrono::Local::now();
+            let mut session = session();
+            let mut sent: Vec<Sent> = Vec::new();
+
+            for turn in 0..12 {
+                let mut stream = vec![text("User", format!("request number {turn}"), None)];
+                stream.extend((0..2).map(|step| tool_call(turn, step)));
+                stream.push(text(
+                    "Hobbes",
+                    format!("Reply to request {turn}."),
+                    Some(format!("Reasoning behind reply {turn}.")),
+                ));
+                for msg in stream {
+                    // A request goes out after the user's message and after
+                    // each tool call; the reply ends the turn.
+                    let builds = !matches!(&msg.content, MessageContent::Text { .. })
+                        || msg.author == "User";
+                    let continuation = msg.author != "User";
+                    session.messages.push(msg);
+                    if !builds {
+                        continue;
+                    }
+                    session.messages.push(placeholder());
+                    let anchor_before = session.history_anchor;
+                    let result = PromptBuilder::new(&session, &settings)
+                        .with_now(now)
+                        .build_prompt(String::new());
+                    session.messages.pop();
+                    // Persisted between builds, as `chat.rs` does.
+                    session.history_anchor = result.history_anchor;
+                    session.context_ledger.extend(result.ledger_entries.iter().cloned());
+                    sent.push(Sent {
+                        request: build(&connector, &result.prompt, opts),
+                        trimmed: session.history_anchor != anchor_before,
+                        continuation,
+                    });
+                }
+            }
+
+            let mut trims_followed = 0;
+            for pair in sent.windows(2) {
+                let (prev, next) = (&pair[0], &pair[1]);
+                assert_eq!(
+                    prev.request["thinking"], next.request["thinking"],
+                    "the thinking object is part of the cache key and must not change"
+                );
+                if !next.continuation {
+                    continue;
+                }
+                let a = strip_markers(&prev.request["messages"]);
+                let b = strip_markers(&next.request["messages"]);
+                let (a, b) = (a.as_array().unwrap(), b.as_array().unwrap());
+                assert!(
+                    b.len() > a.len() && a[..] == b[..a.len()],
+                    "a continuation must extend the previous request exactly (trim: {})",
+                    prev.trimmed
+                );
+                if prev.trimmed {
+                    trims_followed += 1;
+                    assert!(has_thinking(&next.request), "the current tool loop keeps its thinking");
+                }
+            }
+            assert!(trims_followed > 0, "the chat must cross the trim threshold");
+        }
     }
 }

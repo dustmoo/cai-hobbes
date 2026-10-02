@@ -189,38 +189,51 @@ impl<'a> PromptBuilder<'a> {
         }
     }
 
-    /// Strip `ContentBlock::Thinking` blocks from all assistant messages except
-    /// the most recent one. This dramatically reduces context usage for models
-    /// with finite context windows — thinking content from historical turns is
-    /// the single largest contributor to context exhaustion on small models.
+    /// Strip `ContentBlock::Thinking` blocks from every assistant message
+    /// before the current turn. This dramatically reduces context usage for
+    /// models with finite context windows — thinking content from historical
+    /// turns is the single largest contributor to context exhaustion on small
+    /// models.
     ///
-    /// Walks messages in reverse: the most recent `ChatRole::Assistant` message
-    /// keeps its thinking blocks, and so does every assistant message in the
-    /// current tool loop (after the last `ChatRole::User` message) — Claude
-    /// Opus 5.5 and Fable 5.1 reject a tool loop whose thinking blocks were
-    /// partially dropped. Assistant messages from earlier turns are stripped.
+    /// The current turn starts at the last `ChatRole::User` message (tool
+    /// results are `ChatRole::Tool`, ledger entries and tails
+    /// `ChatRole::System`), not counting a trailing continuation nudge, which
+    /// stands in for silence rather than starting a turn. Every assistant
+    /// message after it keeps its thinking — Claude Opus 5.5 and Fable 5.1
+    /// reject a tool loop whose thinking blocks were partially dropped — and
+    /// every one before it is stripped.
+    ///
+    /// The rule depends only on where the turn starts, so within a turn each
+    /// request renders the messages it shares with the previous one
+    /// identically, and the prompt cache carries across the tool loop. (It
+    /// used to also keep thinking on the most recent assistant message even
+    /// when it belonged to an earlier turn: a boundary build then sent the
+    /// previous turn's final reply *with* its thinking and the next request
+    /// sent it without, so the first continuation of every turn missed the
+    /// cache from that reply on — the whole history right after a trim.)
+    /// What is stripped is always a leading run of the thinking blocks the
+    /// previous request carried, which preserved thinking allows.
     fn strip_historical_thinking(messages: &mut [ChatMessage]) {
-        let mut found_latest = false;
-        let mut in_current_turn = true;
-        for msg in messages.iter_mut().rev() {
-            if msg.role == ChatRole::User {
-                in_current_turn = false;
-            }
-            if msg.role == ChatRole::Assistant {
-                if found_latest && !in_current_turn {
-                    // Strip thinking from older assistant messages
-                    let before = msg.content.len();
-                    msg.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
-                    if msg.content.len() < before {
-                        tracing::debug!(
-                            "Stripped {} thinking block(s) from historical assistant message",
-                            before - msg.content.len()
-                        );
-                    }
-                } else {
-                    found_latest = true;
-                    // Keep thinking on the most recent assistant message
-                }
+        let is_nudge = |m: &ChatMessage| {
+            matches!(&m.content[..], [ContentBlock::Text { text }] if text == CONTINUATION_NUDGE)
+        };
+        let Some(turn_start) = messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::User && !is_nudge(m))
+        else {
+            return;
+        };
+        for msg in messages[..turn_start]
+            .iter_mut()
+            .filter(|m| m.role == ChatRole::Assistant)
+        {
+            let before = msg.content.len();
+            msg.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
+            if msg.content.len() < before {
+                tracing::debug!(
+                    "Stripped {} thinking block(s) from historical assistant message",
+                    before - msg.content.len()
+                );
             }
         }
     }

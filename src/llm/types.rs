@@ -104,9 +104,10 @@ pub struct LlmPrompt {
     #[serde(default)]
     pub turn_scoped: Vec<usize>,
     /// True when the prompt builder deliberately rewrote earlier history for
-    /// this request (a history trim). Replayed thinking blocks from before the
-    /// rewrite can no longer match their recorded prefix; Claude opts into
-    /// dropping them instead of failing the request.
+    /// this request (a history trim). Informational: Claude asks the API to
+    /// drop mismatched thinking blocks on every request of a model that binds
+    /// them (`ClaudeModel::binds_thinking_to_conversation`), not only on this
+    /// one, so the `thinking` parameter — part of the cache key — never flips.
     #[serde(default)]
     pub history_rewritten: bool,
     /// Conversation history + current user message
