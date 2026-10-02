@@ -1575,6 +1575,18 @@ struct SelectionState {
     left: f64,
 }
 
+/// Whether a Hobbes bubble should copy its text from `session_state` (P-016).
+///
+/// Only a bubble that is actively draining the live stream channel skips the
+/// mirror — it already receives every chunk. Everyone else mirrors, and that
+/// includes the moment the turn stops generating: the stream task writes the
+/// final chunks and clears the generating flag without yielding in between,
+/// so `generating == false` is exactly when the last sync must happen.
+fn should_mirror_session_text(owns_channel: bool, _generating: bool) -> bool {
+    // `_generating` deliberately does not gate the result — see the doc above.
+    !owns_channel
+}
+
 #[component]
 pub fn MessageBubble(
     message: Message,
@@ -1840,6 +1852,10 @@ pub fn MessageBubble(
                                 }
                             }
                         }
+                        // Channel drained (or never available): hand the bubble back
+                        // to the session_state mirror so it reconciles against the
+                        // persisted text once the turn ends (P-016).
+                        owns_channel.set(false);
                     });
                 }
             });
@@ -1850,35 +1866,43 @@ pub fn MessageBubble(
             // the full accumulated text into session_state on every chunk. Reading
             // session_state here subscribes this effect to those per-chunk writes, so
             // the output keeps painting live instead of freezing at the mount snapshot.
+            //
+            // It also runs the END-OF-TURN reconcile, for every Hobbes bubble. The
+            // stream task can drain its last buffered chunks and finish the turn
+            // without yielding, so this effect may never observe the final chunk
+            // while the turn is still generating. Bailing out once generating ended
+            // froze the bubble short of the persisted text (P-016) — so finishing
+            // is a reason to sync, never a reason to skip.
             use_effect(move || {
                 let _ = stream_manager.stream_activity.read();
+                // Reactive read: when the owner's channel loop ends it clears this
+                // flag, which re-runs the effect to reconcile.
+                let owns = owns_channel();
                 let state = session_state.read();
-                // Skip when we own the live channel (owner drives content directly) or
-                // the turn is no longer generating (nothing left to mirror).
-                if is_user || *owns_channel.peek() || !stream_manager.is_generating(&message.id) {
+                let sid = bubble_session_id.peek().clone();
+                let generating = stream_manager.is_generating(&message.id);
+                if is_user || !should_mirror_session_text(owns, generating) {
                     return;
                 }
-                if let Some((latest, latest_summary)) = state
+                let find = |m: &&Message| m.id == message.id;
+                let persisted = state
                     .sessions
-                    .values()
-                    .flat_map(|s| s.messages.iter())
-                    .find(|m| m.id == message.id)
-                    .and_then(|m| match &m.content {
-                        MessageContent::Text {
-                            content,
-                            thought_summary,
-                            ..
-                        } => Some((content.clone(), thought_summary.clone())),
-                        _ => None,
-                    })
+                    .get(&sid)
+                    .and_then(|s| s.messages.iter().find(find))
+                    .or_else(|| state.sessions.values().flat_map(|s| s.messages.iter()).find(find));
+                if let Some(MessageContent::Text {
+                    content: latest,
+                    thought_summary: latest_summary,
+                    ..
+                }) = persisted.map(|m| &m.content)
                 {
                     let mut changed = false;
-                    if *content.peek() != latest {
-                        content.set(latest);
+                    if *content.peek() != *latest {
+                        content.set(latest.clone());
                         changed = true;
                     }
-                    if *local_thought_summary.peek() != latest_summary {
-                        local_thought_summary.set(latest_summary);
+                    if *local_thought_summary.peek() != *latest_summary {
+                        local_thought_summary.set(latest_summary.clone());
                         changed = true;
                     }
                     if changed {
@@ -2665,5 +2689,32 @@ pub fn WelcomeMessage() -> Element {
                 "Start a new conversation"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bubble_sync_tests {
+    use super::should_mirror_session_text;
+
+    #[test]
+    fn finished_turn_still_reconciles_from_session_state() {
+        // Regression (P-016): a bubble that mounted after its activity block
+        // mirrors session_state. When the last chunks and the end of the turn
+        // land in one poll, the mirror's first look is with generating=false;
+        // skipping then froze the bubble short of the persisted reply.
+        assert!(should_mirror_session_text(false, false));
+    }
+
+    #[test]
+    fn non_owner_mirrors_while_generating() {
+        assert!(should_mirror_session_text(false, true));
+    }
+
+    #[test]
+    fn channel_owner_never_mirrors_until_its_channel_is_drained() {
+        // Mirroring while the owner still has buffered chunks would double
+        // the tail when the channel loop appends them afterwards.
+        assert!(!should_mirror_session_text(true, true));
+        assert!(!should_mirror_session_text(true, false));
     }
 }

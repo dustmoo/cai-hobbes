@@ -166,6 +166,7 @@ mod secret_manager_generic; // keyring crate
 | AP-007 | Reversed MCP Lock Order | App deadlock (hangs forever) | Always lock `servers` before `dynamic_local_tools` |
 | AP-008 | `use_memo` Over a Prop | Streaming code/markdown freezes at first chunk | Compute inline; reserve `use_memo` for Signals (P-012) |
 | AP-009 | Built-in Tool Intercepted at One Call Site | Tool works normally, fails only after a permission approval | Add it to `dispatch_builtin_tool`, never to a call site (P-015) |
+| AP-010 | Stream Mirror Skips Once Generating Ends | Finished reply cut off mid-sentence until a tab switch; DB has the full text | Reconcile from `session_state` at turn end; only a channel owner may skip (P-016) |
 
 ---
 
@@ -513,3 +514,46 @@ approval.
 
 **If broken**: the tool works in most turns and errors only after a permission
 prompt — the hardest possible failure to reproduce from a bug report.
+
+---
+
+### 16. A Finished Turn Is a Reason to Sync, Never a Reason to Skip
+
+> **Pattern ID**: P-016
+> **Anti-Pattern**: Gating a streaming bubble's `session_state` mirror on "still generating" (AP-010)
+
+`MessageBubble` renders a local `content` signal seeded at mount. It is fed one
+of two ways: the bubble that mounted empty owns the single-consumer stream
+channel and appends chunks; every other bubble (re-mounted after a tab switch,
+or mounted late because a live activity block absorbed the empty placeholder —
+i.e. every reply that follows tool calls) mirrors the text the stream task
+writes into `session_state` on each chunk.
+
+The stream task does not yield between chunks that are already buffered, and
+the final leg's cleanup (`summarize_and_cleanup`, the closed tool-results
+channel) is synchronous. So when rendering a long reply falls behind, the last
+chunks, the persisted final text **and** the removal of the generating flag all
+land in one poll. The mirror effect's next run sees `is_generating == false`;
+if it bails out there, the bubble stays frozen at an earlier chunk forever.
+
+**Symptom**: a long reply after tool calls stops mid-table or mid-sentence;
+the footer shows final tokens and cost; `sessions.db` holds the full text; a
+tab switch (remount re-seeds `content` from the prop) fixes it.
+
+**Rules**:
+- The mirror skips **only** while this bubble owns a still-open channel.
+  Everyone else mirrors, generating or not (`should_mirror_session_text`).
+- The channel owner clears `owns_channel` when its loop ends, and the mirror
+  reads that flag reactively, so the owner gets the same end-of-turn
+  reconcile. Never reconcile an owner before its channel drains — the loop
+  would then append the buffered tail a second time.
+- Don't "optimise" by early-returning on a stream state flag before comparing
+  against `session_state`; the compare is the cheap part.
+
+**Location**: `src/components/chat.rs` → `MessageBubble` (mirror effect,
+`should_mirror_session_text`)
+
+**Test**: `finished_turn_still_reconciles_from_session_state`.
+
+**If broken**: the end of long replies silently goes missing on screen while
+persistence, cost and history all look correct.
