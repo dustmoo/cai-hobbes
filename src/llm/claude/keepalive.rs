@@ -641,6 +641,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: Some("stable\nvolatile".into()),
             system_volatile_offset: Some(6),
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text { text: "hello".into() }],

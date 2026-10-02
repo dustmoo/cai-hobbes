@@ -933,6 +933,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: Some("be terse".to_string()),
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
@@ -956,6 +958,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![],
             tools: vec![ToolDefinition {
                 name: "send".to_string(),
@@ -980,6 +984,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![
                 ChatMessage {
                     role: ChatRole::Assistant,
@@ -1026,6 +1032,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![],
             tools: vec![],
         };

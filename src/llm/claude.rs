@@ -1100,6 +1100,8 @@ impl LlmConnector for ClaudeConnector {
                         let stripped_prompt = LlmPrompt {
                             system: prompt_data.system.clone(),
                             system_volatile_offset: prompt_data.system_volatile_offset,
+                            turn_scoped: Vec::new(),
+                            history_rewritten: false,
                             messages: stripped_messages,
                             tools: prompt_data.tools.clone(),
                         };
@@ -1669,6 +1671,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: Some("You are Hobbes.".to_string()),
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
@@ -1703,6 +1707,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::Tool,
                 content: vec![ContentBlock::ToolResult {
@@ -1726,6 +1732,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![],
             tools: vec![ToolDefinition {
                 name: "list_files".to_string(),
@@ -1813,6 +1821,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::Assistant,
                 content: vec![
@@ -1854,6 +1864,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -1872,6 +1884,8 @@ mod tests {
         let with_sig = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::Assistant,
                 content: vec![
@@ -1898,6 +1912,8 @@ mod tests {
         let no_sig = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::Assistant,
                 content: vec![
@@ -2059,6 +2075,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages,
             tools: vec![],
         };
@@ -2105,6 +2123,8 @@ mod tests {
         LlmPrompt {
             system: Some(system.to_string()),
             system_volatile_offset: offset,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages,
             tools: vec![],
         }

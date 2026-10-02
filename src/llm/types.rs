@@ -95,6 +95,20 @@ pub struct LlmPrompt {
     /// clamp it to `system.len()` and to a char boundary before slicing.
     #[serde(default)]
     pub system_volatile_offset: Option<usize>,
+    /// Indices into `messages` of turn-scoped context messages (the per-request
+    /// tail: clock + turn instructions). Each is a `ChatRole::System` message
+    /// persisted with the turn and replayed unchanged on later requests, so the
+    /// history stays append-only. Claude sends these with
+    /// `clear_at: "next_user_message"` where supported; other connectors send
+    /// them like any other system message. Empty = none.
+    #[serde(default)]
+    pub turn_scoped: Vec<usize>,
+    /// True when the prompt builder deliberately rewrote earlier history for
+    /// this request (a history trim). Replayed thinking blocks from before the
+    /// rewrite can no longer match their recorded prefix; Claude opts into
+    /// dropping them instead of failing the request.
+    #[serde(default)]
+    pub history_rewritten: bool,
     /// Conversation history + current user message
     pub messages: Vec<ChatMessage>,
     /// Available tools

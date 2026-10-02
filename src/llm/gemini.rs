@@ -2181,6 +2181,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2269,6 +2271,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2339,6 +2343,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2413,6 +2419,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -3017,6 +3025,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages,
             tools: vec![],
         };
@@ -3092,6 +3102,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![
                 crate::llm::ChatMessage {
                     role: crate::llm::ChatRole::Assistant,

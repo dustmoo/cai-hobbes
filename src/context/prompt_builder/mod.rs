@@ -140,6 +140,8 @@ impl<'a> PromptBuilder<'a> {
             prompt: NeutralLlmPrompt {
                 system: Some(ctx.system),
                 system_volatile_offset: ctx.volatile_offset,
+                turn_scoped: Vec::new(),
+                history_rewritten: false,
                 messages: linearised.messages,
                 tools: ctx.tools,
             },
