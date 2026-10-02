@@ -2105,6 +2105,7 @@ impl StreamManagerContext {
                     break;
                 }
                 if !removed_message_ids.is_empty() {
+                    session.prune_orphaned_ledger();
                     tracing::info!(
                         "Removed {} orphaned Running tool call(s) after stream cancellation.",
                         removed_message_ids.len()

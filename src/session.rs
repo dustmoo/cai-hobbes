@@ -360,6 +360,48 @@ pub struct Session {
     /// that no longer exists) means "recompute from the start of the chat".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history_anchor: Option<uuid::Uuid>,
+    /// Turn context ledger: live context (today's plan, scratchpad, loaded
+    /// skills, ...) and each request's turn-scoped tail, recorded as entries
+    /// anchored after the message they follow. The prompt builder splices
+    /// them into the outgoing history as `ChatRole::System` messages, so that
+    /// state reaches the model as an append-only part of the conversation
+    /// instead of a per-request system block. Written only from
+    /// `PromptBuildResult::ledger_entries`; entries whose anchor message is
+    /// gone are dropped by `prune_orphaned_ledger`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_ledger: Vec<LedgerEntry>,
+}
+
+/// What a [`LedgerEntry`] records.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerKind {
+    /// A context value that changed at a user-turn boundary (empty body =
+    /// the value was cleared).
+    Ledger,
+    /// One request's turn-scoped tail: the clock plus turn instructions.
+    Tail,
+    /// Part of the snapshot written when the history window was trimmed;
+    /// rendered after the pinned first message while `trim_anchor` is the
+    /// session's history anchor.
+    Trim,
+}
+
+/// One entry of `Session.context_ledger`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LedgerEntry {
+    pub id: uuid::Uuid,
+    /// The message this entry renders after.
+    pub after_message_id: uuid::Uuid,
+    pub kind: LedgerKind,
+    /// Context key (`planner_today`, `scratchpad`, ...); `tail` for tails.
+    pub key: String,
+    /// Canonical body. Empty on a `Ledger` entry means "cleared".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// `Trim` entries only: the history anchor whose window they belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trim_anchor: Option<uuid::Uuid>,
 }
 
 /// Stamp `created_at` on a message that is already in `messages`, without
@@ -549,6 +591,7 @@ impl Session {
             }
         }
         self.messages.truncate(index);
+        self.prune_orphaned_ledger();
 
         for exec_id in &deleted_execution_ids {
             let key = format!("tool_snapshot_{}", exec_id);
@@ -565,6 +608,20 @@ impl Session {
             );
         }
         count
+    }
+
+    /// Drop ledger entries whose anchor message is gone (rewind, cancel,
+    /// message removal), and trim snapshots whose window anchor is gone.
+    pub fn prune_orphaned_ledger(&mut self) {
+        if self.context_ledger.is_empty() {
+            return;
+        }
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            self.messages.iter().map(|m| m.id).collect();
+        self.context_ledger.retain(|e| {
+            ids.contains(&e.after_message_id)
+                && e.trim_anchor.is_none_or(|a| ids.contains(&a))
+        });
     }
 
     /// Legacy in-place undo. Journal-complete sessions should go through
@@ -1153,6 +1210,33 @@ impl SessionState {
             .is_some_and(|s| s.history_anchor != anchor)
     }
 
+    /// Append the ledger entries a prompt build produced
+    /// (`PromptBuildResult::ledger_entries`) to `session_id` and journal each
+    /// one. Call after `PromptBuilder::build_prompt` in a separate write
+    /// scope, like `set_history_anchor`. Entries already present (same id)
+    /// are skipped. Returns true when anything was appended.
+    pub fn append_ledger_entries(&mut self, session_id: &str, entries: Vec<LedgerEntry>) -> bool {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let fresh: Vec<LedgerEntry> = entries
+            .into_iter()
+            .filter(|e| !session.context_ledger.iter().any(|x| x.id == e.id))
+            .collect();
+        if fresh.is_empty() {
+            return false;
+        }
+        session.context_ledger.extend(fresh.iter().cloned());
+        crate::session_events::log_events(
+            session_id,
+            fresh
+                .into_iter()
+                .map(|entry| crate::session_events::SessionEvent::LedgerEntryAdded { entry })
+                .collect(),
+        );
+        true
+    }
+
     /// Store newly-generated paginated pages into the queue.
     /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
     ///
@@ -1596,6 +1680,7 @@ impl SessionState {
             name_user_set: false,
             tab_title_provisional: false,
             history_anchor: None,
+            context_ledger: Vec::new(),
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -1728,6 +1813,7 @@ impl SessionState {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
                 session.messages.remove(index);
+                session.prune_orphaned_ledger();
                 tracing::info!(message_id = %message_id, session_id = %session_id, "Removed message from target session.");
             }
         }
@@ -2069,6 +2155,7 @@ mod tests {
                 name_user_set: false,
             tab_title_provisional: false,
             history_anchor: None,
+            context_ledger: Vec::new(),
             }
         }
 
@@ -2915,6 +3002,7 @@ mod tests {
             name_user_set: false,
             tab_title_provisional: false,
             history_anchor: None,
+            context_ledger: Vec::new(),
             messages: vec![
                 Message {
                     id: msg1_id,

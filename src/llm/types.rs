@@ -95,6 +95,20 @@ pub struct LlmPrompt {
     /// clamp it to `system.len()` and to a char boundary before slicing.
     #[serde(default)]
     pub system_volatile_offset: Option<usize>,
+    /// Indices into `messages` of turn-scoped context messages (the per-request
+    /// tail: clock + turn instructions). Each is a `ChatRole::System` message
+    /// persisted with the turn and replayed unchanged on later requests, so the
+    /// history stays append-only. Claude sends these with
+    /// `clear_at: "next_user_message"` where supported; other connectors send
+    /// them like any other system message. Empty = none.
+    #[serde(default)]
+    pub turn_scoped: Vec<usize>,
+    /// True when the prompt builder deliberately rewrote earlier history for
+    /// this request (a history trim). Replayed thinking blocks from before the
+    /// rewrite can no longer match their recorded prefix; Claude opts into
+    /// dropping them instead of failing the request.
+    #[serde(default)]
+    pub history_rewritten: bool,
     /// Conversation history + current user message
     pub messages: Vec<ChatMessage>,
     /// Available tools
@@ -243,6 +257,17 @@ impl LlmPrompt {
 
             // Remove oldest messages
             self.messages.drain(..drop_count);
+            // Keep `turn_scoped` pointing at the same messages: indices of
+            // dropped messages go, the rest shift down by the drop and up by
+            // one for the marker inserted below.
+            self.turn_scoped = self
+                .turn_scoped
+                .iter()
+                .filter(|&&i| i >= drop_count)
+                .map(|&i| i - drop_count + 1)
+                .collect();
+            // Dropping from the front rewrites earlier history.
+            self.history_rewritten = true;
 
             // Inject a context-trimmed marker as the first message.
             // Framed explicitly as a system annotation so the model does not

@@ -15,7 +15,10 @@
 //! The ping is the last real request body with `stream: false` and
 //! `max_tokens: 0` (documented cache pre-warm: no output, usage returned).
 //! Everything that feeds the cache key (tools, system, messages, thinking,
-//! tool_choice) is left byte-identical.
+//! tool_choice) is left byte-identical, and the real request's
+//! `anthropic-beta` header is replayed verbatim: the body may carry beta
+//! fields (`clear_at`, `thinking.block_binding`) that are only valid, and
+//! only key the cache the same way, under the same betas.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,6 +111,8 @@ pub fn refresh_delay(configured_secs: u32) -> Duration {
 }
 
 /// A real turn start (a user message, not a tool-result continuation).
+/// Trailing `role: "system"` messages (ledger entries, turn-scoped tails)
+/// are context, not the turn's opener, so they are skipped.
 pub(super) fn is_turn_start(request: &Value, tail: VolatileTail) -> bool {
     let Some(all) = request["messages"].as_array() else {
         return false;
@@ -116,9 +121,9 @@ pub(super) fn is_turn_start(request: &Value, tail: VolatileTail) -> bool {
         VolatileTail::SystemMessage | VolatileTail::UserMessage => {
             &all[..all.len().saturating_sub(1)]
         }
-        VolatileTail::None | VolatileTail::TextBlock => all,
+        VolatileTail::None | VolatileTail::TextBlock(_) => all,
     };
-    let Some(last) = real.last() else {
+    let Some(last) = real.iter().rev().find(|m| m["role"] != "system") else {
         return false;
     };
     last["role"] == "user"
@@ -130,8 +135,9 @@ pub(super) fn is_turn_start(request: &Value, tail: VolatileTail) -> bool {
 // ── Ping request ──
 
 /// The ping body: the real request body with `stream` off and a minimal
-/// `max_tokens`. The cache-keyed fields are not touched, and the beta-only
-/// `diagnostics` field is dropped (the ping sends no beta header).
+/// `max_tokens`. The cache-keyed fields are not touched, and the
+/// `diagnostics` field is dropped (a ping has no previous message to compare
+/// against; the header alone without the field is valid).
 pub fn build_ping_body(real_body: &str, max_tokens: u32) -> Option<String> {
     let mut v: Value = serde_json::from_str(real_body).ok()?;
     let obj = v.as_object_mut()?;
@@ -175,6 +181,8 @@ struct Entry {
     dead: bool,
     settings: PingSettings,
     body: Option<String>,
+    /// The `anthropic-beta` header the body was sent with.
+    betas: Option<String>,
     prefix_tokens: i32,
     request_started: Instant,
     last_user_activity: Instant,
@@ -322,6 +330,7 @@ pub fn begin_request(start: RequestStart) {
         dead: false,
         settings: settings.clone(),
         body: None,
+        betas: None,
         prefix_tokens: 0,
         request_started: now,
         last_user_activity: now,
@@ -350,8 +359,16 @@ pub fn begin_request(start: RequestStart) {
     e.request_started = now;
 }
 
-/// The request completed: record its usage, remember its body, and re-arm.
-pub fn finish_request(session_id: &str, body: &str, input: i32, read: Option<i32>, created: Option<i32>) {
+/// The request completed: record its usage, remember its body and beta
+/// header, and re-arm.
+pub fn finish_request(
+    session_id: &str,
+    body: &str,
+    betas: Option<&str>,
+    input: i32,
+    read: Option<i32>,
+    created: Option<i32>,
+) {
     let (read, created) = (read.unwrap_or(0), created.unwrap_or(0));
     let Ok(mut r) = registry().lock() else {
         return;
@@ -371,6 +388,7 @@ pub fn finish_request(session_id: &str, body: &str, input: i32, read: Option<i32
         t.within_turn_cache_write = Some(t.within_turn_cache_write.unwrap_or(0) + created as i64);
     }
     e.body = Some(body.to_string());
+    e.betas = betas.map(str::to_string);
     e.prefix_tokens = read + created;
     let from = e.request_started;
     arm(session_id, e, from);
@@ -415,7 +433,7 @@ fn arm(session_id: &str, e: &mut Entry, from: Instant) {
 
 /// Decide, snapshot under the lock, then ping outside it.
 async fn run_ping(id: String, token: u64) {
-    let (body, settings, prefix, idle) = {
+    let (body, betas, settings, prefix, idle) = {
         let Ok(r) = registry().lock() else {
             return;
         };
@@ -443,6 +461,7 @@ async fn run_ping(id: String, token: u64) {
         }
         (
             e.body.clone().unwrap_or_default(),
+            e.betas.clone(),
             e.settings.clone(),
             e.prefix_tokens,
             idle,
@@ -450,7 +469,7 @@ async fn run_ping(id: String, token: u64) {
     };
 
     let started = Instant::now();
-    let Some(result) = send_ping(&body, &settings).await else {
+    let Some(result) = send_ping(&body, betas.as_deref(), &settings).await else {
         tracing::info!(session = %id, "cache keep-alive: ping failed; stopping for this tab");
         return;
     };
@@ -503,9 +522,28 @@ async fn run_ping(id: String, token: u64) {
     arm(&id, e, started);
 }
 
+/// The ping's HTTP request: same endpoint, version and beta header as the
+/// real request it replays.
+fn ping_request(
+    client: &reqwest::Client,
+    body: String,
+    api_key: &str,
+    betas: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client
+        .post(ANTHROPIC_API_URL)
+        .header("content-type", "application/json")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_VERSION);
+    if let Some(b) = betas {
+        req = req.header("anthropic-beta", b);
+    }
+    req.body(body)
+}
+
 /// POST the ping; falls back to `max_tokens: 1` if the API rejects 0.
 /// Returns (input, read, write) tokens, or None on any failure.
-async fn send_ping(real_body: &str, s: &PingSettings) -> Option<(i32, i32, i32)> {
+async fn send_ping(real_body: &str, betas: Option<&str>, s: &PingSettings) -> Option<(i32, i32, i32)> {
     let client = reqwest::Client::builder().timeout(PING_TIMEOUT).build().ok()?;
     let attempts: &[u32] = if ZERO_TOKENS_REJECTED.load(Ordering::SeqCst) {
         &[1]
@@ -514,15 +552,7 @@ async fn send_ping(real_body: &str, s: &PingSettings) -> Option<(i32, i32, i32)>
     };
     for &max_tokens in attempts {
         let body = build_ping_body(real_body, max_tokens)?;
-        let resp = client
-            .post(ANTHROPIC_API_URL)
-            .header("content-type", "application/json")
-            .header("x-api-key", &s.api_key)
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .body(body)
-            .send()
-            .await
-            .ok()?;
+        let resp = ping_request(&client, body, &s.api_key, betas).send().await.ok()?;
         let status = resp.status();
         let text = resp.text().await.ok()?;
         if status.is_success() {
@@ -641,6 +671,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: Some("stable\nvolatile".into()),
             system_volatile_offset: Some(6),
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text { text: "hello".into() }],
@@ -659,6 +691,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn turn_start_skips_trailing_system_messages() {
+        let opener = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "text", "text": "L1"}]},
+            {"role": "system", "content": "T1", "clear_at": "next_user_message"},
+        ]});
+        assert!(is_turn_start(&opener, VolatileTail::None));
+        let cont = json!({"messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "1", "name": "x", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "1", "content": "ok"}]},
+            {"role": "system", "content": "T2", "clear_at": "next_user_message"},
+        ]});
+        assert!(!is_turn_start(&cont, VolatileTail::None));
+    }
+
+    #[test]
+    fn ping_replays_beta_fields_and_the_beta_header() {
+        let real = json!({
+            "model": "claude-opus-5-5", "max_tokens": 32000, "stream": true,
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "system", "content": "T1", "clear_at": "next_user_message"},
+            ],
+            "thinking": {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}},
+        });
+        let ping: Value = serde_json::from_str(&build_ping_body(&real.to_string(), 0).unwrap()).unwrap();
+        assert_eq!(ping["messages"], real["messages"]);
+        assert_eq!(ping["thinking"], real["thinking"]);
+
+        let betas = "mid-conversation-system-clear-at-2026-08-21,thinking-binding-controls-2026-08-01";
+        let client = reqwest::Client::new();
+        let req = ping_request(&client, "{}".into(), "k", Some(betas)).build().unwrap();
+        assert_eq!(req.headers()["anthropic-beta"], betas);
+        assert_eq!(req.headers()["anthropic-version"], ANTHROPIC_VERSION);
+        let req = ping_request(&client, "{}".into(), "k", None).build().unwrap();
+        assert!(req.headers().get("anthropic-beta").is_none());
+
+        // The registry keeps the header the real request went out with.
+        let id = "ka-test-betas";
+        begin_request(start(id));
+        finish_request(id, "{}", Some(betas), 1, Some(10_000), Some(0));
+        assert_eq!(
+            registry().lock().unwrap().get(id).unwrap().betas.as_deref(),
+            Some(betas)
+        );
+        cancel_session(id);
+    }
+
+    #[test]
+    fn ping_header_matches_what_the_connector_sends() {
+        use crate::llm::claude::ClaudeConnector;
+        use crate::llm::types::{ChatMessage, ChatRole, ContentBlock, LlmPrompt};
+        let c = ClaudeConnector::new(ClaudeConfig {
+            model: "claude-opus-5-5".into(),
+            ..ClaudeConfig::default()
+        });
+        let text = |role, t: &str| ChatMessage {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        };
+        let prompt = LlmPrompt {
+            system: Some("stable".into()),
+            system_volatile_offset: None,
+            turn_scoped: vec![1],
+            history_rewritten: true,
+            messages: vec![text(ChatRole::User, "hello"), text(ChatRole::System, "T1")],
+            tools: vec![],
+        };
+        let (real, _) = c.build_request(&prompt, true);
+        let header = c.anthropic_beta_header(&real);
+        let body = serde_json::to_string(&real).unwrap();
+        let ping: Value = serde_json::from_str(&build_ping_body(&body, 0).unwrap()).unwrap();
+        // Same body-derived betas as the real request, so replaying the
+        // stored header is consistent with the replayed body.
+        assert_eq!(c.anthropic_beta_header(&ping), header);
+    }
+
     fn start(id: &str) -> RequestStart<'_> {
         // Leaked: tests only, keeps the borrow trivial.
         let cfg: &'static ClaudeConfig = Box::leak(Box::new(ClaudeConfig::default()));
@@ -669,7 +779,7 @@ mod tests {
     async fn new_request_and_cancel_invalidate_pending_timers() {
         let id = "ka-test-cancel";
         begin_request(start(id));
-        finish_request(id, "{}", 1, Some(10_000), Some(0));
+        finish_request(id, "{}", None, 1, Some(10_000), Some(0));
         let g1 = registry().lock().unwrap().get(id).unwrap().generation;
         assert!(registry().lock().unwrap().get(id).unwrap().timer.is_some());
         begin_request(start(id));

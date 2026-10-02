@@ -449,12 +449,20 @@ impl LlmFormatConverter for GeminiConnector {
         let mut contents: Vec<Content> = Vec::new();
 
         for msg in &prompt.messages {
+            // Mid-conversation system messages (ledger entries, turn-scoped
+            // tails) have no Gemini role of their own: they ride as user text
+            // marked as context, merged into the adjacent user turn below.
+            let is_system = msg.role == crate::llm::ChatRole::System;
             let mut parts = Vec::new();
             for block in &msg.content {
                 match block {
                     crate::llm::ContentBlock::Text { text } => {
                         parts.push(Part::Text {
-                            text: text.clone(),
+                            text: if is_system {
+                                crate::llm::convert::context_text(text)
+                            } else {
+                                text.clone()
+                            },
                             thought: None,
                         });
                     }
@@ -518,7 +526,7 @@ impl LlmFormatConverter for GeminiConnector {
                 crate::llm::ChatRole::User => "user".to_string(),
                 crate::llm::ChatRole::Assistant => "model".to_string(),
                 crate::llm::ChatRole::Tool => "user".to_string(), // Gemini uses 'user' role for tool results
-                crate::llm::ChatRole::System => "user".to_string(), // Should be handled by system_instruction
+                crate::llm::ChatRole::System => "user".to_string(), // Context text; merged below
             };
 
             // Merge consecutive same-role Content objects (Gemini API requirement).
@@ -2181,6 +2189,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2269,6 +2279,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2339,6 +2351,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -2413,6 +2427,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![crate::llm::ChatMessage {
                 role: crate::llm::ChatRole::User,
                 content: vec![crate::llm::ContentBlock::Text {
@@ -3017,6 +3033,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages,
             tools: vec![],
         };
@@ -3092,6 +3110,8 @@ mod tests {
         let prompt_data = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![
                 crate::llm::ChatMessage {
                     role: crate::llm::ChatRole::Assistant,
@@ -3139,5 +3159,78 @@ mod tests {
             recovered,
             "expected the retried (stripped) request to succeed"
         );
+    }
+
+    #[test]
+    fn mid_conversation_system_messages_merge_into_user_turns_as_context() {
+        use crate::llm::{ChatMessage, ChatRole, ContentBlock, LlmPrompt};
+        let text = |role, t: &str| ChatMessage {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        };
+        let prompt = LlmPrompt {
+            system: Some("persona".into()),
+            system_volatile_offset: None,
+            turn_scoped: vec![2, 5],
+            history_rewritten: false,
+            messages: vec![
+                text(ChatRole::User, "hi"),
+                text(ChatRole::System, "L1"),
+                text(ChatRole::System, "T1"),
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "x".into(),
+                        arguments: serde_json::json!({}),
+                        signature: None,
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        call_id: "c1".into(),
+                        name: "x".into(),
+                        content: serde_json::json!("ok"),
+                    }],
+                },
+                text(ChatRole::System, "T2"),
+            ],
+            tools: vec![],
+        };
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-2.5-flash".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+            model_slots: vec![],
+            context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
+        };
+        let connector = GeminiConnector::new(config);
+        let native = connector.to_native_request(&prompt, true);
+        let contents = native["contents"].as_array().unwrap();
+        // Strict user/model alternation: no consecutive same-role turns.
+        let roles: Vec<&str> = contents.iter().map(|c| c["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "model", "user"]);
+        let texts = |i: usize| -> Vec<String> {
+            contents[i]["parts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p["text"].as_str().map(str::to_string))
+                .collect()
+        };
+        assert_eq!(texts(0), ["hi", "[Context]\nL1", "[Context]\nT1"]);
+        let first = &contents[2]["parts"][0];
+        assert!(
+            first.get("functionResponse").is_some() || first.get("function_response").is_some(),
+            "{first}"
+        );
+        assert_eq!(texts(2), ["[Context]\nT2"]);
+        assert_eq!(native, connector.to_native_request(&prompt, true));
     }
 }

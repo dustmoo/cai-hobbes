@@ -230,18 +230,52 @@ pub fn rollup_lines(
     now: DateTime<Utc>,
     cap: usize,
 ) -> Vec<String> {
-    let mut with_minutes: Vec<(&FleetSession, u32)> =
-        rows.iter().map(|s| (s, s.minutes_on(date, now))).collect();
+    session_lines(rows, date, now, cap, 1)
+}
+
+/// Step the AI-facing fleet minutes are rounded down to.
+pub const CTX_MINUTES_STEP: u32 = 15;
+
+/// Lines for the AI's `planner_today` fleet block: the rollup lines, with
+/// each session's active time rounded down to [`CTX_MINUTES_STEP`] minutes
+/// ("<15m" below one step). `planner_today` reaches the model through the
+/// turn context ledger, which records it again whenever its rendering
+/// changes; exact minutes would change it on every request while any coding
+/// session is active.
+pub fn fleet_context_lines(
+    rows: &[FleetSession],
+    date: NaiveDate,
+    now: DateTime<Utc>,
+    cap: usize,
+) -> Vec<String> {
+    session_lines(rows, date, now, cap, CTX_MINUTES_STEP)
+}
+
+/// Shared body of [`rollup_lines`] / [`fleet_context_lines`]: minutes are
+/// rounded down to `step` before sorting and formatting.
+fn session_lines(
+    rows: &[FleetSession],
+    date: NaiveDate,
+    now: DateTime<Utc>,
+    cap: usize,
+    step: u32,
+) -> Vec<String> {
+    let step = step.max(1);
+    let mut with_minutes: Vec<(&FleetSession, u32)> = rows
+        .iter()
+        .map(|s| (s, s.minutes_on(date, now) / step * step))
+        .collect();
     with_minutes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.name.cmp(&b.0.name)));
     with_minutes
         .into_iter()
         .take(cap)
         .map(|(s, m)| {
-            let mut line = format!(
-                "{} — {}",
-                truncate_summary(s.display_name(), 60),
+            let time = if m == 0 && step > 1 {
+                format!("<{step}m")
+            } else {
                 format_minutes(m)
-            );
+            };
+            let mut line = format!("{} — {}", truncate_summary(s.display_name(), 60), time);
             if let Some(b) = &s.brief {
                 line.push_str(&format!(" — {}", truncate_summary(&b.headline, 140)));
                 if let Some(blocked) = &b.blocked_on {
@@ -251,16 +285,6 @@ pub fn rollup_lines(
             line
         })
         .collect()
-}
-
-/// Headline-only lines for the AI's `planner_today` fleet block.
-pub fn fleet_context_lines(
-    rows: &[FleetSession],
-    date: NaiveDate,
-    now: DateTime<Utc>,
-    cap: usize,
-) -> Vec<String> {
-    rollup_lines(rows, date, now, cap)
 }
 
 /// Sessions included in a `HOBBES_FLEET_STATUS` report.
@@ -621,6 +645,27 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("big — 1h 30m — Shipped the thing; blocked: code review"));
         assert!(lines[1].starts_with("small — 5m"));
+    }
+
+    #[test]
+    fn fleet_context_minutes_round_down_to_fifteen() {
+        let day: NaiveDate = "2026-09-01".parse().unwrap();
+        let now = utc("2026-09-01T20:00:00Z");
+        let line = |minutes: u32| {
+            let mut s = session("s");
+            s.day_minutes.insert(day, minutes);
+            fleet_context_lines(&[s], day, now, 5).remove(0)
+        };
+        assert_eq!(line(5), "s — <15m");
+        assert_eq!(line(15), "s — 15m");
+        assert_eq!(line(29), "s — 15m");
+        assert_eq!(line(97), "s — 1h 30m");
+        // Ticking within one step leaves the rendering unchanged.
+        assert_eq!(line(91), line(104));
+        // The rollup keeps exact minutes.
+        let mut s = session("s");
+        s.day_minutes.insert(day, 97);
+        assert_eq!(rollup_lines(&[s], day, now, 5)[0], "s — 1h 37m");
     }
 
     #[test]

@@ -1,8 +1,11 @@
 use crate::components::shared::MessageContent;
-use crate::llm::types::{ChatMessage, ChatRole, ContentBlock, ToolDefinition};
+use crate::llm::types::{ChatMessage, ChatRole, ContentBlock};
 use serde_json::json;
 use super::PromptBuilder;
+use super::ledger;
 use super::types::{ToolResultPosition, unwrap_json_strings};
+use crate::session::{LedgerEntry, LedgerKind};
+use std::collections::HashMap;
 
 /// Decide whether a stored `thought_signature` may be replayed to the provider
 /// this prompt is being built for.
@@ -176,30 +179,63 @@ pub(crate) struct LinearisedMessages {
     /// Trim anchor this build used — persisted by the caller via
     /// `PromptBuildResult::history_anchor`.
     pub history_anchor: Option<uuid::Uuid>,
+    /// Indices into `messages` of the rendered request tails.
+    pub turn_scoped: Vec<usize>,
+    /// Ledger entries this build created (persisted by the caller).
+    pub ledger_entries: Vec<LedgerEntry>,
+    /// The window anchor differs from the stored one (a trim, or a reset
+    /// after the stored anchor's message was deleted).
+    pub history_rewritten: bool,
+}
+
+/// Push rendered ledger entries; tails are listed in `turn_scoped`. Only the
+/// current request's tail renders unless `all_tails` (Claude).
+fn emit_entries(
+    messages: &mut Vec<ChatMessage>,
+    turn_scoped: &mut Vec<usize>,
+    entries: Option<&Vec<&LedgerEntry>>,
+    all_tails: bool,
+    current_tail: Option<uuid::Uuid>,
+) {
+    for entry in entries.into_iter().flatten() {
+        if entry.kind == LedgerKind::Tail {
+            if !all_tails && Some(entry.id) != current_tail {
+                continue;
+            }
+            messages.push(ledger::system_message(ledger::render_entry(entry)));
+            turn_scoped.push(messages.len() - 1);
+        } else {
+            messages.push(ledger::system_message(ledger::render_entry(entry)));
+        }
+    }
 }
 
 impl<'a> PromptBuilder<'a> {
     /// Pass 1: Linearise the session message history into a flat `Vec<ChatMessage>`
     /// suitable for LLM consumption, with tool results tracked for Pass 2 budget
-    /// allocation.
+    /// allocation, and the turn context ledger spliced in (see `ledger.rs`).
     ///
     /// This handles:
     /// - First user message preservation
     /// - The forward-only history window (`resolve_history_window`), capped by
-    ///   message count and, for finite context windows, a char budget
+    ///   message count and, for finite context windows, a char budget. The
+    ///   window only moves at a user-turn boundary.
+    /// - Ledger bookkeeping: trim snapshot, boundary updates, the request tail
     /// - Text → ChatMessage conversion
     /// - ToolCall → functionCall + functionResponse with TOON condensation
     /// - SkillCall → brief stub
     /// - Vision injection from cached screenshots
+    /// - `user_message` (non-empty only on the debug path; live sends push the
+    ///   user message onto the session first), appended after the history
     pub(crate) fn linearise_messages(
         &self,
-        system: &str,
-        tools: &[ToolDefinition],
-        provider_context: Option<usize>,
-        tuning: &crate::settings::ResolvedContextTuning,
-        is_continuation_placeholder: bool,
-        last_message: Option<&crate::components::chat::Message>,
+        ctx: &super::system_context::SystemContextResult,
+        user_message: String,
     ) -> LinearisedMessages {
+        let tools = &ctx.tools;
+        let provider_context = ctx.provider_context;
+        let tuning = &ctx.tuning;
+        let is_continuation_placeholder = ctx.is_continuation_placeholder;
         let mut messages: Vec<ChatMessage> = Vec::new();
         let mut last_thought_signature: Option<String> = None;
         // Track positions of ToolResult messages for Pass 2 budget allocation
@@ -209,34 +245,55 @@ impl<'a> PromptBuilder<'a> {
         let pages_to_store: Vec<(String, crate::session::PagedResult)> = Vec::new();
 
         let session_messages = &self.session.messages;
-        let mut first_message_id = None;
+        let last_message = session_messages.last();
 
-        // 1. Add the first user message to preserve the original intent.
-        let mut first_pinned_idx = None;
-        if let Some((idx, first_message)) =
-            session_messages.iter().enumerate().find(|(_, m)| m.author == "User")
-        {
-            if let MessageContent::Text { .. } = &first_message.content {
-                messages.push(first_message.clone().into());
-                first_message_id = Some(first_message.id);
-                first_pinned_idx = Some(idx);
-            }
-        }
+        // 1. The first user message is pinned to preserve the original intent.
+        let first_pinned_idx = session_messages
+            .iter()
+            .position(|m| m.author == "User")
+            .filter(|&i| matches!(session_messages[i].content, MessageContent::Text { .. }));
+        let first_message_id = first_pinned_idx.map(|i| session_messages[i].id);
 
-        // 2. Add the history window: everything from the persisted trim anchor
-        // on. If we know the provider's context window size, the history must
-        // also fit what is left after system + tool definitions + safety margin
-        // consume their budget (a 32K model can't hold 75 messages). Both limits
-        // only decide *when* the anchor jumps forward (see
-        // `resolve_history_window`); they never re-derive the start on every
-        // build, which is what kept the outgoing prefix (and the provider's
-        // prompt cache) changing on every request.
+        // The message this build follows: the last one, not counting the empty
+        // placeholder the reply will stream into. Entries made by this build
+        // are anchored after it.
+        let anchor_msg = if is_continuation_placeholder {
+            session_messages.len().checked_sub(2).map(|i| &session_messages[i])
+        } else {
+            last_message
+        };
+        let has_param_user = !user_message.is_empty();
+        let persist_anchor = if has_param_user { None } else { anchor_msg.map(|m| m.id) };
+        let existing_tail = persist_anchor.and_then(|id| {
+            self.session
+                .context_ledger
+                .iter()
+                .find(|e| e.kind == LedgerKind::Tail && e.after_message_id == id)
+        });
+        // A user-turn boundary: the first build after a new user text message.
+        // A tail already anchored there means this is a retry of that build.
+        let at_boundary = has_param_user
+            || (anchor_msg.is_some_and(ledger::is_user_text) && existing_tail.is_none());
+
+        // 2. The history window: everything from the persisted trim anchor on.
+        // If we know the provider's context window size, the history must
+        // also fit what is left after system + live context + tool definitions
+        // + safety margin consume their budget (a 32K model can't hold 75
+        // messages). Both limits only decide *when* the anchor jumps forward
+        // (see `resolve_history_window`), and only at a user-turn boundary:
+        // mid-turn the window stays put even past a limit, so a trim never
+        // rewrites history inside a tool loop (whose thinking blocks must
+        // replay unchanged).
         let history_char_budget = provider_context.map(|ctx_tokens| {
-            // `system` includes the per-turn TURN_CONTEXT, so this budget moves a
-            // little between requests. That only shifts the moment a trim fires:
-            // the anchor never moves back, and a trim lands well under the
-            // budget, so a jittering system size can't flip the window.
-            let system_chars = system.len();
+            // The live context is counted at its current size, the way the
+            // old per-turn system block was; it only shifts the moment a trim
+            // fires (the anchor never moves back).
+            let live_chars: usize = ctx
+                .volatile
+                .iter()
+                .map(|(k, v)| k.len() + v.to_string().len())
+                .sum();
+            let system_chars = ctx.system.len() + live_chars;
             let tool_def_chars: usize = tools.iter()
                 .map(|t| t.name.len() + t.description.len() + t.parameters.to_string().len())
                 .sum();
@@ -255,14 +312,132 @@ impl<'a> PromptBuilder<'a> {
             );
             history_budget_chars
         });
-        let window = resolve_history_window(
-            session_messages,
-            self.session.history_anchor,
-            first_pinned_idx,
-            tuning.chat_history_length,
-            history_char_budget,
-        );
+        // A stored anchor whose message is gone (a rewind) already rewrote the
+        // history, so the window may be recomputed whatever the build.
+        let anchor_stale = self
+            .session
+            .history_anchor
+            .is_some_and(|a| !session_messages.iter().any(|m| m.id == a));
+        let window = if at_boundary || anchor_stale {
+            resolve_history_window(
+                session_messages,
+                self.session.history_anchor,
+                first_pinned_idx,
+                tuning.chat_history_length,
+                history_char_budget,
+            )
+        } else {
+            resolve_history_window(
+                session_messages,
+                self.session.history_anchor,
+                first_pinned_idx,
+                usize::MAX,
+                None,
+            )
+        };
         let start_index = window.start_index;
+        let history_rewritten = window.anchor != self.session.history_anchor;
+
+        // 3. Ledger bookkeeping on a working copy (persisted entries + the
+        // ones this build adds, which the caller persists).
+        let pinned_above = first_pinned_idx
+            .filter(|&i| i < start_index)
+            .map(|i| session_messages[i].id);
+        let window_pos: HashMap<uuid::Uuid, usize> = session_messages
+            .iter()
+            .enumerate()
+            .skip(start_index)
+            .map(|(i, m)| (m.id, i))
+            .collect();
+        let view = ledger::WindowView {
+            pinned_above,
+            trim_anchor: window.anchor,
+            window_pos: &window_pos,
+        };
+        let live = ledger::live_context(&ctx.volatile, session_messages, start_index);
+        let mut working: Vec<LedgerEntry> = self.session.context_ledger.clone();
+        let mut new_entries: Vec<LedgerEntry> = Vec::new();
+        let mut transient: Vec<LedgerEntry> = Vec::new();
+
+        if history_rewritten {
+            if let Some(trim_anchor) = window.anchor {
+                let snapshot = ledger::trim_snapshot(
+                    &live,
+                    &view,
+                    &working,
+                    first_message_id.unwrap_or(trim_anchor),
+                );
+                working.extend(snapshot.iter().cloned());
+                new_entries.extend(snapshot);
+            }
+        }
+        if at_boundary {
+            let latest = view.latest_visible(&working);
+            match persist_anchor {
+                Some(anchor) => {
+                    let updates = ledger::boundary_updates(&live, &latest, anchor);
+                    working.extend(updates.iter().cloned());
+                    new_entries.extend(updates);
+                }
+                None => transient.extend(ledger::boundary_updates(&live, &latest, uuid::Uuid::nil())),
+            }
+        }
+        let tail_text = || {
+            let now = self.now.unwrap_or_else(chrono::Local::now).to_rfc3339();
+            ledger::tail_body(&now, &ctx.turn_instructions)
+        };
+        let current_tail = match (persist_anchor, existing_tail) {
+            (Some(_), Some(tail)) => Some(tail.id),
+            (Some(anchor), None) => {
+                let tail = LedgerEntry {
+                    id: uuid::Uuid::new_v4(),
+                    after_message_id: anchor,
+                    kind: LedgerKind::Tail,
+                    key: ledger::TAIL_KEY.to_string(),
+                    body: tail_text(),
+                    trim_anchor: None,
+                };
+                let id = tail.id;
+                working.push(tail.clone());
+                new_entries.push(tail);
+                Some(id)
+            }
+            (None, _) => None,
+        };
+        if has_param_user {
+            // Nothing to anchor to: render, don't persist.
+            new_entries.clear();
+        }
+
+        // Claude replays every persisted tail (each was sent with its turn and
+        // must stay for the prefix to match); other providers get only the
+        // current request's — they bind nothing to it, and stale clocks would
+        // only add tokens.
+        let all_tails = self.effective_provider() == crate::settings::LlmProvider::Claude;
+        let mut by_anchor: HashMap<uuid::Uuid, Vec<&LedgerEntry>> = HashMap::new();
+        for entry in working.iter().filter(|e| e.kind != LedgerKind::Trim) {
+            by_anchor.entry(entry.after_message_id).or_default().push(entry);
+        }
+        let trim_entries: Vec<&LedgerEntry> = working
+            .iter()
+            .filter(|e| {
+                e.kind == LedgerKind::Trim && window.anchor.is_some() && e.trim_anchor == window.anchor
+            })
+            .collect();
+        let mut turn_scoped: Vec<usize> = Vec::new();
+
+        // The pinned first message renders above a trimmed window, followed
+        // by its own entries and then the trim snapshot. When the window
+        // reaches back to it, it renders in place like any other message.
+        if let Some(pinned_id) = pinned_above {
+            if let Some(first_message) = session_messages.iter().find(|m| m.id == pinned_id) {
+                messages.push(first_message.clone().into());
+            }
+            emit_entries(&mut messages, &mut turn_scoped, by_anchor.get(&pinned_id), all_tails, current_tail);
+        }
+        if !trim_entries.is_empty() {
+            emit_entries(&mut messages, &mut turn_scoped, Some(&trim_entries), all_tails, current_tail);
+        }
 
         // Identify the current turn's boundary: every message at or after the
         // most recent user text message belongs to the in-progress turn, and its
@@ -285,8 +460,8 @@ impl<'a> PromptBuilder<'a> {
 
         for (offset, message) in session_messages.iter().skip(start_index).enumerate() {
             let abs_idx = start_index + offset;
-            // Avoid duplicating the first message
-            if Some(message.id) != first_message_id {
+            // The pinned message already rendered above the window.
+            if Some(message.id) != pinned_above {
                 // Skip placeholder
                 if is_continuation_placeholder && last_message.is_some_and(|lm| message.id == lm.id) {
                     continue;
@@ -528,7 +703,24 @@ impl<'a> PromptBuilder<'a> {
                     }
                     _ => {}
                 }
+                emit_entries(&mut messages, &mut turn_scoped, by_anchor.get(&message.id), all_tails, current_tail);
             }
+        }
+
+        // Debug path only: a user message that isn't on the session, with the
+        // boundary updates and tail it would get, rendered but not persisted.
+        if has_param_user {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text { text: user_message }],
+            });
+            for entry in &transient {
+                messages.push(ledger::system_message(ledger::render_entry(entry)));
+            }
+        }
+        if current_tail.is_none() {
+            messages.push(ledger::system_message(tail_text()));
+            turn_scoped.push(messages.len() - 1);
         }
 
         LinearisedMessages {
@@ -536,6 +728,9 @@ impl<'a> PromptBuilder<'a> {
             tool_result_positions,
             pages_to_store,
             history_anchor: window.anchor,
+            turn_scoped,
+            ledger_entries: new_entries,
+            history_rewritten,
         }
     }
 }

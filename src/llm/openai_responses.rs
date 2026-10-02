@@ -148,6 +148,19 @@ impl OpenAiResponsesConnector {
             };
             let joined = text_parts.join("\n");
 
+            // Mid-conversation system message: OpenAI's Responses API takes
+            // system items anywhere; other servers implementing /responses
+            // may not, so they get user-role context text.
+            if msg.role == ChatRole::System
+                && !items.is_empty()
+                && !endpoint_is_openai(&self.config.endpoint)
+            {
+                if !joined.is_empty() {
+                    crate::llm::convert::push_context_as_user(&mut items, &joined, "input_text");
+                }
+                continue;
+            }
+
             if let Some((call_id, output)) = tool_result {
                 // Tool results are standalone items correlated by call_id.
                 items.push(json!({
@@ -933,6 +946,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: Some("be terse".to_string()),
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
@@ -956,6 +971,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![],
             tools: vec![ToolDefinition {
                 name: "send".to_string(),
@@ -980,6 +997,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![
                 ChatMessage {
                     role: ChatRole::Assistant,
@@ -1026,6 +1045,8 @@ mod tests {
         let prompt = LlmPrompt {
             system: None,
             system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![],
             tools: vec![],
         };
@@ -1148,5 +1169,40 @@ mod tests {
             ]
         });
         assert_eq!(extract_output_text(&resp), r#"{"summary":"done"}"#);
+    }
+
+    #[test]
+    fn mid_conversation_system_items_by_endpoint() {
+        let msgs = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+            ChatMessage {
+                role: ChatRole::System,
+                content: vec![ContentBlock::Text { text: "T1".into() }],
+            },
+        ];
+        let prompt = LlmPrompt {
+            system: Some("persona".into()),
+            system_volatile_offset: None,
+            turn_scoped: vec![1],
+            history_rewritten: false,
+            messages: msgs,
+            tools: vec![],
+        };
+        // OpenAI accepts system items anywhere.
+        let req = connector().to_responses_request(&prompt, true);
+        assert_eq!(req["input"][1], json!({ "role": "system", "content": "T1" }));
+        // Another server behind /responses: user-role context text.
+        let local = OpenAiResponsesConnector::new(cfg(
+            "http://localhost:1234/v1",
+            "llama3",
+            ApiStyle::Responses,
+        ));
+        let req = local.to_responses_request(&prompt, true);
+        let input = req["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0], json!({ "role": "user", "content": "hi\n\n[Context]\nT1" }));
     }
 }
