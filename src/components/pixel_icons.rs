@@ -386,8 +386,10 @@ pub fn tiger_rgba(cell_px: u32, colour: bool) -> (Vec<u8>, u32, u32) {
 /// The mascot, alive: idles through a small sprite loop — blink, ear-perk —
 /// as real frame swaps between [`TIGER_GRID`]/[`TIGER_GRID_BLINK`]/
 /// [`TIGER_GRID_EARS_UP`] rather than a transform on one fixed icon. Always
-/// looping for as long as this component stays mounted (the app-menu button
-/// it lives in is permanent, so that's the app's lifetime); `pouncing` (set
+/// looping for as long as this component stays mounted: the loop is a
+/// `use_future` owned by this component's scope, so it is cancelled on unmount
+/// and every instance (app menu, chat empty state) runs its own independent
+/// timer. `pouncing` (set
 /// briefly by the caller's click handler) overrides the loop with a one-shot
 /// squash-and-settle reaction — see the `.tiger-idle`/`.tiger-pounce`
 /// keyframes in `assets/main.css`.
@@ -411,8 +413,8 @@ pub fn AnimatedTiger(pouncing: Signal<bool>, width: u32, height: u32) -> Element
 
     let mut frame = use_signal(|| Frame::Idle);
 
-    use_effect(move || {
-        spawn(async move {
+    use_future(move || async move {
+        {
             // An irregular idle beat (blink sooner, ear-perk further out, a
             // held return to Idle in between) reads as attentive rather than
             // a metronome — real mascots don't blink on a fixed tempo.
@@ -426,7 +428,7 @@ pub fn AnimatedTiger(pouncing: Signal<bool>, width: u32, height: u32) -> Element
                 tokio::time::sleep(std::time::Duration::from_millis(450)).await;
                 frame.set(Frame::Idle);
             }
-        });
+        }
     });
 
     rsx! {
@@ -485,6 +487,13 @@ mod tests {
                 assert_eq!(row.chars().count(), 16, "row {row:?}");
             }
         }
+    }
+
+    #[test]
+    fn idle_loop_frames_are_visibly_distinct() {
+        assert_ne!(TIGER_GRID, TIGER_GRID_BLINK);
+        assert_ne!(TIGER_GRID, TIGER_GRID_EARS_UP);
+        assert_ne!(TIGER_GRID_BLINK, TIGER_GRID_EARS_UP);
     }
 
     #[test]

@@ -2670,6 +2670,9 @@ fn extract_bold_blocks(content: &str) -> Option<String> {
 
 #[component]
 pub fn WelcomeMessage() -> Element {
+    // Click-to-pounce, same feel as the app-menu mascot. The idle blink loop
+    // lives inside `AnimatedTiger` and ends when this empty state unmounts.
+    let mut pouncing = use_signal(|| false);
     rsx! {
         div {
             class: "flex flex-col items-center justify-center h-full text-fg-muted",
@@ -2677,10 +2680,20 @@ pub fn WelcomeMessage() -> Element {
             // the same 6px/5px pixel scale as the mockup (option B).
             div {
                 class: "flex items-start gap-1.5 mb-6",
-                Icon {
-                    icon: crate::components::pixel_icons::HobbesTiger,
-                    width: 96,
-                    height: 96,
+                div {
+                    class: "cursor-pointer",
+                    onclick: move |_| {
+                        pouncing.set(true);
+                        spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                            pouncing.set(false);
+                        });
+                    },
+                    crate::components::pixel_icons::AnimatedTiger {
+                        pouncing,
+                        width: 96,
+                        height: 96,
+                    }
                 }
                 crate::components::pixel_icons::PixelChatBubble { width: 80, height: 75 }
             }
