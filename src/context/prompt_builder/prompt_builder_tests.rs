@@ -2626,3 +2626,148 @@ fn turn_context_size_drops_sharply() {
     assert!(tail.len() * 20 < before, "per-request fresh context drops sharply");
     assert!(!result.prompt.system.as_deref().unwrap().contains("planner_today"));
 }
+
+// =========================================================================
+// Tool-result budget stability (prompt cache)
+// =========================================================================
+
+fn large_window_session(messages: Vec<Message>) -> Session {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::Gemini);
+    session.chat_model = Some("gemini-2.5-flash".to_string()); // 1M context
+    session.messages = messages;
+    session
+}
+
+fn filler(n: usize, tag: &str) -> String {
+    format!("{tag} ").repeat(n / (tag.len() + 1) + 1)
+}
+
+fn messages_json(result: &PromptBuildResult) -> Vec<String> {
+    result
+        .prompt
+        .messages
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect()
+}
+
+#[test]
+fn history_is_byte_identical_across_a_tool_round_on_a_large_window() {
+    let history = vec![
+        user_text_msg("first request"),
+        tool_call_msg("BIG_ONE", filler(300_000, "alpha"), None),
+        tool_call_msg("MID_A", filler(60_000, "bravo"), Some("summary a".into())),
+        tool_call_msg("MID_B", filler(53_000, "charlie"), Some("summary b".into())),
+        tool_call_msg("MID_C", filler(20_000, "delta"), None),
+        user_text_msg("now do the next thing"),
+    ];
+    let settings = Settings::default();
+
+    // Request 1: user text last. Request 2: one tool call/result appended.
+    let session1 = large_window_session(history.clone());
+    let req1 = PromptBuilder::new(&session1, &settings).build_prompt(String::new());
+    let mut with_call = history;
+    with_call.push(tool_call_msg("CURRENT", filler(25_000, "echo"), None));
+    let session2 = large_window_session(with_call);
+    let req2 = PromptBuilder::new(&session2, &settings).build_prompt(String::new());
+
+    let (j1, j2) = (messages_json(&req1), messages_json(&req2));
+    // History = everything in request 1 up to its last non-System message
+    // (trailing ledger/tail System entries may legitimately differ).
+    let hist_len = req1
+        .prompt
+        .messages
+        .iter()
+        .rposition(|m| m.role != ChatRole::System)
+        .unwrap()
+        + 1;
+    assert!(hist_len >= 5);
+    for i in 0..hist_len {
+        assert_eq!(j1[i], j2[i], "message {i} differs between request 1 and 2");
+    }
+    let text = tool_result_text(&req2);
+    assert!(!text.contains("HOBBES_PAGE_RESULT"), "nothing is cut when it all fits");
+    assert!(!text.contains("Summary of an earlier"), "no summary substitution when it fits");
+}
+
+#[test]
+fn no_cut_when_everything_fits_active_or_historical() {
+    let settings = Settings::default();
+    let payload = filler(300_000, "zulu");
+
+    // Active: the tool result is the current turn.
+    let active = large_window_session(vec![
+        user_text_msg("go"),
+        tool_call_msg("BIG", payload.clone(), None),
+    ]);
+    let r = PromptBuilder::new(&active, &settings).build_prompt(String::new());
+    assert!(!tool_result_text(&r).contains("HOBBES_PAGE_RESULT"));
+    assert!(tool_result_text(&r).len() >= payload.len());
+
+    // Historical: a later user message follows it, and a summary exists.
+    let historical = large_window_session(vec![
+        user_text_msg("go"),
+        tool_call_msg("BIG", payload.clone(), Some("short summary".into())),
+        user_text_msg("next"),
+    ]);
+    let r = PromptBuilder::new(&historical, &settings).build_prompt(String::new());
+    let text = tool_result_text(&r);
+    assert!(!text.contains("HOBBES_PAGE_RESULT"));
+    assert!(!text.contains("Summary of an earlier"));
+    assert!(text.len() >= payload.len());
+}
+
+#[test]
+fn over_budget_still_cuts_on_a_small_window() {
+    let mut session = create_test_session();
+    session.llm_provider = Some(LlmProvider::OpenAiCompat);
+    session.chat_model = Some("local-model".to_string());
+    session.messages = vec![
+        user_text_msg("first"),
+        tool_call_msg("BIG", filler(300_000, "yankee"), None),
+        user_text_msg("next"),
+    ];
+    let mut settings = Settings::default();
+    settings.openai_compat_config.endpoint = "http://localhost:11434/v1".to_string();
+    settings.openai_compat_config.max_context_tokens = Some(16_000);
+    let r = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    assert!(tool_result_text(&r).contains("HOBBES_PAGE_RESULT"));
+}
+
+/// Reproduces the real 1M-window session: ~45 historical results (a few large)
+/// make the per-result share small, so the old split cut the large ones, and cut
+/// them differently with vs without an active result.
+#[test]
+fn history_is_byte_identical_across_a_tool_round_with_many_results() {
+    let mut history = vec![user_text_msg("first request")];
+    for (i, size) in [300_000usize, 60_000, 50_000, 25_000].into_iter().enumerate() {
+        history.push(tool_call_msg(&format!("LARGE_{i}"), filler(size, "alpha"), None));
+    }
+    for i in 0..41 {
+        history.push(tool_call_msg(&format!("SMALL_{i}"), filler(5_000, "bravo"), None));
+    }
+    history.push(user_text_msg("now do the next thing"));
+    let settings = Settings::default();
+
+    let session1 = large_window_session(history.clone());
+    let req1 = PromptBuilder::new(&session1, &settings).build_prompt(String::new());
+    let mut with_call = history;
+    with_call.push(tool_call_msg("CURRENT", filler(25_000, "echo"), None));
+    let session2 = large_window_session(with_call);
+    let req2 = PromptBuilder::new(&session2, &settings).build_prompt(String::new());
+
+    let (j1, j2) = (messages_json(&req1), messages_json(&req2));
+    let hist_len = req1
+        .prompt
+        .messages
+        .iter()
+        .rposition(|m| m.role != ChatRole::System)
+        .unwrap()
+        + 1;
+    assert!(hist_len >= 46);
+    for i in 0..hist_len {
+        assert_eq!(j1[i], j2[i], "message {i} differs between request 1 and 2");
+    }
+    assert!(!tool_result_text(&req2).contains("HOBBES_PAGE_RESULT"));
+}

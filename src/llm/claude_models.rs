@@ -269,6 +269,17 @@ impl ClaudeModel {
         matches!(self, ClaudeModel::Fable5_1 | ClaudeModel::Opus5_5)
     }
 
+    /// Models whose thinking blocks are bound to the conversation that
+    /// produced them (preserved thinking's history-editing check). A replayed
+    /// block whose prefix changed is rejected, or dropped when the request
+    /// sets `thinking.block_binding.prefix_mismatch_behavior: "drop_block"`.
+    pub fn binds_thinking_to_conversation(&self) -> bool {
+        matches!(
+            self,
+            ClaudeModel::Fable5_1 | ClaudeModel::Opus5_5 | ClaudeModel::Sonnet5_5
+        )
+    }
+
     /// Whether the model supports extended/adaptive thinking.
     /// Gates the settings toggle and the `thinking` request param.
     pub fn supports_thinking(&self) -> bool {
