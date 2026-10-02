@@ -532,7 +532,24 @@ fn app() -> Element {
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
     // Usage log for cost tracking that survives session deletion
-    use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
+    let mut usage_log_sig = use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
+    // Cache keep-alive pings run on background tasks; their usage entries
+    // come back over a channel because a Signal can't be written from there.
+    use_hook(move || {
+        use llm::claude::keepalive;
+        keepalive::seed_spend(
+            usage_log_sig
+                .read()
+                .keepalive_spend_on_day(chrono::Local::now()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        keepalive::install_sink(tx);
+        spawn(async move {
+            while let Some(entry) = rx.recv().await {
+                usage_log_sig.write().record(entry);
+            }
+        });
+    });
 
     let skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
@@ -1992,6 +2009,9 @@ fn app() -> Element {
                 &closing_session_id,
             );
 
+            // No cache keep-alive pings for a tab that is no longer open.
+            llm::claude::keepalive::cancel_session(&closing_session_id);
+
             // The fleet row (if the bridge is armed) leaves the live map,
             // taking a closing brief from the conversation summary with it.
             let closing_summary = session_state
@@ -2107,6 +2127,7 @@ fn app() -> Element {
             tracing::info!("MenuHandler received action: {:?}", action);
             match action {
                 MenuAction::Quit => {
+                    llm::claude::keepalive::shutdown();
                     let mut app_quit = APP_QUIT.write();
                     *app_quit = true;
                 }

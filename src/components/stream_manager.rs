@@ -1752,6 +1752,10 @@ impl StreamManagerContext {
                                 cached_content_tokens: usage.cached_content_tokens,
                                 cache_creation_tokens: usage.cache_creation_tokens,
                                 cost: usage.cost,
+                                kind: crate::usage_log::UsageKind::Turn,
+                                cache: crate::llm::claude::keepalive::take_turn_telemetry(
+                                    &session_id,
+                                ),
                             });
                     }
                 }
