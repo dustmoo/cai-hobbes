@@ -51,6 +51,22 @@ impl<'a> PromptBuilder<'a> {
             .map(|(i, _)| i)
             .collect();
 
+        // Total size of all tool results, measured the same way the cut loop
+        // measures them, so "fits" here means "nothing would be cut" below.
+        let total_result_chars: usize = tool_result_positions
+            .iter()
+            .filter_map(|trp| messages.get(trp.msg_idx))
+            .filter_map(|m| match m.content.first() {
+                Some(ContentBlock::ToolResult { content, .. }) => Some(match content.as_str() {
+                    Some(s) => s.len(),
+                    None => serde_json::to_string_pretty(content)
+                        .unwrap_or_else(|_| content.to_string())
+                        .len(),
+                }),
+                _ => None,
+            })
+            .sum();
+
         // Resolve per-result budgets. With a known context window we split it
         // proportionally; with an unknown window (an unconfigured OpenAI-compatible
         // endpoint) we fall back to fixed caps so we never ship an unbounded
@@ -60,6 +76,7 @@ impl<'a> PromptBuilder<'a> {
             tool_def_chars,
             non_result_chars,
             tool_result_positions.len(),
+            total_result_chars,
             &active_indices,
             provider_context,
             tuning,
@@ -187,11 +204,23 @@ impl<'a> PromptBuilder<'a> {
     /// receive `active_result_budget_ratio` of the remaining budget, divided equally
     /// among them; historical results share the rest equally. When everything is
     /// active (or nothing is), the budget is split evenly within that group.
+    ///
+    /// If `total_result_chars` fits within the remaining budget, every result gets
+    /// an unlimited budget: nothing is cut, so the representation of a result does
+    /// not depend on whether it is classified active or historical (which changes
+    /// between requests of one turn and would break the byte-exact prompt cache).
+    ///
+    /// Known limitation: when results do NOT fit, the split above still varies per
+    /// request (active vs. historical classification), so the cut sizes for the
+    /// same historical result can differ between requests and bust the prompt
+    /// cache. Making that split stable is a known follow-up.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn compute_tool_result_budget(
         system_chars: usize,
         tool_def_chars: usize,
         non_result_message_chars: usize,
         num_tool_results: usize,
+        total_result_chars: usize,
         active_indices: &[usize],
         max_context_tokens: Option<usize>,
         tuning: &crate::settings::ResolvedContextTuning,
@@ -212,6 +241,10 @@ impl<'a> PromptBuilder<'a> {
 
         if num_tool_results == 0 {
             return Some(vec![]);
+        }
+
+        if total_result_chars <= remaining {
+            return Some(vec![usize::MAX; num_tool_results]);
         }
 
         let active_count = active_indices.len();
