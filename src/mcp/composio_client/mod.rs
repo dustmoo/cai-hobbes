@@ -483,7 +483,7 @@ impl ComposioClient {
         {
             Ok(result) => {
                 if let Some(new_url) = result.new_server_url {
-                    tracing::info!("[RECONNECT] Server re-patched: {}", new_url);
+                    tracing::info!("[RECONNECT] Server re-patched: {}", crate::log_utils::redact_url(&new_url));
                 } else {
                     tracing::info!(
                         "[RECONNECT] Server already configured for '{}'",

@@ -125,7 +125,7 @@ impl<'a> PromptBuilder<'a> {
 
         // Log page queue availability
         if !linearised.pages_to_store.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 "HOBBES_PAGE_RESULT available via hobbes-core — {} paginated result(s) queued",
                 linearised.pages_to_store.len()
             );

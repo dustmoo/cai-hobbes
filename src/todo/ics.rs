@@ -96,7 +96,8 @@ pub async fn fetch_ics(
     let response = request
         .send()
         .await
-        .map_err(|e| format!("Calendar feed request failed: {}", e))?;
+        // The feed URL is a credential (secret-token path/query): never echo it.
+        .map_err(|e| format!("Calendar feed request failed: {}", crate::log_utils::net_err(e)))?;
 
     let status = response.status();
     if status == reqwest::StatusCode::NOT_MODIFIED {
@@ -106,7 +107,7 @@ pub async fn fetch_ics(
         return Err(format!(
             "Calendar feed returned HTTP {} for {}",
             status.as_u16(),
-            url
+            crate::log_utils::redact_url(&url)
         ));
     }
 
@@ -123,7 +124,7 @@ pub async fn fetch_ics(
     let body = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read calendar feed body: {}", e))?;
+        .map_err(|e| format!("Failed to read calendar feed body: {}", crate::log_utils::net_err(e)))?;
 
     let events = parse_ics(&body, subscription_id, window)?;
     Ok(FetchOutcome::Fetched {

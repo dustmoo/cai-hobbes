@@ -966,9 +966,12 @@ fn scan_line_meta(line: &str) -> LineMeta {
     meta
 }
 
-/// Whether a response is a cache miss worth an `info` line.
-fn is_notable_miss(created: i32, read: i32, has_previous: bool) -> bool {
-    has_previous && (created > CACHE_WRITE_LOG_THRESHOLD || read == 0)
+/// Whether a response is a cache miss worth an `info` line: nothing read
+/// back, or a large write caused by a real divergence. A pure append (the
+/// previous request is an exact prefix) that still read from cache is just
+/// the cache growing — DEBUG only.
+fn is_notable_miss(created: i32, read: i32, has_previous: bool, pure_append: bool) -> bool {
+    has_previous && (read == 0 || (created > CACHE_WRITE_LOG_THRESHOLD && !pure_append))
 }
 
 /// Format the divergence line. Hashes, indices, roles and block types only.
@@ -1112,14 +1115,23 @@ impl ClaudeConnector {
             return;
         };
         let (created, read) = (created.unwrap_or(0), read.unwrap_or(0));
-        let notable = state
-            .previous
-            .as_ref()
-            .is_some_and(|_| is_notable_miss(created, read, true));
-        if let (true, Some(prev)) = (notable, &state.previous) {
-            tracing::info!("{}", format_miss_line(&state, prev, read, created));
+        let notable = state.previous.as_ref().is_some_and(|prev| {
+            let pure_append = matches!(
+                find_divergence(&prev.fingerprint, &state.fingerprint),
+                Divergence::None
+            );
+            is_notable_miss(created, read, true, pure_append)
+        });
+        if let Some(prev) = &state.previous {
+            if notable {
+                tracing::info!("{}", format_miss_line(&state, prev, read, created));
+            } else if created > CACHE_WRITE_LOG_THRESHOLD {
+                tracing::debug!("{}", format_miss_line(&state, prev, read, created));
+            }
         }
         if let Some(d) = diagnostics {
+            // Server diagnostics can be large; cap what reaches the log.
+            let d = crate::log_utils::truncate_for_log(&d.to_string(), 1024);
             if notable {
                 tracing::info!("Claude cache diagnostics (server): {}", d);
             } else {
@@ -1879,7 +1891,11 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            tracing::error!("Claude summarization error [{}]: {}", status, body);
+            tracing::error!(
+                "Claude summarization error [{}]: {}",
+                status,
+                crate::log_utils::truncate_for_log(&body, crate::log_utils::LOG_BODY_MAX_CHARS)
+            );
             return Err(Box::new(std::io::Error::other(format!(
                 "Summarization API request failed with status {}: {}",
                 status, body
@@ -3059,10 +3075,12 @@ mod tests {
         assert!(line.contains("prev_messages=7 new_messages=7"));
         assert!(line.contains("messages[3] changed (role=assistant, blocks=[text]) kind=in-place edit"));
         assert!(!line.contains("SECRET"));
-        assert!(is_notable_miss(5000, 100, true));
-        assert!(is_notable_miss(0, 0, true));
-        assert!(!is_notable_miss(100, 9000, true));
-        assert!(!is_notable_miss(9000, 0, false));
+        assert!(is_notable_miss(5000, 100, true, false));
+        assert!(is_notable_miss(0, 0, true, false));
+        assert!(is_notable_miss(0, 0, true, true), "read == 0 is always notable");
+        assert!(!is_notable_miss(5000, 100, true, true), "pure append with a read is DEBUG");
+        assert!(!is_notable_miss(100, 9000, true, false));
+        assert!(!is_notable_miss(9000, 0, false, false));
     }
 
     #[test]

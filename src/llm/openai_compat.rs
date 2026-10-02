@@ -95,11 +95,20 @@ impl LlmConnector for OpenAiCompatConnector {
 
             let dropped = prompt_data.enforce_context_budget(max_tokens, 6, chars_per_token);
             if dropped > 0 {
-                tracing::warn!(
-                    "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window",
-                    dropped,
-                    max_tokens
-                );
+                if crate::log_utils::first_time(&format!("oai_compat_trim:{}", self.config.model)) {
+                    tracing::info!(
+                        "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window (model '{}'; further trims logged at DEBUG)",
+                        dropped,
+                        max_tokens,
+                        self.config.model
+                    );
+                } else {
+                    tracing::debug!(
+                        "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window",
+                        dropped,
+                        max_tokens
+                    );
+                }
             }
         }
 
@@ -517,7 +526,7 @@ impl LlmConnector for OpenAiCompatConnector {
                         tracing::error!(
                             "OpenAI Compat Stream Error: {}\n  unparsed SSE buffer: {:?}",
                             e,
-                            &sse_buffer[..sse_buffer.len().min(300)],
+                            crate::log_utils::truncate_for_log(&sse_buffer, crate::log_utils::LOG_BODY_MAX_CHARS),
                         );
 
                         // Autorecovery: if no data has been sent yet and we have retries left,
@@ -617,12 +626,11 @@ You MUST respond with valid JSON containing exactly these fields:
             "stream": false
         });
 
-        // Dump truncated JSON to verify model is actually in the serialized body
         let body_str = serde_json::to_string(&request_body).unwrap_or_default();
         tracing::debug!(
-            "Summarizer request: endpoint='{}', body_start='{}'",
-            endpoint,
-            &body_str[..body_str.len().min(200)],
+            "Summarizer request: endpoint='{}', model='{}'",
+            crate::log_utils::redact_url(&endpoint),
+            request_body.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
         );
 
         let client = Client::builder()
@@ -654,15 +662,26 @@ You MUST respond with valid JSON containing exactly these fields:
                         if attempt < MAX_SUMMARIZER_RETRIES
                             && (e.is_connect() || e.is_timeout()) =>
                     {
-                        tracing::warn!(
-                            "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {}",
-                            attempt + 1, e
-                        );
+                        let e = crate::log_utils::net_err(e);
+                        // First connection failure per endpoint at WARN, the
+                        // rest (every summarizer call on a dead endpoint) at DEBUG.
+                        let key = format!("oai_summarizer_conn:{}", crate::log_utils::redact_url(&endpoint));
+                        if crate::log_utils::first_time(&key) {
+                            tracing::warn!(
+                                "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {} (further connection errors logged at DEBUG)",
+                                attempt + 1, e
+                            );
+                        } else {
+                            tracing::debug!(
+                                "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {}",
+                                attempt + 1, e
+                            );
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        last_err = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        last_err = Some(e.into());
                     }
                     Err(e) => {
-                        last_err = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        last_err = Some(crate::log_utils::net_err(e).into());
                         break;
                     }
                 }
@@ -676,7 +695,11 @@ You MUST respond with valid JSON containing exactly these fields:
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            tracing::error!("OpenAI Compat summarization error [{}]: {}", status, body);
+            tracing::error!(
+                "OpenAI Compat summarization error [{}]: {}",
+                status,
+                crate::log_utils::truncate_for_log(&body, crate::log_utils::LOG_BODY_MAX_CHARS)
+            );
             return Err(Box::new(std::io::Error::other(format!(
                 "Summarization API request failed with status {}: {}",
                 status, body
@@ -1194,7 +1217,7 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                         tracing::debug!(
                             "SSE parse: dropped non-JSON line ({}): {:?}",
                             e,
-                            &json_str[..json_str.len().min(120)]
+                            crate::log_utils::truncate_for_log(json_str, 120)
                         );
                     }
                 }
@@ -1343,7 +1366,7 @@ impl OpenAiCompatConnector {
         resolve_fn: &dyn Fn(&str) -> (String, String),
     ) {
         let trimmed = buffer.trim();
-        tracing::trace!("OpenAI Compat: Parsing inline tool_call: {}", trimmed);
+        tracing::trace!("OpenAI Compat: Parsing inline tool_call ({} chars)", trimmed.len());
 
         match serde_json::from_str::<Value>(trimmed) {
             Ok(val) => {
@@ -1363,7 +1386,7 @@ impl OpenAiCompatConnector {
                 } else {
                     tracing::warn!(
                         "OpenAI Compat: Inline tool_call JSON missing 'name': {}",
-                        trimmed
+                        crate::log_utils::truncate_for_log(trimmed, crate::log_utils::LOG_BODY_MAX_CHARS)
                     );
                     return;
                 };
@@ -1389,7 +1412,7 @@ impl OpenAiCompatConnector {
                 tracing::warn!(
                     "OpenAI Compat: Failed to parse inline tool_call JSON: {} — raw: {}",
                     e,
-                    trimmed
+                    crate::log_utils::truncate_for_log(trimmed, crate::log_utils::LOG_BODY_MAX_CHARS)
                 );
                 // Fall back to emitting as text so the user at least sees it
                 let _ = tx.send(StreamMessage::Text {

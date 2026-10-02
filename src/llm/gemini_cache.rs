@@ -160,7 +160,8 @@ pub async fn api_create_cache(
     prefix_hash: u64,
     key_fp: u64,
 ) -> Result<GeminiCacheEntry, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/v1beta/cachedContents?key={}", base_url.trim_end_matches('/'), api_key);
+    // Key goes in the x-goog-api-key header, never the URL.
+    let url = format!("{}/v1beta/cachedContents", base_url.trim_end_matches('/'));
     let ttl_str = format!("{}s", ttl_seconds);
 
     // If model name already has models/ prefix, make sure we use it as is
@@ -183,11 +184,11 @@ pub async fn api_create_cache(
 
     tracing::debug!("POST /v1beta/cachedContents request: model={}, messages_count={}", model, contents.len());
 
-    let response = client
-        .post(&url)
+    let response = crate::llm::gemini::with_gemini_key(client.post(&url), api_key)
         .json(&request_body)
         .send()
-        .await?;
+        .await
+        .map_err(crate::log_utils::net_err)?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -203,7 +204,8 @@ pub async fn api_create_cache(
         ).into());
     }
 
-    let cache_resp: CachedContentResponse = response.json().await?;
+    let cache_resp: CachedContentResponse =
+        response.json().await.map_err(crate::log_utils::net_err)?;
     let expires_at = DateTime::parse_from_rfc3339(&cache_resp.expire_time)
         .map(|dt| dt.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now() + chrono::Duration::seconds(ttl_seconds as i64));
@@ -237,15 +239,17 @@ pub async fn api_delete_cache(
     cache_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let url = format!(
-        "{}/v1beta/{}?key={}",
+        "{}/v1beta/{}",
         base_url.trim_end_matches('/'),
-        cache_id.trim_start_matches('/'),
-        api_key
+        cache_id.trim_start_matches('/')
     );
 
     tracing::debug!("DELETE /v1beta/{}", cache_id);
 
-    let response = client.delete(&url).send().await?;
+    let response = crate::llm::gemini::with_gemini_key(client.delete(&url), api_key)
+        .send()
+        .await
+        .map_err(crate::log_utils::net_err)?;
 
     if !response.status().is_success() {
         let status = response.status();

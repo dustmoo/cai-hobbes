@@ -43,15 +43,22 @@ impl<'a> PromptBuilder<'a> {
         if let Some(scratch) = system_context_map.get("scratchpad") {
             let scratch_chars = serde_json::to_string(scratch).map(|s| s.len()).unwrap_or(0);
             if scratch_chars > system_budget_chars / 2 {
-                tracing::warn!(
-                    "Scratchpad ({} chars) exceeds 50% of system budget ({} chars). \
-                     Consider calling HOBBES_UPDATE_SCRATCHPAD to condense it.",
-                    scratch_chars, system_budget_chars
-                );
+                if crate::log_utils::first_time("scratchpad_over_half_budget") {
+                    tracing::warn!(
+                        "Scratchpad ({} chars) exceeds 50% of system budget ({} chars). \
+                         Consider calling HOBBES_UPDATE_SCRATCHPAD to condense it.",
+                        scratch_chars, system_budget_chars
+                    );
+                } else {
+                    tracing::debug!(
+                        "Scratchpad ({} chars) exceeds 50% of system budget ({} chars).",
+                        scratch_chars, system_budget_chars
+                    );
+                }
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "System context composition: {} chars vs {} budget ({}K model). Compressing.",
             running_size, system_budget_chars, max_tokens / 1000
         );
@@ -146,7 +153,7 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "System context composition complete: ~{} chars (budget: {})",
             running_size, system_budget_chars
         );

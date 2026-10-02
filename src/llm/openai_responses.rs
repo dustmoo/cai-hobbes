@@ -472,11 +472,20 @@ impl LlmConnector for OpenAiResponsesConnector {
                 .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
             let dropped = prompt_data.enforce_context_budget(max_tokens, 6, chars_per_token);
             if dropped > 0 {
-                tracing::warn!(
-                    "OpenAI Responses: trimmed {} oldest messages to fit {} token window",
-                    dropped,
-                    max_tokens
-                );
+                if crate::log_utils::first_time(&format!("oai_responses_trim:{}", self.config.model)) {
+                    tracing::info!(
+                        "OpenAI Responses: trimmed {} oldest messages to fit {} token window (model '{}'; further trims logged at DEBUG)",
+                        dropped,
+                        max_tokens,
+                        self.config.model
+                    );
+                } else {
+                    tracing::debug!(
+                        "OpenAI Responses: trimmed {} oldest messages to fit {} token window",
+                        dropped,
+                        max_tokens
+                    );
+                }
             }
         }
 

@@ -149,7 +149,7 @@ impl<'a> PromptBuilder<'a> {
                         "[Summary of an earlier '{}' result — key facts preserved. Full data: call HOBBES_PAGE_RESULT with tool_call_id \"{}\"]\n\n{}",
                         tool_name, tool_call_id, summary
                     );
-                    tracing::info!(
+                    tracing::debug!(
                         "Pass 2: summarised historical '{}' ({} bytes → {} chars summary, id={})",
                         tool_name,
                         serialized.len(),
@@ -181,7 +181,7 @@ impl<'a> PromptBuilder<'a> {
                     "{}\n\n[More content available. To view the next page, use the HOBBES_PAGE_RESULT tool with tool_call_id \"{}\"]",
                     &serialized[..split_at], tool_call_id
                 );
-                tracing::info!(
+                tracing::debug!(
                     "Pass 2: paginated '{}' ({} bytes → {} chars budget, id={})",
                     tool_name,
                     serialized.len(),

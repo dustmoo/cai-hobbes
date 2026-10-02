@@ -164,7 +164,7 @@ pub fn hydrate_from_stored_key(stored: Option<&str>) {
     match stored {
         Some(key) => match Entitlement::verify(key) {
             Ok(info) => {
-                tracing::info!("Pro license verified for {}", info.email);
+                tracing::info!("Pro license verified");
                 activate(info);
             }
             Err(e) => {

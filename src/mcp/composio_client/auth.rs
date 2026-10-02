@@ -536,12 +536,8 @@ pub(crate) async fn create_auth_config(
         })
     };
 
-    tracing::trace!("Auth config payload: {:?}", payload);
-    tracing::trace!("Auth config request URL: {}", url);
-    tracing::trace!(
-        "Auth config payload: {}",
-        serde_json::to_string_pretty(&payload).unwrap_or_default()
-    );
+    // Payload intentionally not logged: it can carry OAuth client secrets.
+    tracing::trace!("Auth config request host: {}", crate::log_utils::redact_url(&url));
 
     let response = client
         .client
@@ -1089,7 +1085,11 @@ pub async fn initiate_connection(
         "callback_url": callback_url
     });
 
-    tracing::info!("[REST] Initiating connection via {}: {:?}", url, payload);
+    tracing::info!(
+        "[REST] Initiating connection via {} for toolkit '{}'",
+        crate::log_utils::redact_url(&url),
+        toolkit_slug
+    );
 
     let response = client
         .client
@@ -1099,10 +1099,10 @@ pub async fn initiate_connection(
         .json(&payload)
         .send()
         .await
-        .map_err(|e| format!("Connection initiation error: {}", e))?;
+        .map_err(|e| format!("Connection initiation error: {}", crate::log_utils::net_err(e)))?;
 
     let status = response.status();
-    let response_text = response.text().await.map_err(|e| e.to_string())?;
+    let response_text = response.text().await.map_err(crate::log_utils::net_err)?;
 
     // Debug log the response
     let _ = write_to_debug_file("composio_initiate_resp.json", &response_text);

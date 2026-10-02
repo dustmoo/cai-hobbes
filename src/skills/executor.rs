@@ -144,9 +144,10 @@ pub async fn execute_skill(
     let tool_map = mcp_context.map(extract_tool_map).unwrap_or_default();
     let available_keys: Vec<String> = tool_map.keys().cloned().collect();
 
-    tracing::info!(
-        "Available Capability Keys for Resolution: {:?}",
-        available_keys
+    tracing::debug!(
+        "Available Capability Keys for Resolution ({}): {}",
+        available_keys.len(),
+        crate::log_utils::cap_list(&available_keys, 5)
     );
     let mut resolved_tools = HashMap::new();
     let mut warnings = Vec::new();

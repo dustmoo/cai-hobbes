@@ -30,15 +30,16 @@ pub async fn validate_composio_api_key(api_key: &str) -> Result<(), String> {
                 Err(format!("API error ({}): {}", status, error_text))
             }
         }
-        Err(e) => Err(format!("Network error: {}", e)),
+        Err(e) => Err(format!("Network error: {}", crate::log_utils::net_err(e))),
     }
 }
 
-// Helper function to write content to a file for debugging
-// Only writes files when DEBUG or TRACE log level is enabled
+// Helper function to write content to a file for debugging.
+// Only writes with an explicit HOBBES_DEBUG_DUMPS=1 — these payloads include
+// auth configs and connected-account data, so DEBUG logging alone must not
+// switch them on.
 pub fn write_to_debug_file(filename: &str, content: &str) -> std::io::Result<()> {
-    // Only write debug files if DEBUG or TRACE level is enabled
-    if !tracing::enabled!(tracing::Level::DEBUG) {
+    if !crate::log_utils::debug_dumps_enabled() {
         return Ok(());
     }
 

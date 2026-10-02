@@ -464,7 +464,7 @@ impl<'a> PromptBuilder<'a> {
                     "loaded_skills".to_string(),
                     serde_json::Value::Array(skills_array),
                 );
-                tracing::info!(
+                tracing::debug!(
                     "Loaded skills injected: {} total, {} turn-active, {} idle",
                     self.session.loaded_skills.len(),
                     turn_active_skill_names.len(),
@@ -552,7 +552,7 @@ impl<'a> PromptBuilder<'a> {
                         .iter()
                         .any(|st| t.name == *st || t.name.ends_with(st))
                 });
-                tracing::info!(
+                tracing::debug!(
                     "Skill-scoped tool filter (last turn): {} → {} tools (skill resolved: {:?})",
                     before,
                     tools.len(),
@@ -660,7 +660,11 @@ impl<'a> PromptBuilder<'a> {
                     .collect();
                 for key in &oversized_keys {
                     entities_obj.remove(key);
-                    tracing::warn!("Stripped oversized entity '{}' from SYSTEM_CONTEXT", key);
+                    if crate::log_utils::first_time(&format!("oversized_entity:{}", key)) {
+                        tracing::warn!("Stripped oversized entity '{}' from SYSTEM_CONTEXT", key);
+                    } else {
+                        tracing::debug!("Stripped oversized entity '{}' from SYSTEM_CONTEXT", key);
+                    }
                 }
             }
         }
@@ -825,11 +829,15 @@ fn dedupe_by_wire_name(tools: Vec<ToolDefinition>) -> Vec<ToolDefinition> {
             let wire = crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
             let first = seen.insert(wire.clone());
             if !first {
-                tracing::warn!(
-                    tool = %wire,
-                    server = %t.server_name,
-                    "Dropping duplicate tool declaration (same provider-facing name)"
-                );
+                if crate::log_utils::first_time(&format!("duplicate_tool:{}", wire)) {
+                    tracing::warn!(
+                        tool = %wire,
+                        server = %t.server_name,
+                        "Dropping duplicate tool declaration (same provider-facing name)"
+                    );
+                } else {
+                    tracing::debug!(tool = %wire, "Dropping duplicate tool declaration");
+                }
             }
             first
         })

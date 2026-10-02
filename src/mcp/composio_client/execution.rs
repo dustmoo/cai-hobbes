@@ -88,7 +88,7 @@ pub async fn add_toolkit_to_server(
         // Construct the new MCP URL for the caller to save
         let base_domain = api_base.replace("/api/v3", "");
         let new_url = format!("{}/v3/mcp/{}/mcp", base_domain, new_server_id);
-        tracing::info!("Created new server with URL: {}", new_url);
+        tracing::info!("Created new server {} at {}", new_server_id, crate::log_utils::redact_url(&new_url));
 
         // Create instance to bind user to this server
         if let Some(ref user_id) = client.user_id {
@@ -973,9 +973,9 @@ async fn create_mcp_server(
     tracing::info!(
         "Creating new MCP server with initial toolkit '{}': {}",
         toolkit_slug,
-        url
+        crate::log_utils::redact_url(&url)
     );
-    tracing::debug!("POST {} with payload: {:?}", url, payload);
+    tracing::debug!("POST {} with payload: {:?}", crate::log_utils::redact_url(&url), payload);
 
     let response = client
         .client
@@ -1044,7 +1044,7 @@ pub async fn create_fresh_mcp_server(
         "[RECREATE] Fresh server {} (seeded with '{}') at {}",
         server_id,
         seed_toolkit,
-        new_url
+        crate::log_utils::redact_url(&new_url)
     );
     Ok((server_id, new_url))
 }
@@ -1095,12 +1095,7 @@ async fn create_mcp_instance(
         "user_id": user_id
     });
 
-    tracing::info!(
-        "Creating MCP instance for user '{}' on server '{}': {}",
-        user_id,
-        server_id,
-        url
-    );
+    tracing::info!("Creating MCP instance on server '{}'", server_id);
 
     let response = client
         .client
@@ -1183,7 +1178,7 @@ pub async fn execute_tool(
             if let Some(obj) = arguments.as_object_mut() {
                 for (k, v) in context {
                     if !obj.contains_key(&k) {
-                        tracing::info!(
+                        tracing::debug!(
                             "[CONTEXT] Injecting context param '{}' for toolkit '{}'",
                             k,
                             tk_slug
@@ -1424,9 +1419,9 @@ pub async fn execute_tool(
                                 && (text.contains("No connected account")
                                     || text.contains("valid connection not found"))
                             {
-                                tracing::info!(
+                                tracing::debug!(
                                     "[AUTH] Detected MCP Protocol error (substring match): {}",
-                                    text
+                                    crate::log_utils::truncate_for_log(text, crate::log_utils::LOG_BODY_MAX_CHARS)
                                 );
                                 needs_auth = true;
                                 error_msg = text.to_string();

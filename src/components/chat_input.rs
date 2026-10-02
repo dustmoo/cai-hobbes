@@ -1295,7 +1295,7 @@ pub fn ChatInput(
                                                     AutocompleteMode::Unload => {
                                                         // For unload, always fill the full command
                                                         let skill_command = format!("/unload {}", skill.metadata.name);
-                                                        tracing::info!("Populated draft with skill command: {}", skill_command);
+                                                        tracing::debug!("Populated draft with skill command ({} chars)", skill_command.len());
                                                         crate::components::shared::set_chat_draft(draft, skill_command, None, true);
                                                     }
                                                     mode @ (AutocompleteMode::Skill | AutocompleteMode::Fleet) => {
@@ -1334,7 +1334,7 @@ pub fn ChatInput(
                                                                 &new_draft,
                                                                 cursor_byte,
                                                             );
-                                                        tracing::info!("Spliced skill command into draft: {}", new_draft);
+                                                        tracing::debug!("Spliced skill command into draft ({} chars)", new_draft.len());
                                                         crate::components::shared::set_chat_draft(
                                                             draft,
                                                             new_draft,
@@ -1876,6 +1876,10 @@ pub fn ChatInput(
                                         class: "w-7 h-7 shrink-0 flex items-center justify-center rounded-md text-fg-muted hover:text-fg hover:bg-card transition-colors focus:outline-none",
                                         title: "Dump prompt (debug)",
                                         onclick: move |_| {
+                                            if !crate::log_utils::debug_dumps_enabled() {
+                                                tracing::info!("Prompt dump skipped: set HOBBES_DEBUG_DUMPS=1 to enable");
+                                                return;
+                                            }
                                             spawn(async move {
                                                 let mcp_context = {
                                                     let mcp_manager_reader = _mcp_manager.read();
