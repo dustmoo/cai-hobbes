@@ -308,24 +308,13 @@ body {
 
 /* Stop-control mascot (src/components/chat_input.rs's `TigerStopMascot`):
  * the personality comes from real sprite-frame swaps (blink, ear-perk —
- * see TIGER_GRID_BLINK/TIGER_GRID_EARS_UP in pixel_icons.rs), not a
- * transform loop. `.tiger-idle` only adds a faint breathing scale — a
- * transform-only, no-layout-cost accent underneath the frame swaps, not the
- * animation itself — and `.tiger-pounce` is the one-shot reaction when Stop
- * is clicked. Both share a fixed transform-origin so they read as weight
- * shifting on all fours rather than the icon spinning in place. */
-@keyframes tiger-idle-anim {
-    0%, 100% {
-        transform: scale(1);
-    }
-    50% {
-        transform: scale(1.035);
-    }
-}
+ * see TIGER_GRID_BLINK/TIGER_GRID_EARS_UP in pixel_icons.rs). `.tiger-idle`
+ * is static; `.tiger-pounce` is the one-shot reaction when Stop is clicked.
+ * Both share a fixed transform-origin so they read as weight shifting rather
+ * than spinning in place. */
 .tiger-idle {
     display: inline-flex;
     transform-origin: 50% 85%;
-    animation: tiger-idle-anim 2.8s ease-in-out infinite;
 }
 
 @keyframes tiger-pounce-anim {
@@ -349,30 +338,14 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .tiger-idle,
     .tiger-pounce {
         animation: none;
     }
 }
 
-/* Empty-chat bubble: the three pixel dots drift up and down in turn, a slow
- * idle "breathing" rather than the quick pulse of an active typing
- * indicator. Each dot is staggered by an inline `animation-delay`. */
-@keyframes bubble-typing {
-    0%, 100% {
-        opacity: 0.45;
-    }
-    50% {
-        opacity: 0.9;
-    }
-}
+/* Empty-chat bubble: the three pixel dots are static placeholders. */
 .bubble-typing-dot {
-    animation: bubble-typing 4s ease-in-out infinite;
-}
-@media (prefers-reduced-motion: reduce) {
-    .bubble-typing-dot {
-        animation: none;
-    }
+    opacity: 0.6;
 }
 
 /*
