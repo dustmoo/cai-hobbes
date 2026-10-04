@@ -1403,7 +1403,12 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                     }
 
                                                     // Refresh context and UI
-                                                    let new_context = mcp_manager.read().get_mcp_context(None).await;
+                                                    let profile_id = crate::mcp::manager::context_profile_for_session(
+                                                        &session_state.peek(),
+                                                        &current_session_id.peek(),
+                                                        &settings.peek(),
+                                                    );
+                                                    let new_context = mcp_manager.read().get_mcp_context(profile_id).await;
                                                     mcp_context.set(new_context);
                                                     let current = *refresh_trigger.peek();
                                                     refresh_trigger.set(current + 1);
@@ -1725,7 +1730,12 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                         tracing::error!("Failed to reload Composio tools: {}", e);
                                                                     }
                                                                     // Update mcp_context with new tools
-                                                                    let new_context = mcp_manager.read().get_mcp_context(None).await;
+                                                                    let profile_id = crate::mcp::manager::context_profile_for_session(
+                                                                        &session_state.peek(),
+                                                                        &current_session_id.peek(),
+                                                                        &updated_settings,
+                                                                    );
+                                                                    let new_context = mcp_manager.read().get_mcp_context(profile_id).await;
                                                                     mcp_context.set(new_context);
                                                                     // Invalidate cache and trigger refresh
                                                                     mcp_manager.read().invalidate_status_cache();
@@ -1889,7 +1899,11 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     tracing::error!("Failed to save settings after remove: {}", e);
                                 }
                                 connected_slugs.write().remove(&slug.to_lowercase());
-                                let profile_id = updated.get_active_profile().map(|p| p.id.clone());
+                                let profile_id = crate::mcp::manager::context_profile_for_session(
+                                    &session_state.peek(),
+                                    &current_session_id.peek(),
+                                    &updated,
+                                );
                                 mcp_context.set(manager.get_mcp_context(profile_id).await);
                                 match manager.get_composio_toolkits().await {
                                     Ok(kits) => toolkits.set(kits),
@@ -1966,6 +1980,8 @@ fn ToolkitToolEditor(
     let mut mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
+    let current_session_id = use_context::<SessionIdContext>().0;
 
     let mut checked_tools: Signal<std::collections::HashSet<String>> =
         use_signal(std::collections::HashSet::new);
@@ -2075,7 +2091,12 @@ fn ToolkitToolEditor(
                         if let Err(e) = settings_manager.read().save(&updated_settings) {
                             tracing::error!("Failed to persist tool curation locally: {}", e);
                         }
-                        let new_context = manager.get_mcp_context(None).await;
+                        let profile_id = crate::mcp::manager::context_profile_for_session(
+                            &session_state.peek(),
+                            &current_session_id.peek(),
+                            &updated_settings,
+                        );
+                        let new_context = manager.get_mcp_context(profile_id).await;
                         mcp_context.set(new_context);
                         let current = *refresh_trigger.peek();
                         refresh_trigger.set(current + 1);

@@ -1882,8 +1882,16 @@ pub fn ChatInput(
                                             }
                                             spawn(async move {
                                                 let mcp_context = {
+                                                    let profile_id = {
+                                                        let state = session_state.peek();
+                                                        crate::mcp::manager::context_profile_for_session(
+                                                            &state,
+                                                            &state.active_session_id,
+                                                            &settings.peek(),
+                                                        )
+                                                    };
                                                     let mcp_manager_reader = _mcp_manager.read();
-                                                    mcp_manager_reader.get_mcp_context(None).await
+                                                    mcp_manager_reader.get_mcp_context(profile_id).await
                                                 };
 
                                                 let context_string = {

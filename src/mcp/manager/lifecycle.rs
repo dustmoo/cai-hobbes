@@ -223,7 +223,7 @@ impl McpManager {
                     .await;
 
                 // Get the full, updated context and set the signal
-                let new_context = self_clone_for_receiver.get_mcp_context(None).await;
+                let new_context = self_clone_for_receiver.get_active_profile_mcp_context().await;
                 mcp_context_signal_clone_for_receiver.set(new_context);
                 tracing::info!(
                     "Successfully added '{}' and updated MCP context atomically.",
@@ -984,7 +984,7 @@ impl McpManager {
                             .await
                             .insert(server_name_owned.clone(), active_client);
                         self_clone.invalidate_status_cache_async().await;
-                        let new_context = self_clone.get_mcp_context(None).await;
+                        let new_context = self_clone.get_active_profile_mcp_context().await;
                         mcp_context_signal_clone.set(new_context);
                         tracing::info!(
                             "Successfully retried virtual Composio client: {}",
@@ -1001,7 +1001,7 @@ impl McpManager {
                                 .await
                                 .insert(server_name_owned, (stub, error_msg));
                             self_clone.invalidate_status_cache_async().await;
-                            let new_context = self_clone.get_mcp_context(None).await;
+                            let new_context = self_clone.get_active_profile_mcp_context().await;
                             mcp_context_signal_clone.set(new_context);
                         }
                     }
@@ -1127,7 +1127,7 @@ impl McpManager {
                                     .insert(server_name.clone(), active_client);
                                 // Invalidate status cache after client mutation (Pattern 150.8)
                                 self_clone.invalidate_status_cache_async().await;
-                                let new_context = self_clone.get_mcp_context(None).await;
+                                let new_context = self_clone.get_active_profile_mcp_context().await;
                                 mcp_context_signal_clone.set(new_context);
                                 tracing::info!("Successfully reconnected Composio client");
                             }
@@ -1445,7 +1445,7 @@ impl McpManager {
                     self_clone.invalidate_status_cache_async().await;
 
                     // Update context
-                    let new_context = self_clone.get_mcp_context(None).await;
+                    let new_context = self_clone.get_active_profile_mcp_context().await;
                     mcp_context_signal_clone.set(new_context);
                     tracing::info!("Successfully reconnected '{}'", server_name);
                 }

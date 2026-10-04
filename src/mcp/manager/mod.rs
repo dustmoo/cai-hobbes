@@ -16,12 +16,14 @@ mod composio_toolkits;
 mod config;
 mod lifecycle;
 mod oauth;
+mod profile_scope;
 mod status;
 mod tool_call;
 
 // Keep the pre-split `crate::mcp::manager::X` paths resolving.
 #[allow(unused_imports)]
 pub(crate) use composio::{purge_composio_profile_state, resolve_composio_key, ComposioKeyLookup};
+pub use profile_scope::{context_profile_for_session, resolve_context_profile, scope_context_to_profile};
 
 /// The bare server name for Composio native virtual clients.
 pub const COMPOSIO_NATIVE_PREFIX: &str = "composio-native";
