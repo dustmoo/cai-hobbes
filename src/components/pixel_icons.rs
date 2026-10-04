@@ -316,7 +316,7 @@ pub fn PixelChatBubble(
             shape_rendering: "crispEdges",
             "aria-hidden": "true",
             for (x, y, c) in cells {
-                if let Some(dot) = c.to_digit(10) {
+                if c.is_ascii_digit() {
                     rect {
                         key: "{x}-{y}",
                         x: "{x}",
