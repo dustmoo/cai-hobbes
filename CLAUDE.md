@@ -23,7 +23,7 @@ cargo clippy --release
 cargo test --release && cargo clippy --release && ./scripts/build_pro.sh && ./scripts/notarize.sh
 # App output: target/dx/Hobbes/release/macos/pro/Hobbes.app  (open -n it)
 
-# Unsigned production build — only when you need the app's own logs to debug
+# Unsigned production build — rarely needed now that the Pro build writes logs (see Logs below)
 dx build --release
 # App output: target/dx/Hobbes/release/macos/Hobbes.app
 
@@ -34,7 +34,7 @@ dx build --release
 ./scripts/build_windows.ps1 -Release
 ```
 
-**Handing over a build.** Do not `cargo build`/`dx build` as the verification step. Run tests and clippy, then `./scripts/build_pro.sh && ./scripts/notarize.sh` and open the Pro app. The unsigned `dx build` app prompts for keychain credentials on every launch; the Pro build doesn't. Use `dx build` only when the app's logs are needed to debug.
+**Handing over a build.** Do not `cargo build`/`dx build` as the verification step. Run tests and clippy, then `./scripts/build_pro.sh && ./scripts/notarize.sh` and open the Pro app. The unsigned `dx build` app prompts for keychain credentials on every launch; the Pro build doesn't. The Pro build writes the same log file as debug builds (see Logs below), so debug with it too.
 
 Tailwind classes are compiled by `npm run build:css` (input `tailwind.css` → `assets/tailwind.css`, which `main.rs` inlines). The Tailwind step in `build.rs` writes an unused `assets/output.css`, so a plain `cargo build` does NOT pick up new utility classes — run `npm run build:css` after adding classes to any `rsx!`. `npm ci` must be run once so `node_modules/` exists.
 
@@ -135,7 +135,7 @@ Streaming and summarization state is **per-session**, not global:
 - **Sessions**: SQLite at `~/.config/com.hobbes.app/sessions.db` (macOS: `~/Library/Application Support/...`), one row per session + a `meta` key/value table (lifetime counters, active session, window size, tool-call history). On first launch, `session_store::init()` runs a one-time import of the legacy `sessions.json` and `sessions-archive.jsonl` (guarded by the `migrated_from_json` meta key); the JSON files are left in place but no longer read or written — don't run pre-SQLite builds afterwards, their writes won't be seen.
 - **Settings**: same config dir, `settings.json`
 - **Credentials**: macOS Keychain via `SecretManager` (biometric-protected). Windows via `keyring` crate. Never call keychain APIs directly from components — use `secret_manager::save_secret_to_keychain()` (P-011).
-- **Logs**: daily rolling log at `~/Library/Application Support/com.hobbes.app/hobbes.log`
+- **Logs**: daily files `logs/hobbes.YYYY-MM-DD.log` in the config dir (macOS `~/Library/Application Support/com.hobbes.app/logs/`, Windows `%LOCALAPPDATA%\com.hobbes.app\logs\`), 7 kept, written by debug and release builds alike. Release filter: `warn,Hobbes=info,rmcp=warn,h2=error,hyper=error,hyper_util=error,rustls=error`; debug: `info,Hobbes=debug`. The target is `Hobbes` (capital H; `windows_app` on Windows) — filters are case-sensitive. Overrides: `HOBBES_LOG` (filter; `RUST_LOG` is ignored), `HOBBES_LOG_STDERR=1` (release stderr; on by default only on a TTY), `HOBBES_DEBUG_DUMPS=1` (full request/response JSON dumps to `$TMPDIR/hobbes_debug_logs/` — private content, opt-in only). Never log secrets or user content at INFO+: use `log_utils::{net_err, redact_url, truncate_for_log}`; one INFO line per turn ("Turn complete").
 
 ### Clippy Configuration
 
