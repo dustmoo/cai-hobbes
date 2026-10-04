@@ -13,7 +13,6 @@ use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRen
 use crate::components::stream_manager::StreamManagerContext;
 use crate::context::permissions::PermissionManager;
 use crate::context::prompt_builder::PromptBuilder;
-use crate::mcp::manager::{is_composio_native, COMPOSIO_NATIVE_PREFIX};
 use crate::session::ActiveContext;
 use crate::session_events::{log_event, SessionEvent};
 use crate::settings::Settings;
@@ -198,39 +197,34 @@ pub fn ChatWindow(
     };
 
     // Sync mcp_context signal changes to the active session's mcp_tools
-    // This ensures the UI updates immediately when tools are loaded/unloaded
-    // We filter tools by the session's active profile to ensure isolation.
+    // This ensures the UI updates immediately when tools are loaded/unloaded.
+    // The shared context may have been built for another Composio profile
+    // (background refreshes follow the global active profile), so it is
+    // scoped to this session's profile: a session pinned elsewhere keeps its
+    // own profile's Composio tools and toolkit slugs.
     use_effect(move || {
-        let mut current_context = mcp_context_signal.read().clone();
+        let global_context = mcp_context_signal.read().clone();
+        let settings_read = settings.read();
         let mut state = session_state.write();
-        if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
-            // Same fallback as `fetch_fresh_mcp_context`: an unpinned session
-            // follows the global active profile.
-            let profile_id = session
-                .composio_profile
-                .clone()
-                .or_else(|| settings.read().get_active_profile().map(|p| p.id.clone()));
+        let target_id = current_target_id.read().clone();
+        if let Some(session) = state.sessions.get_mut(&target_id) {
+            // Same resolution as `fetch_fresh_mcp_context`.
+            let profile_id = crate::mcp::manager::resolve_context_profile(
+                session.composio_profile.as_deref(),
+                &settings_read,
+            );
+            let profile_name = profile_id
+                .as_deref()
+                .and_then(|id| settings_read.profile_name_for_id(id));
+            let scoped = crate::mcp::manager::scope_context_to_profile(
+                &global_context,
+                session.active_context.mcp_tools.as_ref(),
+                profile_id.as_deref(),
+                profile_name,
+            );
 
-            // Filter servers to only include non-native or profile-matching native tools
-            // Use the server_name convention: config.name contains the display key,
-            // but we filter by matching the profile_id against the known session profile.
-            current_context.servers.retain(|s| {
-                if is_composio_native(&s.name) {
-                    if let Some(ref target_id) = profile_id {
-                        // Include singleton (legacy) or if name contains the target profile ID/name
-                        let suffix = s.name.strip_prefix("composio-native:").unwrap_or_default();
-                        suffix.is_empty() || suffix == target_id
-                    } else {
-                        // If no profile, only allow the legacy/default composio-native
-                        s.name == COMPOSIO_NATIVE_PREFIX
-                    }
-                } else {
-                    true
-                }
-            });
-
-            if !current_context.servers.is_empty() {
-                session.active_context.mcp_tools = Some(current_context);
+            if !scoped.servers.is_empty() {
+                session.active_context.mcp_tools = Some(scoped);
             } else {
                 session.active_context.mcp_tools = None;
             }

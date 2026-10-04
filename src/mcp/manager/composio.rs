@@ -115,11 +115,26 @@ pub(crate) fn resolve_composio_key<V>(
             .filter(|k| is_composio_native(k))
             .cloned()
             .collect();
-        tracing::warn!(
-            profile_id = ?profile_id,
-            candidates = ?candidates,
-            "resolve_composio_key: several Composio native clients and no profile match; refusing to guess which profile to operate on."
+        // Warn once per (requested profile, candidate set); repeats are debug,
+        // so a refresh loop can't flood the log with the same refusal.
+        let once_key = format!(
+            "resolve_composio_key:{:?}:{}",
+            profile_id,
+            candidates.join(",")
         );
+        if crate::log_utils::first_time(&once_key) {
+            tracing::warn!(
+                profile_id = ?profile_id,
+                candidates = ?candidates,
+                "resolve_composio_key: several Composio native clients and no profile match; refusing to guess which profile to operate on."
+            );
+        } else {
+            tracing::debug!(
+                profile_id = ?profile_id,
+                candidates = ?candidates,
+                "resolve_composio_key: several Composio native clients and no profile match (repeat)."
+            );
+        }
         return ComposioKeyLookup::Ambiguous { candidates };
     }
     ComposioKeyLookup::Found(first.clone())

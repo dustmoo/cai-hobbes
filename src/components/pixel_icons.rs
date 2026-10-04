@@ -290,10 +290,10 @@ pub const CHAT_BUBBLE_GRID: [&str; 15] = [
 
 /// [`CHAT_BUBBLE_GRID`] as an inline svg. The outline takes `currentColor`
 /// (so a `text-*` class tints it for either theme); the dots are the tiger's
-/// body orange and, with `animate`, pulse in turn via `.bubble-typing-dot`
-/// (main.css, which also honours reduced motion).
+/// body orange and, with `animate`, apply `.bubble-typing-dot` for a static
+/// soft placeholder style (main.css).
 ///
-/// Not an [`IconShape`]: the dots need per-cell classes and delays.
+/// Not an [`IconShape`]: the dots need per-cell classes.
 #[component]
 pub fn PixelChatBubble(
     width: u32,
@@ -325,7 +325,6 @@ pub fn PixelChatBubble(
                         height: "1",
                         fill: "{dot_fill}",
                         class: if animate { "bubble-typing-dot" } else { "" },
-                        style: "animation-delay: {(dot - 1) as f32 * 0.6}s",
                     }
                 } else {
                     rect {
@@ -385,14 +384,13 @@ pub fn tiger_rgba(cell_px: u32, colour: bool) -> (Vec<u8>, u32, u32) {
 
 /// The mascot, alive: idles through a small sprite loop — blink, ear-perk —
 /// as real frame swaps between [`TIGER_GRID`]/[`TIGER_GRID_BLINK`]/
-/// [`TIGER_GRID_EARS_UP`] rather than a transform on one fixed icon. Always
-/// looping for as long as this component stays mounted: the loop is a
-/// `use_future` owned by this component's scope, so it is cancelled on unmount
-/// and every instance (app menu, chat empty state) runs its own independent
-/// timer. `pouncing` (set
+/// [`TIGER_GRID_EARS_UP`] rather than animation. Always looping for as long
+/// as this component stays mounted: the loop is a `use_future` owned by this
+/// component's scope, so it is cancelled on unmount and every instance (app
+/// menu, chat empty state) runs its own independent timer. `pouncing` (set
 /// briefly by the caller's click handler) overrides the loop with a one-shot
-/// squash-and-settle reaction — see the `.tiger-idle`/`.tiger-pounce`
-/// keyframes in `assets/main.css`.
+/// squash-and-settle reaction — see the `.tiger-pounce` keyframe in
+/// `assets/main.css`.
 #[component]
 pub fn AnimatedTiger(pouncing: Signal<bool>, width: u32, height: u32) -> Element {
     #[derive(Copy, Clone, PartialEq)]

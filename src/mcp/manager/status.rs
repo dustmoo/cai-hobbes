@@ -10,6 +10,21 @@ use dioxus_signals::Readable;
 use rmcp::model::Tool;
 use std::collections::HashSet;
 
+/// `get_mcp_context`'s native-client filter. With a target profile, a native
+/// client is in scope when it claims that profile or claims none (the legacy
+/// singleton). With no target every native client is in scope — which is why
+/// refreshes must name a profile (`profile_scope::resolve_context_profile`).
+pub(super) fn native_client_in_profile_scope(
+    client_profile_id: Option<&str>,
+    target_profile_id: Option<&str>,
+) -> bool {
+    match (target_profile_id, client_profile_id) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(target), Some(pid)) => pid == target,
+    }
+}
+
 impl McpManager {
     pub async fn get_mcp_context(&self, profile_id: Option<String>) -> McpContext {
         let servers = self.servers.lock().await;
@@ -26,14 +41,13 @@ impl McpManager {
 
             // FILTER: If this is a native client, only include it if it matches the profile
             // Use client.profile_id for comparison (not the HashMap key, which may differ from the name)
-            if is_composio_native(name) {
-                if let Some(ref target_id) = profile_id {
-                    match &client.profile_id {
-                        Some(pid) if pid == target_id => { /* include — profile matches */ }
-                        None => { /* legacy singleton — include for any profile */ }
-                        _ => continue, // different profile — skip
-                    }
-                }
+            if is_composio_native(name)
+                && !native_client_in_profile_scope(
+                    client.profile_id.as_deref(),
+                    profile_id.as_deref(),
+                )
+            {
+                continue; // different profile — skip
             }
 
             // On-demand servers: include name/description but NOT tools
@@ -156,10 +170,10 @@ impl McpManager {
         let composio_lookup =
             resolve_composio_key(&servers, profile_id.as_deref(), |c| c.profile_id.as_deref());
         if let ComposioKeyLookup::Ambiguous { ref candidates } = composio_lookup {
-            // Not a warning here: this is the prompt-build path, called on every
-            // turn, so a degrade (silently reporting no connected toolkits) must
-            // stay traceable without being noisy.
-            tracing::info!(
+            // Debug, not info: every refresh now names a profile (see
+            // `profile_scope`), so this only fires on genuine misconfiguration,
+            // and `resolve_composio_key` already warned once for this set.
+            tracing::debug!(
                 profile_id = ?profile_id,
                 candidates = ?candidates,
                 "get_mcp_context: several Composio native clients and no profile match; \
@@ -420,5 +434,52 @@ impl McpManager {
         let mut cache = self.cached_server_statuses.lock().await;
         *cache = None;
         tracing::debug!("Invalidated server status cache (async)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// The selection `get_mcp_context(Some(active))` makes with two profiles'
+    /// native clients connected: only the active profile's client is in
+    /// scope, and toolkit slugs resolve to that client instead of the
+    /// ambiguous refusal a profile-less call gets.
+    #[test]
+    fn active_profile_context_selects_only_active_client_and_its_toolkits() {
+        let servers: HashMap<String, Option<&str>> = [
+            ("composio-native:clearmirror".to_string(), Some("clearmirror")),
+            ("composio-native:puget".to_string(), Some("puget")),
+            ("filesystem".to_string(), None),
+        ]
+        .into_iter()
+        .collect();
+        let active = Some("puget");
+
+        let mut in_scope: Vec<&str> = servers
+            .iter()
+            .filter(|(k, pid)| !is_composio_native(k) || native_client_in_profile_scope(**pid, active))
+            .map(|(k, _)| k.as_str())
+            .collect();
+        in_scope.sort();
+        assert_eq!(in_scope, vec!["composio-native:puget", "filesystem"]);
+
+        assert_eq!(
+            resolve_composio_key(&servers, active, |pid| *pid),
+            ComposioKeyLookup::Found("composio-native:puget".to_string())
+        );
+        // Profile-less: both natives in scope and the toolkit lookup refuses.
+        assert!(native_client_in_profile_scope(Some("clearmirror"), None));
+        assert!(matches!(
+            resolve_composio_key(&servers, None, |pid| *pid),
+            ComposioKeyLookup::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn legacy_singleton_in_scope_for_any_profile() {
+        assert!(native_client_in_profile_scope(None, Some("puget")));
+        assert!(!native_client_in_profile_scope(Some("clearmirror"), Some("puget")));
     }
 }
