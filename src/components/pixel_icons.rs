@@ -290,10 +290,10 @@ pub const CHAT_BUBBLE_GRID: [&str; 15] = [
 
 /// [`CHAT_BUBBLE_GRID`] as an inline svg. The outline takes `currentColor`
 /// (so a `text-*` class tints it for either theme); the dots are the tiger's
-/// body orange and, with `animate`, apply `.bubble-typing-dot` for a static
-/// soft placeholder style (main.css).
+/// body orange and, with `animate`, pulse in turn via `.bubble-typing-dot`
+/// (main.css, which also honours reduced motion).
 ///
-/// Not an [`IconShape`]: the dots need per-cell classes.
+/// Not an [`IconShape`]: the dots need per-cell classes and delays.
 #[component]
 pub fn PixelChatBubble(
     width: u32,
@@ -316,7 +316,7 @@ pub fn PixelChatBubble(
             shape_rendering: "crispEdges",
             "aria-hidden": "true",
             for (x, y, c) in cells {
-                if c.is_ascii_digit() {
+                if let Some(dot) = c.to_digit(10) {
                     rect {
                         key: "{x}-{y}",
                         x: "{x}",
@@ -325,6 +325,7 @@ pub fn PixelChatBubble(
                         height: "1",
                         fill: "{dot_fill}",
                         class: if animate { "bubble-typing-dot" } else { "" },
+                        style: "animation-delay: {(dot - 1) as f32 * 0.6}s",
                     }
                 } else {
                     rect {

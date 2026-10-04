@@ -343,9 +343,24 @@ body {
     }
 }
 
-/* Empty-chat bubble: the three pixel dots are static placeholders. */
+/* Empty-chat bubble: the three pixel dots drift up and down in turn, a slow
+ * idle "breathing" rather than the quick pulse of an active typing
+ * indicator. Each dot is staggered by an inline `animation-delay`. */
+@keyframes bubble-typing {
+    0%, 100% {
+        opacity: 0.45;
+    }
+    50% {
+        opacity: 0.9;
+    }
+}
 .bubble-typing-dot {
-    opacity: 0.6;
+    animation: bubble-typing 4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+    .bubble-typing-dot {
+        animation: none;
+    }
 }
 
 /*
