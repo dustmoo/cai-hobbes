@@ -31,6 +31,7 @@ mod keychain_ffi;
 #[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
 mod llm;
+mod layout_budget;
 mod log_utils;
 mod mcp;
 mod menu;
@@ -1770,11 +1771,28 @@ fn app() -> Element {
     // unrelated `ui_state` writes (tab persistence, widths) don't re-render
     // the whole app; only a flip of this flag does.
     let tabs_as_sidebar = use_memo(move || ui_state.read().tabs_as_sidebar);
-    let mut settings_panel_width = use_signal(|| ui_state.read().settings_panel_width);
-    let mut is_dragging = use_signal(|| false);
-    let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
-    let mut final_width_on_drag_end = use_signal(|| 0.0);
+    // The user's requested Planner column widths. Shared with PlannerView
+    // (which edits them) and the layout solver below; automatic collapsing
+    // never writes them.
+    let planner_widths = use_context_provider(|| components::planner_view::PlannerWidths {
+        nav: Signal::new(ui_state.peek().planner_left_width),
+        timeline: Signal::new(ui_state.peek().planner_today_width),
+    });
+    let planner_focus_hint = use_context::<components::planner_view::PlannerFocusHint>().0;
+    // Drawer (History/Settings/MCP) and tab-sidebar widths as the user asked
+    // for them. The layout solver below decides what actually fits; it
+    // never writes back here, so saved widths return when space does.
+    let mut settings_panel_width = use_signal(|| ui_state.peek().settings_panel_width);
+    let mut tab_sidebar_width = use_signal(|| ui_state.peek().tab_sidebar_width);
+    let mut tab_sidebar_railed = use_signal(|| ui_state.peek().tab_sidebar_railed);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
+    // Window logical width for the layout solver (updated on resize).
+    let mut window_logical_width = use_signal(|| {
+        window
+            .inner_size()
+            .to_logical::<f64>(window.scale_factor())
+            .width
+    });
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
     let mut session_to_delete =
@@ -2224,12 +2242,72 @@ fn app() -> Element {
     hotkey::use_hotkey_manager(permission_status_signal);
 
     // This handler continuously updates the last known size during a resize.
+    let window_for_resize = window.clone();
     use_wry_event_handler(move |event, _| {
         if let Event::WindowEvent { event, .. } = event {
             if let WindowEvent::Resized(new_size) = event {
                 last_known_size.set(*new_size);
+                let logical = new_size
+                    .to_logical::<f64>(window_for_resize.scale_factor())
+                    .width;
+                if (*window_logical_width.peek() - logical).abs() >= 0.5 {
+                    window_logical_width.set(logical);
+                }
             }
         }
+    });
+
+    // What gives way when the window is too narrow for the requested widths
+    // (layout_budget::solve_chat). A memo over signals only, so the app
+    // re-renders when the *outcome* changes, not on every resize event.
+    // The Planner has its own give-way policy (layout_budget::solve_planner);
+    // it only applies while the Planner is the visible view.
+    let planner_layout = use_memo(move || {
+        let drawer_open = *show_session_manager.read()
+            || *show_settings_panel.read()
+            || *show_mcp_manager.read();
+        // The timeline only exists on Today (the default before the Planner
+        // has mounted and reported its selection).
+        let show_timeline = planner_focus_hint.read().as_ref().is_none_or(|sel| {
+            *sel == components::planner_view::PlannerSelection::View(todo::views::TodoView::Today)
+        });
+        layout_budget::solve_planner(&layout_budget::PlannerLayoutInput {
+            window_width: *window_logical_width.read(),
+            sidebar: tabs_as_sidebar().then(|| layout_budget::SidebarRequest {
+                width: *tab_sidebar_width.read(),
+                user_railed: *tab_sidebar_railed.read(),
+            }),
+            drawer_width: drawer_open.then(|| *settings_panel_width.read()),
+            nav_width: *planner_widths.nav.read(),
+            show_timeline,
+            timeline_width: *planner_widths.timeline.read(),
+        })
+    });
+    let chat_layout = use_memo(move || {
+        if *planner_active.read() {
+            let p = planner_layout.read();
+            return layout_budget::ChatLayout {
+                sidebar_mode: p.sidebar_mode,
+                sidebar_width: p.sidebar_width,
+                drawer_width: p.drawer_width,
+                drawer_nav_railed: p.drawer_nav_railed,
+                main_width: p.main_width,
+            };
+        }
+        let drawer_open = *show_session_manager.read()
+            || *show_settings_panel.read()
+            || *show_mcp_manager.read();
+        layout_budget::solve_chat(&layout_budget::ChatLayoutInput {
+            window_width: *window_logical_width.read(),
+            sidebar: tabs_as_sidebar().then(|| layout_budget::SidebarRequest {
+                width: *tab_sidebar_width.read(),
+                user_railed: *tab_sidebar_railed.read(),
+            }),
+            drawer: drawer_open.then(|| layout_budget::DrawerRequest {
+                width: *settings_panel_width.read(),
+                has_inner_nav: *show_settings_panel.read(),
+            }),
+        })
     });
 
     let menu_handler = use_coroutine(move |mut rx: UnboundedReceiver<MenuAction>| async move {
@@ -2413,23 +2491,6 @@ fn app() -> Element {
         }
     });
 
-    // This effect saves the settings panel width when the user stops dragging
-    use_effect(move || {
-        let new_width = final_width_on_drag_end();
-        if new_width > 0.0 {
-            spawn(async move {
-                settings_panel_width.set(new_width);
-                let mut current_ui_state = ui_state.write();
-                if current_ui_state.settings_panel_width != new_width {
-                    current_ui_state.settings_panel_width = new_width;
-                    let uism = ui_state_manager.read();
-                    uism.save_async(current_ui_state.clone(), None);
-                }
-                final_width_on_drag_end.set(0.0); // Reset after saving
-            });
-        }
-    });
-
     // Debounced window resize saver
     // This effect runs whenever last_known_size changes (due to resize events)
     let window_resize_handler = window.clone();
@@ -2437,9 +2498,6 @@ fn app() -> Element {
         let physical_size = last_known_size.read();
         if physical_size.width > 0 && physical_size.height > 0 {
             let mut session_state = session_state;
-            let show_session_manager = show_session_manager;
-            let show_settings_panel = show_settings_panel;
-            let show_mcp_manager = show_mcp_manager;
 
             // Capture the current values we need for calculation
             let current_physical_size = *physical_size;
@@ -2454,18 +2512,13 @@ fn app() -> Element {
                 let scale_factor = window.scale_factor();
                 let logical_size = current_physical_size.to_logical::<f64>(scale_factor);
 
-                // The tab sidebar is deliberately not counted: unlike these
-                // panels it is still showing at the next launch, so it's part
-                // of the window's normal content width.
-                let sidebar_visible = *show_session_manager.read()
-                    || *show_settings_panel.read()
-                    || *show_mcp_manager.read();
-                let sidebar_width = if sidebar_visible {
-                    settings_panel_width()
-                } else {
-                    0.0
-                };
-                let content_width = logical_size.width - sidebar_width;
+                // Subtract the open drawer at the width it actually takes
+                // (the solver may have shrunk it). The tab sidebar is
+                // deliberately not counted: unlike the drawers it is still
+                // showing at the next launch, so it's part of the window's
+                // normal content width.
+                let drawer_width = chat_layout.peek().drawer_width.unwrap_or(0.0);
+                let content_width = logical_size.width - drawer_width;
 
                 session_state
                     .write()
@@ -3072,10 +3125,11 @@ fn app() -> Element {
 
                             // Tab list sidebar (UiState::tabs_as_sidebar). Not part of
                             // the History/Settings/MCP group below: those are transient
-                            // tool panels sharing one width slot and one divider, while
-                            // this is persistent navigation — it stays put, at a fixed
-                            // width, and a tool panel opens to its right. Same open-tabs
-                            // state and handlers as the TabBar further down.
+                            // tool panels sharing one width slot, while this is
+                            // persistent navigation with its own width — a tool panel
+                            // opens to its right. Same open-tabs state and handlers as
+                            // the TabBar (top-tabs mode). It carries the Hobbes menu
+                            // and the only + in this mode; the top strip isn't shown.
                             if tabs_as_sidebar() {
                                 div {
                                     class: "h-full shrink-0",
@@ -3129,118 +3183,103 @@ fn app() -> Element {
                                                     fleet_active.set(false);
                                                     fleet_tab_open.set(false);
                                                 },
+                                                width: chat_layout().sidebar_width,
+                                                rail: chat_layout().sidebar_mode.is_rail(),
+                                                edge_border: chat_layout().sidebar_mode == layout_budget::SidebarMode::AutoRail,
                                             }
                                         }
                                     }
                                 }
+                                // The solver's automatic rail is temporary and not
+                                // user-resizable; every other state gets the divider.
+                                if chat_layout().sidebar_mode != layout_budget::SidebarMode::AutoRail {
+                                    components::column_divider::ColumnDivider {
+                                        width: tab_sidebar_width().clamp(layout_budget::SIDEBAR_MIN_WIDTH, layout_budget::SIDEBAR_MAX_WIDTH),
+                                        railed: tab_sidebar_railed(),
+                                        min: layout_budget::SIDEBAR_MIN_WIDTH,
+                                        max: layout_budget::SIDEBAR_MAX_WIDTH,
+                                        default: layout_budget::SIDEBAR_DEFAULT_WIDTH,
+                                        side: components::column_divider::ColumnSide::Left,
+                                        label: "Resize tab sidebar".to_string(),
+                                        rail: Some(components::column_divider::RailSnap {
+                                            below: layout_budget::SIDEBAR_SNAP_TO_RAIL_BELOW,
+                                            rail_width: layout_budget::SIDEBAR_RAIL_WIDTH,
+                                        }),
+                                        on_resize: move |w: components::column_divider::ColumnWidth| {
+                                            tab_sidebar_width.set(w.width);
+                                            tab_sidebar_railed.set(w.railed);
+                                        },
+                                        on_commit: move |w: components::column_divider::ColumnWidth| {
+                                            tab_sidebar_width.set(w.width);
+                                            tab_sidebar_railed.set(w.railed);
+                                            let mut ui = ui_state.write();
+                                            if ui.tab_sidebar_width != w.width || ui.tab_sidebar_railed != w.railed {
+                                                ui.tab_sidebar_width = w.width;
+                                                ui.tab_sidebar_railed = w.railed;
+                                                ui_state_manager.read().save_async(ui.clone(), None);
+                                            }
+                                        },
+                                    }
+                                }
                             }
 
-                            // Session Manager Sidebar
+                            // Drawers (History / Settings / MCP) share one width slot,
+                            // resolved by the layout solver from settings_panel_width.
                             if *show_session_manager.read() {
                                 div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Session Manager Panel
-                                    div {
-                                        id: "session-manager-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        components::session_manager::SessionManager {}
-                                    }
-                                    // Draggable Divider
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
+                                    id: "session-manager-panel",
+                                    style: "width: {chat_layout().drawer_width.unwrap_or_default()}px;",
+                                    class: "bg-section text-fg h-full shrink-0",
+                                    components::session_manager::SessionManager {}
                                 }
                             }
-
-                            // Settings Panel Sidebar
                             if *show_settings_panel.read() {
                                 div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Settings Panel
-                                    div {
-                                        id: "settings-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        // This is the correct location for the settings panel component
-                                        components::settings_panel::SettingsPanel {}
-                                    }
-                                    // Draggable Divider
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
+                                    id: "settings-panel",
+                                    style: "width: {chat_layout().drawer_width.unwrap_or_default()}px;",
+                                    class: "bg-section text-fg h-full shrink-0",
+                                    components::settings_panel::SettingsPanel {
+                                        nav_railed: chat_layout().drawer_nav_railed,
                                     }
                                 }
                             }
-
-                            // MCP Manager Sidebar
                             if *show_mcp_manager.read() {
                                 div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // MCP Manager Panel
-                                    div {
-                                        id: "mcp-manager-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        components::mcp_marketplace::McpMarketplace {}
-                                    }
-                                    // Draggable Divider
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
+                                    id: "mcp-manager-panel",
+                                    style: "width: {chat_layout().drawer_width.unwrap_or_default()}px;",
+                                    class: "bg-section text-fg h-full shrink-0",
+                                    components::mcp_marketplace::McpMarketplace {}
                                 }
                             }
-
-                            // Mouse move handler for resizing
-                            if *is_dragging.read() {
-                                div {
-                                    class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
-                                    onmousemove: move |event| {
-                                        if *is_dragging.read() {
-                                            let (start_x, start_width) = drag_start_info();
-                                            let delta_x = event.data.screen_coordinates().x - start_x;
-                                            let new_width = start_width + delta_x;
-                                            if new_width > 200.0 && new_width < 800.0 {
-                                                let panel_id = if *show_settings_panel.read() {
-                                                    "settings-panel"
-                                                } else if *show_mcp_manager.read() {
-                                                    "mcp-manager-panel"
-                                                } else {
-                                                    "session-manager-panel"
-                                                };
-                                                let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
-                                                let _ = document::eval(&js);
-                                                final_width_on_drag_end.set(new_width);
-                                            }
+                            if let Some(drawer_width) = chat_layout().drawer_width {
+                                components::column_divider::ColumnDivider {
+                                    width: drawer_width,
+                                    min: layout_budget::DRAWER_MIN_WIDTH,
+                                    max: layout_budget::DRAWER_MAX_WIDTH,
+                                    default: layout_budget::DRAWER_DEFAULT_WIDTH,
+                                    side: components::column_divider::ColumnSide::Left,
+                                    label: if *show_settings_panel.read() { "Resize settings".to_string() } else if *show_mcp_manager.read() { "Resize MCP tools".to_string() } else { "Resize history".to_string() },
+                                    on_resize: move |w: components::column_divider::ColumnWidth| {
+                                        settings_panel_width.set(w.width);
+                                    },
+                                    on_commit: move |w: components::column_divider::ColumnWidth| {
+                                        settings_panel_width.set(w.width);
+                                        let mut ui = ui_state.write();
+                                        if ui.settings_panel_width != w.width {
+                                            ui.settings_panel_width = w.width;
+                                            ui_state_manager.read().save_async(ui.clone(), None);
                                         }
                                     },
-                                    onmouseup: move |_| {
-                                        is_dragging.set(false);
-                                    },
-                                    onmouseleave: move |_| {
-                                        // If mouse leaves the overlay, stop dragging
-                                        if *is_dragging.read() {
-                                            is_dragging.set(false);
-                                        }
-                                    }
                                 }
                             }
 
                             // Main Chat Window
                             div {
                                 class: "flex-1 flex flex-col min-h-0 min-w-0 border-t border-primary-700/50",
-                                {
+                                // Top tab strip — top-tabs mode only. In sidebar mode the
+                                // content starts at the window's top edge.
+                                if !tabs_as_sidebar() {
+                                    {
                                     let tabs = open_tabs.read();
                                     let state = session_state.read();
                                     rsx! {
@@ -3294,8 +3333,8 @@ fn app() -> Element {
                                                 fleet_active.set(false);
                                                 fleet_tab_open.set(false);
                                             },
-                                            show_tabs: !tabs_as_sidebar(),
                                         }
+                                    }
                                     }
                                 }
 
@@ -3312,7 +3351,11 @@ fn app() -> Element {
                                 if *planner_active.read() {
                                     div {
                                         class: "flex-1 min-h-0 min-w-0",
-                                        components::planner_view::PlannerView {}
+                                        components::planner_view::PlannerView {
+                                            nav_railed: planner_layout().nav_railed,
+                                            nav_width: planner_layout().nav_width,
+                                            timeline_width: planner_layout().timeline_width,
+                                        }
                                     }
                                 }
                                 if *fleet_active.read() {

@@ -1274,7 +1274,7 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
 
     rsx! {
         div {
-            class: "h-full w-full flex flex-col gap-4 overflow-y-auto border-l border-subtle bg-section p-4 outline-none",
+            class: "h-full w-full flex flex-col gap-4 overflow-y-auto bg-section p-4 outline-none",
             tabindex: "0",
             // `[` / `]` walk the day while the rail has focus (clicking
             // anywhere in it gives focus). Arrow keys are left alone — the

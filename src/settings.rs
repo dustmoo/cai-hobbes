@@ -2188,10 +2188,22 @@ pub struct UiState {
     /// preference, never written to `open_tabs`. Missing = open order.
     #[serde(default)]
     pub tab_sidebar_order: crate::tab_list::TabListOrder,
+    /// The tab sidebar's full width (px, 180–400). Kept while the sidebar is
+    /// railed — by the user or by the layout solver — so it comes back.
+    #[serde(default = "default_tab_sidebar_width")]
+    pub tab_sidebar_width: f64,
+    /// The user snapped the tab sidebar to its 48px emoji rail. The layout
+    /// solver's automatic rail is temporary and never written here.
+    #[serde(default)]
+    pub tab_sidebar_railed: bool,
 }
 
 fn default_token_display_mode() -> String {
     "all".to_string()
+}
+
+fn default_tab_sidebar_width() -> f64 {
+    crate::layout_budget::SIDEBAR_DEFAULT_WIDTH
 }
 
 fn default_planner_left_width() -> f64 {
@@ -2238,6 +2250,8 @@ impl Default for UiState {
             fleet_active: false,
             tabs_as_sidebar: false,
             tab_sidebar_order: crate::tab_list::TabListOrder::default(),
+            tab_sidebar_width: default_tab_sidebar_width(),
+            tab_sidebar_railed: false,
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,
@@ -2413,6 +2427,34 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_ui_state_without_tab_sidebar_fields_loads_defaults() {
+        let state: UiState = serde_json::from_str(
+            r#"{"settings_panel_width": 512.0, "tabs_as_sidebar": true}"#,
+        )
+        .unwrap();
+        assert_eq!(state.tab_sidebar_width, 256.0);
+        assert!(!state.tab_sidebar_railed);
+        assert_eq!(state.settings_panel_width, 512.0);
+        assert!(state.tabs_as_sidebar);
+
+        let fresh = UiState::default();
+        assert_eq!(fresh.tab_sidebar_width, 256.0);
+        assert!(!fresh.tab_sidebar_railed);
+    }
+
+    #[test]
+    fn tab_sidebar_fields_round_trip() {
+        let state = UiState {
+            tab_sidebar_width: 312.0,
+            tab_sidebar_railed: true,
+            ..UiState::default()
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.tab_sidebar_width, 312.0);
+        assert!(back.tab_sidebar_railed);
+    }
 
     #[test]
     fn ui_state_without_list_orders_loads_manual() {
