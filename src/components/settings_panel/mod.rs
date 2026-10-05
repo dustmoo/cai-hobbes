@@ -39,13 +39,74 @@ struct SettingsCtx {
     skill_registry: Signal<crate::skills::registry::SkillRegistry>,
 }
 
+/// Nav label for a settings section (the railed header names it).
+fn settings_tab_label(tab: crate::settings::SettingsTab) -> &'static str {
+    use crate::settings::SettingsTab as T;
+    match tab {
+        T::General => "General",
+        T::Mcp => "MCP Tools",
+        T::Behavior => "Behavior",
+        T::Planner => "Planner",
+        T::Data => "Data",
+        T::Permissions => "Permissions",
+        T::Hotkeys => "Hotkeys",
+        T::Credentials => "Credentials",
+        T::Skills => "Skills",
+        T::About => "About",
+        T::ImageGen => "Image",
+    }
+}
+
+/// One settings nav entry: icon + uppercase label, or icon only (with a
+/// tooltip) when the nav is a 44px rail. Selecting persists the tab.
 #[component]
-pub fn SettingsPanel() -> Element {
+fn SettingsNavItem<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
+    tab: crate::settings::SettingsTab,
+    icon: I,
+    railed: bool,
+) -> Element {
+    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
+    let active = ui_state.read().active_settings_tab == tab;
+    let label = settings_tab_label(tab);
+    let class = match (railed, active) {
+        (false, true) => "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg",
+        (false, false) => "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg",
+        (true, true) => "flex items-center justify-center w-full h-8 border-l-2 border-l-primary-500 bg-card text-fg",
+        (true, false) => "flex items-center justify-center w-full h-8 border-l-2 border-transparent text-fg-muted hover:bg-card hover:text-fg",
+    };
+    rsx! {
+        button {
+            class: "{class}",
+            title: if railed { label } else { "" },
+            "aria-label": "{label}",
+            onclick: move |_| {
+                ui_state.write().active_settings_tab = tab;
+                let state = (*ui_state.read()).clone();
+                let manager = (*ui_state_manager.read()).clone();
+                spawn(async move { let _ = manager.save(&state); });
+            },
+            Icon { width: 18, height: 18, icon }
+            if !railed {
+                "{label}"
+            }
+        }
+    }
+}
+
+#[component]
+pub fn SettingsPanel(
+    /// Show the nav as a 44px icon rail (the layout solver needed the room,
+    /// or the drawer is narrower than ~600px); the content header then
+    /// names the current section.
+    #[props(default)]
+    nav_railed: bool,
+) -> Element {
     let app_name = crate::settings::get_app_name();
     let app_version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let mut settings = use_context::<Signal<Settings>>();
     let settings_manager = use_context::<Signal<SettingsManager>>();
-    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state = use_context::<Signal<crate::settings::UiState>>();
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
     let mut session_state = use_context::<Signal<SessionState>>();
     let _permission_manager =
@@ -609,134 +670,54 @@ pub fn SettingsPanel() -> Element {
                     }
                 }
             }
-            // Sidebar (shrink-0 to not affect content width)
+            // Nav (shrink-0 to not affect content width): full labels, or a
+            // 44px icon rail when the drawer is short on room.
             div {
-                class: "w-48 shrink-0 flex flex-col border-r border-subtle bg-section",
+                class: if nav_railed { "w-11 shrink-0 flex flex-col border-r border-subtle bg-section" } else { "w-48 shrink-0 flex flex-col border-r border-subtle bg-section" },
+                if nav_railed {
+                    div {
+                        class: "h-11 flex items-center justify-center border-b border-subtle shrink-0 text-fg-muted",
+                        title: "Settings",
+                        Icon { width: 16, height: 16, icon: fi_icons::FiSettings }
+                    }
+                } else {
+                    div {
+                        class: "h-11 flex items-baseline gap-2.5 px-4 border-b border-subtle shrink-0",
+                        span { class: "text-base font-semibold text-fg", "Settings" }
+                        span { class: "font-mono text-[11px] text-fg-muted", "{app_version}" }
+                        span { class: "font-mono text-[11px] text-fg-muted ml-auto", "{crate::hotkey::display_combo(&settings.read().hotkeys.toggle_settings)}" }
+                    }
+                }
                 div {
-                    class: "h-11 flex items-baseline gap-2.5 px-4 border-b border-subtle shrink-0",
-                    span { class: "text-base font-semibold text-fg", "Settings" }
-                    span { class: "font-mono text-[11px] text-fg-muted", "{app_version}" }
-                    span { class: "font-mono text-[11px] text-fg-muted ml-auto", "{crate::hotkey::display_combo(&settings.read().hotkeys.toggle_settings)}" }
-                }
-                // Tabs
-                div {
-                    class: "flex flex-col gap-0.5 p-2",
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::General { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::General;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiSettings }
-                    "General"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Mcp { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Mcp;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiCpu }
-                    "MCP Tools"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Behavior { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Behavior;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiSliders }
-                    "Behavior"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Planner { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Planner;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiCheckSquare }
-                    "Planner"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Data { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Data;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiDatabase }
-                    "Data"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Permissions { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Permissions;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiLock }
-                    "Permissions"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Hotkeys { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Hotkeys;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiCommand }
-                    "Hotkeys"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Credentials { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Credentials;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiKey }
-                    "Credentials"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::Skills { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::Skills;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiBook }
-                    "Skills"
-                }
-                button {
-                    class: if ui_state.read().active_settings_tab == crate::settings::SettingsTab::About { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] bg-input text-fg" } else { "flex items-center gap-2 h-8 px-2.5 rounded text-[11px] uppercase tracking-[0.06em] text-fg-muted hover:bg-input hover:text-fg" },
-                    onclick: move |_| {
-                        ui_state.write().active_settings_tab = crate::settings::SettingsTab::About;
-                        let state = (*ui_state.read()).clone();
-                        let manager = (*ui_state_manager.read()).clone();
-                        spawn(async move { let _ = manager.save(&state); });
-                    },
-                    Icon { width: 18, height: 18, icon: fi_icons::FiInfo }
-                    "About"
-                }
+                    class: if nav_railed { "flex flex-col gap-0.5 py-2" } else { "flex flex-col gap-0.5 p-2" },
+                    SettingsNavItem { tab: crate::settings::SettingsTab::General, icon: fi_icons::FiSettings, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Mcp, icon: fi_icons::FiCpu, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Behavior, icon: fi_icons::FiSliders, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Planner, icon: fi_icons::FiCheckSquare, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Data, icon: fi_icons::FiDatabase, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Permissions, icon: fi_icons::FiLock, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Hotkeys, icon: fi_icons::FiCommand, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Credentials, icon: fi_icons::FiKey, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Skills, icon: fi_icons::FiBook, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::About, icon: fi_icons::FiInfo, railed: nav_railed }
                 }
             }
 
             // Content Area (maintains original settings pane width)
             div {
                 class: "flex-1 flex flex-col min-w-0 p-4",
+                // Railed nav: the header moves here so the section stays named.
+                if nav_railed {
+                    div {
+                        class: "h-11 -mx-4 -mt-4 mb-4 flex items-baseline gap-2.5 px-4 border-b border-subtle shrink-0 min-w-0",
+                        span { class: "text-base font-semibold text-fg shrink-0", "Settings" }
+                        span {
+                            class: "font-mono text-[11px] text-fg-muted truncate",
+                            "{app_version} · {settings_tab_label(ui_state.read().active_settings_tab)}"
+                        }
+                        span { class: "font-mono text-[11px] text-fg-muted ml-auto shrink-0", "{crate::hotkey::display_combo(&settings.read().hotkeys.toggle_settings)}" }
+                    }
+                }
                 div {
                    class: "flex-1 overflow-y-auto pr-2",
                    match ui_state.read().active_settings_tab {

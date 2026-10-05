@@ -2,7 +2,7 @@
 use crate::components::chat_input::ChatCommand;
 use crate::components::stream_manager::StreamManagerContext;
 use crate::session::SessionState;
-use crate::settings::{Settings, UiState};
+use crate::settings::UiState;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
@@ -58,9 +58,9 @@ pub struct TabBarProps {
     pub fleet_attention: usize,
     pub on_select_fleet: EventHandler<()>,
     pub on_close_fleet: EventHandler<()>,
-    /// False when the tab sidebar is listing the tabs
-    /// (`UiState::tabs_as_sidebar`): the strip then keeps only its app
-    /// chrome — tiger menu, History/MCP, new tab.
+    /// False renders only the app chrome — tiger menu, History/MCP, new tab.
+    /// `main.rs` no longer uses it: in tab-sidebar mode the strip isn't
+    /// rendered at all and the sidebar header carries the menu and +.
     #[props(default = true)]
     pub show_tabs: bool,
 }
@@ -74,13 +74,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
     // chat bar used to. It is provided in `App`, above this component.
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let ui_state = use_context::<Signal<UiState>>();
-    let settings = use_context::<Signal<Settings>>();
     let mut editing_tab_id = use_signal(|| None::<String>);
     let mut temp_name = use_signal(String::new);
-    let mut show_app_menu = use_signal(|| false);
-    // One-shot "pounce" reaction on the app-menu mascot when it's clicked;
-    // its idle sprite loop otherwise runs continuously (see `AnimatedTiger`).
-    let mut tiger_pouncing = use_signal(|| false);
 
     // Use a memo to create a proper reactive subscription to the streaming state.
     // This ensures the component re-renders when stream_activity changes,
@@ -103,98 +98,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
             class: "flex items-center bg-section border-b border-primary-700/50 h-10 shrink-0 overflow-hidden",
 
             // App mark — the tiger anchors the window's top-left corner and
-            // doubles as the app menu: it's the only way back to Planner/Fleet
-            // once their pinned tabs have been closed.
-            div {
-                class: "relative flex items-center h-full shrink-0 border-r border-faint",
-                button {
-                    class: "flex items-center justify-center w-11 h-full text-fg-muted hover:bg-card hover:text-fg focus:outline-none transition-colors",
-                    title: "Hobbes menu",
-                    onclick: move |_| {
-                        show_app_menu.set(!show_app_menu());
-                        // The mascot pounces to confirm the click, same
-                        // reaction it used to give on the chat bar's Stop
-                        // button — here it's just opening/closing the menu
-                        // instead of cancelling a turn.
-                        tiger_pouncing.set(true);
-                        spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
-                            tiger_pouncing.set(false);
-                        });
-                    },
-                    crate::components::pixel_icons::AnimatedTiger {
-                        pouncing: tiger_pouncing,
-                        width: 18,
-                        height: 18,
-                    }
-                }
-
-                if show_app_menu() {
-                    // `fixed` (not `absolute`) so the menu escapes the tab
-                    // strip's own `overflow-hidden` — that clipping stays on
-                    // the root to keep the tab row contained, and `fixed`
-                    // positions relative to the viewport instead of this
-                    // (clipped) ancestor.
-                    div {
-                        class: "fixed top-10 left-0 w-60 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1.5",
-                        AppMenuRow {
-                            icon: fi_icons::FiCheckSquare,
-                            label: "Planner",
-                            hotkey: settings.read().hotkeys.toggle_planner.clone(),
-                            visible: ui_state.read().show_planner_icon,
-                            onclick: move |_| {
-                                chat_command.set(Some(ChatCommand::TogglePlanner));
-                                show_app_menu.set(false);
-                            },
-                        }
-                        AppMenuRow {
-                            icon: crate::components::pixel_icons::HobbesTiger,
-                            label: "Fleet",
-                            hotkey: settings.read().hotkeys.toggle_fleet.clone(),
-                            visible: ui_state.read().show_fleet_icon,
-                            onclick: move |_| {
-                                chat_command.set(Some(ChatCommand::ToggleFleet));
-                                show_app_menu.set(false);
-                            },
-                        }
-                        div { class: "border-t border-faint my-1" }
-                        AppMenuRow {
-                            icon: fi_icons::FiClock,
-                            label: "History",
-                            hotkey: settings.read().hotkeys.toggle_history.clone(),
-                            visible: ui_state.read().show_history_icon,
-                            onclick: move |_| {
-                                chat_command.set(Some(ChatCommand::ToggleHistory));
-                                show_app_menu.set(false);
-                            },
-                        }
-                        AppMenuRow {
-                            icon: fi_icons::FiPackage,
-                            label: "MCP Tools",
-                            hotkey: settings.read().hotkeys.toggle_mcp.clone(),
-                            visible: ui_state.read().show_mcp_icon,
-                            onclick: move |_| {
-                                chat_command.set(Some(ChatCommand::ToggleMcp));
-                                show_app_menu.set(false);
-                            },
-                        }
-                        AppMenuRow {
-                            icon: fi_icons::FiSettings,
-                            label: "Settings",
-                            hotkey: settings.read().hotkeys.toggle_settings.clone(),
-                            visible: true,
-                            onclick: move |_| {
-                                chat_command.set(Some(ChatCommand::ToggleSettings));
-                                show_app_menu.set(false);
-                            },
-                        }
-                    }
-                    // Click-outside backdrop to close the menu.
-                    div {
-                        class: "fixed inset-0 z-40",
-                        onclick: move |_| show_app_menu.set(false),
-                    }
-                }
+            // doubles as the app menu (shared with the tab sidebar header).
+            crate::components::app_menu::AppMenuButton {
+                placement: crate::components::app_menu::AppMenuPlacement::Strip,
             }
 
             // Tab items — each chat tab's identity layers (emoji · date ·
@@ -581,41 +487,6 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     icon: fi_icons::FiPlus,
                     width: 16,
                     height: 16,
-                }
-            }
-        }
-    }
-}
-
-/// One row in the tiger's app menu — an icon, a label, and (optionally) the
-/// user's configured hotkey for the command it dispatches. `visible` mirrors
-/// the same `ui_state.show_*_icon` flags the old chat-bar buttons honoured;
-/// an empty `hotkey` renders no hint rather than a hardcoded guess.
-#[component]
-fn AppMenuRow<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
-    icon: I,
-    label: String,
-    hotkey: String,
-    onclick: EventHandler<MouseEvent>,
-    #[props(default = true)] visible: bool,
-) -> Element {
-    if !visible {
-        return rsx! {};
-    }
-
-    let display_hotkey = crate::hotkey::display_combo(&hotkey);
-
-    rsx! {
-        button {
-            class: "w-full flex items-center gap-3 px-3 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg whitespace-nowrap",
-            onclick: move |evt| onclick.call(evt),
-            Icon { icon: icon, width: 16, height: 16 }
-            span { "{label}" }
-            div { class: "flex-1" }
-            if !display_hotkey.is_empty() {
-                span {
-                    class: "text-[11px] font-mono text-fg-muted/70 tabular-nums tracking-wide pl-6",
-                    "{display_hotkey}"
                 }
             }
         }

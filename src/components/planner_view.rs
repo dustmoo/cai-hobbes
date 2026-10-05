@@ -16,12 +16,14 @@ use chrono::{Local, NaiveDate, Utc};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+use crate::layout_budget;
 use crate::settings::Settings;
 use crate::todo::model::{self, TimeBlock, Todo};
 use crate::todo::store;
 use crate::todo::views::{self, TodoView};
 use crate::todo::PlannerState;
 
+use super::column_divider::{ColumnDivider, ColumnSide, ColumnWidth};
 use super::planner_rows::CentreColumn;
 use super::planner_timeline::TodayRail;
 
@@ -59,6 +61,34 @@ impl PlannerSelection {
 /// palette only samples it when it opens.
 #[derive(Clone, Copy)]
 pub(crate) struct PlannerFocusHint(pub(crate) Signal<Option<PlannerSelection>>);
+
+/// The user's *requested* Planner column widths, owned by `main.rs` so its
+/// layout solver can see them. The widths the Planner actually renders are
+/// the solver's outcome, passed to `PlannerView` as props; automatic
+/// collapsing never writes these.
+#[derive(Clone, Copy)]
+pub(crate) struct PlannerWidths {
+    pub(crate) nav: Signal<f64>,
+    pub(crate) timeline: Signal<f64>,
+}
+
+/// A list's count as the rail badge shows it: hidden at zero, "99+" above 99.
+pub(crate) fn badge_text(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1..=99 => Some(count.to_string()),
+        _ => Some("99+".to_string()),
+    }
+}
+
+/// Tooltip / accessible name for a rail button: the list name and count.
+pub(crate) fn rail_label(name: &str, count: usize) -> String {
+    if count == 0 {
+        name.to_string()
+    } else {
+        format!("{name}, {count}")
+    }
+}
 
 /// Which timeline block is selected on the Today rail. Provided at the
 /// PlannerView root (same pattern as TodoDetailContext) so a row's timebox
@@ -259,7 +289,14 @@ fn FocusBar() -> Element {
 // ── Root ────────────────────────────────────────────────────────────────────
 
 #[component]
-pub fn PlannerView() -> Element {
+pub fn PlannerView(
+    /// The Planner nav shows its 52px icon rail (solver outcome).
+    nav_railed: bool,
+    /// Effective nav width (the rail width when railed).
+    nav_width: f64,
+    /// Effective timeline width.
+    timeline_width: f64,
+) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
     let selection = use_signal(|| PlannerSelection::View(TodoView::Today));
@@ -360,103 +397,72 @@ pub fn PlannerView() -> Element {
 
     let show_today_rail = *selection.read() == PlannerSelection::View(TodoView::Today);
 
-    // Column resizing follows the main view's sidebar convention: a divider
-    // strip arms a fullscreen overlay, mousemove writes the width straight to
-    // the DOM via document::eval (no re-render churn), and mouseup commits the
-    // final width to the signal and persists it in UiState.
+    // Requested widths live in `PlannerWidths` (main.rs reads them for the
+    // give-way solver); the dividers update them live and persist on commit.
     let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
     let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
-    let mut left_width = use_signal(|| ui_state.peek().planner_left_width);
-    let mut today_width = use_signal(|| ui_state.peek().planner_today_width);
-    // (is_left_divider, drag start x, width at drag start)
-    let mut drag: Signal<Option<(bool, f64, f64)>> = use_signal(|| None);
-    let mut drag_last_width = use_signal(|| 0.0f64);
-
-    let mut commit_drag = move || {
-        let Some((is_left, _, _)) = *drag.peek() else {
-            return;
-        };
-        let w = *drag_last_width.peek();
-        drag.set(None);
-        if w <= 0.0 {
-            return;
-        }
-        if is_left {
-            left_width.set(w);
-            ui_state.write().planner_left_width = w;
-        } else {
-            today_width.set(w);
-            ui_state.write().planner_today_width = w;
-        }
-        let state = (*ui_state.read()).clone();
-        let manager = (*ui_state_manager.read()).clone();
-        spawn(async move {
-            let _ = manager.save(&state);
-        });
-    };
+    let PlannerWidths { nav: mut nav_requested, timeline: mut timeline_requested } =
+        use_context::<PlannerWidths>();
 
     rsx! {
         div {
             class: "flex h-full min-h-0 flex-col bg-app text-fg",
             FocusBar {}
             div {
-            class: "relative flex flex-row flex-1 min-h-0",
-            div {
-                id: "planner-left-rail",
-                class: "shrink-0 h-full min-h-0",
-                style: "width: {left_width}px;",
-                LeftRail { selection }
-            }
-            div {
-                class: "w-1 shrink-0 cursor-col-resize bg-primary-700/40 hover:bg-primary-500 transition-colors",
-                onmousedown: move |evt| {
-                    drag_last_width.set(*left_width.peek());
-                    drag.set(Some((true, evt.data.screen_coordinates().x, *left_width.peek())));
-                },
-            }
-            CentreColumn { selection }
-            if show_today_rail {
+                class: "relative flex flex-row flex-1 min-h-0",
                 div {
-                    class: "w-1 shrink-0 cursor-col-resize bg-primary-700/40 hover:bg-primary-500 transition-colors",
-                    onmousedown: move |evt| {
-                        drag_last_width.set(*today_width.peek());
-                        drag.set(Some((false, evt.data.screen_coordinates().x, *today_width.peek())));
-                    },
-                }
-                div {
-                    id: "planner-today-rail",
+                    id: "planner-left-rail",
                     class: "shrink-0 h-full min-h-0",
-                    style: "width: {today_width}px;",
-                    TodayRail { viewing: viewing_day }
+                    style: "width: {nav_width}px;",
+                    LeftRail { selection, railed: nav_railed }
                 }
-            }
-
-            if drag.read().is_some() {
-                div {
-                    class: "fixed inset-0 z-50 cursor-col-resize",
-                    onmousemove: move |evt| {
-                        let Some((is_left, start_x, start_w)) = *drag.peek() else {
-                            return;
-                        };
-                        let dx = evt.data.screen_coordinates().x - start_x;
-                        // The right divider sits on the rail's left edge, so
-                        // dragging left grows the rail.
-                        let (id, new_w) = if is_left {
-                            ("planner-left-rail", (start_w + dx).clamp(160.0, 340.0))
-                        } else {
-                            ("planner-today-rail", (start_w - dx).clamp(240.0, 560.0))
-                        };
-                        let js = format!(
-                            "document.getElementById('{}').style.width = '{}px';",
-                            id, new_w
-                        );
-                        let _ = document::eval(&js);
-                        drag_last_width.set(new_w);
-                    },
-                    onmouseup: move |_| commit_drag(),
-                    onmouseleave: move |_| commit_drag(),
+                // The solver's automatic rail is temporary and not
+                // user-resizable; otherwise the divider is always there.
+                if !nav_railed {
+                    ColumnDivider {
+                        width: nav_width,
+                        min: layout_budget::PLANNER_NAV_MIN_WIDTH,
+                        max: layout_budget::PLANNER_NAV_MAX_WIDTH,
+                        default: layout_budget::PLANNER_NAV_DEFAULT_WIDTH,
+                        side: ColumnSide::Left,
+                        label: "Resize Planner list nav".to_string(),
+                        on_resize: move |w: ColumnWidth| nav_requested.set(w.width),
+                        on_commit: move |w: ColumnWidth| {
+                            nav_requested.set(w.width);
+                            let mut ui = ui_state.write();
+                            if ui.planner_left_width != w.width {
+                                ui.planner_left_width = w.width;
+                                ui_state_manager.read().save_async(ui.clone(), None);
+                            }
+                        },
+                    }
                 }
-            }
+                CentreColumn { selection }
+                if show_today_rail {
+                    ColumnDivider {
+                        width: timeline_width,
+                        min: layout_budget::PLANNER_TIMELINE_MIN_WIDTH,
+                        max: layout_budget::PLANNER_TIMELINE_MAX_WIDTH,
+                        default: layout_budget::PLANNER_TIMELINE_DEFAULT_WIDTH,
+                        side: ColumnSide::Right,
+                        label: "Resize day timeline".to_string(),
+                        on_resize: move |w: ColumnWidth| timeline_requested.set(w.width),
+                        on_commit: move |w: ColumnWidth| {
+                            timeline_requested.set(w.width);
+                            let mut ui = ui_state.write();
+                            if ui.planner_today_width != w.width {
+                                ui.planner_today_width = w.width;
+                                ui_state_manager.read().save_async(ui.clone(), None);
+                            }
+                        },
+                    }
+                    div {
+                        id: "planner-today-rail",
+                        class: "shrink-0 h-full min-h-0",
+                        style: "width: {timeline_width}px;",
+                        TodayRail { viewing: viewing_day }
+                    }
+                }
             }
             crate::components::todo_detail::TodoDetailCard {}
         }
@@ -491,8 +497,10 @@ fn RailItem<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static
 }
 
 #[component]
-fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
+fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
+    // Rail mode's projects popover (hook declared before the rail early-return).
+    let mut projects_open = use_signal(|| false);
     let day = today();
 
     let state = planner.read();
@@ -543,9 +551,105 @@ fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
     let sel = selection.read().clone();
     let is_view = |v: TodoView| sel == PlannerSelection::View(v);
 
+    if railed {
+        let smart: [(TodoView, &'static str, usize); 6] = [
+            (TodoView::Inbox, "Inbox", count(TodoView::Inbox)),
+            (TodoView::Today, "Today", count(TodoView::Today)),
+            (TodoView::Upcoming, "Upcoming", count(TodoView::Upcoming)),
+            (TodoView::Anytime, "Anytime", count(TodoView::Anytime)),
+            (TodoView::Someday, "Someday", count(TodoView::Someday)),
+            (TodoView::Logbook, "Logbook", count(TodoView::Logbook)),
+        ];
+        let project_selected = matches!(sel, PlannerSelection::Project(_));
+        let project_rows: Vec<RailProjectRow> = top_level
+            .iter()
+            .map(|p| (p.id.clone(), p.title.clone(), project_count(&p.id)))
+            .collect();
+        let area_rows: Vec<RailAreaRows> = by_area
+            .iter()
+            .map(|(title, ps)| {
+                (
+                    title.clone(),
+                    ps.iter().map(|p| (p.id.clone(), p.title.clone(), project_count(&p.id))).collect(),
+                )
+            })
+            .collect();
+        return rsx! {
+            div {
+                class: "relative h-full w-full border-r border-subtle bg-section",
+                div {
+                    class: "flex h-full w-full flex-col items-stretch gap-1 overflow-y-auto py-2",
+                RailIconButton {
+                    icon: fi_icons::FiInbox,
+                    label: rail_label(smart[0].1, smart[0].2),
+                    badge: smart[0].2,
+                    selected: is_view(smart[0].0),
+                    onclick: move |_| selection.set(PlannerSelection::View(smart[0].0)),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiStar,
+                    label: rail_label(smart[1].1, smart[1].2),
+                    badge: smart[1].2,
+                    selected: is_view(smart[1].0),
+                    onclick: move |_| selection.set(PlannerSelection::View(smart[1].0)),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiCalendar,
+                    label: rail_label(smart[2].1, smart[2].2),
+                    badge: smart[2].2,
+                    selected: is_view(smart[2].0),
+                    onclick: move |_| selection.set(PlannerSelection::View(smart[2].0)),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiLayers,
+                    label: rail_label(smart[3].1, smart[3].2),
+                    badge: smart[3].2,
+                    selected: is_view(smart[3].0),
+                    onclick: move |_| selection.set(PlannerSelection::View(smart[3].0)),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiArchive,
+                    label: rail_label(smart[4].1, smart[4].2),
+                    badge: smart[4].2,
+                    selected: is_view(smart[4].0),
+                    onclick: move |_| selection.set(PlannerSelection::View(smart[4].0)),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiCheckCircle,
+                    label: rail_label(smart[5].1, smart[5].2),
+                    badge: smart[5].2,
+                    selected: is_view(smart[5].0),
+                    onclick: move |_| selection.set(PlannerSelection::View(smart[5].0)),
+                }
+                if has_tree {
+                    div { class: "mx-3 my-1 border-t border-faint" }
+                    RailIconButton {
+                        icon: fi_icons::FiFolder,
+                        label: "Projects".to_string(),
+                        badge: 0usize,
+                        selected: project_selected || *projects_open.read(),
+                        onclick: move |_| {
+                            let now = *projects_open.peek();
+                            projects_open.set(!now);
+                        },
+                    }
+                }
+                }
+                if *projects_open.read() {
+                    RailProjectsPopover {
+                        selection,
+                        open: projects_open,
+                        top_level: project_rows,
+                        by_area: area_rows,
+                    }
+                }
+            }
+        };
+    }
+
     rsx! {
         div {
-            class: "h-full w-full flex flex-col gap-0.5 overflow-y-auto border-r border-subtle bg-section p-2",
+            class: "h-full w-full flex flex-col gap-0.5 overflow-y-auto bg-section p-2",
             RailItem {
                 icon: fi_icons::FiInbox,
                 label: "Inbox",
@@ -630,5 +734,131 @@ fn LeftRail(mut selection: Signal<PlannerSelection>) -> Element {
                 }
             }
         }
+    }
+}
+
+/// (id, title, open-todo count) for one project in the rail popover.
+type RailProjectRow = (String, String, usize);
+/// An area heading and its projects.
+type RailAreaRows = (String, Vec<RailProjectRow>);
+
+// ── Icon rail (52px) ────────────────────────────────────────────────────────
+
+/// One icon button in the railed nav: tooltip + aria-label carry the list
+/// name and count, a 10px badge shows the count (hidden at zero).
+#[component]
+fn RailIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
+    icon: I,
+    label: String,
+    badge: usize,
+    selected: bool,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    let badge = badge_text(badge);
+    rsx! {
+        button {
+            class: if selected {
+                "relative flex h-9 w-full shrink-0 items-center justify-center border-l-2 border-l-primary-500 bg-card text-fg"
+            } else {
+                "relative flex h-9 w-full shrink-0 items-center justify-center border-l-2 border-transparent text-fg-muted hover:bg-card hover:text-fg transition-colors"
+            },
+            title: "{label}",
+            "aria-label": "{label}",
+            "aria-current": if selected { "true" } else { "false" },
+            onclick: move |evt| onclick.call(evt),
+            Icon { width: 16, height: 16, icon }
+            if let Some(text) = badge {
+                span {
+                    class: "absolute right-1.5 top-0.5 min-w-[14px] rounded-full bg-input px-1 text-center text-[10px] leading-[14px] text-fg-muted",
+                    "{text}"
+                }
+            }
+        }
+    }
+}
+
+/// The rail's projects popover (opened by its folder button): projects
+/// grouped by area, using the same `RailItem` rows as the full nav. Picking
+/// one selects it and closes the popover; a click outside closes it too.
+/// Rendered outside the rail's scroll container so it isn't clipped.
+#[component]
+fn RailProjectsPopover(
+    mut selection: Signal<PlannerSelection>,
+    mut open: Signal<bool>,
+    top_level: Vec<RailProjectRow>,
+    by_area: Vec<RailAreaRows>,
+) -> Element {
+    rsx! {
+            div {
+                class: "fixed inset-0 z-40",
+                onclick: move |_| open.set(false),
+            }
+            div {
+                class: "absolute left-full top-0 z-50 ml-1 max-h-[70vh] w-60 overflow-y-auto rounded-md border border-subtle bg-card p-2 shadow-lg",
+                role: "menu",
+                "aria-label": "Projects",
+                for (id, title, n) in top_level {
+                    RailItem {
+                        key: "{id}",
+                        icon: fi_icons::FiFolder,
+                        label: title,
+                        count: n,
+                        selected: *selection.read() == PlannerSelection::Project(id.clone()),
+                        onclick: {
+                            let id = id.clone();
+                            move |_| {
+                                selection.set(PlannerSelection::Project(id.clone()));
+                                open.set(false);
+                            }
+                        },
+                    }
+                }
+                for (area_title, projects) in by_area {
+                    div {
+                        key: "{area_title}",
+                        class: "mt-2",
+                        p {
+                            class: "px-2 pb-1 text-xs font-medium uppercase tracking-wide text-fg-muted",
+                            "{area_title}"
+                        }
+                        for (id, title, n) in projects {
+                            RailItem {
+                                key: "{id}",
+                                icon: fi_icons::FiFolder,
+                                label: title,
+                                count: n,
+                                selected: *selection.read() == PlannerSelection::Project(id.clone()),
+                                onclick: {
+                                    let id = id.clone();
+                                    move |_| {
+                                        selection.set(PlannerSelection::Project(id.clone()));
+                                        open.set(false);
+                                    }
+                                },
+                            }
+                        }
+                    }
+                }
+            }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badge_hides_zero_and_caps_at_99_plus() {
+        assert_eq!(badge_text(0), None);
+        assert_eq!(badge_text(1).as_deref(), Some("1"));
+        assert_eq!(badge_text(99).as_deref(), Some("99"));
+        assert_eq!(badge_text(100).as_deref(), Some("99+"));
+        assert_eq!(badge_text(5000).as_deref(), Some("99+"));
+    }
+
+    #[test]
+    fn rail_label_names_the_list_and_its_count() {
+        assert_eq!(rail_label("Inbox", 0), "Inbox");
+        assert_eq!(rail_label("Today", 7), "Today, 7");
     }
 }

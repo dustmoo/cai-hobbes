@@ -7,6 +7,11 @@
 //! Its sort and grouping are the planner's lens (`tab_list::TabListOrder`,
 //! driven by the shared `ListOrderControl`), persisted in
 //! `UiState::tab_sidebar_order`.
+//!
+//! Resizable (180–400px) by the shared `ColumnDivider` that `main.rs` renders
+//! on its right edge, and collapsible to a 48px emoji rail — by the user
+//! (dragging below 140px, persisted) or by the layout solver when the window
+//! runs out of room (temporary). See `layout_budget::solve_chat`.
 
 use crate::components::planner_rows::{ListOrderControl, SECTION_HEADER};
 use crate::components::stream_manager::StreamManagerContext;
@@ -18,9 +23,33 @@ use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
-/// Fixed width (px) of the tab sidebar. It is persistent navigation rather
-/// than one of the resizable tool panels, so it has no drag divider.
-pub const TAB_SIDEBAR_WIDTH: u32 = 256;
+/// What a tab shows in the 48px rail: its emoji, else the first letter of
+/// its topic (AI summary or the user's rename), else a neutral chat glyph —
+/// the bare date-stamp title of a fresh chat would make every letter "O"
+/// in October, which tells tabs apart no better than nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RailGlyph {
+    Emoji(String),
+    Letter(String),
+    Blank,
+}
+
+pub fn rail_glyph(emoji: Option<&str>, topic: Option<&str>) -> RailGlyph {
+    if let Some(e) = emoji.filter(|e| !e.trim().is_empty()) {
+        return RailGlyph::Emoji(e.to_string());
+    }
+    match topic.and_then(|t| t.trim().chars().next()) {
+        Some(c) => RailGlyph::Letter(c.to_uppercase().collect()),
+        None => RailGlyph::Blank,
+    }
+}
+
+fn is_middle_click(evt: &MouseEvent) -> bool {
+    matches!(
+        evt.trigger_button(),
+        Some(dioxus::html::input_data::MouseButton::Auxiliary)
+    )
+}
 
 /// One open chat tab, as `TabBar`'s per-tab props bundled into a row.
 #[derive(Clone, PartialEq, Debug)]
@@ -58,11 +87,22 @@ pub struct TabSidebarProps {
     pub fleet_attention: usize,
     pub on_select_fleet: EventHandler<()>,
     pub on_close_fleet: EventHandler<()>,
+    /// Full-mode width (px), already resolved by the layout solver.
+    pub width: f64,
+    /// Show the 48px emoji rail (user's choice or the solver's).
+    #[props(default)]
+    pub rail: bool,
+    /// Draw our own right border — when no divider sits on the edge (the
+    /// solver's automatic rail isn't user-resizable).
+    #[props(default)]
+    pub edge_border: bool,
 }
 
 const ROW: &str = "group relative flex items-center gap-1.5 h-8 pl-3 pr-1 cursor-pointer select-none border-l-2";
 const ROW_ACTIVE: &str = "bg-card border-l-primary-500";
 const ROW_IDLE: &str = "border-transparent hover:bg-card";
+const RAIL_ITEM: &str = "group relative flex items-center justify-center w-full h-9 shrink-0 cursor-pointer select-none border-l-2";
+const RAIL_CLOSE: &str = "absolute top-0 right-0.5 p-px rounded-sm text-fg-muted bg-section hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity";
 const CLOSE_BTN: &str = "p-0.5 rounded-md shrink-0 text-fg-muted hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity";
 
 pub fn TabSidebar(props: TabSidebarProps) -> Element {
@@ -129,29 +169,182 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
     };
     let groups = arrange_tabs(&facts, *order.read());
     let any_view = props.planner_tab_open || props.fleet_tab_open;
+    // The rail lists tabs in the same display order as the full list.
+    let rail_order: Vec<usize> = groups.iter().flat_map(|g| g.rows.iter().copied()).collect();
+    let width = if props.rail {
+        crate::layout_budget::SIDEBAR_RAIL_WIDTH
+    } else {
+        props.width
+    };
+    let root_class = if props.edge_border {
+        "flex flex-col h-full shrink-0 bg-section border-r border-primary-700/50"
+    } else {
+        "flex flex-col h-full shrink-0 bg-section"
+    };
+
+    if props.rail {
+        return rsx! {
+            div {
+                class: "{root_class}",
+                style: "width: {width}px;",
+                div {
+                    class: "flex items-center justify-center h-10 shrink-0 border-b border-faint",
+                    crate::components::app_menu::AppMenuButton {
+                        placement: crate::components::app_menu::AppMenuPlacement::Rail,
+                    }
+                }
+                div {
+                    class: "flex-1 min-h-0 overflow-y-auto overflow-x-hidden py-1 flex flex-col",
+                    if props.planner_tab_open {
+                        div {
+                            class: if props.planner_active { "{RAIL_ITEM} {ROW_ACTIVE}" } else { "{RAIL_ITEM} {ROW_IDLE}" },
+                            title: "Planner",
+                            onclick: move |_| props.on_select_planner.call(()),
+                            onmouseup: move |evt| if is_middle_click(&evt) { props.on_close_planner.call(()) },
+                            Icon {
+                                icon: fi_icons::FiCheckSquare,
+                                width: 14,
+                                height: 14,
+                                class: if props.planner_active { "text-fg" } else { "text-fg-muted" },
+                            }
+                            button {
+                                class: "{RAIL_CLOSE}",
+                                title: "Close Planner",
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    props.on_close_planner.call(());
+                                },
+                                Icon { icon: fi_icons::FiX, width: 10, height: 10 }
+                            }
+                        }
+                    }
+                    if props.fleet_tab_open {
+                        div {
+                            class: if props.fleet_active { "{RAIL_ITEM} {ROW_ACTIVE}" } else { "{RAIL_ITEM} {ROW_IDLE}" },
+                            title: if props.fleet_attention > 0 { "Fleet · {props.fleet_attention} need you" } else { "Fleet" },
+                            onclick: move |_| props.on_select_fleet.call(()),
+                            onmouseup: move |evt| if is_middle_click(&evt) { props.on_close_fleet.call(()) },
+                            Icon {
+                                icon: crate::components::pixel_icons::HobbesTiger,
+                                width: 16,
+                                height: 16,
+                                class: if props.fleet_active { "" } else { "opacity-70" },
+                            }
+                            if props.fleet_attention > 0 {
+                                span {
+                                    class: "absolute bottom-1 right-1.5 w-1.5 h-1.5 rounded-full",
+                                    style: "background-color: #f59e0b;",
+                                }
+                            }
+                            button {
+                                class: "{RAIL_CLOSE}",
+                                title: "Close Fleet",
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    props.on_close_fleet.call(());
+                                },
+                                Icon { icon: fi_icons::FiX, width: 10, height: 10 }
+                            }
+                        }
+                    }
+                    if any_view {
+                        div { class: "h-px mx-2 bg-[var(--color-border-muted)] my-1 shrink-0" }
+                    }
+                    for idx in rail_order.iter().copied() {
+                        {
+                            let tab = props.tabs[idx].clone();
+                            let is_active = idx == props.active_tab_index
+                                && !props.planner_active
+                                && !props.fleet_active;
+                            let is_streaming = streaming.read().contains(&tab.session_id);
+                            let label = tab.topic.clone().unwrap_or_else(|| tab.title.clone());
+                            let glyph = rail_glyph(tab.emoji.as_deref(), tab.topic.as_deref());
+                            let on_select = props.on_select_tab;
+                            let on_close = props.on_close_tab;
+                            rsx! {
+                                div {
+                                    key: "{tab.session_id}",
+                                    class: if is_active { "{RAIL_ITEM} {ROW_ACTIVE}" } else { "{RAIL_ITEM} {ROW_IDLE}" },
+                                    title: "{label}",
+                                    onclick: move |_| on_select.call(idx),
+                                    onmouseup: move |evt| if is_middle_click(&evt) { on_close.call(idx) },
+                                    match glyph {
+                                        RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
+                                        RailGlyph::Letter(l) => rsx! {
+                                            span {
+                                                class: if is_active { "text-xs font-medium text-fg" } else { "text-xs font-medium text-fg-muted" },
+                                                "{l}"
+                                            }
+                                        },
+                                        RailGlyph::Blank => rsx! {
+                                            Icon {
+                                                icon: fi_icons::FiMessageSquare,
+                                                width: 13,
+                                                height: 13,
+                                                class: if is_active { "text-fg" } else { "text-fg-muted" },
+                                            }
+                                        },
+                                    }
+                                    if is_streaming {
+                                        div { class: "absolute bottom-1 right-1.5 w-1.5 h-1.5 rounded-full bg-primary-400 animate-pulse" }
+                                    }
+                                    button {
+                                        class: "{RAIL_CLOSE}",
+                                        title: "Close Tab",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            on_close.call(idx);
+                                        },
+                                        Icon { icon: fi_icons::FiX, width: 10, height: 10 }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                div {
+                    class: "flex items-center justify-center h-10 shrink-0 border-t border-faint",
+                    button {
+                        class: "flex items-center justify-center w-8 h-8 rounded-md text-fg-muted hover:bg-card hover:text-fg transition-colors",
+                        onclick: move |_| props.on_new_tab.call(()),
+                        title: "New Tab (Cmd+Shift+N)",
+                        Icon { icon: fi_icons::FiPlus, width: 14, height: 14 }
+                    }
+                }
+            }
+        };
+    }
 
     rsx! {
         div {
-            class: "flex flex-col h-full bg-section border-r border-primary-700/50",
-            style: "width: {TAB_SIDEBAR_WIDTH}px;",
+            class: "{root_class}",
+            style: "width: {width}px;",
 
-            // Header: title, new tab, the planner's sort/group pill. The pill
-            // sits last because its popover is right-anchored and 224px wide —
-            // anywhere further left it would hang off the window edge.
+            // Header: the Hobbes menu, title, the planner's sort/group pill,
+            // new tab. The pill's popover is right-anchored and 224px wide,
+            // which would hang off the window edge this far left, so
+            // `.tab-sidebar-order` (tailwind.css) anchors it to the pill's
+            // left edge instead and lets it overhang the chat column.
             div {
-                class: "flex items-center gap-1.5 h-10 shrink-0 pl-3 pr-2 border-b border-faint",
+                class: "flex items-center gap-1.5 h-10 shrink-0 pl-1.5 pr-2 border-b border-faint",
+                crate::components::app_menu::AppMenuButton {
+                    placement: crate::components::app_menu::AppMenuPlacement::SidebarHeader,
+                }
                 span { class: "flex-1 min-w-0 truncate text-[11px] uppercase tracking-[0.08em] text-fg-muted", "Tabs" }
+                div {
+                    class: "tab-sidebar-order shrink-0",
+                    ListOrderControl {
+                        order,
+                        keys: TabSortKey::ALL.to_vec(),
+                        groups: group_options(),
+                        on_change: set_order,
+                    }
+                }
                 button {
                     class: "flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-fg-muted hover:bg-card hover:text-fg transition-colors",
                     onclick: move |_| props.on_new_tab.call(()),
                     title: "New Tab (Cmd+Shift+N)",
                     Icon { icon: fi_icons::FiPlus, width: 14, height: 14 }
-                }
-                ListOrderControl {
-                    order,
-                    keys: TabSortKey::ALL.to_vec(),
-                    groups: group_options(),
-                    on_change: set_order,
                 }
             }
 
@@ -164,6 +357,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                         div {
                             class: if props.planner_active { "{ROW} {ROW_ACTIVE}" } else { "{ROW} {ROW_IDLE}" },
                             onclick: move |_| props.on_select_planner.call(()),
+                            onmouseup: move |evt| if is_middle_click(&evt) { props.on_close_planner.call(()) },
                             Icon {
                                 icon: fi_icons::FiCheckSquare,
                                 width: 12,
@@ -189,6 +383,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                         div {
                             class: if props.fleet_active { "{ROW} {ROW_ACTIVE}" } else { "{ROW} {ROW_IDLE}" },
                             onclick: move |_| props.on_select_fleet.call(()),
+                            onmouseup: move |evt| if is_middle_click(&evt) { props.on_close_fleet.call(()) },
                             Icon {
                                 icon: crate::components::pixel_icons::HobbesTiger,
                                 width: 14,
@@ -268,6 +463,11 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                                 on_select.call(idx);
                                             }
                                         },
+                                        onmouseup: move |evt| {
+                                            if !is_editing && is_middle_click(&evt) {
+                                                on_close.call(idx);
+                                            }
+                                        },
                                         if is_editing {
                                             input {
                                                 class: "flex-1 min-w-0 bg-input text-fg text-xs rounded-sm px-1 py-0.5 focus:outline-none focus:ring-1 focus:ring-primary-500",
@@ -337,5 +537,19 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rail_glyph_prefers_emoji_then_topic_letter_then_blank() {
+        assert_eq!(rail_glyph(Some("🐯"), Some("tigers")), RailGlyph::Emoji("🐯".into()));
+        assert_eq!(rail_glyph(None, Some("budget review")), RailGlyph::Letter("B".into()));
+        assert_eq!(rail_glyph(Some("  "), Some(" écrire")), RailGlyph::Letter("É".into()));
+        assert_eq!(rail_glyph(None, None), RailGlyph::Blank);
+        assert_eq!(rail_glyph(None, Some("   ")), RailGlyph::Blank);
     }
 }

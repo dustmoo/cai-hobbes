@@ -1,5 +1,7 @@
 pub mod activity_stream;
 pub mod chat;
+pub mod column_divider;
+pub mod app_menu;
 pub mod chat_input;
 pub mod chat_queue;
 pub mod comment_modal;
