@@ -46,6 +46,9 @@ pub enum ClaudeModel {
     Sonnet5,
     Sonnet4_6,
     Sonnet4_5,
+    /// Current small model (October 2026). Priced by prompt length: higher
+    /// rates above 100k prompt tokens (see [`ClaudeModel::price_multiplier`]).
+    Haiku5_5,
     Haiku4_5,
     /// Any unrecognized slug — handled gracefully (conservative defaults).
     Unknown(String),
@@ -74,6 +77,7 @@ impl ClaudeModel {
             _ if s.starts_with("claude-sonnet-5") => ClaudeModel::Sonnet5,
             _ if s.starts_with("claude-sonnet-4-6") => ClaudeModel::Sonnet4_6,
             _ if s.starts_with("claude-sonnet-4-5") => ClaudeModel::Sonnet4_5,
+            _ if s.starts_with("claude-haiku-5-5") => ClaudeModel::Haiku5_5,
             _ if s.starts_with("claude-haiku-4-5") => ClaudeModel::Haiku4_5,
             other => ClaudeModel::Unknown(other.to_string()),
         }
@@ -95,6 +99,7 @@ impl ClaudeModel {
             ClaudeModel::Sonnet5 => "claude-sonnet-5",
             ClaudeModel::Sonnet4_6 => "claude-sonnet-4-6",
             ClaudeModel::Sonnet4_5 => "claude-sonnet-4-5",
+            ClaudeModel::Haiku5_5 => "claude-haiku-5-5",
             ClaudeModel::Haiku4_5 => "claude-haiku-4-5",
             ClaudeModel::Unknown(slug) => slug,
         }
@@ -116,6 +121,7 @@ impl ClaudeModel {
             ClaudeModel::Sonnet5 => "Claude Sonnet 5".to_string(),
             ClaudeModel::Sonnet4_6 => "Claude Sonnet 4.6".to_string(),
             ClaudeModel::Sonnet4_5 => "Claude Sonnet 4.5".to_string(),
+            ClaudeModel::Haiku5_5 => "Claude Haiku 5.5".to_string(),
             ClaudeModel::Haiku4_5 => "Claude Haiku 4.5".to_string(),
             ClaudeModel::Unknown(slug) => slug
                 .replace(['-', '_'], " ")
@@ -148,7 +154,8 @@ impl ClaudeModel {
             | ClaudeModel::Sonnet5_5
             | ClaudeModel::Sonnet5
             | ClaudeModel::Sonnet4_6
-            | ClaudeModel::Sonnet4_5 => 1_000_000,
+            | ClaudeModel::Sonnet4_5
+            | ClaudeModel::Haiku5_5 => 1_000_000,
             // 200K context window.
             ClaudeModel::Opus4_5 | ClaudeModel::Opus4_1 | ClaudeModel::Haiku4_5 => 200_000,
             // Unknown: conservative.
@@ -167,12 +174,11 @@ impl ClaudeModel {
             | ClaudeModel::Opus4_8
             | ClaudeModel::Opus4_7
             | ClaudeModel::Opus4_6
-            | ClaudeModel::Sonnet5_5 => 128_000,
-            ClaudeModel::Sonnet5
+            | ClaudeModel::Sonnet5_5
+            | ClaudeModel::Sonnet5
             | ClaudeModel::Sonnet4_6
-            | ClaudeModel::Sonnet4_5
-            | ClaudeModel::Opus4_5
-            | ClaudeModel::Haiku4_5 => 64_000,
+            | ClaudeModel::Haiku5_5 => 128_000,
+            ClaudeModel::Sonnet4_5 | ClaudeModel::Opus4_5 | ClaudeModel::Haiku4_5 => 64_000,
             ClaudeModel::Opus4_1 => 32_000,
             // Unknown/custom or future slug: use a generous ceiling so the
             // streaming-safe default isn't silently truncated. If the real model
@@ -184,8 +190,8 @@ impl ClaudeModel {
     /// USD price per 1M input tokens (for cost estimation in `UsageData`).
     /// Manually maintained; re-verify against
     /// platform.claude.com/docs/en/about-claude/pricing (SYSTEM_PATTERNS P-013).
-    /// Last verified: 2026-09-28 — added Opus 5.5 ($4/$20, the first Opus
-    /// priced below $5/$25) and Sonnet 5.5 ($2/$10).
+    /// Last verified: 2026-10-07 — added Haiku 5.5 ($0.10/$0.50 up to 100k
+    /// prompt tokens; see `price_multiplier`); all other rates re-checked.
     pub fn input_price_per_mtok(&self) -> f64 {
         match self {
             ClaudeModel::Fable5_1 => 10.0,
@@ -203,6 +209,7 @@ impl ClaudeModel {
             // from the old Sonnet 4.6 ladder rung.
             ClaudeModel::Sonnet5_5 | ClaudeModel::Sonnet5 => 2.0,
             ClaudeModel::Sonnet4_6 | ClaudeModel::Sonnet4_5 => 3.0,
+            ClaudeModel::Haiku5_5 => 0.10,
             ClaudeModel::Haiku4_5 => 1.0,
             ClaudeModel::Unknown(_) => 0.0,
         }
@@ -222,13 +229,29 @@ impl ClaudeModel {
             ClaudeModel::Opus4_1 => 75.0,
             ClaudeModel::Sonnet5_5 | ClaudeModel::Sonnet5 => 10.0,
             ClaudeModel::Sonnet4_6 | ClaudeModel::Sonnet4_5 => 15.0,
+            ClaudeModel::Haiku5_5 => 0.50,
             ClaudeModel::Haiku4_5 => 5.0,
             ClaudeModel::Unknown(_) => 0.0,
         }
     }
 
+    /// Multiplier on every rate above (input, output, cache reads and writes)
+    /// for a request whose total prompt is `prompt_tokens` (input + cache
+    /// reads + cache writes). Haiku 5.5 is priced by prompt length: prompts
+    /// over 100,000 tokens pay 5x ($0.50/$2.50 instead of $0.10/$0.50).
+    /// Every other model is flat across its context window.
+    pub fn price_multiplier(&self, prompt_tokens: u64) -> f64 {
+        match self {
+            ClaudeModel::Haiku5_5 if prompt_tokens > 100_000 => 5.0,
+            _ => 1.0,
+        }
+    }
+
     /// USD price per 1M prompt-cache read tokens. The standard multiplier is
     /// 0.1x base input; Fable 5.1 is 0.025x and Opus 5.5 is 0.05x.
+    /// Sonnet 5.5 uses the standard 0.1x ($0.20): the pricing table and its
+    /// footnote say so, though one prose line on the same page (2026-10-07)
+    /// says 0.05x ($0.10). Re-check when the docs settle.
     pub fn cache_read_price_per_mtok(&self) -> f64 {
         match self {
             ClaudeModel::Fable5_1 => 0.25,
@@ -296,6 +319,7 @@ impl ClaudeModel {
             | ClaudeModel::Sonnet5
             | ClaudeModel::Sonnet4_6
             | ClaudeModel::Sonnet4_5
+            | ClaudeModel::Haiku5_5
             | ClaudeModel::Haiku4_5 => true,
             ClaudeModel::Opus4_1 => false,
             // Unknown: assume modern → supports adaptive thinking.
@@ -317,7 +341,7 @@ impl ClaudeModel {
             ClaudeModel::Opus5_5,
             ClaudeModel::Fable5_1,
             ClaudeModel::Sonnet5_5,
-            ClaudeModel::Haiku4_5,
+            ClaudeModel::Haiku5_5,
             ClaudeModel::Opus5,
             ClaudeModel::Sonnet5,
             ClaudeModel::Fable5,
@@ -327,6 +351,7 @@ impl ClaudeModel {
             ClaudeModel::Sonnet4_6,
             ClaudeModel::Opus4_5,
             ClaudeModel::Sonnet4_5,
+            ClaudeModel::Haiku4_5,
         ]
     }
 }
@@ -334,6 +359,39 @@ impl ClaudeModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Haiku 5.5 (verified 2026-10-07): its own slug, $0.10/$0.50 base with
+    /// 0.1x cache reads, and 5x every rate once the prompt passes 100k.
+    #[test]
+    fn haiku_5_5_slug_prices_and_long_prompt_tier() {
+        let h = ClaudeModel::from_slug("claude-haiku-5-5");
+        assert_eq!(h, ClaudeModel::Haiku5_5);
+        assert_eq!(h.canonical_slug(), "claude-haiku-5-5");
+        assert_ne!(ClaudeModel::from_slug("claude-haiku-4-5"), ClaudeModel::Haiku5_5);
+        assert!((h.input_price_per_mtok() - 0.10).abs() < 1e-12);
+        assert!((h.output_price_per_mtok() - 0.50).abs() < 1e-12);
+        assert!((h.cache_read_price_per_mtok() - 0.01).abs() < 1e-12);
+        assert_eq!(h.price_multiplier(100_000), 1.0);
+        assert_eq!(h.price_multiplier(100_001), 5.0);
+        // Long-prompt tier matches the published $0.50/$2.50, $0.05 reads.
+        assert!((h.input_price_per_mtok() * h.price_multiplier(200_000) - 0.50).abs() < 1e-12);
+        assert!((h.output_price_per_mtok() * h.price_multiplier(200_000) - 2.50).abs() < 1e-12);
+        assert!((h.cache_read_price_per_mtok() * h.price_multiplier(200_000) - 0.05).abs() < 1e-12);
+        // Flat pricing everywhere else.
+        assert_eq!(ClaudeModel::Opus5_5.price_multiplier(900_000), 1.0);
+        assert_eq!(h.max_output_tokens(), 128_000);
+        assert_eq!(h.context_window_tokens(), 1_000_000);
+        assert!(h.supports_thinking() && !h.thinking_always_on());
+        assert!(ClaudeModel::all_models().contains(&ClaudeModel::Haiku5_5));
+    }
+
+    /// Sonnet 5 and Sonnet 4.6 accept 128K max_tokens, like Sonnet 5.5.
+    #[test]
+    fn sonnet_5_and_4_6_allow_128k_output() {
+        assert_eq!(ClaudeModel::Sonnet5.max_output_tokens(), 128_000);
+        assert_eq!(ClaudeModel::Sonnet4_6.max_output_tokens(), 128_000);
+        assert_eq!(ClaudeModel::Sonnet4_5.max_output_tokens(), 64_000);
+    }
 
     #[test]
     fn from_slug_recognizes_aliases() {

@@ -505,11 +505,13 @@ fn claude_usage(
 ) -> UsageData {
     let read = cache_read.unwrap_or(0);
     let write = cache_write.unwrap_or(0);
-    let cost = (input as f64 / 1_000_000.0) * model.input_price_per_mtok()
-        + (read as f64 / 1_000_000.0) * model.cache_read_price_per_mtok()
-        + (write as f64 / 1_000_000.0) * model.cache_write_price_per_mtok(ttl)
-        + (completion as f64 / 1_000_000.0) * model.output_price_per_mtok();
     let prompt = input + read + write;
+    let tier = model.price_multiplier(prompt.max(0) as u64);
+    let cost = tier
+        * ((input as f64 / 1_000_000.0) * model.input_price_per_mtok()
+            + (read as f64 / 1_000_000.0) * model.cache_read_price_per_mtok()
+            + (write as f64 / 1_000_000.0) * model.cache_write_price_per_mtok(ttl)
+            + (completion as f64 / 1_000_000.0) * model.output_price_per_mtok());
     UsageData {
         prompt_tokens: prompt,
         completion_tokens: completion,

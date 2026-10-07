@@ -100,7 +100,7 @@ pub fn default_claude_model_slots() -> Vec<String> {
     let mut slots: Vec<String> = vec![
         ClaudeModel::DEFAULT_CHAT_SLUG.to_string(),
         ClaudeModel::Sonnet5_5.canonical_slug().to_string(),
-        ClaudeModel::Haiku4_5.canonical_slug().to_string(),
+        ClaudeModel::Haiku5_5.canonical_slug().to_string(),
         ClaudeModel::Fable5_1.canonical_slug().to_string(),
     ];
     slots.resize(10, String::new());
@@ -384,7 +384,7 @@ impl Default for ClaudeConfig {
             api_key: None,
             model: ClaudeModel::DEFAULT_CHAT_SLUG.to_string(),
             // Default summaries to a cheaper model; falls back to `model` if unset.
-            summary_model: Some(ClaudeModel::Haiku4_5.canonical_slug().to_string()),
+            summary_model: Some(ClaudeModel::Haiku5_5.canonical_slug().to_string()),
             max_tokens: default_claude_max_tokens(),
             extended_thinking: false,
             prompt_caching_enabled: true,

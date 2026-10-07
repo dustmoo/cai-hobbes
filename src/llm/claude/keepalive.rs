@@ -475,9 +475,11 @@ async fn run_ping(id: String, token: u64) {
     };
     let (input, read, created) = result;
     let m = ClaudeModel::from_slug(&settings.model);
-    let cost = (input as f64 * m.input_price_per_mtok()
-        + read as f64 * m.cache_read_price_per_mtok()
-        + created as f64 * m.cache_write_price_per_mtok(settings.ttl))
+    let tier = m.price_multiplier((input + read + created).max(0) as u64);
+    let cost = tier
+        * (input as f64 * m.input_price_per_mtok()
+            + read as f64 * m.cache_read_price_per_mtok()
+            + created as f64 * m.cache_write_price_per_mtok(settings.ttl))
         / 1_000_000.0;
     add_spend(cost);
     let missed = created >= MISS_WRITE_TOKENS && created > read;
