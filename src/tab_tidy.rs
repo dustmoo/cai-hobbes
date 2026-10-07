@@ -90,6 +90,13 @@ pub struct TidySuggestions {
     pub unsorted: Vec<UnsortedTab>,
 }
 
+#[cfg(test)]
+impl TidySuggestions {
+    pub fn is_empty(&self) -> bool {
+        self.finished.is_empty() && self.idle.is_empty() && self.unsorted.is_empty()
+    }
+}
+
 /// Never close what the user is looking at, what is working, what will fire,
 /// or what they pinned.
 fn protected(t: &TidyTab) -> bool {
