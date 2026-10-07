@@ -395,9 +395,15 @@ pub fn ChatWindow(
                     *stream_manager.stream_activity.write() += 1;
                     // Clear this session's in-flight guard before re-triggering
                     continuation_controller.write().clear_in_flight(&owning_id);
-                    continuation_controller
-                        .write()
-                        .trigger_continuation(owning_id.clone());
+                    if !crate::agent_time_runtime::continuation_blocked(
+                        &planner_state.peek(),
+                        &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                        &owning_id,
+                    ) {
+                        continuation_controller
+                            .write()
+                            .trigger_continuation(owning_id.clone());
+                    }
                     return;
                 }
 
@@ -421,25 +427,46 @@ pub fn ChatWindow(
                     // Built-in tools run before MCP dispatch, through the same
                     // dispatcher the streaming path uses so the two can't drift
                     // apart (see components::builtin_tools).
-                    let builtin = crate::components::builtin_tools::dispatch_builtin_tool(
-                        crate::components::builtin_tools::BuiltinToolCtx {
-                            session_state,
-                            settings,
-                            skill_registry,
-                            permission_manager,
-                            mcp_context: mcp_context_signal,
-                            planner: planner_state,
-                            chat_command,
-                        },
+                    let builtin_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+                        session_state,
+                        settings,
+                        skill_registry,
+                        permission_manager,
+                        mcp_context: mcp_context_signal,
+                        planner: planner_state,
+                        chat_command,
+                    };
+                    // Agent time: the same scope gate as the streaming path,
+                    // with the user's approval in hand (an approved outside
+                    // effect runs; Deny, no intent, or an ended run refuse).
+                    let builtin = match crate::components::builtin_tools::agent_time_gate(
+                        builtin_ctx,
                         &tool_call,
                         &args_json,
                         &owning_id,
-                        composio_profile.as_ref(),
-                        // Only approved calls are `Running` here (see step 1):
-                        // the Approve click already satisfied the skill gate.
                         true,
-                    )
-                    .await;
+                    ) {
+                        crate::components::builtin_tools::AgentTimeGate::Refuse(message) => {
+                            Some(crate::components::builtin_tools::BuiltinOutcome {
+                                status: crate::components::shared::ToolCallStatus::Error,
+                                response: message,
+                                persist: true,
+                            })
+                        }
+                        _ => {
+                            crate::components::builtin_tools::dispatch_builtin_tool(
+                                builtin_ctx,
+                                &tool_call,
+                                &args_json,
+                                &owning_id,
+                                composio_profile.as_ref(),
+                                // Only approved calls are `Running` here (see step 1):
+                                // the Approve click already satisfied the skill gate.
+                                true,
+                            )
+                            .await
+                        }
+                    };
 
                     let (status, response_str, persist) = match builtin {
                         Some(outcome) => (outcome.status, outcome.response, outcome.persist),
@@ -537,7 +564,18 @@ pub fn ChatWindow(
                     }
                 }
 
-                // 3. Trigger continuation to send results back to LLM
+                // 3. Trigger continuation to send results back to LLM —
+                // unless agent time ended in this chat meanwhile.
+                if crate::agent_time_runtime::continuation_blocked(
+                    &planner_state.peek(),
+                    &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                    &owning_id,
+                ) {
+                    tracing::info!(session_id = %owning_id, "Continuation skipped: agent time has ended in this chat.");
+                    stream_manager.streaming_sessions.write().remove(&owning_id);
+                    *stream_manager.stream_activity.write() += 1;
+                    return;
+                }
                 continuation_controller
                     .write()
                     .trigger_continuation(owning_id.clone());
@@ -672,6 +710,7 @@ pub fn ChatWindow(
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder = PromptBuilder::new(session, &settings_read)
+                                        .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
                                         .with_planner_today(
                                             crate::todo::handlers::planner_today_context(
                                                 &planner_state.read(),
@@ -852,6 +891,7 @@ pub fn ChatWindow(
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read)
+                                .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
                                 .with_planner_today(crate::todo::handlers::planner_today_context(
                                     &planner_state.read(),
                                     &settings_read,
@@ -957,8 +997,9 @@ pub fn ChatWindow(
                 let (prompt_data, pages, history_anchor, ledger_entries) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
-                        let builder = PromptBuilder::new(session, &settings).with_planner_today(
-                            crate::todo::handlers::planner_today_context(
+                        let builder = PromptBuilder::new(session, &settings)
+                            .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                            .with_planner_today(crate::todo::handlers::planner_today_context(
                                 &planner_state.read(),
                                 &settings,
                                 chrono::Local::now().date_naive(),

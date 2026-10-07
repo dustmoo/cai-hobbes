@@ -15,6 +15,7 @@ use dioxus::prelude::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 
+mod agent_time_runtime;
 mod async_persist;
 #[cfg(target_os = "macos")]
 mod biometric_auth;
@@ -87,6 +88,13 @@ static STREAMING_SESSIONS: GlobalSignal<std::collections::HashSet<String>> =
 /// landing between two effect runs don't drop one of the cancels.
 static CANCEL_STREAM_REQUEST: GlobalSignal<std::collections::HashSet<String>> =
     Signal::global(std::collections::HashSet::new);
+
+/// Ask `StreamBridge` to cancel `session_id`'s active stream, from code
+/// that cannot reach `StreamManagerContext` (the agent-time runtime's
+/// Pause / Stop / budget stop). No-op when nothing is streaming there.
+pub(crate) fn request_stream_cancel(session_id: &str) {
+    CANCEL_STREAM_REQUEST.write().insert(session_id.to_string());
+}
 
 /// Drain `CANCEL_STREAM_REQUEST`, subscribing the caller to it.
 ///
@@ -1957,6 +1965,25 @@ fn app() -> Element {
     });
     use_context_provider(|| SessionIdContext(current_session_id));
 
+    // ── Agent-time budget tick ───────────────────────────────────────────────
+    // While a lease is held, re-check today's minutes and spend every 30 s and
+    // stop the run when it is over (usage events re-check sooner). No
+    // auto-start: agent time only ever starts from ChatCommand::AgentTimeStart.
+    {
+        let planner_state = planner_state;
+        let session_state = session_state;
+        use_future(move || async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    agent_time_runtime::TICK_SECS,
+                ))
+                .await;
+                let streaming = STREAMING_SESSIONS.peek().clone();
+                agent_time_runtime::tick(planner_state, session_state, &streaming);
+            }
+        });
+    }
+
     // ── AI-settable timer scheduler ──────────────────────────────────────────
     // Polls every 5s for due timers (HOBBES_SET_TIMER) and fires them: focus the
     // window + toast, and for `prompt` mode enqueue the prompt and switch to its
@@ -3171,11 +3198,35 @@ fn app() -> Element {
                 ChatCommand::TidyTabs => {
                     show_tidy.set(true);
                 }
-                // Agent-time runtime controls: wired by the runtime (wave 2).
-                ChatCommand::AgentTimeStart
-                | ChatCommand::AgentTimePause
-                | ChatCommand::AgentTimeStop => {
-                    tracing::debug!("agent-time control not wired yet");
+                // Agent-time runtime controls (agent_time_runtime.rs). Start
+                // is user-initiated only; the run gets its own background
+                // tab and never steals focus.
+                ChatCommand::AgentTimeStart => {
+                    match agent_time_runtime::start_now(planner_state, session_state, settings) {
+                        Ok(chat_id) => {
+                            let mut tabs = open_tabs.read().clone();
+                            if !tabs.contains(&chat_id) {
+                                tabs.push(chat_id);
+                                open_tabs.set(tabs);
+                            }
+                        }
+                        Err(r) => {
+                            tracing::info!("Agent time not started: {}", r.message());
+                            flash_timer_toast(format!("Agent time: {}", r.message()));
+                        }
+                    }
+                }
+                ChatCommand::AgentTimePause => {
+                    agent_time_runtime::halt(
+                        planner_state,
+                        crate::todo::model::AgentTimeEndReason::Paused,
+                    );
+                }
+                ChatCommand::AgentTimeStop => {
+                    agent_time_runtime::halt(
+                        planner_state,
+                        crate::todo::model::AgentTimeEndReason::Stopped,
+                    );
                 }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {

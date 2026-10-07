@@ -127,17 +127,101 @@ pub fn is_planner_tool(name: &str) -> bool {
 /// `PlannerClient::agent_time_tools()` only to a session for which
 /// [`agent_time_tool_visible`] holds. Dispatch refuses it from any other
 /// session regardless (belt and braces).
-#[cfg_attr(not(test), allow(dead_code))] // consumer: system_context.rs withholding (wave 2)
 pub fn is_agent_time_tool(name: &str) -> bool {
     name == "HOBBES_AGENT_TIME"
 }
 
 /// Whether `session_id` is the leased agent-time session — the condition
 /// for offering (and dispatching) `HOBBES_AGENT_TIME`. For the prompt-side
-/// tool list (system_context.rs, wave 2).
-#[allow(dead_code)] // consumer: the agent-time runtime's prompt wiring (wave 2)
+/// tool list (`PromptBuilder::with_agent_time_tools`, set by chat.rs).
 pub fn agent_time_tool_visible(planner: &crate::todo::PlannerState, session_id: &str) -> bool {
     planner.is_agent_time_session(session_id)
+}
+
+/// What the agent-time gate tells a tool-call site to do.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AgentTimeGate {
+    /// Continue through the normal flow (built-in dispatch / MCP permission).
+    Proceed,
+    /// Hold the call as a `PermissionRequest` without consulting trust rules
+    /// or always-allow (streaming path only).
+    ForceApproval,
+    /// Refuse: write this as the call's error result.
+    Refuse(String),
+}
+
+/// **The agent-time scope gate** (SYMBIOTIC_PLANNER.md §3), run by BOTH
+/// tool-call sites — the streaming path (`stream_manager.rs`) and the
+/// approval-resume path (`chat.rs`) — before built-in dispatch and before
+/// `McpManager::use_mcp_tool`'s permission check, for every tool call.
+/// A no-op (`Proceed`) for chats that are not agent-time chats. Records
+/// every gated call on the run's log and persists it (the decision itself
+/// is the pure `agent_time_runtime::gate_decision`).
+pub fn agent_time_gate(
+    deps: BuiltinToolCtx,
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+    user_approved: bool,
+) -> AgentTimeGate {
+    use crate::agent_time_runtime as rt;
+    // Budget is checked at every call too, not only on usage events and the
+    // tick: an over-budget run is stopped here, and the call below is then
+    // refused as an ended run.
+    if deps.planner.peek().is_agent_time_session(session_id) {
+        rt::enforce_now(deps.planner);
+    }
+    let decision = {
+        let planner = deps.planner.peek();
+        rt::gate_decision(&rt::GateInput {
+            is_agent_time_chat: rt::is_agent_time_chat_now(&planner, session_id),
+            leased: planner.is_agent_time_session(session_id),
+            intent_declared: rt::intent_declared(&planner, session_id),
+            tool: &tool_call.tool_name,
+            args: args_json,
+            user_approved,
+        })
+    };
+    let summary = || crate::context::trust_store::arg_summary(args_json);
+    match decision {
+        rt::GateDecision::NotAgentTime => AgentTimeGate::Proceed,
+        rt::GateDecision::Proceed { record } => {
+            if let Some(verdict) = record {
+                rt::record_call(deps.planner, session_id, &tool_call.tool_name, &summary(), verdict);
+            }
+            AgentTimeGate::Proceed
+        }
+        rt::GateDecision::ApprovedByUser => {
+            rt::note(
+                deps.planner,
+                session_id,
+                &tool_call.tool_name,
+                &format!("{} [approved by the user]", summary()),
+            );
+            AgentTimeGate::Proceed
+        }
+        rt::GateDecision::ForceApproval => {
+            rt::record_call(
+                deps.planner,
+                session_id,
+                &tool_call.tool_name,
+                &summary(),
+                crate::todo::agent_time::ScopeVerdict::NeedsApproval,
+            );
+            AgentTimeGate::ForceApproval
+        }
+        rt::GateDecision::Refuse { message, record } => {
+            if let Some(verdict) = record {
+                rt::record_call(deps.planner, session_id, &tool_call.tool_name, &summary(), verdict);
+            }
+            tracing::info!(
+                session_id,
+                tool = %tool_call.tool_name,
+                "Agent-time gate refused a tool call"
+            );
+            AgentTimeGate::Refuse(message)
+        }
+    }
 }
 
 /// The app-state signals a built-in handler may need.

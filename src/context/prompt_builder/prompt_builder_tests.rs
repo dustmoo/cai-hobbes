@@ -790,6 +790,61 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
     }
 }
 
+/// HOBBES_AGENT_TIME is never offered to a normal chat — not even when the
+/// synced MCP context somehow carries it — and is offered to the leased
+/// agent-time session only.
+#[test]
+fn agent_time_tool_only_in_the_leased_agent_time_session() {
+    let settings = Settings::default();
+    let mut session = session_with_planner_tools();
+    let has_it = |p: &crate::context::prompt_builder::PromptBuildResult| {
+        p.prompt.tools.iter().any(|t| t.name == "HOBBES_AGENT_TIME")
+    };
+
+    // Normal chat: not in the list (the visibility check says no).
+    let planner = crate::todo::PlannerState::default();
+    let visible = crate::components::builtin_tools::agent_time_tool_visible(&planner, &session.id);
+    assert!(!visible);
+    let prompt = PromptBuilder::new(&session, &settings)
+        .with_agent_time_tools(visible)
+        .build_prompt("Hi".to_string());
+    assert!(!has_it(&prompt), "normal chat must not see HOBBES_AGENT_TIME");
+    assert!(
+        prompt.prompt.tools.iter().any(|t| t.name == "HOBBES_TODO_CREATE"),
+        "the rest of the planner is still there"
+    );
+
+    // Even a context that carries the definition gets it stripped.
+    if let Some(ctx) = session.active_context.mcp_tools.as_mut() {
+        ctx.servers[0]
+            .tools
+            .extend(crate::mcp::planner_client::PlannerClient::agent_time_tools());
+    }
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt("Hi".to_string());
+    assert!(!has_it(&prompt), "stripped unless the builder is told otherwise");
+
+    // The leased agent-time session sees it, exactly once.
+    let mut planner = crate::todo::PlannerState::default();
+    planner.agent_time_lease = Some(crate::todo::agent_time::AgentTimeLease {
+        chat_session_id: session.id.clone(),
+        opened_at: chrono::Utc::now(),
+    });
+    let visible = crate::components::builtin_tools::agent_time_tool_visible(&planner, &session.id);
+    assert!(visible);
+    let prompt = PromptBuilder::new(&session, &settings)
+        .with_agent_time_tools(visible)
+        .build_prompt("Hi".to_string());
+    assert_eq!(
+        prompt
+            .prompt
+            .tools
+            .iter()
+            .filter(|t| t.name == "HOBBES_AGENT_TIME")
+            .count(),
+        1
+    );
+}
+
 // =========================================================================
 // Thought-signature provenance filtering (mid-chat provider switch)
 // =========================================================================

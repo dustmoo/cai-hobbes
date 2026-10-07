@@ -32,6 +32,11 @@ pub struct PromptBuilder<'a> {
     /// Clock for a new request tail; `None` (the default) reads the local
     /// clock. Tests pin it so a build is a pure function of its inputs.
     pub(crate) now: Option<chrono::DateTime<chrono::Local>>,
+    /// Offer `HOBBES_AGENT_TIME` (`PlannerClient::agent_time_tools`). True
+    /// only for the leased agent-time session
+    /// (`builtin_tools::agent_time_tool_visible`); every other prompt has
+    /// the tool stripped, whatever its MCP context says.
+    pub(crate) agent_time_tools: bool,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -41,7 +46,15 @@ impl<'a> PromptBuilder<'a> {
             settings,
             planner_today: None,
             now: None,
+            agent_time_tools: false,
         }
+    }
+
+    /// Offer the agent-time tool. Pass
+    /// `builtin_tools::agent_time_tool_visible(&planner, session_id)`.
+    pub fn with_agent_time_tools(mut self, visible: bool) -> Self {
+        self.agent_time_tools = visible;
+        self
     }
 
     /// Attach the `planner_today` block built by

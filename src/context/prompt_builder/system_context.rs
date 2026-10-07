@@ -129,19 +129,34 @@ impl<'a> PromptBuilder<'a> {
         // 1. Extract and format tools from the session context.
         let mut tools = Vec::new();
         if let Some(mcp_context) = &self.session.active_context.mcp_tools {
-            tools = sort_and_dedupe_tools(
-                mcp_context
-                    .servers
+            tools = mcp_context
+                .servers
+                .iter()
+                .flat_map(|server| {
+                    server
+                        .tools
+                        .iter()
+                        .map(|tool| ToolDefinition::from_mcp(tool, &server.name))
+                })
+                .collect();
+        }
+        // Agent time: HOBBES_AGENT_TIME exists only in the leased agent-time
+        // session. Stripped from every other prompt (whatever the synced MCP
+        // context holds), added for that one. Added before the sort, so its
+        // place in the cached tool prefix is stable for the whole run.
+        tools.retain(|t: &ToolDefinition| {
+            !crate::components::builtin_tools::is_agent_time_tool(&t.name)
+        });
+        if self.agent_time_tools {
+            tools.extend(
+                crate::mcp::planner_client::PlannerClient::agent_time_tools()
                     .iter()
-                    .flat_map(|server| {
-                        server
-                            .tools
-                            .iter()
-                            .map(|tool| ToolDefinition::from_mcp(tool, &server.name))
-                    })
-                    .collect(),
+                    .map(|tool| {
+                        ToolDefinition::from_mcp(tool, crate::mcp::manager::HOBBES_PLANNER_SERVER)
+                    }),
             );
         }
+        let mut tools = sort_and_dedupe_tools(tools);
 
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();

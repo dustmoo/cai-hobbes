@@ -704,12 +704,33 @@ impl StreamManagerContext {
                             // the skill approval bubble) and no result is sent.
                             // Approve flips it back to a Running ToolCall, which
                             // the resume path in chat.rs dispatches.
-                            if crate::components::builtin_tools::skill_invoke_needs_approval(
-                                builtin_ctx,
-                                &tool_call,
-                                &args_json,
-                                &session_id_inner,
-                            ) {
+                            //
+                            // Agent time (SYMBIOTIC_PLANNER.md §3): every call
+                            // from an agent-time chat passes the scope gate
+                            // first. Deny/no-intent → refused with a tool
+                            // error; an outside effect → held for approval
+                            // here, bypassing trust rules and always-allow
+                            // (use_mcp_tool is never reached). The resume
+                            // path in chat.rs runs the same gate.
+                            let agent_time_gate =
+                                crate::components::builtin_tools::agent_time_gate(
+                                    builtin_ctx,
+                                    &tool_call,
+                                    &args_json,
+                                    &session_id_inner,
+                                    false,
+                                );
+                            if agent_time_gate
+                                == crate::components::builtin_tools::AgentTimeGate::ForceApproval
+                                || (agent_time_gate
+                                    == crate::components::builtin_tools::AgentTimeGate::Proceed
+                                    && crate::components::builtin_tools::skill_invoke_needs_approval(
+                                        builtin_ctx,
+                                        &tool_call,
+                                        &args_json,
+                                        &session_id_inner,
+                                    ))
+                            {
                                 let mut pending_snapshot: Option<
                                     crate::components::chat::Message,
                                 > = None;
@@ -737,17 +758,27 @@ impl StreamManagerContext {
                                 return;
                             }
 
-                            if let Some(outcome) =
-                                crate::components::builtin_tools::dispatch_builtin_tool(
-                                    builtin_ctx,
-                                    &tool_call,
-                                    &args_json,
-                                    &session_id_inner,
-                                    profile_id.as_ref(),
-                                    false,
-                                )
-                                .await
-                            {
+                            let builtin_outcome = match agent_time_gate {
+                                crate::components::builtin_tools::AgentTimeGate::Refuse(
+                                    message,
+                                ) => Some(crate::components::builtin_tools::BuiltinOutcome {
+                                    status: ToolCallStatus::Error,
+                                    response: message,
+                                    persist: true,
+                                }),
+                                _ => {
+                                    crate::components::builtin_tools::dispatch_builtin_tool(
+                                        builtin_ctx,
+                                        &tool_call,
+                                        &args_json,
+                                        &session_id_inner,
+                                        profile_id.as_ref(),
+                                        false,
+                                    )
+                                    .await
+                                }
+                            };
+                            if let Some(outcome) = builtin_outcome {
                                 let crate::components::builtin_tools::BuiltinOutcome {
                                     status,
                                     response,
@@ -1108,6 +1139,16 @@ impl StreamManagerContext {
                                 .count()
                                 as i32;
                         }
+                        drop(state);
+
+                        // Agent time: charge this chat's new spend to the open
+                        // agent-time session and re-check the budget (stops the
+                        // run — lease closed, stream cancelled — when over).
+                        crate::agent_time_runtime::on_usage(
+                            self.planner_state,
+                            self.session_state,
+                            &session_id,
+                        );
 
                         // Forward usage to UI
                         if stream_tx.send(StreamMessage::Usage(usage_data)).is_err() {
@@ -1602,6 +1643,17 @@ impl StreamManagerContext {
                     return; // Stop — user must send a message to reset and continue.
                 }
 
+                // Agent time: a chat whose lease was closed (paused, stopped,
+                // over budget) mid-round must not loop back into the model.
+                if crate::agent_time_runtime::continuation_blocked(
+                    &self.planner_state.peek(),
+                    &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                    &session_id,
+                ) {
+                    tracing::info!(session_id, "Continuation skipped: agent time has ended in this chat.");
+                    return;
+                }
+
                 self.continuation_controller
                     .write()
                     .trigger_continuation(session_id.clone());
@@ -1707,9 +1759,15 @@ impl StreamManagerContext {
                             self.streaming_sessions.write().remove(&session_id);
                             *self.stream_activity.write() += 1;
 
-                            self.continuation_controller
-                                .write()
-                                .trigger_continuation(session_id.clone());
+                            if !crate::agent_time_runtime::continuation_blocked(
+                                &self.planner_state.peek(),
+                                &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                                &session_id,
+                            ) {
+                                self.continuation_controller
+                                    .write()
+                                    .trigger_continuation(session_id.clone());
+                            }
                             return; // End this stream task. Continuation will retry.
                         }
                     } else {
@@ -1803,6 +1861,10 @@ impl StreamManagerContext {
             // background so they can be substituted (not paginated) once they
             // become historical. Fire-and-forget; never blocks turn completion.
             self.spawn_tool_result_summaries(&session_id, &settings);
+
+            // Agent time: the model stopped (no tool calls left), so nothing
+            // drives it further — the run is over; close the lease.
+            crate::agent_time_runtime::on_turn_complete(self.planner_state, &session_id);
 
             on_complete();
             self.streaming_sessions.write().remove(&session_id);
@@ -2034,6 +2096,14 @@ impl StreamManagerContext {
                 session_id,
                 "Watch word recovery halted: turn limit reached."
             );
+            return false;
+        }
+        // Agent time ended in this chat: no recovery turn.
+        if crate::agent_time_runtime::continuation_blocked(
+            &self.planner_state.peek(),
+            &crate::agent_time_runtime::LEASED_CHATS.peek(),
+            session_id,
+        ) {
             return false;
         }
 

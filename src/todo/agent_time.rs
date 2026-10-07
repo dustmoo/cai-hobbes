@@ -489,6 +489,52 @@ impl PlannerState {
         Some(s.clone())
     }
 
+    /// **Runtime note.** Append a line to the open session run in
+    /// `chat_session_id`, without touching the trust ledger (for events the
+    /// gate already counted, like a held call the user then approved, or the
+    /// runtime closing a session). Returns the session to persist.
+    pub fn note_agent_time(
+        &mut self,
+        chat_session_id: &str,
+        tool: &str,
+        summary: &str,
+        now: DateTime<Utc>,
+    ) -> Option<AgentTimeSession> {
+        let s = self
+            .agent_time_sessions
+            .iter_mut()
+            .find(|s| s.is_open() && s.chat_session_id.as_deref() == Some(chat_session_id))?;
+        Self::push_log(s, tool, summary, now);
+        Some(s.clone())
+    }
+
+    /// **Runtime cost hook, keyed by chat.** Add spend (USD) to the open
+    /// session run in `chat_session_id`, or failing that to the latest
+    /// session that chat ran (the closing reply after `end` still costs
+    /// something and belongs on that session's record).
+    pub fn add_agent_time_cost_for_chat(
+        &mut self,
+        chat_session_id: &str,
+        usd: f64,
+    ) -> Option<AgentTimeSession> {
+        let in_chat = |s: &AgentTimeSession| s.chat_session_id.as_deref() == Some(chat_session_id);
+        let idx = self
+            .agent_time_sessions
+            .iter()
+            .position(|s| s.is_open() && in_chat(s))
+            .or_else(|| {
+                self.agent_time_sessions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| in_chat(s))
+                    .max_by_key(|(_, s)| s.started_at)
+                    .map(|(i, _)| i)
+            })?;
+        let s = &mut self.agent_time_sessions[idx];
+        s.cost_usd += usd.max(0.0);
+        Some(s.clone())
+    }
+
     /// **UI action** (never a tool): accept, accept-after-edit, or dismiss a
     /// proposal. Only open proposals move; the trust ledger counts the
     /// outcome. `edited` replaces the title/body (implies `Edited`). Returns
@@ -599,7 +645,7 @@ const READ_TOKENS: &[&str] = &[
     "get", "list", "search", "read", "fetch", "find", "query", "view", "show", "describe",
     "lookup", "retrieve", "status", "info", "count", "browse", "inspect", "preview", "cat",
     "head", "tail", "grep", "ls", "stat", "history", "logs", "log", "diff", "glob", "peek",
-    "download", "export", "summary", "summarize",
+    "summary", "summarize",
 ];
 
 /// Name verbs that mark an outside effect (normal approval gate).
@@ -611,6 +657,8 @@ const WRITE_TOKENS: &[&str] = &[
     "star", "fork", "archive", "label", "mark", "assign", "close", "start", "stop",
     "install", "apply", "sync", "save", "replace", "append", "mkdir", "touch", "chmod",
     "invoke", "trigger", "dispatch", "notify", "email", "message", "tweet", "react",
+    // Write files outside Hobbes-owned space, so they ask too.
+    "download", "export",
 ];
 
 /// Name verbs that are never allowed during agent time.
