@@ -137,6 +137,24 @@ pub(in super::super) fn HotkeysTab(ctx: SettingsCtx) -> Element {
 
                                     div {
                                         class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Next Tab Group" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.next_tab_group.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.next_tab_group = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
+                                        label { class: "text-sm text-fg-muted", "Previous Tab Group" }
+                                        HotkeyRecorder {
+                                            value: local_settings.read().hotkeys.prev_tab_group.clone(),
+                                            onchange: move |v: String| local_settings.write().hotkeys.prev_tab_group = v,
+                                        }
+                                    }
+
+                                    div {
+                                        class: "grid grid-cols-2 items-center gap-4",
                                         label { class: "text-sm text-fg-muted", "Open Profile Selector" }
                                         HotkeyRecorder {
                                             value: local_settings.read().hotkeys.toggle_profile.clone(),

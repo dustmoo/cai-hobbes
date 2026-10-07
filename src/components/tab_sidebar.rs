@@ -13,6 +13,7 @@
 //! (dragging below 140px, persisted) or by the layout solver when the window
 //! runs out of room (temporary). See `layout_budget::solve_chat`.
 
+use crate::components::chat_input::ChatCommand;
 use crate::components::planner_rows::{ListOrderControl, SECTION_HEADER};
 use crate::components::stream_manager::StreamManagerContext;
 use crate::session::SessionState;
@@ -112,6 +113,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
     let ui_state_manager = use_context::<Signal<UiStateManager>>();
     let settings = use_context::<Signal<Settings>>();
     let planner = use_context::<Signal<PlannerState>>();
+    let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut editing_tab_id = use_signal(|| None::<String>);
     let mut temp_name = use_signal(String::new);
 
@@ -171,6 +173,10 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
     let any_view = props.planner_tab_open || props.fleet_tab_open;
     // The rail lists tabs in the same display order as the full list.
     let rail_order: Vec<usize> = groups.iter().flat_map(|g| g.rows.iter().copied()).collect();
+    let nudge = {
+        let ui = ui_state.read();
+        ui.tidy_tabs_nudge && props.tabs.len() > ui.tidy_tabs_threshold && props.width >= 240.0
+    };
     let width = if props.rail {
         crate::layout_budget::SIDEBAR_RAIL_WIDTH
     } else {
@@ -338,6 +344,35 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                         keys: TabSortKey::ALL.to_vec(),
                         groups: group_options(),
                         on_change: set_order,
+                    }
+                }
+                // Optional nudge: a quiet pill, only once the open-tab count
+                // passes the user's threshold, and only where there's room.
+                if nudge {
+                    button {
+                        class: "shrink-0 inline-flex items-center h-[22px] px-2 rounded-full border border-subtle text-[11px] text-fg hover:border-primary-500 hover:bg-card transition-colors",
+                        title: "{props.tabs.len()} tabs open",
+                        onclick: move |_| chat_command.set(Some(ChatCommand::TidyTabs)),
+                        "Tidy tabs?"
+                    }
+                }
+                button {
+                    class: "flex items-center justify-center w-7 h-7 shrink-0 rounded-md text-fg-muted hover:bg-card hover:text-fg transition-colors",
+                    onclick: move |_| chat_command.set(Some(ChatCommand::TidyTabs)),
+                    title: "Tidy tabs",
+                    "aria-label": "Tidy tabs",
+                    svg {
+                        width: "14",
+                        height: "14",
+                        view_box: "0 0 24 24",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        path { d: "M4 20l8-8" }
+                        path { d: "M14 4l6 6-6 2-2-2z" }
+                        path { d: "M3 21l3-1" }
                     }
                 }
                 button {

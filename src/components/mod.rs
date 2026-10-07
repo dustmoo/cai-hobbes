@@ -21,6 +21,7 @@ pub mod stream_manager;
 pub mod syntax_highlighter;
 pub mod tab_bar;
 pub mod tab_sidebar;
+pub mod tab_tidy;
 pub mod tool_call_display;
 
 pub mod builtin_tools;

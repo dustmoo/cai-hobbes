@@ -214,6 +214,103 @@ pub fn arrange_tabs(facts: &[TabFacts], order: TabListOrder) -> Vec<TabGroup> {
         .collect()
 }
 
+// ── Keyboard navigation order ───────────────────────────────────────────────
+
+/// Something the tab shortcuts can land on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavTarget {
+    Planner,
+    Fleet,
+    /// Index into `open_tabs` (a `TabFacts::idx`).
+    Chat(usize),
+}
+
+/// One stop in the visible navigation order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NavStop {
+    pub target: NavTarget,
+    /// Which block it sits in: 0 is the Planner/Fleet block when either is
+    /// open, then one per `TabGroup` in display order.
+    pub block: usize,
+}
+
+/// The order the sidebar shows things in, flattened for the shortcuts:
+/// Planner, Fleet (when open), then every chat across the arranged groups.
+/// The sidebar has no collapsible groups today, so nothing is skipped; if
+/// groups ever collapse, drop their rows from `groups` before calling.
+pub fn nav_order(groups: &[TabGroup], planner_open: bool, fleet_open: bool) -> Vec<NavStop> {
+    let mut out = Vec::new();
+    let mut block = 0;
+    if planner_open || fleet_open {
+        if planner_open {
+            out.push(NavStop { target: NavTarget::Planner, block });
+        }
+        if fleet_open {
+            out.push(NavStop { target: NavTarget::Fleet, block });
+        }
+        block += 1;
+    }
+    for g in groups {
+        for idx in &g.rows {
+            out.push(NavStop { target: NavTarget::Chat(*idx), block });
+        }
+        if !g.rows.is_empty() {
+            block += 1;
+        }
+    }
+    out
+}
+
+/// Next/previous stop after `current`, wrapping. `None` when there is
+/// nowhere else to go (fewer than two stops). A `current` that isn't in the
+/// list is treated as the first stop.
+pub fn nav_step(nav: &[NavStop], current: NavTarget, forward: bool) -> Option<NavTarget> {
+    if nav.len() <= 1 {
+        return None;
+    }
+    let pos = nav.iter().position(|s| s.target == current).unwrap_or(0);
+    let len = nav.len();
+    let next = if forward { (pos + 1) % len } else { (pos + len - 1) % len };
+    Some(nav[next].target)
+}
+
+/// First stop of the next/previous block, wrapping. The Planner/Fleet block
+/// counts as a block. With `grouped == false` (grouping None, or the top
+/// strip) or a single block this is `nav_step`.
+pub fn nav_step_group(
+    nav: &[NavStop],
+    current: NavTarget,
+    forward: bool,
+    grouped: bool,
+) -> Option<NavTarget> {
+    let blocks = nav.last().map(|s| s.block + 1).unwrap_or(0);
+    if !grouped || blocks <= 1 {
+        return nav_step(nav, current, forward);
+    }
+    let cur_block = nav
+        .iter()
+        .find(|s| s.target == current)
+        .map(|s| s.block)
+        .unwrap_or(0);
+    let target_block = if forward {
+        (cur_block + 1) % blocks
+    } else {
+        (cur_block + blocks - 1) % blocks
+    };
+    nav.iter().find(|s| s.block == target_block).map(|s| s.target)
+}
+
+/// The Nth chat (0-based) in visible order, ignoring Planner and Fleet —
+/// what Cmd+1..9 selects in sidebar mode. Returns its `open_tabs` index.
+pub fn nav_chat_at(nav: &[NavStop], position: usize) -> Option<usize> {
+    nav.iter()
+        .filter_map(|s| match s.target {
+            NavTarget::Chat(i) => Some(i),
+            _ => None,
+        })
+        .nth(position)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,5 +435,138 @@ mod tests {
         assert_eq!(back, o);
         let empty: TabListOrder = serde_json::from_str("{}").unwrap();
         assert!(empty.is_manual());
+    }
+
+    // ── navigation order ────────────────────────────────────────────────────
+
+    fn project_tabs() -> Vec<TabFacts> {
+        // open order 0..=4; p-a rail 1.0 holds {3, 0}, p-b rail 2.0 holds {1}, 2 and 4 unsorted
+        let mut tabs = vec![
+            tab(0, "a0", 10, 0),
+            tab(1, "b1", 20, 0),
+            tab(2, "c2", 30, 0),
+            tab(3, "d3", 40, 0),
+            tab(4, "e4", 50, 0),
+        ];
+        tabs[0].project = Some((1.0, "p-a".into(), "A".into()));
+        tabs[3].project = Some((1.0, "p-a".into(), "A".into()));
+        tabs[1].project = Some((2.0, "p-b".into(), "B".into()));
+        tabs
+    }
+
+    #[test]
+    fn nav_order_puts_views_first_then_groups_in_display_order() {
+        let groups = arrange_tabs(&project_tabs(), order(TabSortKey::Manual, SortDir::Asc, TabGroupBy::Project));
+        let nav = nav_order(&groups, true, true);
+        let targets: Vec<_> = nav.iter().map(|s| s.target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                NavTarget::Planner,
+                NavTarget::Fleet,
+                NavTarget::Chat(0),
+                NavTarget::Chat(3),
+                NavTarget::Chat(1),
+                NavTarget::Chat(2),
+                NavTarget::Chat(4),
+            ]
+        );
+        let blocks: Vec<_> = nav.iter().map(|s| s.block).collect();
+        assert_eq!(blocks, vec![0, 0, 1, 1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn nav_order_follows_sort_key() {
+        let groups = arrange_tabs(&project_tabs(), order(TabSortKey::Recent, SortDir::Asc, TabGroupBy::None));
+        let nav = nav_order(&groups, false, false);
+        let targets: Vec<_> = nav.iter().map(|s| s.target).collect();
+        assert_eq!(
+            targets,
+            [4, 3, 2, 1, 0].map(NavTarget::Chat).to_vec(),
+            "most recent first"
+        );
+    }
+
+    #[test]
+    fn nav_order_omits_closed_views() {
+        let groups = arrange_tabs(&sample(), TabListOrder::default());
+        let only_fleet = nav_order(&groups, false, true);
+        assert_eq!(only_fleet[0].target, NavTarget::Fleet);
+        assert_eq!(only_fleet.len(), 4);
+        let none = nav_order(&groups, false, false);
+        assert_eq!(none[0].target, NavTarget::Chat(0));
+        assert_eq!(none[0].block, 0);
+    }
+
+    #[test]
+    fn nav_step_wraps_both_ways() {
+        let groups = arrange_tabs(&project_tabs(), order(TabSortKey::Manual, SortDir::Asc, TabGroupBy::Project));
+        let nav = nav_order(&groups, true, false);
+        assert_eq!(nav_step(&nav, NavTarget::Chat(4), true), Some(NavTarget::Planner));
+        assert_eq!(nav_step(&nav, NavTarget::Planner, false), Some(NavTarget::Chat(4)));
+        assert_eq!(nav_step(&nav, NavTarget::Chat(0), true), Some(NavTarget::Chat(3)));
+        assert_eq!(nav_step(&nav, NavTarget::Chat(1), false), Some(NavTarget::Chat(3)));
+    }
+
+    #[test]
+    fn nav_step_with_one_stop_or_none_does_nothing() {
+        let groups = arrange_tabs(&[tab(0, "x", 1, 1)], TabListOrder::default());
+        let nav = nav_order(&groups, false, false);
+        assert_eq!(nav_step(&nav, NavTarget::Chat(0), true), None);
+        assert_eq!(nav_step(&[], NavTarget::Planner, true), None);
+    }
+
+    #[test]
+    fn nav_step_unknown_current_counts_as_first() {
+        let groups = arrange_tabs(&sample(), TabListOrder::default());
+        let nav = nav_order(&groups, false, false);
+        assert_eq!(nav_step(&nav, NavTarget::Planner, true), Some(NavTarget::Chat(1)));
+    }
+
+    #[test]
+    fn nav_group_jump_lands_on_first_tab_of_each_block_and_wraps() {
+        let groups = arrange_tabs(&project_tabs(), order(TabSortKey::Manual, SortDir::Asc, TabGroupBy::Project));
+        let nav = nav_order(&groups, true, true);
+        // Planner/Fleet block -> project A
+        assert_eq!(nav_step_group(&nav, NavTarget::Planner, true, true), Some(NavTarget::Chat(0)));
+        // from the middle of A -> B's first
+        assert_eq!(nav_step_group(&nav, NavTarget::Chat(3), true, true), Some(NavTarget::Chat(1)));
+        // B -> No project (first tab 2)
+        assert_eq!(nav_step_group(&nav, NavTarget::Chat(1), true, true), Some(NavTarget::Chat(2)));
+        // last block wraps to the views block (its first stop: Planner)
+        assert_eq!(nav_step_group(&nav, NavTarget::Chat(4), true, true), Some(NavTarget::Planner));
+        // backwards: A -> views block, views -> last block's first
+        assert_eq!(nav_step_group(&nav, NavTarget::Chat(3), false, true), Some(NavTarget::Planner));
+        assert_eq!(nav_step_group(&nav, NavTarget::Fleet, false, true), Some(NavTarget::Chat(2)));
+    }
+
+    #[test]
+    fn nav_group_jump_without_grouping_is_plain_step() {
+        let groups = arrange_tabs(&sample(), TabListOrder::default());
+        let nav = nav_order(&groups, true, false);
+        assert_eq!(
+            nav_step_group(&nav, NavTarget::Chat(0), true, false),
+            nav_step(&nav, NavTarget::Chat(0), true)
+        );
+        // a single chat block plus the views block, grouping off: still plain step
+        assert_eq!(nav_step_group(&nav, NavTarget::Planner, true, false), Some(NavTarget::Chat(0)));
+    }
+
+    #[test]
+    fn nav_group_jump_with_one_block_is_plain_step() {
+        let groups = arrange_tabs(&sample(), order(TabSortKey::Manual, SortDir::Asc, TabGroupBy::Project));
+        let nav = nav_order(&groups, false, false);
+        assert_eq!(nav_step_group(&nav, NavTarget::Chat(0), true, true), Some(NavTarget::Chat(1)));
+    }
+
+    #[test]
+    fn nav_chat_at_counts_chats_only_in_visible_order() {
+        let groups = arrange_tabs(&project_tabs(), order(TabSortKey::Manual, SortDir::Asc, TabGroupBy::Project));
+        let nav = nav_order(&groups, true, true);
+        assert_eq!(nav_chat_at(&nav, 0), Some(0));
+        assert_eq!(nav_chat_at(&nav, 1), Some(3));
+        assert_eq!(nav_chat_at(&nav, 2), Some(1));
+        assert_eq!(nav_chat_at(&nav, 4), Some(4));
+        assert_eq!(nav_chat_at(&nav, 5), None);
     }
 }

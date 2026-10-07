@@ -53,6 +53,7 @@ mod session_events;
 mod session_store;
 mod str_utils;
 mod tab_list;
+mod tab_tidy;
 mod timers;
 mod todo;
 mod usage_log;
@@ -159,6 +160,112 @@ fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
     } else {
         (current + len - 1) % len
     }
+}
+
+/// The sidebar's visible navigation order, built from live state the same
+/// way `TabSidebar` builds its rows (same facts, same sanitised lens), so the
+/// shortcuts walk what is on screen. Returns the stops and whether the list
+/// is grouped (grouping other than None).
+fn sidebar_nav_stops(
+    open_tabs: &[String],
+    state: &session::SessionState,
+    planner: &todo::PlannerState,
+    settings: &settings::Settings,
+    stored_order: tab_list::TabListOrder,
+    planner_tab_open: bool,
+    fleet_tab_open: bool,
+) -> (Vec<tab_list::NavStop>, bool) {
+    let order = stored_order.sanitized(
+        &tab_list::TabSortKey::ALL,
+        &tab_list::tab_group_options(settings.planner_enabled, settings.composio_profiles.len()),
+    );
+    let facts: Vec<tab_list::TabFacts> = open_tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| {
+            let s = state.sessions.get(id);
+            let last_updated = s.map(|s| s.last_updated).unwrap_or_else(chrono::Utc::now);
+            tab_list::TabFacts {
+                idx,
+                title: s.map(|s| s.display_title()).unwrap_or_default(),
+                last_updated,
+                started: s
+                    .and_then(|s| s.messages.first())
+                    .map(|m| m.created_at)
+                    .unwrap_or(last_updated),
+                project: s.and_then(|s| s.project_id.as_ref()).and_then(|pid| {
+                    planner
+                        .projects
+                        .iter()
+                        .find(|p| &p.id == pid)
+                        .map(|p| (p.sort_order, p.id.clone(), p.title.clone()))
+                }),
+                profile: s.and_then(|s| {
+                    settings.resolve_session_profile_display_name(s.composio_profile.as_deref())
+                }),
+            }
+        })
+        .collect();
+    let groups = tab_list::arrange_tabs(&facts, order);
+    (
+        tab_list::nav_order(&groups, planner_tab_open, fleet_tab_open),
+        order.group != tab_list::TabGroupBy::None,
+    )
+}
+
+/// Snapshot for the Tidy tabs sheet: the open chats, the planner's to-dos
+/// reduced to what tidying reads, and the projects a tab can be filed into
+/// (open ones, A-Z, as the chat-bar chip lists them).
+fn tidy_inputs(
+    open_tabs: &[String],
+    state: &session::SessionState,
+    planner: &todo::PlannerState,
+    streaming: &std::collections::HashSet<String>,
+) -> (Vec<tab_tidy::TidyTab>, Vec<tab_tidy::TidyTodo>, Vec<tab_tidy::TidyProject>) {
+    use tab_tidy::TidyTodoStatus;
+    let tabs = open_tabs
+        .iter()
+        .filter_map(|id| {
+            let s = state.sessions.get(id)?;
+            Some(tab_tidy::TidyTab {
+                session_id: id.clone(),
+                title: s.display_title(),
+                topic: s.tab_topic(),
+                emoji: s.tab_emoji.clone(),
+                last_updated: s.last_updated,
+                project_id: s.project_id.clone(),
+                is_active: state.active_session_id == *id,
+                is_streaming: streaming.contains(id),
+                has_pending_timer: s
+                    .scheduled_timers
+                    .iter()
+                    .any(|t| t.status == timers::TimerStatus::Pending),
+                pinned: false,
+            })
+        })
+        .collect();
+    let todos = planner
+        .todos
+        .iter()
+        .map(|t| tab_tidy::TidyTodo {
+            linked_session: t.linked_fleet_session.clone(),
+            status: match t.status {
+                todo::model::TodoStatus::Completed => TidyTodoStatus::Done,
+                todo::model::TodoStatus::Cancelled => TidyTodoStatus::Cancelled,
+                _ => TidyTodoStatus::Open,
+            },
+            done_at: t.completed_at.unwrap_or(t.updated_at),
+            project_id: t.project_id.clone(),
+        })
+        .collect();
+    let mut projects: Vec<tab_tidy::TidyProject> = planner
+        .projects
+        .iter()
+        .filter(|p| !p.status.is_closed())
+        .map(|p| tab_tidy::TidyProject { id: p.id.clone(), title: p.title.clone() })
+        .collect();
+    projects.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    (tabs, todos, projects)
 }
 
 #[cfg(test)]
@@ -1795,6 +1902,7 @@ fn app() -> Element {
     });
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
+    let mut show_tidy = use_signal(|| false);
     let mut session_to_delete =
         use_context_provider(|| SessionToDeleteContext(Signal::new(String::new())));
     let mut save_error =
@@ -2041,7 +2149,47 @@ fn app() -> Element {
     // finds where we currently are in it, and moves with wraparound. Landing
     // on a chat item reuses `switch_tab_fn` rather than only poking
     // `active_tab_index`, so it gets whatever else that path does.
-    let mut cycle_tab_fn = move |forward: bool| {
+    //
+    // In sidebar mode the walk follows what the sidebar shows instead (see
+    // `sidebar_nav_stops`): Planner, Fleet, then chats in arranged order.
+    // `by_group` jumps to the first tab of the next/previous group.
+    let mut cycle_tab_fn = move |forward: bool, by_group: bool| {
+        if *tabs_as_sidebar.peek() {
+            let (nav, grouped) = sidebar_nav_stops(
+                &open_tabs.peek(),
+                &session_state.peek(),
+                &planner_state.peek(),
+                &settings.peek(),
+                ui_state.peek().tab_sidebar_order,
+                *planner_tab_open.peek(),
+                *fleet_tab_open.peek(),
+            );
+            let current = if *planner_active.peek() {
+                tab_list::NavTarget::Planner
+            } else if *fleet_active.peek() {
+                tab_list::NavTarget::Fleet
+            } else {
+                tab_list::NavTarget::Chat(*active_tab_index.peek())
+            };
+            let next = if by_group {
+                tab_list::nav_step_group(&nav, current, forward, grouped)
+            } else {
+                tab_list::nav_step(&nav, current, forward)
+            };
+            match next {
+                Some(tab_list::NavTarget::Chat(idx)) => switch_tab_fn(idx),
+                Some(tab_list::NavTarget::Planner) => {
+                    planner_active.set(true);
+                    fleet_active.set(false);
+                }
+                Some(tab_list::NavTarget::Fleet) => {
+                    fleet_active.set(true);
+                    planner_active.set(false);
+                }
+                None => {}
+            }
+            return;
+        }
         let strip = build_tab_strip(
             open_tabs.peek().len(),
             *planner_tab_open.peek(),
@@ -2227,6 +2375,56 @@ fn app() -> Element {
         active_tab_index.set(tabs.len() - 1);
         session_state.write().active_session_id = new_id.clone();
         current_session_id.set(new_id);
+    };
+
+    // Tidy tabs, confirmed: file the chosen tabs (the chat-bar chip's path:
+    // set the tag, mark it user-decided, journal it, one P-009 save), then
+    // close the chosen tabs through `close_tab_fn` (sessions stay in
+    // History). Closing goes highest index first so earlier indices stay
+    // valid; `close_tab_fn` doesn't follow the active tab when a tab to its
+    // left goes, so the active chat is re-pinned afterwards.
+    let apply_tidy_fn = move |apply: components::tab_tidy::TidyApply| {
+        if !apply.tag.is_empty() {
+            for (sid, pid) in &apply.tag {
+                {
+                    let mut state = session_state.write();
+                    if let Some(s) = state.sessions.get_mut(sid) {
+                        s.project_id = Some(pid.clone());
+                        s.project_tag_user_set = true;
+                    }
+                }
+                crate::session_events::log_event(
+                    sid,
+                    crate::session_events::SessionEvent::ProjectTagged {
+                        project_id: Some(pid.clone()),
+                        user_set: true,
+                    },
+                );
+            }
+            SessionState::save_signal(&session_state, None);
+        }
+        if !apply.close.is_empty() {
+            let keep_id = current_session_id.peek().clone();
+            let mut idxs: Vec<usize> = open_tabs
+                .peek()
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| apply.close.contains(id) && **id != keep_id)
+                .map(|(i, _)| i)
+                .collect();
+            idxs.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in idxs {
+                close_tab_fn(idx);
+            }
+            let pos = open_tabs.peek().iter().position(|id| *id == keep_id);
+            if let Some(pos) = pos {
+                active_tab_index.set(pos);
+                current_session_id.set(keep_id.clone());
+                session_state.write().active_session_id = keep_id.clone();
+                sync_profile_from_session(&keep_id);
+            }
+        }
+        show_tidy.set(false);
     };
 
     // Call the summarization scheduler hook BEFORE the hotkey manager
@@ -2573,7 +2771,25 @@ fn app() -> Element {
                     state.selected_byoa_slug = slug;
                 }
                 ChatCommand::SwitchTab(idx) => {
-                    switch_tab_fn(idx);
+                    // Sidebar mode: Cmd+N is the Nth *chat* as the sidebar
+                    // lists it (Planner/Fleet are not counted, as in the
+                    // strip today). Out of range does nothing.
+                    if *tabs_as_sidebar.peek() {
+                        let (nav, _) = sidebar_nav_stops(
+                            &open_tabs.peek(),
+                            &session_state.peek(),
+                            &planner_state.peek(),
+                            &settings.peek(),
+                            ui_state.peek().tab_sidebar_order,
+                            false,
+                            false,
+                        );
+                        if let Some(real) = tab_list::nav_chat_at(&nav, idx) {
+                            switch_tab_fn(real);
+                        }
+                    } else {
+                        switch_tab_fn(idx);
+                    }
                 }
                 ChatCommand::SwitchProfile(idx) => {
                     let profiles = settings.peek().composio_profiles.clone();
@@ -2941,10 +3157,19 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::NextTab => {
-                    cycle_tab_fn(true);
+                    cycle_tab_fn(true, false);
                 }
                 ChatCommand::PrevTab => {
-                    cycle_tab_fn(false);
+                    cycle_tab_fn(false, false);
+                }
+                ChatCommand::NextTabGroup => {
+                    cycle_tab_fn(true, true);
+                }
+                ChatCommand::PrevTabGroup => {
+                    cycle_tab_fn(false, true);
+                }
+                ChatCommand::TidyTabs => {
+                    show_tidy.set(true);
                 }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
@@ -3070,6 +3295,26 @@ fn app() -> Element {
                     StreamBridge {}
                     // Cmd+K quick capture into the Planner, over any view.
                     components::quick_capture::QuickCapture { open: show_quick_capture }
+                    if show_tidy() {
+                        {
+                            let streaming = STREAMING_SESSIONS.read().clone();
+                            let (tabs, todos, projects) = tidy_inputs(
+                                &open_tabs.read(),
+                                &session_state.read(),
+                                &planner_state.read(),
+                                &streaming,
+                            );
+                            rsx! {
+                                components::tab_tidy::TidyTabsSheet {
+                                    tabs,
+                                    todos,
+                                    projects,
+                                    on_apply: apply_tidy_fn,
+                                    on_cancel: move |_| show_tidy.set(false),
+                                }
+                            }
+                        }
+                    }
                     ConfirmDeleteModal {
                         is_visible: show_confirm_modal,
                         title: "Delete Session".to_string(),

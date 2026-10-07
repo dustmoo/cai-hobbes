@@ -81,6 +81,13 @@ pub enum ChatCommand {
     NextTab,
     /// Cycle to the previous tab in the visible strip, wrapping at the start.
     PrevTab,
+    /// Jump to the first tab of the next sidebar group, wrapping (plain
+    /// next-tab when the sidebar isn't grouped or the top strip is showing).
+    NextTabGroup,
+    /// Jump to the first tab of the previous sidebar group, wrapping.
+    PrevTabGroup,
+    /// Open the Tidy tabs sheet.
+    TidyTabs,
 }
 
 /// Distinguishes which autocomplete context is active in the chat input.
@@ -330,7 +337,10 @@ pub fn ChatInput(
                 | ChatCommand::SwitchConnector(_)
                 | ChatCommand::CloseTab
                 | ChatCommand::NextTab
-                | ChatCommand::PrevTab => {
+                | ChatCommand::PrevTab
+                | ChatCommand::NextTabGroup
+                | ChatCommand::PrevTabGroup
+                | ChatCommand::TidyTabs => {
                     // Handled globally in main.rs
                 }
                 ChatCommand::NewChatWithMemory => {

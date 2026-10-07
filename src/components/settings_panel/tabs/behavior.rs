@@ -71,6 +71,50 @@ pub(in super::super) fn BehaviorTab(
                                         }
                                     }
                                 }
+                                div {
+                                    class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-t border-faint",
+                                    div {
+                                        label { class: "text-sm text-fg", "Suggest tidying tabs" }
+                                        p { class: "text-xs text-fg-muted", "Show a \"Tidy tabs?\" pill in the tab sidebar when many tabs are open. Tidying is always available from the broom button" }
+                                    }
+                                    div {
+                                        class: "justify-self-end",
+                                        Toggle {
+                                            checked: ui_state.read().tidy_tabs_nudge,
+                                            onchange: move |v| {
+                                                let mut state = ui_state.write();
+                                                state.tidy_tabs_nudge = v;
+                                                let state_clone = state.clone();
+                                                let manager = ui_state_manager.read().clone();
+                                                spawn(async move { let _ = manager.save(&state_clone); });
+                                            }
+                                        }
+                                    }
+                                }
+                                if ui_state.read().tidy_tabs_nudge {
+                                    div {
+                                        class: "grid grid-cols-[minmax(0,1fr)_220px] gap-4 items-center py-2.5 border-t border-faint",
+                                        div {
+                                            label { class: "text-sm text-fg", "Tidy suggestion threshold" }
+                                            p { class: "text-xs text-fg-muted", "Suggest when more than this many tabs are open" }
+                                        }
+                                        input {
+                                            r#type: "number",
+                                            min: "2",
+                                            class: "{INPUT} justify-self-end",
+                                            value: "{ui_state.read().tidy_tabs_threshold}",
+                                            onchange: move |e| {
+                                                if let Ok(value) = e.value().parse::<usize>() {
+                                                    let mut state = ui_state.write();
+                                                    state.tidy_tabs_threshold = value.max(2);
+                                                    let state_clone = state.clone();
+                                                    let manager = ui_state_manager.read().clone();
+                                                    spawn(async move { let _ = manager.save(&state_clone); });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             // 1. Context & History (Global Defaults)

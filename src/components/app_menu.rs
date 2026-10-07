@@ -94,6 +94,16 @@ pub fn AppMenuButton(placement: AppMenuPlacement) -> Element {
                     }
                     div { class: "border-t border-faint my-1" }
                     AppMenuRow {
+                        icon: fi_icons::FiScissors,
+                        label: "Tidy tabs…",
+                        hotkey: String::new(),
+                        visible: true,
+                        onclick: move |_| {
+                            chat_command.set(Some(ChatCommand::TidyTabs));
+                            show_app_menu.set(false);
+                        },
+                    }
+                    AppMenuRow {
                         icon: fi_icons::FiClock,
                         label: "History",
                         hotkey: settings.read().hotkeys.toggle_history.clone(),

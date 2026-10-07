@@ -122,6 +122,8 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "close_tab" => chat_command.set(Some(ChatCommand::CloseTab)),
                 "next_tab" => chat_command.set(Some(ChatCommand::NextTab)),
                 "prev_tab" => chat_command.set(Some(ChatCommand::PrevTab)),
+                "next_tab_group" => chat_command.set(Some(ChatCommand::NextTabGroup)),
+                "prev_tab_group" => chat_command.set(Some(ChatCommand::PrevTabGroup)),
                 // Profile switching (session-local)
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
@@ -240,6 +242,8 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_focus_chat, event)) action = "focus_chat";
                         else if (check(config.toggle_scroll_to_bottom, event)) action = "scroll_bottom";
                         else if (check(config.cancel_generation, event)) action = "cancel_generation";
+                        else if (check(config.next_tab_group, event)) action = "next_tab_group";
+                        else if (check(config.prev_tab_group, event)) action = "prev_tab_group";
                         else if (check(config.next_tab, event)) action = "next_tab";
                         else if (check(config.prev_tab, event)) action = "prev_tab";
 
