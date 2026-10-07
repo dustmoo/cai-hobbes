@@ -26,6 +26,8 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
             .find(|p| p.id == *id)
             .map(|p| p.title.clone())
             .unwrap_or_else(|| "Project".to_string()),
+        // Panels render in place of the centre column; never shown here.
+        PlannerSelection::Panel(_) => String::new(),
     };
     let is_today_view = sel == PlannerSelection::View(TodoView::Today);
     let subtitle = is_today_view.then(|| Local::now().format("%A, %-d %B").to_string());
@@ -140,6 +142,19 @@ pub(crate) fn CentreColumn(selection: Signal<PlannerSelection>) -> Element {
                     div { class: "flex-1" }
                     if let Some(line) = capacity_line {
                         span { class: "{META} text-right", "{line}" }
+                    }
+                }
+                // The two lanes at a glance: your protected time against
+                // your own goal, and what the agents are doing / need.
+                if is_today_view {
+                    div {
+                        class: "mt-3 flex flex-wrap gap-2.5",
+                        crate::components::planner_view::your_time::YourTimeReadout {
+                            on_edit_goals: move |_| selection.set(PlannerSelection::Panel(
+                                crate::components::planner_view::PlannerPanel::WeeklyReview,
+                            )),
+                        }
+                        crate::components::planner_view::agent_lane::AgentsReadout {}
                     }
                 }
             }

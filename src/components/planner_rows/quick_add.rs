@@ -4,12 +4,14 @@ use super::helpers::{priority_tone_class, todos_for_selection};
 use super::list::ProjectPicker;
 use super::{MENU_ITEM, MENU_LABEL, MENU_RULE, META, PILL, POPOVER};
 use crate::settings::Settings;
-use crate::todo::model::{self, BlockSource, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus};
+use crate::todo::model::{
+    self, BlockSource, HumanKind, Lane, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoStatus,
+};
 use crate::todo::project_match::{
     self, MatchTier, ProjectIndex, ProjectResolution, Ranked, PENDING_PROJECT_ID,
 };
 use crate::todo::quick_add::{
-    active_project_query, parse_quick_add_with, set_project_token, QuickAddParse,
+    active_project_query, parse_capture, set_project_token, QuickAddParse,
 };
 use crate::todo::store;
 use crate::todo::views::{self, TodoView};
@@ -47,6 +49,11 @@ pub(crate) struct QuickAddDraft {
     pub(crate) inherited: Option<Inherited>,
     /// "Create project …" chosen from the list: created at commit, never before.
     pub(crate) create_project: Option<String>,
+    /// "Keep it yours?" was chosen on a lane suggestion: the person's
+    /// explicit pick (never applied by the parser). `kind_pick` is the kind
+    /// the suggestion named, accepted with it.
+    pub(crate) keep_yours: bool,
+    pub(crate) kind_pick: Option<HumanKind>,
 }
 
 impl QuickAddDraft {
@@ -63,8 +70,38 @@ impl QuickAddDraft {
             .with_pending(self.create_project.as_deref())
     }
 
+    /// The full capture grammar, with `@worker` resolving against the live
+    /// fleet's session names.
     pub(crate) fn parse(&self, state: &PlannerState, day: NaiveDate) -> QuickAddParse {
-        parse_quick_add_with(&self.text, day, &self.index(state))
+        let workers = super::super::planner_view::agent_lane::capture_workers(
+            &crate::fleet::shared().snapshot(),
+        );
+        parse_capture(&self.text, day, &self.index(state), &workers)
+    }
+
+    /// "Hand to Hobbes": the suggestion's agent half, as a typed token (the
+    /// text stays the source of truth).
+    pub(crate) fn hand_to_hobbes(&mut self) {
+        let t = self.text.trim_end();
+        self.text = if t.is_empty() { "@hobbes ".to_string() } else { format!("{t} @hobbes ") };
+        self.keep_yours = false;
+        self.kind_pick = None;
+    }
+}
+
+/// Lane fields a committed to-do takes from its parse plus the person's
+/// suggestion pick: `(lane, kind, outcome)`. A marker always wins; a kept
+/// suggestion supplies only the kind it named.
+pub(crate) fn capture_lane(
+    parsed: &QuickAddParse,
+    draft: &QuickAddDraft,
+) -> (Lane, Option<HumanKind>, Option<String>) {
+    match parsed.lane {
+        Some(Lane::Agent) => (Lane::Agent, None, parsed.outcome.clone()),
+        _ => {
+            let kind = parsed.kind.or(if draft.keep_yours { draft.kind_pick } else { None });
+            (Lane::Human, kind, None)
+        }
     }
 }
 
@@ -360,7 +397,7 @@ pub(super) fn QuickAdd(selection: Signal<PlannerSelection>) -> Element {
                         let _ = document::eval("document.activeElement?.blur()");
                     },
                     input_class: "w-full bg-transparent border-0 p-0 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:ring-0",
-                    placeholder: "Add a to-do — ~30m · #tag · +project · @2pm · *mon · !fri · !!1 — press Enter",
+                    placeholder: "Add a to-do — @me · @hobbes · ~30m · !chore · +project",
                 }
             }
             if let Some((_, title, landing)) = confirmation.read().clone() {
@@ -408,10 +445,33 @@ pub(crate) fn commit_quick_add(
     todo.estimate_minutes = parsed
         .estimate_minutes
         .or((default_estimate > 0).then_some(default_estimate));
-    todo.tags = parsed.tags;
+    todo.tags = parsed.tags.clone();
     todo.deadline = parsed.deadline;
     todo.time_of_day = parsed.time_of_day;
     todo.priority = parsed.priority;
+
+    // Lanes (SYMBIOTIC_PLANNER.md §4): a marker decides; a suggestion only
+    // counts when the person picked it.
+    let (lane, kind, outcome) = capture_lane(&parsed, draft);
+    if lane == Lane::Agent {
+        todo.set_lane(Lane::Agent);
+        todo.outcome = outcome;
+        // `@worker` naming a live fleet session hands it to that worker:
+        // link it, and let the fleet sync derive its state.
+        if let Some(w) = parsed.worker.as_deref().filter(|w| *w != "Hobbes") {
+            let live = crate::fleet::shared().snapshot();
+            if let Some(row) = live
+                .sessions
+                .values()
+                .find(|r| r.ended_at.is_none() && r.display_name() == w)
+            {
+                todo.linked_fleet_session = Some(row.id.clone());
+                todo.agent_state = None;
+            }
+        }
+    } else {
+        todo.kind = kind;
+    }
 
     // An @clock token also implies a time-of-day group when none was given
     // explicitly, so "@7pm" lands in This Evening without a second token.
@@ -770,6 +830,28 @@ fn QuickAddPreview(
         .block_start
         .map(|m| format!("Enter to add · goes on the timeline at {}", fmt_hhmm(m)));
     let priority_display = settings.read().planner_priority.clone();
+    // Lane chips: what the capture grammar detected, and the person's pick
+    // on a suggestion. Suggestions are offered, never applied.
+    let (keep_yours, kind_pick) = {
+        let d = draft.read();
+        (d.keep_yours, d.kind_pick)
+    };
+    let lane_chip: Option<(bool, String)> = match preview.lane {
+        Some(Lane::Agent) => Some((true, format!("Agent \u{b7} {}", preview.worker.clone().unwrap_or_else(|| "Hobbes".into())))),
+        Some(Lane::Human) => Some((false, match preview.kind {
+            Some(k) => format!("Yours \u{b7} {}", capitalize(k.label())),
+            None => "Yours".to_string(),
+        })),
+        None if keep_yours => Some((false, match kind_pick {
+            Some(k) => format!("Yours \u{b7} {}", capitalize(k.label())),
+            None => "Yours".to_string(),
+        })),
+        None => None,
+    };
+    let suggestion = preview
+        .lane_suggestion
+        .clone()
+        .filter(|_| !keep_yours && !preview.title.is_empty());
 
     let refocus = move || {
         if let Some(el) = input_el.peek().clone() {
@@ -892,6 +974,37 @@ fn QuickAddPreview(
                         }
                     }
                 }
+                if let Some((agent, label)) = lane_chip.clone() {
+                    span {
+                        class: if agent { "{PILL} border-[#EA8A2E]/70 text-fg" } else { "{PILL} text-fg" },
+                        if agent {
+                            Icon { width: 10, height: 10, icon: fi_icons::FiTerminal }
+                        }
+                        span { class: "font-semibold", "Lane" }
+                        span { class: "truncate max-w-48", "{label}" }
+                        if keep_yours && preview.lane.is_none() {
+                            button {
+                                class: "px-0.5 text-fg-muted hover:text-fg",
+                                title: "Undo — leave it untriaged",
+                                onclick: move |evt| {
+                                    evt.stop_propagation();
+                                    let mut d = draft.write();
+                                    d.keep_yours = false;
+                                    d.kind_pick = None;
+                                },
+                                "×"
+                            }
+                        }
+                    }
+                }
+                if let Some(o) = preview.outcome.clone() {
+                    span {
+                        class: "{PILL} border-primary-400 text-fg max-w-80",
+                        Icon { width: 10, height: 10, icon: fi_icons::FiTarget }
+                        span { class: "font-semibold", "Outcome" }
+                        span { class: "truncate", "{o}" }
+                    }
+                }
                 if let Some(m) = preview.estimate_minutes {
                     span { class: "{PILL}", "{model::format_minutes(m)}" }
                 }
@@ -941,6 +1054,67 @@ fn QuickAddPreview(
                 }
             }
         }
+        // Could go either way: no marker, but the text reads like an
+        // outcome (or like something only you can do). Offer both; Enter
+        // keeps it yours, untriaged.
+        if let Some(sg) = suggestion {
+            div {
+                class: "mt-2 flex flex-wrap items-center gap-1.5",
+                span {
+                    class: "{PILL} text-fg",
+                    span { class: "font-semibold", "Suggested" }
+                    match sg.lane {
+                        Lane::Agent => rsx! { "Agent \u{b7} Hobbes" },
+                        Lane::Human => rsx! {
+                            {match sg.kind {
+                                Some(k) => format!("Yours \u{b7} {}", capitalize(k.label())),
+                                None => "Yours".to_string(),
+                            }}
+                        },
+                    }
+                }
+                span { class: "text-[11px] text-fg-muted", "{sg.reason}" }
+                div { class: "flex-1" }
+                button {
+                    class: if sg.lane == Lane::Human { "{BTN_PRIMARY_SM}" } else { "{BTN_SECONDARY_SM}" },
+                    onmousedown: move |evt| evt.prevent_default(),
+                    onclick: {
+                        let kind = if sg.lane == Lane::Human { sg.kind } else { None };
+                        move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            let mut d = draft.write();
+                            d.keep_yours = true;
+                            d.kind_pick = kind;
+                        }
+                    },
+                    "Keep it yours?"
+                }
+                button {
+                    class: if sg.lane == Lane::Agent { "{BTN_PRIMARY_SM}" } else { "{BTN_SECONDARY_SM}" },
+                    onmousedown: move |evt| evt.prevent_default(),
+                    onclick: move |evt: MouseEvent| {
+                        evt.stop_propagation();
+                        draft.write().hand_to_hobbes();
+                        refocus();
+                    },
+                    "Hand to Hobbes"
+                }
+                span { class: "text-[11px] text-fg-muted", "\u{21b5} keeps it yours" }
+            }
+        }
+    }
+}
+
+const BTN_PRIMARY_SM: &str =
+    "text-[11px] rounded-md px-2 py-0.5 bg-btn-primary text-fg hover:bg-btn-primary-hover shrink-0";
+const BTN_SECONDARY_SM: &str =
+    "text-[11px] rounded-md px-2 py-0.5 border border-faint bg-input text-fg hover:bg-card shrink-0";
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().chain(c).collect(),
+        None => String::new(),
     }
 }
 
@@ -1070,6 +1244,43 @@ mod tests {
         let b = birth(&draft, &PlannerSelection::View(TodoView::Inbox));
         assert_eq!(b.project, BirthProject::None);
         assert_eq!(b.bucket, TodoBucket::Inbox);
+    }
+
+    #[test]
+    fn capture_lane_honours_markers_and_only_picked_suggestions() {
+        let day = d("2026-09-24");
+        let state = PlannerState::default();
+        // @hobbes → agent lane, the rest is the outcome.
+        let draft = text("@hobbes ship the release with tests passing");
+        let parsed = draft.parse(&state, day);
+        let (lane, kind, outcome) = capture_lane(&parsed, &draft);
+        assert_eq!(lane, Lane::Agent);
+        assert_eq!(kind, None);
+        assert_eq!(outcome.as_deref(), Some("ship the release with tests passing"));
+
+        // !chore → yours, a chore.
+        let draft = text("!chore pay Comcast bill ~5m");
+        let (lane, kind, _) = capture_lane(&draft.parse(&state, day), &draft);
+        assert_eq!((lane, kind), (Lane::Human, Some(HumanKind::Chore)));
+
+        // No marker: a suggestion exists but is never applied by itself.
+        let mut draft = text("call mom ~20m");
+        let parsed = draft.parse(&state, day);
+        let sg = parsed.lane_suggestion.clone().expect("call → commitment suggestion");
+        assert_eq!(sg.kind, Some(HumanKind::Commitment));
+        assert_eq!(capture_lane(&parsed, &draft), (Lane::Human, None, None));
+        // "Keep it yours?" accepts the suggested kind.
+        draft.keep_yours = true;
+        draft.kind_pick = sg.kind;
+        assert_eq!(capture_lane(&parsed, &draft).1, Some(HumanKind::Commitment));
+
+        // "Hand to Hobbes" types the marker.
+        let mut draft = text("research KV-cache offload");
+        draft.hand_to_hobbes();
+        assert_eq!(draft.text, "research KV-cache offload @hobbes ");
+        let (lane, _, outcome) = capture_lane(&draft.parse(&state, day), &draft);
+        assert_eq!(lane, Lane::Agent);
+        assert_eq!(outcome.as_deref(), Some("research KV-cache offload"));
     }
 
     #[test]

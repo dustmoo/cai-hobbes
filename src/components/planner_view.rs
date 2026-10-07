@@ -27,12 +27,70 @@ use super::column_divider::{ColumnDivider, ColumnSide, ColumnWidth};
 use super::planner_rows::CentreColumn;
 use super::planner_timeline::TodayRail;
 
+// Symbiotic planner surfaces (SYMBIOTIC_PLANNER.md): the agent lane and its
+// readouts, the decision queue, your-time goals, the weekly review and the
+// agent-time panel.
+pub(crate) mod agent_lane;
+pub(crate) mod agent_time;
+pub(crate) mod decisions;
+pub(crate) mod review;
+pub(crate) mod your_time;
+
 /// What the centre column is showing: a built-in view or a single project.
 /// (The fleet lives in its own top-level tab, not in this rail.)
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum PlannerSelection {
     View(TodoView),
     Project(String),
+    /// A full-width Planner panel (no to-do list, no timeline).
+    Panel(PlannerPanel),
+}
+
+/// The Planner's non-list panels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlannerPanel {
+    AgentTime,
+    WeeklyReview,
+}
+
+impl PlannerPanel {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            PlannerPanel::AgentTime => "agent_time",
+            PlannerPanel::WeeklyReview => "weekly_review",
+        }
+    }
+}
+
+/// Whether the decision-queue drawer is open. Provided at the Planner root
+/// so the nav, the header readout and the agent lane can all open it.
+#[derive(Clone, Copy)]
+pub(crate) struct DecisionsDrawerContext(pub(crate) Signal<bool>);
+
+/// Agent-lane column width: the lane only becomes its own column when the
+/// task list can keep its 520px minimum beside it.
+pub(crate) const AGENT_LANE_MIN_WIDTH: f64 = 320.0;
+pub(crate) const AGENT_LANE_MAX_WIDTH: f64 = 480.0;
+pub(crate) const AGENT_LANE_DEFAULT_WIDTH: f64 = 400.0;
+
+/// Where the agent lane goes on Today, given the Planner row's measured
+/// width and the solver's nav/timeline widths: `Some(width)` for its own
+/// column (taken only from space beyond the task list's 520px minimum —
+/// the layout solver's guarantee is never eaten into), `None` to embed it
+/// as a section in the right column. An unmeasured row (0) embeds.
+pub(crate) fn agent_lane_width(row_width: f64, nav_width: f64, timeline_width: f64, requested: f64) -> Option<f64> {
+    if row_width <= 0.0 {
+        return None;
+    }
+    let spare = row_width - nav_width - timeline_width - layout_budget::PLANNER_MAIN_MIN_WIDTH;
+    let want = requested.clamp(AGENT_LANE_MIN_WIDTH, AGENT_LANE_MAX_WIDTH);
+    if spare >= want {
+        Some(want)
+    } else if spare >= AGENT_LANE_MIN_WIDTH {
+        Some(spare.floor())
+    } else {
+        None
+    }
 }
 
 impl PlannerSelection {
@@ -42,6 +100,7 @@ impl PlannerSelection {
         match self {
             PlannerSelection::View(v) => v.as_str().to_string(),
             PlannerSelection::Project(id) => format!("project:{id}"),
+            PlannerSelection::Panel(p) => format!("panel:{}", p.as_str()),
         }
     }
 
@@ -50,7 +109,7 @@ impl PlannerSelection {
     pub(crate) fn view(&self) -> Option<TodoView> {
         match self {
             PlannerSelection::View(v) => Some(*v),
-            PlannerSelection::Project(_) => None,
+            PlannerSelection::Project(_) | PlannerSelection::Panel(_) => None,
         }
     }
 }
@@ -317,6 +376,14 @@ pub fn PlannerView(
     let detail_open = use_signal(|| Option::<String>::None);
     use_context_provider(|| crate::components::todo_detail::TodoDetailContext(detail_open));
 
+    // The decision queue drawer (over Today).
+    let decisions_drawer = use_signal(|| false);
+    use_context_provider(|| DecisionsDrawerContext(decisions_drawer));
+    // The Planner row's measured width and the agent lane's requested width
+    // (see `agent_lane_width`). Declared before any early return.
+    let mut row_width = use_signal(|| 0.0f64);
+    let mut lane_requested = use_signal(|| AGENT_LANE_DEFAULT_WIDTH);
+
     // Timeline block selection lives at the root (not in TodayRail) so the
     // timebox chip on a row can select the block it navigates to.
     let selected_block = use_signal(|| Option::<String>::None);
@@ -395,7 +462,12 @@ pub fn PlannerView(
         };
     }
 
-    let show_today_rail = *selection.read() == PlannerSelection::View(TodoView::Today);
+    let sel_now = selection.read().clone();
+    let show_today_rail = sel_now == PlannerSelection::View(TodoView::Today);
+    let panel = match sel_now {
+        PlannerSelection::Panel(p) => Some(p),
+        _ => None,
+    };
 
     // Requested widths live in `PlannerWidths` (main.rs reads them for the
     // give-way solver); the dividers update them live and persist on commit.
@@ -404,12 +476,31 @@ pub fn PlannerView(
     let PlannerWidths { nav: mut nav_requested, timeline: mut timeline_requested } =
         use_context::<PlannerWidths>();
 
+    // The agent lane takes its own column only from space the solver left
+    // beyond the task list's minimum; otherwise it's a section in the right
+    // column. The row's width is measured (onresize) rather than solved, so
+    // main.rs's solver stays the single owner of the 520px guarantee.
+    let lane_column = if show_today_rail {
+        agent_lane_width(*row_width.read(), nav_width, timeline_width, *lane_requested.read())
+    } else {
+        None
+    };
+    let decisions_open = *decisions_drawer.read();
+
     rsx! {
         div {
             class: "flex h-full min-h-0 flex-col bg-app text-fg",
             FocusBar {}
+            agent_lane::AgentStateSync {}
             div {
                 class: "relative flex flex-row flex-1 min-h-0",
+                onresize: move |evt| {
+                    if let Ok(size) = evt.data().get_border_box_size() {
+                        if (size.width - *row_width.peek()).abs() >= 1.0 {
+                            row_width.set(size.width);
+                        }
+                    }
+                },
                 div {
                     id: "planner-left-rail",
                     class: "shrink-0 h-full min-h-0",
@@ -437,7 +528,11 @@ pub fn PlannerView(
                         },
                     }
                 }
-                CentreColumn { selection }
+                match panel {
+                    Some(PlannerPanel::AgentTime) => rsx! { agent_time::AgentTimeView {} },
+                    Some(PlannerPanel::WeeklyReview) => rsx! { review::WeeklyReview {} },
+                    None => rsx! { CentreColumn { selection } },
+                }
                 if show_today_rail {
                     ColumnDivider {
                         width: timeline_width,
@@ -460,8 +555,29 @@ pub fn PlannerView(
                         id: "planner-today-rail",
                         class: "shrink-0 h-full min-h-0",
                         style: "width: {timeline_width}px;",
-                        TodayRail { viewing: viewing_day }
+                        TodayRail { viewing: viewing_day, embed_agent_lane: lane_column.is_none() }
                     }
+                    if let Some(w) = lane_column {
+                        ColumnDivider {
+                            width: w,
+                            min: AGENT_LANE_MIN_WIDTH,
+                            max: AGENT_LANE_MAX_WIDTH,
+                            default: AGENT_LANE_DEFAULT_WIDTH,
+                            side: ColumnSide::Right,
+                            label: "Resize agent lane".to_string(),
+                            on_resize: move |w: ColumnWidth| lane_requested.set(w.width),
+                            on_commit: move |w: ColumnWidth| lane_requested.set(w.width),
+                        }
+                        div {
+                            id: "planner-agent-lane",
+                            class: "shrink-0 h-full min-h-0",
+                            style: "width: {w}px;",
+                            agent_lane::AgentLaneColumn {}
+                        }
+                    }
+                }
+                if decisions_open {
+                    decisions::DecisionDrawer { open: decisions_drawer }
                 }
             }
             crate::components::todo_detail::TodoDetailCard {}
@@ -491,6 +607,38 @@ fn RailItem<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static
             span { class: "flex-1 truncate text-left", "{label}" }
             if count > 0 {
                 span { class: "text-xs text-fg-muted", "{count}" }
+            }
+        }
+    }
+}
+
+/// A rail row whose right-hand tag is text ("off", "18m") or, with `warn`,
+/// the yellow count badge the decision queue uses.
+#[component]
+fn RailItemTagged<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
+    icon: I,
+    label: String,
+    tag: Option<String>,
+    warn: bool,
+    selected: bool,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    rsx! {
+        button {
+            class: if selected {
+                "flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm bg-input text-fg"
+            } else {
+                "flex w-full items-center gap-2 rounded px-2 py-1.5 text-sm text-fg-muted hover:bg-input hover:text-fg transition-colors"
+            },
+            onclick: move |evt| onclick.call(evt),
+            Icon { width: 16, height: 16, icon }
+            span { class: "flex-1 truncate text-left", "{label}" }
+            if let Some(t) = tag {
+                if warn {
+                    span { class: "rounded-full bg-yellow-800 px-1.5 text-[10px] font-bold leading-4 text-yellow-300", "{t}" }
+                } else {
+                    span { class: "text-xs text-fg-muted", "{t}" }
+                }
             }
         }
     }
@@ -550,6 +698,25 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
 
     let sel = selection.read().clone();
     let is_view = |v: TodoView| sel == PlannerSelection::View(v);
+    let mut drawer = use_context::<DecisionsDrawerContext>().0;
+    let decisions_count = crate::todo::lanes::needs_you(&state.todos).len();
+    let agent_time_label = {
+        let b = state.agent_time_budget(day, Utc::now());
+        if !b.enabled {
+            Some("off".to_string())
+        } else if b.minutes_used > 0 {
+            Some(format!("{}m", b.minutes_used))
+        } else {
+            None
+        }
+    };
+    let is_panel = |p: PlannerPanel| sel == PlannerSelection::Panel(p);
+    let mut open_decisions = move || {
+        if *selection.peek() != PlannerSelection::View(TodoView::Today) {
+            selection.set(PlannerSelection::View(TodoView::Today));
+        }
+        drawer.set(true);
+    };
 
     if railed {
         let smart: [(TodoView, &'static str, usize); 6] = [
@@ -621,6 +788,27 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                     selected: is_view(smart[5].0),
                     onclick: move |_| selection.set(PlannerSelection::View(smart[5].0)),
                 }
+                RailIconButton {
+                    icon: fi_icons::FiGitMerge,
+                    label: rail_label("Decisions", decisions_count),
+                    badge: decisions_count,
+                    selected: *drawer.read(),
+                    onclick: move |_| open_decisions(),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiClock,
+                    label: "Agent time".to_string(),
+                    badge: 0usize,
+                    selected: is_panel(PlannerPanel::AgentTime),
+                    onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
+                }
+                RailIconButton {
+                    icon: fi_icons::FiBarChart2,
+                    label: "Weekly review".to_string(),
+                    badge: 0usize,
+                    selected: is_panel(PlannerPanel::WeeklyReview),
+                    onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::WeeklyReview)),
+                }
                 if has_tree {
                     div { class: "mx-3 my-1 border-t border-faint" }
                     RailIconButton {
@@ -691,6 +879,30 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                 count: count(TodoView::Logbook),
                 selected: is_view(TodoView::Logbook),
                 onclick: move |_| selection.set(PlannerSelection::View(TodoView::Logbook)),
+            }
+            RailItemTagged {
+                icon: fi_icons::FiGitMerge,
+                label: "Decisions",
+                tag: badge_text(decisions_count),
+                warn: true,
+                selected: *drawer.read(),
+                onclick: move |_| open_decisions(),
+            }
+            RailItemTagged {
+                icon: fi_icons::FiClock,
+                label: "Agent time",
+                tag: agent_time_label,
+                warn: false,
+                selected: is_panel(PlannerPanel::AgentTime),
+                onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
+            }
+            RailItemTagged {
+                icon: fi_icons::FiBarChart2,
+                label: "Weekly review",
+                tag: None,
+                warn: false,
+                selected: is_panel(PlannerPanel::WeeklyReview),
+                onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::WeeklyReview)),
             }
 
             if has_tree {
@@ -854,6 +1066,18 @@ mod tests {
         assert_eq!(badge_text(99).as_deref(), Some("99"));
         assert_eq!(badge_text(100).as_deref(), Some("99+"));
         assert_eq!(badge_text(5000).as_deref(), Some("99+"));
+    }
+
+    #[test]
+    fn agent_lane_takes_only_space_beyond_the_task_list_minimum() {
+        // 1600 row, 220 nav, 380 timeline → 1000 for main; 480 spare.
+        assert_eq!(agent_lane_width(1600.0, 220.0, 380.0, 400.0), Some(400.0));
+        assert_eq!(agent_lane_width(1600.0, 220.0, 380.0, 900.0), Some(AGENT_LANE_MAX_WIDTH));
+        // 1450 → 330 spare: shrinks to fit rather than eat the list's 520.
+        assert_eq!(agent_lane_width(1450.0, 220.0, 380.0, 400.0), Some(330.0));
+        // Too narrow (or unmeasured): a section in the right column.
+        assert_eq!(agent_lane_width(1300.0, 220.0, 380.0, 400.0), None);
+        assert_eq!(agent_lane_width(0.0, 220.0, 380.0, 400.0), None);
     }
 
     #[test]

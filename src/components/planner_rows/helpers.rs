@@ -172,6 +172,7 @@ pub(super) fn empty_state_line(selection: &PlannerSelection) -> &'static str {
         PlannerSelection::View(TodoView::Someday) => "Nothing on the back burner.",
         PlannerSelection::View(TodoView::Logbook) => "Nothing finished yet.",
         PlannerSelection::Project(_) => "No todos in this project yet.",
+        PlannerSelection::Panel(_) => "",
     }
 }
 
@@ -201,6 +202,7 @@ pub(super) fn todos_for_selection(
             });
             out
         }
+        PlannerSelection::Panel(_) => Vec::new(),
     }
 }
 

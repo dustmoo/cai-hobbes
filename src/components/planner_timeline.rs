@@ -854,7 +854,13 @@ fn CapacityBar(
 }
 
 #[component]
-pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
+pub(crate) fn TodayRail(
+    mut viewing: Signal<NaiveDate>,
+    /// Render the agent lane as a section here (narrow windows); on wide
+    /// windows it has its own column beside the rail.
+    #[props(default)]
+    embed_agent_lane: bool,
+) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let settings = use_context::<Signal<Settings>>();
     let fleet_state = use_context::<Signal<crate::fleet::FleetState>>();
@@ -872,6 +878,8 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
     let mut rollup_bump = use_signal(|| 0u64);
     let mut rollup_running = use_signal(|| false);
     let mut rollup_error = use_signal(|| Option::<String>::None);
+    // The empty-slot menu: the clicked slot's start (local minutes).
+    let mut slot_menu = use_signal(|| Option::<u32>::None);
 
     // Current-time indicator: a once-a-minute tick is enough for a line that
     // moves ~0.8 px/min; subscribing to it re-renders the rail so the line
@@ -996,6 +1004,22 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
             ))
         })
         .collect();
+    // Your-time colours and the chores each batched block lists.
+    let goals = state.time_goals.clone();
+    let chore_lists: std::collections::HashMap<String, Vec<(String, Option<u32>, bool)>> = blocks
+        .iter()
+        .filter_map(|b| match &b.source {
+            BlockSource::Chores { todo_ids } => Some((
+                b.id.clone(),
+                todo_ids
+                    .iter()
+                    .filter_map(|id| state.todo(id))
+                    .map(|t| (t.title.clone(), t.estimate_minutes, t.status.is_closed()))
+                    .collect(),
+            )),
+            _ => None,
+        })
+        .collect();
     // End-the-day inputs, gathered while the state borrow is live.
     let carry_candidates = carry_over_candidates(&state.todos, day);
     let eod_core = end_of_day_summary(&state.todos, &state.focus_sessions, day, 0);
@@ -1092,6 +1116,36 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
             state.blocks.push(block);
         }
     };
+
+    // A protected your-time block: no to-do behind it (your time isn't a
+    // task), counted toward the category's weekly goal.
+    let mut create_your_time_at = move |minutes: u32, category: String| {
+        let start_min = snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)));
+        let block = TimeBlock {
+            id: uuid::Uuid::new_v4().to_string(),
+            todo_id: None,
+            title: category.clone(),
+            start: local_minutes_to_utc(day, start_min),
+            end: local_minutes_to_utc(day, (start_min + 60).min(day_end.max(start_min + 15))),
+            source: BlockSource::YourTime { category },
+        };
+        persist_block(&block);
+        selected_block.set(Some(block.id.clone()));
+        planner.write().blocks.push(block);
+    };
+    let slot_categories: Vec<(String, String)> = if goals.is_empty() {
+        super::planner_view::your_time::DEFAULT_PALETTE
+            .iter()
+            .map(|(n, c)| (n.to_string(), c.to_string()))
+            .collect()
+    } else {
+        let mut g = goals.clone();
+        g.sort_by(|a, b| a.sort_order.partial_cmp(&b.sort_order).unwrap_or(std::cmp::Ordering::Equal));
+        g.iter()
+            .map(|g| (g.category.clone(), super::planner_view::your_time::category_colour(&goals, &g.category)))
+            .collect()
+    };
+    let menu_at = *slot_menu.read();
 
     // Auto-placement's busy set. Non-busy external blocks (free / focus-time
     // mirrors) are NOT busy — tasks may be placed over them.
@@ -1358,6 +1412,11 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
             if let Some(line) = strategic_line {
                 p { class: "text-xs text-fg-muted", "{line}" }
             }
+            // Narrow windows: the agent lane lives here as a section (wide
+            // windows give it its own column beside this rail).
+            if embed_agent_lane && is_today {
+                super::planner_view::agent_lane::AgentLaneColumn { embedded: true }
+            }
 
             // All-day events: a thin banner row above the timeline. These are
             // cached calendar events, never TimeBlocks — a 24h block would
@@ -1419,7 +1478,7 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                 onclick: move |evt| {
                     let y = evt.data.element_coordinates().y;
                     let minutes = day_start + (y / PX_PER_HOUR * 60.0).max(0.0) as u32;
-                    create_block_at(minutes);
+                    slot_menu.set(Some(snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)))));
                 },
                 // External events the window can't show at all, as an honest
                 // count. Non-interactive so it never eats a create-block click.
@@ -1441,6 +1500,62 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                                     class: "pointer-events-none absolute left-1 -top-0.5 text-[10px] leading-none text-fg-muted",
                                     "{hour:02}:00"
                                 }
+                            }
+                        }
+                    }
+                }
+                // The empty-slot menu: a plain block, or protected your
+                // time in one of the person's categories.
+                if let Some(m) = menu_at {
+                    div {
+                        class: "fixed inset-0 z-30",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            slot_menu.set(None);
+                        },
+                    }
+                    div {
+                        class: "absolute left-10 z-40 w-56 rounded-lg border border-subtle bg-card py-1 shadow-xl",
+                        style: "top: {((m.saturating_sub(day_start)) as f64 / 60.0 * PX_PER_HOUR).min((timeline_height - 220.0).max(0.0))}px;",
+                        role: "menu",
+                        onclick: move |evt| evt.stop_propagation(),
+                        onmousedown: move |evt| evt.stop_propagation(),
+                        div { class: "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted", "{fmt_hhmm(m)}" }
+                        button {
+                            class: "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg text-left hover:bg-input",
+                            onclick: move |evt| {
+                                evt.stop_propagation();
+                                slot_menu.set(None);
+                                create_block_at(m);
+                            },
+                            Icon { width: 11, height: 11, icon: fi_icons::FiPlus }
+                            span { class: "flex-1", "Focus block" }
+                            span { class: "font-mono text-fg-muted", "{model::format_minutes(block_minutes)}" }
+                        }
+                        div { class: "h-px bg-[var(--color-border-muted)] my-1" }
+                        div {
+                            class: "px-2.5 pt-1 pb-1 flex items-center gap-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted",
+                            "Your time \u{25b8}"
+                            if goals.is_empty() {
+                                span { class: "normal-case tracking-normal", "\u{b7} no goals yet" }
+                            }
+                        }
+                        for (cat, colour) in slot_categories.iter().cloned() {
+                            button {
+                                key: "yt-{cat}",
+                                class: "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg text-left hover:bg-input",
+                                title: "Protect 1h for {cat}",
+                                onclick: {
+                                    let cat = cat.clone();
+                                    move |evt: MouseEvent| {
+                                        evt.stop_propagation();
+                                        slot_menu.set(None);
+                                        create_your_time_at(m, cat.clone());
+                                    }
+                                },
+                                span { class: "h-2 w-2 shrink-0 rounded-full", style: "background: {colour};" }
+                                span { class: "flex-1 truncate", "{cat}" }
+                                Icon { width: 10, height: 10, icon: fi_icons::FiLock }
                             }
                         }
                     }
@@ -1478,7 +1593,7 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                                     title: "{fmt_hhmm(gs)}\u{2013}{fmt_hhmm(ge)} \u{2014} click to plan something here",
                                     onclick: move |evt| {
                                         evt.stop_propagation();
-                                        create_block_at(gs);
+                                        slot_menu.set(Some(gs));
                                     },
                                     span { class: "truncate px-1", "{label}" }
                                 }
@@ -1535,6 +1650,18 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                 }) {
                     {
                         let is_external = matches!(block.source, BlockSource::External { .. });
+                        // Protected your time renders in its category colour;
+                        // a chores batch lists its chores.
+                        let your_time = block.your_time_category().map(str::to_string);
+                        let yt_colour = your_time
+                            .as_ref()
+                            .map(|c| super::planner_view::your_time::category_colour(&goals, c));
+                        let chore_items = chore_lists.get(&block.id).cloned();
+                        let yt_meta = your_time.as_ref().map(|_| {
+                            let mins = (block.end - block.start).num_minutes().max(0) as u32;
+                            let done = if block.end <= Utc::now() { " \u{b7} done \u{2713}" } else { "" };
+                            format!("protected{done} \u{b7} {} \u{b7} {}", fmt_hhmm(s_min.max(0) as u32), model::format_minutes(mins))
+                        });
                         // Subscription tint + deep link for mirrored calendar
                         // events. A block whose subscription is unknown (legacy
                         // or just removed) keeps the muted fallback style.
@@ -1562,6 +1689,12 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                             .copied()
                             .unwrap_or((0, 1));
                         block_style.push_str(&overlap_column_style_scaled(col, count, lane_avail));
+                        if let Some(c) = &yt_colour {
+                            block_style.push_str(&format!(
+                                " background: {c}; color: {};",
+                                super::planner_view::your_time::text_on(c)
+                            ));
+                        }
                         let is_selected = selected_block.read().as_deref() == Some(block.id.as_str());
                         let is_dragging_this = preview_for.as_ref().is_some_and(|(pid, _, _)| *pid == block.id);
                         let (display_title, is_done, is_focus_block) = linked_info
@@ -1587,6 +1720,19 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                                 "absolute overflow-hidden rounded border border-faint px-1.5 py-0.5 text-fg-muted"
                             } else {
                                 "absolute overflow-hidden rounded border border-faint bg-input px-1.5 py-0.5 text-fg-muted"
+                            }
+                        } else if your_time.is_some() {
+                            // Fill and text colour arrive via inline style.
+                            if is_selected {
+                                "absolute overflow-hidden rounded px-1.5 py-0.5 cursor-grab ring-2 ring-primary-300"
+                            } else {
+                                "absolute overflow-hidden rounded px-1.5 py-0.5 cursor-grab"
+                            }
+                        } else if chore_items.is_some() {
+                            if is_selected {
+                                "absolute overflow-hidden rounded border border-subtle border-l-2 border-l-gray-400 bg-input px-1.5 py-0.5 text-fg cursor-grab"
+                            } else {
+                                "absolute overflow-hidden rounded border border-faint border-l-2 border-l-gray-400 bg-card px-1.5 py-0.5 text-fg cursor-grab"
                             }
                         } else if is_selected {
                             "absolute overflow-hidden rounded border border-subtle bg-btn-primary-hover px-1.5 py-0.5 text-fg cursor-grab"
@@ -1641,9 +1787,17 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                                     div {
                                         class: "flex items-start justify-between gap-1",
                                         p {
-                                            class: "truncate text-xs font-medium leading-4",
+                                            class: "flex min-w-0 items-center gap-1 text-xs font-medium leading-4",
                                             class: if is_done { "line-through opacity-60" },
-                                            "{display_title}"
+                                            if your_time.is_some() {
+                                                span { class: "shrink-0", title: "Protected your time", Icon { width: 10, height: 10, icon: fi_icons::FiLock } }
+                                            }
+                                            if let Some(items) = &chore_items {
+                                                span { class: "min-w-0 truncate", "Chores \u{b7} {items.len()}" }
+                                                span { class: "shrink-0 font-normal text-fg-muted", "batched" }
+                                            } else {
+                                                span { class: "min-w-0 truncate", "{display_title}" }
+                                            }
                                         }
                                         if is_external && has_url {
                                             span {
@@ -1672,7 +1826,26 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                                             }
                                         }
                                     }
-                                    if height >= 30.0 {
+                                    if let Some(items) = &chore_items {
+                                        div {
+                                            class: "grid grid-cols-2 gap-x-3 text-[10.5px] leading-[13px]",
+                                            for (i, (title, est, closed)) in items.iter().cloned().enumerate() {
+                                                span {
+                                                    key: "{i}",
+                                                    class: "flex min-w-0 gap-1.5 whitespace-nowrap",
+                                                    class: if closed { "line-through opacity-60" },
+                                                    span { class: "min-w-0 flex-1 truncate", "{title}" }
+                                                    if let Some(m) = est {
+                                                        span { class: "shrink-0 font-mono text-fg-muted", "{model::format_minutes(m)}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(meta) = yt_meta.clone() {
+                                        if height >= 24.0 {
+                                            p { class: "truncate font-mono text-[10px] opacity-80", "{meta}" }
+                                        }
+                                    } else if height >= 30.0 {
                                         p { class: "text-[10px] opacity-80", "{start_label}–{end_label}" }
                                     }
                                     if !is_external {
@@ -1820,7 +1993,7 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                     onmouseleave: move |_| commit_block_drag(),
                 }
             }
-            p { class: "text-[11px] text-fg-muted", "Click an empty slot for a new block · drag a block to move it · drag its bottom edge to resize." }
+            p { class: "text-[11px] text-fg-muted", "Click an empty slot for a block or protected your time · drag a block to move it · drag its bottom edge to resize." }
 
             if !unblocked.is_empty() && !*end_day_open.read() {
                 div {
@@ -2004,6 +2177,25 @@ pub(crate) fn TodayRail(mut viewing: Signal<NaiveDate>) -> Element {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // Optional: tabs pile up as work moves async. The sheet
+                    // only suggests; closed tabs stay in History.
+                    p { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Tabs" }
+                    div {
+                        class: "flex items-center gap-2",
+                        button {
+                            class: "shrink-0 rounded border border-faint px-2 py-0.5 text-[11px] text-fg hover:bg-input",
+                            title: "Review suggested tab closes and filing",
+                            onclick: move |_| {
+                                chat_command.set(Some(crate::components::chat_input::ChatCommand::TidyTabs));
+                            },
+                            "Tidy tabs"
+                        }
+                        span {
+                            class: "min-w-0 flex-1 truncate text-[11px] text-fg-muted",
+                            "Optional \u{b7} close finished and idle tabs; they stay in History."
                         }
                     }
 
