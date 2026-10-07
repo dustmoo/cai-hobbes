@@ -15,13 +15,28 @@
 //! | `!fri` `!tomorrow` `!today` | deadline (weekday = next occurrence, today counts) |
 //! | `!!1`…`!!4` `!!p1`…`!!p4` `!!do` `!!schedule` `!!delegate` `!!drop` | Eisenhower priority (Q1–Q4) |
 //! | `+hobbes` `+hobbes-rc` `+rc` | project (slug / word prefix; must resolve) |
+//! | `@me`                 | human lane (explicit) |
+//! | `@hobbes` `@<worker>` | agent lane; the rest of the text is the outcome |
+//! | `!chore`              | human chore |
+//! | `!mine`               | human lane (explicit) |
+//!
+//! `@` is shared with the clock and time-of-day tokens: a word after `@`
+//! that parses as a time (`@2pm`, `@9`, `@14:30`, `@evening`) is ALWAYS a
+//! time, checked first; only then `me`, `hobbes`, and the known worker names
+//! (slug match, then a unique slug prefix of 3+ characters). An `@word` that
+//! is none of these stays in the title ("email @john").
+//!
+//! Lane rules: an agent marker wins over `!chore`/`!mine`/`@me` (the kind is
+//! dropped — kinds belong to human to-dos); the last lane marker otherwise
+//! wins. With no lane marker at all, [`suggest_lane`] may offer a
+//! [`LaneSuggestion`] — the UI only *suggests*, it never applies one.
 //!
 //! Shared by the quick-add input; the AI goes through its structured tools and
 //! never needs this.
 
 use chrono::{Datelike, NaiveDate, Weekday};
 
-use super::model::{Priority, TimeOfDay};
+use super::model::{HumanKind, Lane, Priority, TimeOfDay};
 use super::project_match::{self, MatchTier, ProjectIndex, ProjectResolution};
 
 /// A `+token` that resolved to an open project.
@@ -51,6 +66,30 @@ pub struct QuickAddParse {
     /// The last `+token` that did NOT resolve. It stays in the title; kept
     /// here only so the preview can show the amber "stays in title" pill.
     pub project_miss: Option<ProjectResolution>,
+    /// An explicit lane marker (`@me`/`!mine` → Human, `@hobbes`/`@worker`
+    /// → Agent). `None` = no marker (the to-do defaults to the human lane).
+    pub lane: Option<Lane>,
+    /// `!chore` → `Chore`. Dropped when an agent marker is present.
+    pub kind: Option<HumanKind>,
+    /// The worker an agent marker named: `"Hobbes"` for `@hobbes`, else the
+    /// matched worker name as given in the `workers` list.
+    pub worker: Option<String>,
+    /// Agent lane only: the outcome — the title text with tokens stripped.
+    pub outcome: Option<String>,
+    /// With no lane marker: a suggested lane when the text reads like an
+    /// outcome (or clearly needs the person). Never applied by the parser.
+    pub lane_suggestion: Option<LaneSuggestion>,
+}
+
+/// A suggested lane for unmarked input. The UI offers it ("Hand to
+/// Hobbes?" / "Keep it yours?"); the person decides.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaneSuggestion {
+    pub lane: Lane,
+    /// For a human suggestion: the kind the verb implies.
+    pub kind: Option<HumanKind>,
+    /// Why, in a few words, for the hint line.
+    pub reason: &'static str,
 }
 
 impl QuickAddParse {
@@ -65,6 +104,119 @@ impl QuickAddParse {
             || self.priority.is_some()
             || self.project.is_some()
             || self.project_miss.is_some()
+            || self.lane.is_some()
+            || self.kind.is_some()
+    }
+}
+
+// ── Lane suggestion heuristic ───────────────────────────────────────────────
+//
+// Deliberately small and predictable — word lists, not NLP. Checked in
+// order, first match wins:
+//
+// 1. An outcome phrase anywhere ("tests passing", "ready for", "so that",
+//    "pr open"…) → agent: the text states a definition of done.
+// 2. The first word is a delegable work verb (research, draft, summarize,
+//    compare, fix, refactor, benchmark…) → agent.
+// 3. The first word needs the person there (call, meet, attend… →
+//    commitment; pay, buy, renew, pick… → chore; play, watch, walk, hike…
+//    → your time) → human, with that kind.
+// 4. Otherwise no suggestion.
+
+const OUTCOME_PHRASES: &[&str] = &[
+    "tests passing", "tests pass", "ready for", "ready by", "so that", "pr open",
+    "open a pr", "pull request", "with a summary", "end to end", "definition of done",
+];
+
+const AGENT_VERBS: &[&str] = &[
+    "research", "investigate", "summarize", "summarise", "compare", "draft", "compile",
+    "analyze", "analyse", "benchmark", "refactor", "implement", "fix", "debug", "migrate",
+    "triage", "audit", "prototype", "document", "outline", "collect", "gather", "scrape",
+    "transcribe", "translate", "ship", "build", "test", "find", "update",
+];
+
+const COMMITMENT_VERBS: &[&str] = &[
+    "call", "meet", "attend", "visit", "interview", "present", "talk", "discuss", "lunch",
+    "dinner", "coffee",
+];
+
+const CHORE_VERBS: &[&str] = &[
+    "pay", "buy", "pick", "renew", "sign", "return", "book", "order", "file", "drop",
+    "collect", "clean", "wash", "mail",
+];
+
+const YOUR_TIME_VERBS: &[&str] = &[
+    "play", "watch", "read", "walk", "hike", "run", "game", "garden", "paint", "bike", "swim",
+];
+
+/// Suggest a lane for unmarked capture text (see the rules above).
+pub fn suggest_lane(title: &str) -> Option<LaneSuggestion> {
+    let lower = title.trim().to_lowercase();
+    if lower.is_empty() {
+        return None;
+    }
+    if OUTCOME_PHRASES.iter().any(|p| lower.contains(p)) {
+        return Some(LaneSuggestion {
+            lane: Lane::Agent,
+            kind: None,
+            reason: "reads like an outcome",
+        });
+    }
+    let first = lower
+        .split_whitespace()
+        .next()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .unwrap_or("");
+    // Chore verbs are checked before agent verbs so "collect the dry
+    // cleaning" stays the person's errand.
+    if CHORE_VERBS.contains(&first) {
+        return Some(LaneSuggestion {
+            lane: Lane::Human,
+            kind: Some(HumanKind::Chore),
+            reason: "a quick errand",
+        });
+    }
+    if AGENT_VERBS.contains(&first) {
+        return Some(LaneSuggestion {
+            lane: Lane::Agent,
+            kind: None,
+            reason: "work an agent can take on",
+        });
+    }
+    if COMMITMENT_VERBS.contains(&first) {
+        return Some(LaneSuggestion {
+            lane: Lane::Human,
+            kind: Some(HumanKind::Commitment),
+            reason: "needs you there",
+        });
+    }
+    if YOUR_TIME_VERBS.contains(&first) {
+        return Some(LaneSuggestion {
+            lane: Lane::Human,
+            kind: Some(HumanKind::YourTime),
+            reason: "your time",
+        });
+    }
+    None
+}
+
+/// Resolve an `@word` against the known workers: slug equality first, then a
+/// unique slug prefix of at least 3 characters. Returns the name as given.
+fn match_worker<'a>(word: &str, workers: &'a [String]) -> Option<&'a str> {
+    let w = project_match::slug(word);
+    if w.is_empty() {
+        return None;
+    }
+    if let Some(exact) = workers.iter().find(|n| project_match::slug(n) == w) {
+        return Some(exact.as_str());
+    }
+    if w.chars().count() < 3 {
+        return None;
+    }
+    let mut hits = workers.iter().filter(|n| project_match::slug(n).starts_with(&w));
+    match (hits.next(), hits.next()) {
+        (Some(one), None) => Some(one.as_str()),
+        _ => None,
     }
 }
 
@@ -88,8 +240,21 @@ fn project_query(word: &str) -> Option<&str> {
 }
 
 pub fn parse_quick_add_with(input: &str, today: NaiveDate, projects: &ProjectIndex) -> QuickAddParse {
+    parse_capture(input, today, projects, &[])
+}
+
+/// The full capture grammar: [`parse_quick_add_with`] plus `@worker` names.
+/// `workers` are the names an `@word` may resolve to (live fleet sessions,
+/// chat tab names…); `@hobbes` and `@me` work without it.
+pub fn parse_capture(
+    input: &str,
+    today: NaiveDate,
+    projects: &ProjectIndex,
+    workers: &[String],
+) -> QuickAddParse {
     let mut out = QuickAddParse::default();
     let mut title_words: Vec<&str> = Vec::new();
+    let mut agent_marked = false;
 
     for word in input.split_whitespace() {
         // Split after the first CHARACTER, not the first byte — a multibyte
@@ -117,6 +282,7 @@ pub fn parse_quick_add_with(input: &str, today: NaiveDate, projects: &ProjectInd
                     false
                 }
             }
+            // Times first: `@2pm` must never read as a worker.
             ("@", rest) => match parse_time_word(rest) {
                 Some(TimeToken::TimeOfDay(t)) => {
                     out.time_of_day = Some(t);
@@ -126,8 +292,43 @@ pub fn parse_quick_add_with(input: &str, today: NaiveDate, projects: &ProjectInd
                     out.block_start = Some(minutes);
                     true
                 }
-                None => false,
+                None => match rest.to_ascii_lowercase().as_str() {
+                    "me" => {
+                        if !agent_marked {
+                            out.lane = Some(Lane::Human);
+                        }
+                        true
+                    }
+                    "hobbes" => {
+                        agent_marked = true;
+                        out.lane = Some(Lane::Agent);
+                        out.worker = Some("Hobbes".to_string());
+                        true
+                    }
+                    _ => match match_worker(rest, workers) {
+                        Some(name) => {
+                            agent_marked = true;
+                            out.lane = Some(Lane::Agent);
+                            out.worker = Some(name.to_string());
+                            true
+                        }
+                        None => false,
+                    },
+                },
             },
+            ("!", rest) if rest.eq_ignore_ascii_case("chore") || rest.eq_ignore_ascii_case("chores") => {
+                out.kind = Some(HumanKind::Chore);
+                if !agent_marked {
+                    out.lane = Some(Lane::Human);
+                }
+                true
+            }
+            ("!", rest) if rest.eq_ignore_ascii_case("mine") => {
+                if !agent_marked {
+                    out.lane = Some(Lane::Human);
+                }
+                true
+            }
             // Checked before the single-`!` deadline arm, which would
             // otherwise see "!2" and leave the word in the title.
             ("!", rest) if rest.starts_with('!') => match Priority::parse(&rest[1..]) {
@@ -177,6 +378,13 @@ pub fn parse_quick_add_with(input: &str, today: NaiveDate, projects: &ProjectInd
     }
 
     out.title = title_words.join(" ");
+    if agent_marked {
+        // Kinds belong to human to-dos; the rest of the text is the outcome.
+        out.kind = None;
+        out.outcome = Some(out.title.clone()).filter(|t| !t.is_empty());
+    } else if out.lane.is_none() {
+        out.lane_suggestion = suggest_lane(&out.title);
+    }
     out
 }
 
@@ -569,6 +777,110 @@ mod tests {
         assert_eq!(set_project_token("x ~30m", Some("reno")), "x ~30m +reno");
         assert_eq!(set_project_token("x +rc ~30m", None), "x ~30m");
         assert_eq!(set_project_token("+1 idea +rc", None), "+1 idea", "+1 is text");
+    }
+
+    fn workers() -> Vec<String> {
+        vec!["clearmirror-site".into(), "Scott Marsh Phase 2".into(), "puget-app-packs".into(), "puget-bench".into()]
+    }
+
+    fn cap(input: &str) -> QuickAddParse {
+        parse_capture(input, today(), &ProjectIndex::empty(), &workers())
+    }
+
+    #[test]
+    fn at_hobbes_routes_to_the_agent_lane_with_the_rest_as_outcome() {
+        let p = cap("@hobbes ship the Docker app-packs release with tests passing ~2h");
+        assert_eq!(p.lane, Some(Lane::Agent));
+        assert_eq!(p.worker.as_deref(), Some("Hobbes"));
+        assert_eq!(p.title, "ship the Docker app-packs release with tests passing");
+        assert_eq!(p.outcome.as_deref(), Some("ship the Docker app-packs release with tests passing"));
+        assert_eq!(p.estimate_minutes, Some(120));
+        assert!(p.lane_suggestion.is_none(), "an explicit marker never gets a suggestion");
+        assert!(p.has_tokens());
+        // Case-insensitive, any position.
+        assert_eq!(cap("fix the build @HOBBES").lane, Some(Lane::Agent));
+    }
+
+    #[test]
+    fn at_worker_names_resolve_by_slug_and_unique_prefix() {
+        assert_eq!(cap("rename Monica @clearmirror-site").worker.as_deref(), Some("clearmirror-site"));
+        assert_eq!(cap("scope doc @scott-marsh-phase-2").worker.as_deref(), Some("Scott Marsh Phase 2"));
+        assert_eq!(cap("scope doc @scott").worker.as_deref(), Some("Scott Marsh Phase 2"));
+        // Ambiguous prefix ("puget" → two workers) and short prefixes stay text.
+        let p = cap("tag release @puget");
+        assert_eq!(p.lane, None);
+        assert_eq!(p.title, "tag release @puget");
+        assert_eq!(cap("x @sc").lane, None);
+        // Unknown @names stay in the title, as before.
+        let p = cap("email @john about it");
+        assert_eq!(p.title, "email @john about it");
+        assert_eq!(p.worker, None);
+        // Without a worker list only @hobbes / @me are lane markers.
+        assert_eq!(parse_quick_add("x @clearmirror-site", today()).lane, None);
+    }
+
+    #[test]
+    fn at_times_still_parse_as_times() {
+        for (input, mins) in [("call @2pm", 14 * 60), ("call @9", 9 * 60), ("call @14:30", 14 * 60 + 30), ("call @12am", 0)] {
+            let p = cap(input);
+            assert_eq!(p.block_start, Some(mins), "{input}");
+            assert_eq!(p.lane, None, "{input}");
+            assert_eq!(p.title, "call", "{input}");
+        }
+        assert_eq!(cap("read @evening").time_of_day, Some(TimeOfDay::Evening));
+        // A time and a lane marker compose.
+        let p = cap("standup @me @9");
+        assert_eq!((p.lane, p.block_start), (Some(Lane::Human), Some(9 * 60)));
+    }
+
+    #[test]
+    fn chore_and_mine_markers() {
+        let p = cap("pay Comcast bill !chore ~5m");
+        assert_eq!(p.title, "pay Comcast bill");
+        assert_eq!(p.kind, Some(HumanKind::Chore));
+        assert_eq!(p.lane, Some(Lane::Human));
+        assert_eq!(p.estimate_minutes, Some(5));
+        assert!(p.lane_suggestion.is_none());
+
+        let p = cap("call mom !mine");
+        assert_eq!((p.lane, p.kind), (Some(Lane::Human), None));
+        let p = cap("plan the trip @me");
+        assert_eq!(p.lane, Some(Lane::Human));
+        assert_eq!(p.title, "plan the trip");
+
+        // !chore / !mine never collide with the deadline day words.
+        assert_eq!(cap("x !mon").deadline, Some(date("2026-08-17")));
+        assert_eq!(cap("x !mon").kind, None);
+    }
+
+    #[test]
+    fn agent_marker_wins_and_drops_the_kind() {
+        let p = cap("renew passport !chore @hobbes");
+        assert_eq!(p.lane, Some(Lane::Agent));
+        assert_eq!(p.kind, None);
+        assert_eq!(p.outcome.as_deref(), Some("renew passport"));
+        let p = cap("@hobbes renew passport @me");
+        assert_eq!(p.lane, Some(Lane::Agent), "@me after an agent marker doesn't flip it back");
+    }
+
+    #[test]
+    fn unmarked_text_gets_a_lane_suggestion() {
+        let s = cap("ship the release with tests passing").lane_suggestion.unwrap();
+        assert_eq!((s.lane, s.kind), (Lane::Agent, None));
+        let s = cap("Research KV-cache offload approaches").lane_suggestion.unwrap();
+        assert_eq!(s.lane, Lane::Agent);
+        let s = cap("call mom ~20m").lane_suggestion.unwrap();
+        assert_eq!((s.lane, s.kind), (Lane::Human, Some(HumanKind::Commitment)));
+        let s = cap("pay the water bill").lane_suggestion.unwrap();
+        assert_eq!((s.lane, s.kind), (Lane::Human, Some(HumanKind::Chore)));
+        let s = cap("collect the dry cleaning").lane_suggestion.unwrap();
+        assert_eq!(s.kind, Some(HumanKind::Chore), "chore verbs outrank agent verbs");
+        let s = cap("walk by the river").lane_suggestion.unwrap();
+        assert_eq!(s.kind, Some(HumanKind::YourTime));
+        assert!(cap("Quarterly numbers").lane_suggestion.is_none());
+        assert!(cap("").lane_suggestion.is_none());
+        // A suggestion is not a token: the chip row stays quiet.
+        assert!(!parse_quick_add("Research things", today()).has_tokens());
     }
 
     #[test]

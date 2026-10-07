@@ -12,7 +12,26 @@
 use dioxus::prelude::{Readable, Writable};
 
 use crate::components::builtin_tools::BuiltinToolCtx;
-use crate::todo::model::{Project, Todo, TodoStatus};
+use crate::todo::model::{AgentState, Lane, Project, Todo, TodoStatus};
+
+/// Dispatching IS handing the to-do to an agent: it joins the agent lane and
+/// starts `Working` (its brief-driven state takes over from there).
+fn mark_dispatched(t: &mut Todo, worker_session: &str) {
+    t.linked_fleet_session = Some(worker_session.to_string());
+    t.set_lane(Lane::Agent);
+    t.agent_state = Some(AgentState::Working);
+    t.updated_at = chrono::Utc::now();
+}
+
+/// The extra line a Hobbes chat worker gets: how to raise a decision so it
+/// lands in the person's decision queue.
+fn chat_worker_note(todo_id: &str) -> String {
+    format!(
+        "\nIf you need a decision from the user, call HOBBES_DECISIONS with action 'ask' \
+         (todo_id: {todo_id}) giving a one-line question, the options, and an estimate, then stop; \
+         the answer will arrive here as a message."
+    )
+}
 
 /// What the spawner is asked to launch. Separated behind a trait so the
 /// handler is testable without running `claude`.
@@ -86,6 +105,9 @@ pub fn build_assignment_prompt(
     instructions: Option<&str>,
 ) -> String {
     let mut out = format!("Assignment: {}\n", todo.title);
+    if let Some(o) = todo.outcome.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
+        out.push_str(&format!("Definition of done: {}\n", o));
+    }
     if let Some(p) = project {
         out.push_str(&format!("Project: {}\n", p.title));
     }
@@ -154,7 +176,7 @@ pub fn handle_dispatch(
             .cloned();
         (todo, project)
     };
-    let prompt = build_assignment_prompt(&todo, project.as_ref(), instructions);
+    let mut prompt = build_assignment_prompt(&todo, project.as_ref(), instructions);
 
     match target {
         "chat" => {
@@ -192,10 +214,10 @@ pub fn handle_dispatch(
             {
                 let mut planner = deps.planner.write();
                 if let Some(t) = planner.todo_mut(todo_id) {
-                    t.linked_fleet_session = Some(new_id.clone());
-                    t.updated_at = chrono::Utc::now();
+                    mark_dispatched(t, &new_id);
                 }
             }
+            prompt.push_str(&chat_worker_note(todo_id));
             if let Some(t) = deps.planner.peek().todo(todo_id) {
                 let _ = crate::todo::store::save_todo(t);
             }
@@ -240,8 +262,7 @@ pub fn handle_dispatch(
             {
                 let mut planner = deps.planner.write();
                 if let Some(t) = planner.todo_mut(todo_id) {
-                    t.linked_fleet_session = Some(run_id.clone());
-                    t.updated_at = chrono::Utc::now();
+                    mark_dispatched(t, &run_id);
                 }
             }
             if let Some(t) = deps.planner.peek().todo(todo_id) {
@@ -279,6 +300,8 @@ pub fn handle_dispatch(
                             if let Some(t) = p.todo_mut(&todo_id) {
                                 t.latest_progress =
                                     Some(format!("Dispatch failed to launch claude: {e}"));
+                                // Explicit: the worker never started.
+                                t.agent_state = Some(AgentState::Stuck);
                                 t.updated_at = chrono::Utc::now();
                                 true
                             } else {
@@ -437,6 +460,51 @@ mod tests {
                 .cloned()
                 .expect("precreate_dispatched_session inserts the row");
             assert_eq!(row.dispatched_from.as_deref(), Some("parent-chat-1"));
+            assert!(!req.prompt.contains("HOBBES_DECISIONS"), "headless runs have no Hobbes tools");
+
+            dioxus::prelude::rsx! { div {} }
+        });
+        dom.rebuild_in_place();
+    }
+
+    #[test]
+    fn dispatch_moves_the_todo_into_the_agent_lane() {
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let spawner = RecordingSpawner(Default::default());
+            let mut planner = crate::todo::PlannerState::default();
+            let project = Project {
+                id: "proj-2".into(),
+                title: "Bench".into(),
+                notes: String::new(),
+                area_id: None,
+                status: TodoStatus::Open,
+                deadline: None,
+                sort_order: 0.0,
+                path: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let mut todo = Todo::new("Run the 70B suite", 1.0);
+            todo.project_id = Some(project.id.clone());
+            todo.kind = Some(crate::todo::model::HumanKind::Chore);
+            todo.outcome = Some("Results table in Notes".into());
+            let id = todo.id.clone();
+            planner.projects.push(project);
+            planner.todos.push(todo);
+            let ctx = test_ctx(planner);
+            handle_dispatch(
+                ctx,
+                &serde_json::json!({"todo_id": id, "target": "claude_code"}),
+                &spawner,
+                None,
+            )
+            .unwrap();
+            let t = ctx.planner.peek().todo(&id).cloned().unwrap();
+            assert_eq!(t.lane, Lane::Agent);
+            assert_eq!(t.agent_state, Some(AgentState::Working));
+            assert_eq!(t.kind, None, "kinds belong to human to-dos");
+            let req = spawner.0.lock().unwrap().last().cloned().unwrap();
+            assert!(req.prompt.contains("Definition of done: Results table in Notes"));
 
             dioxus::prelude::rsx! { div {} }
         });

@@ -18,6 +18,12 @@ pub struct PlannerClient;
 const SHARED_NOTE: &str = "The to-do list is global and shared across all chat tabs — todos \
     created in other conversations are visible and editable here.";
 
+/// The lane rule for create/update: the model may suggest delegating, never
+/// decide it.
+const LANE_NOTE: &str = "To-dos are in the human lane (the user's own time) by default. When an \
+    outcome is clear and no human presence is needed you may SUGGEST handing it to an agent, but \
+    create human to-dos unless the user said to delegate.";
+
 impl PlannerClient {
     pub fn new() -> Self {
         Self
@@ -32,8 +38,8 @@ impl PlannerClient {
                 description: Some(format!(
                     "Create one or more todos in the user's planner. Pass an array so a \
                     whole capture session is one call. Dates are YYYY-MM-DD (or the \
-                    literal strings 'today' / 'tomorrow'). {}",
-                    SHARED_NOTE
+                    literal strings 'today' / 'tomorrow'). {} {}",
+                    LANE_NOTE, SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
                     serde_json::from_value(serde_json::json!({
@@ -56,7 +62,11 @@ impl PlannerClient {
                                         "project_id": { "type": "string", "description": "Id of an existing project to file it under." },
                                         "linked_session": { "type": "string", "description": "Fleet session carrying this todo: a session id from HOBBES_FLEET_STATUS, or a unique live session name." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Free-form tags." },
-                                        "checklist": { "type": "array", "items": { "type": "string" }, "description": "Sub-step titles." }
+                                        "checklist": { "type": "array", "items": { "type": "string" }, "description": "Sub-step titles." },
+                                        "lane": { "type": "string", "enum": ["human", "agent"], "description": "Who spends time on it. Defaults to human. Use 'agent' ONLY when the user said to delegate it (otherwise suggest it in your reply)." },
+                                        "kind": { "type": "string", "enum": ["commitment", "chore", "your_time"], "description": "Human to-dos only: commitment (needs the user personally), chore (quick task to batch), your_time (the user's own non-work time)." },
+                                        "time_category": { "type": "string", "description": "For kind your_time: the user's your-time category (e.g. 'Reading'), matching a goal from HOBBES_TIME_GOALS." },
+                                        "outcome": { "type": "string", "description": "Agent to-dos: the definition of done the agent works toward, e.g. 'PR open with the fix and tests passing'." }
                                     },
                                     "required": ["title"]
                                 }
@@ -78,9 +88,9 @@ impl PlannerClient {
                     "Update one or more todos: patch any mutable field, or set 'status' to \
                     complete, cancel, or reopen them. Setting status to in_progress starts focus mode: only one todo is ever in focus, the previous one is paused automatically with its elapsed time banked. Setting status back to 'open' on an in-progress todo pauses its timer and banks the elapsed time — this is how you stop a focus timer you started. Pass an explicit JSON null to CLEAR an \
                     optional field (scheduled_for, time_of_day, deadline, estimate_minutes, \
-                    priority, project_id) — omitted fields are left untouched. Replacing 'checklist' \
-                    resets item completion. {}",
-                    SHARED_NOTE
+                    priority, project_id, kind, time_category, outcome) — omitted fields are left \
+                    untouched. Replacing 'checklist' resets item completion. {} {}",
+                    LANE_NOTE, SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
                     serde_json::from_value(serde_json::json!({
@@ -105,7 +115,11 @@ impl PlannerClient {
                                         "project_id": { "type": ["string", "null"], "description": "null clears it." },
                                         "linked_session": { "type": ["string", "null"], "description": "Fleet session carrying this todo (id from HOBBES_FLEET_STATUS or unique live name); null clears the link. Setting status to in_progress auto-links the calling session when unlinked." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full tag list." },
-                                        "checklist": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full checklist." }
+                                        "checklist": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full checklist." },
+                                        "lane": { "type": "string", "enum": ["human", "agent"], "description": "Move between lanes. Set 'agent' only when the user said to delegate it; HOBBES_DISPATCH does this for you when it starts a worker." },
+                                        "kind": { "type": ["string", "null"], "enum": ["commitment", "chore", "your_time", null], "description": "Human to-dos only; null clears it." },
+                                        "time_category": { "type": ["string", "null"], "description": "Your-time category for kind your_time; null clears it." },
+                                        "outcome": { "type": ["string", "null"], "description": "Agent to-dos: the definition of done; null clears it." }
                                     },
                                     "required": ["id"]
                                 }
@@ -152,11 +166,15 @@ impl PlannerClient {
             Tool {
                 name: "HOBBES_PLAN_DAY".into(),
                 description: Some(format!(
-                    "Plan a day, Sunsama-style: schedule the given todos onto the date in \
-                    the given order, apply estimate overrides, and return the capacity \
-                    arithmetic (planned vs available). If the plan overcommits the day the \
-                    response says so explicitly — surface that warning to the user instead \
-                    of silently accepting it. {}",
+                    "Plan a day, Sunsama-style: schedule the given human to-dos onto the date \
+                    in the given order, apply estimate overrides, and return the capacity \
+                    arithmetic (planned vs available). The response leads with the user's \
+                    your-time status: protected your-time blocks are planned AROUND and never \
+                    moved. Pass chores_slots to batch the day's chores into one or two Chores \
+                    blocks. Agent-lane to-dos are never placed on the day; the response lists \
+                    the agent lane separately (to dispatch / working / needs you). If the plan \
+                    overcommits the day the response says so explicitly — surface that warning \
+                    to the user instead of silently accepting it. {}",
                     SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
@@ -177,7 +195,20 @@ impl PlannerClient {
                                     "required": ["id"]
                                 }
                             },
-                            "capacity_minutes": { "type": "integer", "description": "Override the day's capacity (defaults to the stored day plan or the settings default)." }
+                            "capacity_minutes": { "type": "integer", "description": "Override the day's capacity (defaults to the stored day plan or the settings default)." },
+                            "chores_slots": {
+                                "type": "array",
+                                "maxItems": 2,
+                                "description": "Up to two local slots to batch the day's chores into (replaces earlier chore batches that day). Must not overlap protected your-time.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start": { "type": "string", "description": "Local 'HH:MM'." },
+                                        "end": { "type": "string", "description": "Local 'HH:MM', after start." }
+                                    },
+                                    "required": ["start", "end"]
+                                }
+                            }
                         },
                         "required": ["items"]
                     }))
@@ -197,7 +228,10 @@ impl PlannerClient {
                     an existing one. Link 'todo_id' when the block is time for a to-do — \
                     a block without todo_id is a calendar-only event (e.g. a meeting) that \
                     does NOT appear in the to-do lists or count toward the day's capacity. \
-                    Resizing a linked block re-estimates its to-do. {}",
+                    Resizing a linked block re-estimates its to-do. kind 'your_time' creates a \
+                    PROTECTED block for the user's own time (needs a category); work cannot be \
+                    placed over protected time, and protected blocks are never moved or deleted \
+                    unless the user explicitly agreed (then pass user_confirmed: true). {}",
                     SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
@@ -210,7 +244,11 @@ impl PlannerClient {
                             "title": { "type": "string", "description": "Block title. For create, defaults to the linked todo's title." },
                             "date": { "type": "string", "description": "Day of the block (YYYY-MM-DD, 'today' or 'tomorrow'). Required for create." },
                             "start": { "type": "string", "description": "Local start time 'HH:MM'. Required for create." },
-                            "end": { "type": "string", "description": "Local end time 'HH:MM', after start. Required for create." }
+                            "end": { "type": "string", "description": "Local end time 'HH:MM', after start. Required for create." },
+                            "kind": { "type": "string", "enum": ["work", "your_time", "chores"], "description": "Create only. work (default): a to-do timebox or event; your_time: protected time for the user (needs category, no todo_id); chores: a batched chores slot." },
+                            "category": { "type": "string", "description": "Your-time category for kind your_time (e.g. 'Outside')." },
+                            "override_protected": { "type": "boolean", "description": "Create only: place work over protected your-time. ONLY when the user explicitly asked to use that time." },
+                            "user_confirmed": { "type": "boolean", "description": "Move/delete of a protected your-time block: true ONLY after the user explicitly agreed in this conversation." }
                         },
                         "required": ["action"]
                     }))
@@ -256,9 +294,11 @@ impl PlannerClient {
                     "Send a todo to a worker. target 'chat' opens a new Hobbes tab that \
                     starts on the assignment immediately; target 'claude_code' launches a \
                     headless Claude Code run in the todo's project directory (the project \
-                    must have a path). Either way the todo links to the worker and progress \
-                    flows back onto it automatically; a headless run's permission requests \
-                    appear in the Fleet for approval."
+                    must have a path). Either way the todo joins the agent lane, links to the \
+                    worker, and its state (working / needs you / stuck / done) and progress \
+                    flow back onto it automatically; a headless run's permission requests \
+                    appear in the Fleet for approval. Set the todo's 'outcome' first so the \
+                    worker knows what done looks like."
                         .into(),
                 ),
                 input_schema: Arc::new(
@@ -326,6 +366,127 @@ impl PlannerClient {
                 icons: None,
                 meta: None,
             },
+            Tool {
+                name: "HOBBES_DECISIONS".into(),
+                description: Some(
+                    "The decision queue: agent to-dos waiting on the user's judgment. \
+                    'list' (default) shows each question with its options, estimated decision \
+                    time, worker and brief. 'resolve' records the user's answer (todo_id, \
+                    choice — an option's text or 1-based number — and an optional note) and \
+                    hands it back to the worker; only resolve with an answer the user actually \
+                    gave. Permission gates cannot be resolved here — the user approves those in \
+                    the Fleet. 'ask' is for a worker (a Hobbes chat working an agent to-do) to \
+                    raise a decision: todo_id, a one-line question, options, est_minutes, and \
+                    did/blocked/next; then stop and wait for the answer."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["list", "resolve", "ask"], "description": "Defaults to list." },
+                            "todo_id": { "type": "string", "description": "resolve / ask: the agent to-do." },
+                            "choice": { "type": "string", "description": "resolve: the user's answer — an option's text, its 1-based number, or their own words." },
+                            "note": { "type": "string", "description": "resolve: anything the user added." },
+                            "question": { "type": "string", "description": "ask: one line." },
+                            "options": { "type": "array", "items": { "type": "string" }, "description": "ask: the choices, most likely first." },
+                            "est_minutes": { "type": "integer", "description": "ask: how long deciding should take." },
+                            "did": { "type": "string", "description": "ask: what you did so far, one line." },
+                            "blocked": { "type": "string", "description": "ask: what you are blocked on." },
+                            "next": { "type": "string", "description": "ask: what you will do once answered." }
+                        }
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Decision Queue".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
+                name: "HOBBES_TIME_GOALS".into(),
+                description: Some(
+                    "The user's your-time goals: weekly targets for what their time is FOR \
+                    (reading, gaming, getting outside…), and this week's progress against \
+                    them (protected your-time blocks plus time logged on your-time to-dos). \
+                    'get' (default) reads; 'set' upserts goals by category and removes \
+                    categories listed in 'remove'. Only set goals the user stated."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "action": { "type": "string", "enum": ["get", "set"], "description": "Defaults to get." },
+                            "goals": {
+                                "type": "array",
+                                "description": "set: goals to create or update, matched by category (case-insensitive).",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "category": { "type": "string" },
+                                        "weekly_target_minutes": { "type": "integer", "description": "Required for a new category." },
+                                        "colour": { "type": ["string", "null"], "description": "#RRGGBB; null clears it." }
+                                    },
+                                    "required": ["category"]
+                                }
+                            },
+                            "remove": { "type": "array", "items": { "type": "string" }, "description": "set: categories to delete." }
+                        }
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Your-Time Goals".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
         ]
+    }
+
+    /// `HOBBES_AGENT_TIME` — deliberately NOT in [`Self::list_tools`], so no
+    /// ordinary chat is ever offered it. The agent-time runtime adds this
+    /// definition to the prompt only for the leased agent-time session
+    /// (`PlannerState::is_agent_time_session`); dispatch refuses it from any
+    /// other session regardless.
+    #[cfg_attr(not(test), allow(dead_code))] // consumer: the agent-time runtime (wave 2)
+    pub fn agent_time_tools() -> Vec<Tool> {
+        use std::sync::Arc;
+        vec![Tool {
+            name: "HOBBES_AGENT_TIME".into(),
+            description: Some(
+                "Your granted agent time: a small budget in which you choose your own work, \
+                in the open. start(intent) first — declare what you will do and why, in one \
+                or two lines. log(tool, summary) notes a step. propose(kind, title, body) files \
+                an output (note, todo, skill, research, other) for the user to accept, edit or \
+                dismiss — proposals are your ONLY output; never change the user's to-dos, plan \
+                or anything outside Hobbes directly. end(summary) closes the session. Refused \
+                when the grant, day, minutes or spend cap don't allow it."
+                    .into(),
+            ),
+            input_schema: Arc::new(
+                serde_json::from_value(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["start", "log", "propose", "end"] },
+                        "intent": { "type": "string", "description": "start: what you will do and why, one or two lines." },
+                        "tool": { "type": "string", "description": "log: the tool or step." },
+                        "summary": { "type": "string", "description": "log / end: one line." },
+                        "kind": { "type": "string", "enum": ["note", "todo", "skill", "research", "other"], "description": "propose." },
+                        "title": { "type": "string", "description": "propose: one line." },
+                        "body": { "type": "string", "description": "propose: the content (markdown)." }
+                    },
+                    "required": ["action"]
+                }))
+                .unwrap_or_default(),
+            ),
+            title: Some("Agent Time".to_string()),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+        }]
     }
 }

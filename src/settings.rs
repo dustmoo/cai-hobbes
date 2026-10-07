@@ -128,6 +128,14 @@ pub struct HotkeySettings {
     /// Cycle to the previous tab in the visible strip, wrapping at the start.
     #[serde(default = "default_prev_tab")]
     pub prev_tab: String,
+    /// Jump to the first tab of the next group in the sidebar (the
+    /// Planner/Fleet block counts as a group); plain next-tab when the
+    /// sidebar isn't grouped or the top strip is showing.
+    #[serde(default = "default_next_tab_group")]
+    pub next_tab_group: String,
+    /// Jump to the first tab of the previous group, wrapping.
+    #[serde(default = "default_prev_tab_group")]
+    pub prev_tab_group: String,
 }
 
 impl Default for HotkeySettings {
@@ -160,6 +168,8 @@ impl Default for HotkeySettings {
             switch_tab_9: default_switch_tab_9(),
             next_tab: default_next_tab(),
             prev_tab: default_prev_tab(),
+            next_tab_group: default_next_tab_group(),
+            prev_tab_group: default_prev_tab_group(),
         }
     }
 }
@@ -251,6 +261,12 @@ fn default_next_tab() -> String {
 }
 fn default_prev_tab() -> String {
     "CmdOrCtrl+Shift+[".to_string()
+}
+fn default_next_tab_group() -> String {
+    "CmdOrCtrl+Alt+Shift+]".to_string()
+}
+fn default_prev_tab_group() -> String {
+    "CmdOrCtrl+Alt+Shift+[".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -409,6 +425,12 @@ pub struct Settings {
     /// How priorities are labelled (Q1–Q4 or P1–P4, plus custom names).
     #[serde(default)]
     pub planner_priority: crate::todo::model::PriorityDisplay,
+    /// How the weekly review gives feedback (direct / balanced /
+    /// encouraging). Always visible and changeable; Hobbes may *suggest* a
+    /// switch from the acted/dismissed nudge counts
+    /// (`todo::measures::suggest_review_style`) but never switches silently.
+    #[serde(default)]
+    pub planner_review_style: crate::todo::model::ReviewStyle,
 
     // ── Fleet (Pro) ─────────────────────────────────────────────────────────
     /// Master switch for fleet observation: when on (and Pro is active), the
@@ -871,6 +893,7 @@ impl Default for Settings {
             planner_default_estimate_minutes: 0,
             planner_default_block_minutes: default_planner_block_minutes(),
             planner_priority: Default::default(),
+            planner_review_style: Default::default(),
             fleet_enabled: false,
             fleet_briefs_enabled: true,
             fleet_retire_minutes: default_fleet_retire_minutes(),
@@ -2196,6 +2219,17 @@ pub struct UiState {
     /// solver's automatic rail is temporary and never written here.
     #[serde(default)]
     pub tab_sidebar_railed: bool,
+    /// Show a small "Tidy tabs?" pill in the sidebar header once more than
+    /// `tidy_tabs_threshold` tabs are open. Off = tidy only when asked.
+    #[serde(default)]
+    pub tidy_tabs_nudge: bool,
+    /// Open-tab count above which the nudge appears.
+    #[serde(default = "default_tidy_tabs_threshold")]
+    pub tidy_tabs_threshold: usize,
+}
+
+fn default_tidy_tabs_threshold() -> usize {
+    20
 }
 
 fn default_token_display_mode() -> String {
@@ -2252,6 +2286,8 @@ impl Default for UiState {
             tab_sidebar_order: crate::tab_list::TabListOrder::default(),
             tab_sidebar_width: default_tab_sidebar_width(),
             tab_sidebar_railed: false,
+            tidy_tabs_nudge: false,
+            tidy_tabs_threshold: default_tidy_tabs_threshold(),
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,

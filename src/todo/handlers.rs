@@ -19,8 +19,8 @@ use serde_json::Value;
 use crate::components::shared::ToolCallStatus;
 
 use super::model::{
-    self, Area, BlockSource, CalendarEvent, ChecklistItem, DayPlan, Priority, Project, TimeBlock, TimeOfDay,
-    Todo, TodoBucket, TodoOrigin, TodoStatus, SORT_STEP,
+    self, Area, BlockSource, CalendarEvent, ChecklistItem, DayPlan, HumanKind, Lane,
+    Priority, Project, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoOrigin, TodoStatus, SORT_STEP,
 };
 use super::views::{self, TodoView};
 use super::{store, PlannerState};
@@ -74,6 +74,25 @@ fn parse_priority(raw: &str) -> Result<Priority, String> {
             raw
         )
     })
+}
+
+fn parse_lane(raw: &str) -> Result<Lane, String> {
+    Lane::parse(raw).ok_or_else(|| format!("invalid lane '{}' — expected human or agent", raw))
+}
+
+fn parse_kind(raw: &str) -> Result<HumanKind, String> {
+    HumanKind::parse(raw).ok_or_else(|| {
+        format!("invalid kind '{}' — expected commitment, chore, or your_time", raw)
+    })
+}
+
+fn trimmed_nonempty(v: &Value) -> Result<String, String> {
+    let s = as_str_value(v)?.trim();
+    if s.is_empty() {
+        Err("expected a non-empty string (use null to clear)".to_string())
+    } else {
+        Ok(s.to_string())
+    }
 }
 
 fn parse_status(raw: &str) -> Result<TodoStatus, String> {
@@ -283,6 +302,31 @@ fn build_todo(
             .map(new_checklist_item)
             .collect();
     }
+    // Lanes. Human is the default; the agent lane is only ever the user's
+    // call (the tool description tells the model to suggest, not choose).
+    let lane = match obj.get("lane").and_then(|v| v.as_str()) {
+        Some(raw) => parse_lane(raw)?,
+        None => Lane::Human,
+    };
+    let kind = match obj.get("kind").and_then(|v| v.as_str()) {
+        Some(raw) => Some(parse_kind(raw)?),
+        None => None,
+    };
+    if lane == Lane::Agent && kind.is_some() {
+        return Err("'kind' applies to human to-dos only — omit it for lane 'agent'".to_string());
+    }
+    todo.kind = kind;
+    if let Some(c) = obj.get("time_category").and_then(|v| v.as_str()).map(str::trim) {
+        if !c.is_empty() {
+            todo.time_category = Some(c.to_string());
+        }
+    }
+    if let Some(o) = obj.get("outcome").and_then(|v| v.as_str()).map(str::trim) {
+        if !o.is_empty() {
+            todo.outcome = Some(o.to_string());
+        }
+    }
+    todo.set_lane(lane);
     Ok(todo)
 }
 
@@ -491,10 +535,21 @@ fn apply_todo_update(
         Some(raw) => Some(parse_status(raw)?),
         None => None,
     };
+    let lane = match obj.get("lane").and_then(|v| v.as_str()) {
+        Some(raw) => Some(parse_lane(raw)?),
+        None => None,
+    };
+    let kind = patch_from(obj, "kind", |v| as_str_value(v).and_then(parse_kind))?;
+    let outcome = patch_from(obj, "outcome", trimmed_nonempty)?;
+    let time_category = patch_from(obj, "time_category", trimmed_nonempty)?;
 
     let todo = state
         .todo_mut(id)
         .ok_or_else(|| format!("unknown id '{}'", id))?;
+    let lane_after = lane.unwrap_or(todo.lane);
+    if lane_after == Lane::Agent && matches!(kind, Patch::Set(_)) {
+        return Err("'kind' applies to human to-dos only — this one is in the agent lane".to_string());
+    }
 
     if let Some(title) = obj.get("title").and_then(|v| v.as_str()) {
         let title = title.trim();
@@ -516,6 +571,12 @@ fn apply_todo_update(
     priority.apply(&mut todo.priority);
     project_id.apply(&mut todo.project_id);
     linked_session.apply(&mut todo.linked_fleet_session);
+    if let Some(lane) = lane {
+        todo.set_lane(lane);
+    }
+    kind.apply(&mut todo.kind);
+    outcome.apply(&mut todo.outcome);
+    time_category.apply(&mut todo.time_category);
     // Auto-link: agent focus starting on an unlinked todo binds it to the
     // driving chat session (never overwrites an existing link).
     if status == Some(TodoStatus::InProgress)
@@ -780,6 +841,7 @@ pub fn handle_plan_day(
     let mut scheduled: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let mut pruned_blocks = 0usize;
+    let mut skipped_agent: Vec<String> = Vec::new();
 
     for (i, item) in items.iter().enumerate() {
         let Some(id) = item.get("id").and_then(|v| v.as_str()) else {
@@ -807,6 +869,12 @@ pub fn handle_plan_day(
             None => None,
         };
 
+        // The agent lane is not the person's day: never put it on the
+        // human timeline. It is reported in its own section below.
+        if state.todo(id).is_some_and(|t| t.lane == Lane::Agent) {
+            skipped_agent.push(id.to_string());
+            continue;
+        }
         // Re-key onto the end of the ordering so the day runs in the order the
         // items were given.
         let sort_order = state.next_sort_order();
@@ -855,6 +923,15 @@ pub fn handle_plan_day(
         }
     }
 
+    // Chores batch into one or two Chores blocks (when slots are given).
+    let chores_note = match batch_chores(state, args, date, persist) {
+        Ok(note) => note,
+        Err(e) => {
+            errors.push(format!("chores_slots: {}", e));
+            None
+        }
+    };
+
     let cap = model::measure_capacity_full(
         &state.todos,
         &state.blocks,
@@ -864,7 +941,15 @@ pub fn handle_plan_day(
         meetings_count_against_capacity,
     );
     let mut out = String::new();
-    // The product opinion: overcommitment leads the response, never a footnote.
+    // Your time leads: the planner's objective is to protect and grow it
+    // (SYMBIOTIC_PLANNER.md §2). Only when there is something to say, so a
+    // planner without goals or protected blocks reads exactly as before.
+    if let Some(line) = your_time_status_line(state, date) {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    // The product opinion: overcommitment leads the work lines, never a
+    // footnote.
     if cap.is_overcommitted() {
         out.push_str(&format!(
             "OVERCOMMITTED: {}. Tell the user, and suggest moving something to another day.\n",
@@ -885,6 +970,24 @@ pub fn handle_plan_day(
             pruned_blocks
         ));
     }
+    for w in protected_overlap_warnings(state, date) {
+        out.push('\n');
+        out.push_str(&w);
+    }
+    if let Some(note) = chores_note {
+        out.push('\n');
+        out.push_str(&note);
+    }
+    if !skipped_agent.is_empty() {
+        out.push_str(&format!(
+            "\nNot placed on the day (agent lane — it runs async, not on your time): {}",
+            skipped_agent.join(", ")
+        ));
+    }
+    if let Some(section) = agent_lane_section(state, today) {
+        out.push('\n');
+        out.push_str(&section);
+    }
     if errors.is_empty() {
         (ToolCallStatus::Completed, out)
     } else {
@@ -894,6 +997,240 @@ pub fn handle_plan_day(
         ));
         (ToolCallStatus::Error, out)
     }
+}
+
+/// Cap on each agent-lane bucket listed in tool output.
+const AGENT_LANE_MAX_LINES: usize = 5;
+
+fn hhmm(t: DateTime<Utc>) -> String {
+    t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
+/// `"Your time: 2h protected today (Reading 19:00–20:00, …); this week
+/// Reading 2h/4h · Outside 30m/4h."` — or `None` when there are no goals and
+/// nothing protected today.
+fn your_time_status_line(state: &PlannerState, date: NaiveDate) -> Option<String> {
+    let (protected, blocks) = super::measures::protected_on(&state.blocks, date);
+    let week = super::measures::your_time_week(
+        &state.time_goals,
+        &state.blocks,
+        &state.todos,
+        &state.focus_sessions,
+        date,
+    );
+    if state.time_goals.is_empty() && protected == 0 {
+        return None;
+    }
+    let mut line = if protected > 0 {
+        let list: Vec<String> = blocks
+            .iter()
+            .take(4)
+            .map(|b| {
+                format!(
+                    "{} {}–{}",
+                    b.your_time_category().unwrap_or("your time"),
+                    hhmm(b.start),
+                    hhmm(b.end)
+                )
+            })
+            .collect();
+        format!(
+            "Your time: {} protected on {} ({}) — plan around it, never over it",
+            model::format_minutes(protected),
+            date,
+            list.join(", ")
+        )
+    } else {
+        format!("Your time: nothing protected on {}", date)
+    };
+    if !week.is_empty() {
+        line.push_str(&format!("; this week {}", week.compact(1)));
+    }
+    line.push('.');
+    Some(line)
+}
+
+/// Warnings for Hobbes-owned work blocks on `date` that sit over protected
+/// your-time. The protected block wins: the work moves, or the person is
+/// asked.
+fn protected_overlap_warnings(state: &PlannerState, date: NaiveDate) -> Vec<String> {
+    let on_day = state.blocks_on(date);
+    let protected: Vec<&&TimeBlock> = on_day.iter().filter(|b| b.is_protected()).collect();
+    on_day
+        .iter()
+        .filter(|b| matches!(b.source, BlockSource::Manual | BlockSource::Auto | BlockSource::Chores { .. }))
+        .filter_map(|b| {
+            let p = protected.iter().find(|p| p.overlaps(b))?;
+            Some(format!(
+                "Warning — '{}' {}–{} is over protected your-time ({} {}–{}). Move the work,                  not the protected block, or ask the user.",
+                state.block_display_title(b),
+                hhmm(b.start),
+                hhmm(b.end),
+                p.your_time_category().unwrap_or("your time"),
+                hhmm(p.start),
+                hhmm(p.end)
+            ))
+        })
+        .collect()
+}
+
+/// The agent lane as a separate section: to dispatch, working, needs you,
+/// stuck. `None` when the lane is empty.
+fn agent_lane_section(state: &PlannerState, today: NaiveDate) -> Option<String> {
+    let lane = super::lanes::agent_lane(&state.todos, today);
+    if lane.is_empty() {
+        return None;
+    }
+    let mut out = format!("Agent lane ({}):", lane.counts_line());
+    let list = |label: &str, todos: &[&Todo], out: &mut String| {
+        if todos.is_empty() {
+            return;
+        }
+        let mut lines: Vec<String> = todos
+            .iter()
+            .take(AGENT_LANE_MAX_LINES)
+            .map(|t| {
+                let mut l = format!("[{}] {}", t.id, truncate_title(&t.title));
+                if let Some(p) = t.latest_progress.as_deref().filter(|p| !p.is_empty()) {
+                    l.push_str(&format!(" — {}", truncate_title(p)));
+                }
+                l
+            })
+            .collect();
+        if todos.len() > AGENT_LANE_MAX_LINES {
+            lines.push(format!("…and {} more", todos.len() - AGENT_LANE_MAX_LINES));
+        }
+        out.push_str(&format!("\n{}: {}", label, lines.join("; ")));
+    };
+    list("To dispatch (HOBBES_DISPATCH)", &lane.to_dispatch, &mut out);
+    list("Working", &lane.working, &mut out);
+    if !lane.needs_you.is_empty() {
+        let lines: Vec<String> = lane
+            .needs_you
+            .iter()
+            .take(AGENT_LANE_MAX_LINES)
+            .map(|t| {
+                super::lanes::decision_line(t)
+                    .unwrap_or_else(|| format!("[{}] {} — waiting on the user", t.id, truncate_title(&t.title)))
+            })
+            .collect();
+        out.push_str(&format!("\nNeeds you (HOBBES_DECISIONS): {}", lines.join("; ")));
+    }
+    list("Stuck", &lane.stuck, &mut out);
+    Some(out)
+}
+
+/// `chores_slots` on HOBBES_PLAN_DAY: up to two `{start, end}` local slots.
+/// The day's open human chores are split across them in order (filling the
+/// first slot by estimate, the rest into the second) as `Chores` blocks,
+/// replacing any earlier Chores blocks that day. Slots may not overlap
+/// protected your-time. Without slots, a note suggests batching when there
+/// are 2+ chores and no batch yet.
+fn batch_chores(
+    state: &mut PlannerState,
+    args: &Value,
+    date: NaiveDate,
+    persist: bool,
+) -> Result<Option<String>, String> {
+    let chores: Vec<(String, u32)> = state
+        .todos
+        .iter()
+        .filter(|t| {
+            t.scheduled_for == Some(date)
+                && t.lane == Lane::Human
+                && t.kind == Some(HumanKind::Chore)
+                && !t.status.is_closed()
+        })
+        .map(|t| (t.id.clone(), t.estimate_minutes.unwrap_or(5)))
+        .collect();
+    let slots = match args.get("chores_slots").and_then(|v| v.as_array()) {
+        Some(s) if !s.is_empty() => s,
+        _ => {
+            let batched = state.blocks_on(date).iter().any(|b| matches!(b.source, BlockSource::Chores { .. }));
+            if chores.len() >= 2 && !batched {
+                let total: u32 = chores.iter().map(|(_, m)| *m).sum();
+                return Ok(Some(format!(
+                    "Chores: {} on {} (~{}). Batch them into one or two Chores blocks —                      re-run with chores_slots [{{start, end}}].",
+                    chores.len(),
+                    date,
+                    model::format_minutes(total)
+                )));
+            }
+            return Ok(None);
+        }
+    };
+    if slots.len() > 2 {
+        return Err("at most two slots — batching is the point".to_string());
+    }
+    if chores.is_empty() {
+        return Ok(Some(format!("No open chores on {} to batch.", date)));
+    }
+    let mut spans = Vec::new();
+    for slot in slots {
+        let (start, end) = parse_block_times(slot, date)?;
+        let probe = TimeBlock {
+            id: String::new(),
+            todo_id: None,
+            title: String::new(),
+            start,
+            end,
+            source: BlockSource::Chores { todo_ids: vec![] },
+        };
+        if let Some(p) = state.blocks.iter().find(|b| b.is_protected() && b.overlaps(&probe)) {
+            return Err(format!(
+                "slot {}–{} overlaps protected your-time ({} {}–{}) — pick another slot",
+                hhmm(start),
+                hhmm(end),
+                p.your_time_category().unwrap_or("your time"),
+                hhmm(p.start),
+                hhmm(p.end)
+            ));
+        }
+        spans.push((start, end));
+    }
+    // Replace the day's earlier batch.
+    let old: Vec<String> = state
+        .blocks_on(date)
+        .iter()
+        .filter(|b| matches!(b.source, BlockSource::Chores { .. }))
+        .map(|b| b.id.clone())
+        .collect();
+    state.blocks.retain(|b| !old.contains(&b.id));
+    if persist {
+        for id in &old {
+            if let Err(e) = store::delete_block(id) {
+                tracing::error!("Failed to delete old chores block {}: {}", id, e);
+            }
+        }
+    }
+    let first_cap = (spans[0].1 - spans[0].0).num_minutes().max(0) as u32;
+    let mut groups: Vec<Vec<String>> = vec![Vec::new(); spans.len()];
+    let mut used = 0u32;
+    for (id, mins) in &chores {
+        let idx = if spans.len() == 2 && used + mins > first_cap && !groups[0].is_empty() { 1 } else { 0 };
+        if idx == 0 {
+            used += mins;
+        }
+        groups[idx].push(id.clone());
+    }
+    let mut lines = Vec::new();
+    for ((start, end), ids) in spans.into_iter().zip(groups) {
+        if ids.is_empty() {
+            continue;
+        }
+        let block = TimeBlock {
+            id: format!("blk_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            todo_id: None,
+            title: format!("Chores · {}", ids.len()),
+            start,
+            end,
+            source: BlockSource::Chores { todo_ids: ids.clone() },
+        };
+        persist_block(&block, persist);
+        lines.push(format!("{}–{} ({} chores)", hhmm(start), hhmm(end), ids.len()));
+        state.blocks.push(block);
+    }
+    Ok(Some(format!("Batched chores: {}.", lines.join(", "))))
 }
 
 // ── HOBBES_TIME_BLOCK ───────────────────────────────────────────────────────
@@ -974,6 +1311,22 @@ fn overlap_warning(state: &PlannerState, block: &TimeBlock) -> Option<String> {
     }
 }
 
+/// Protected your-time never moves or disappears without the user's say so:
+/// the call must carry `user_confirmed: true`, set only after the user
+/// explicitly agreed in this conversation.
+fn protected_guard(block: &TimeBlock, args: &Value, verb: &str) -> Option<String> {
+    if !block.is_protected() || args.get("user_confirmed").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    Some(format!(
+        "'{}' is protected your-time ({}). Ask the user before you {} it; retry with \
+         user_confirmed: true only once they have agreed.",
+        block.title,
+        block.your_time_category().unwrap_or("your time"),
+        verb
+    ))
+}
+
 fn time_block_create(
     state: &mut PlannerState,
     args: &Value,
@@ -1019,11 +1372,60 @@ fn time_block_create(
                 .and_then(|tid| state.todo(tid))
                 .map(|t| t.title.clone())
         });
-    let Some(title) = title else {
-        return (
-            ToolCallStatus::Error,
-            "Provide 'title' (or a 'todo_id' to take the title from).".to_string(),
-        );
+    // `kind`: work (default), your_time (protected, needs `category`), or
+    // chores (a batch slot).
+    let source = match args.get("kind").and_then(|v| v.as_str()).map(|k| k.trim().to_ascii_lowercase()) {
+        None => BlockSource::Auto,
+        Some(k) if k == "work" || k.is_empty() => BlockSource::Auto,
+        Some(k) if k == "your_time" || k == "yourtime" => {
+            let Some(category) = args
+                .get("category")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            else {
+                return (
+                    ToolCallStatus::Error,
+                    "A your_time block needs a 'category' (e.g. one of the user's time goals).".to_string(),
+                );
+            };
+            BlockSource::YourTime {
+                category: category.to_string(),
+            }
+        }
+        Some(k) if k == "chores" => BlockSource::Chores {
+            todo_ids: todo_id.iter().cloned().collect(),
+        },
+        Some(k) => {
+            return (
+                ToolCallStatus::Error,
+                format!("invalid kind '{}' — expected work, your_time, or chores", k),
+            )
+        }
+    };
+    let title = match (&source, title) {
+        (_, Some(t)) => t,
+        (BlockSource::YourTime { category }, None) => category.clone(),
+        (BlockSource::Chores { .. }, None) => "Chores".to_string(),
+        (_, None) => {
+            return (
+                ToolCallStatus::Error,
+                "Provide 'title' (or a 'todo_id' to take the title from).".to_string(),
+            )
+        }
+    };
+    let todo_id = match source {
+        BlockSource::YourTime { .. } | BlockSource::Chores { .. } => {
+            // Protected time and chore batches are not one to-do's timebox.
+            if matches!(source, BlockSource::YourTime { .. }) && todo_id.is_some() {
+                return (
+                    ToolCallStatus::Error,
+                    "A your_time block is protected time, not a to-do's timebox — omit todo_id.".to_string(),
+                );
+            }
+            None
+        }
+        _ => todo_id,
     };
 
     let block = TimeBlock {
@@ -1032,8 +1434,22 @@ fn time_block_create(
         title,
         start,
         end,
-        source: BlockSource::Auto,
+        source,
     };
+    // Protected your-time is planned around: work may not be placed over it
+    // unless the user explicitly asked for that.
+    if !block.is_protected() && !args.get("override_protected").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(p) = state.blocks.iter().find(|b| b.is_protected() && b.overlaps(&block)) {
+            return (
+                ToolCallStatus::Error,
+                format!(
+                    "That slot overlaps protected your-time: {}. Pick another slot. Only if the \
+                     user explicitly asks to use that time, retry with override_protected: true.",
+                    block_line(state, p)
+                ),
+            );
+        }
+    }
     let warning = overlap_warning(state, &block);
     persist_block(&block, persist);
     let mut out = format!("Created {}", block_line(state, &block));
@@ -1078,6 +1494,9 @@ fn time_block_move(
                 existing.title
             ),
         );
+    }
+    if let Some(e) = protected_guard(&existing, args, "move") {
+        return (ToolCallStatus::Error, e);
     }
 
     // Unspecified parts keep the block's current local date/times, so "move it
@@ -1188,6 +1607,9 @@ fn time_block_delete(
                 state.blocks[idx].title
             ),
         );
+    }
+    if let Some(e) = protected_guard(&state.blocks[idx], args, "delete") {
+        return (ToolCallStatus::Error, e);
     }
     let removed = state.blocks.remove(idx);
     if persist {
@@ -1627,7 +2049,527 @@ pub fn apply_brief_progress(
             changed.push(todo.id.clone());
         }
     }
+    // The agent-state hook: a fresh brief is the moment the worker's state is
+    // worth re-reading. The fleet row (live, else stored) supplies the
+    // explicit fields; the derivation never reads the line's text.
+    let live = crate::fleet::shared().snapshot();
+    let row = live
+        .sessions
+        .get(session_id)
+        .cloned()
+        .or_else(|| crate::fleet::store::load_session(session_id));
+    if let Some(row) = row {
+        let signal = worker_signal_from_fleet(&row);
+        for id in apply_signal_to_linked(state, session_id, &signal, now) {
+            if !changed.contains(&id) {
+                changed.push(id);
+            }
+        }
+    }
     changed
+}
+
+/// Reduce a fleet row to the explicit fields `lanes::derive_agent_state`
+/// may use: status, a held gate, the attention message, the brief's
+/// headline/`blocked_on`, and whether the session ended.
+pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession) -> super::lanes::WorkerSignal {
+    use super::lanes::{GateSignal, WorkerSignal, WorkerStatus};
+    use crate::fleet::{AttentionKind, FleetStatus};
+    let (status, attention_message) = match &row.status {
+        FleetStatus::Working | FleetStatus::WorkingBackground => (WorkerStatus::Working, None),
+        FleetStatus::Idle => (WorkerStatus::Idle, None),
+        FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) => {
+            (WorkerStatus::WaitingOnUser, Some(message.clone()).filter(|m| !m.trim().is_empty()))
+        }
+        FleetStatus::NeedsAttention(AttentionKind::Gate) => (WorkerStatus::WaitingOnUser, None),
+    };
+    WorkerSignal {
+        status,
+        ended: row.ended_at.is_some(),
+        gate: row.pending_gate.as_ref().map(|g| GateSignal {
+            request_id: g.request_id.clone(),
+            tool_name: g.tool_name.clone(),
+            input_summary: g.input_summary.clone(),
+        }),
+        attention_message,
+        attention_at: row.attention_at,
+        brief: row.brief.as_ref().map(|b| model::Brief {
+            did: b.headline.clone(),
+            blocked: b.blocked_on.clone().filter(|x| !x.trim().is_empty()),
+            next: None,
+        }),
+        worker_name: row.display_name().to_string(),
+    }
+}
+
+/// Apply one worker's signal to every open agent to-do linked to it.
+/// Returns the changed ids (persist each via `store::save_todo`).
+pub fn apply_signal_to_linked(
+    state: &mut PlannerState,
+    session_id: &str,
+    signal: &super::lanes::WorkerSignal,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for todo in state.todos.iter_mut() {
+        if todo.linked_fleet_session.as_deref() == Some(session_id)
+            && todo.status != TodoStatus::Cancelled
+            && super::lanes::apply_worker_signal(todo, signal, now)
+        {
+            changed.push(todo.id.clone());
+        }
+    }
+    changed
+}
+
+/// **For the fleet-change listener** (wave 2: call on every `FleetShared`
+/// poke): re-derive `agent_state` for every linked agent to-do from a fleet
+/// snapshot plus ended rows (`fleet::store` rows leave the live map on
+/// SessionEnd). Pure over its inputs. Returns changed ids to persist.
+#[allow(dead_code)] // consumer: the fleet-change listener (wave 2)
+pub fn sync_agent_states(
+    state: &mut PlannerState,
+    live: &crate::fleet::FleetState,
+    ended_rows: &[crate::fleet::FleetSession],
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let linked: Vec<String> = state
+        .todos
+        .iter()
+        .filter(|t| t.lane == Lane::Agent && !t.status.is_closed())
+        .filter_map(|t| t.linked_fleet_session.clone())
+        .collect();
+    let mut changed = Vec::new();
+    for sid in linked {
+        let row = live
+            .sessions
+            .get(&sid)
+            .or_else(|| ended_rows.iter().find(|r| r.id == sid));
+        if let Some(row) = row {
+            let signal = worker_signal_from_fleet(row);
+            for id in apply_signal_to_linked(state, &sid, &signal, now) {
+                if !changed.contains(&id) {
+                    changed.push(id);
+                }
+            }
+        }
+    }
+    changed
+}
+
+// ── HOBBES_DECISIONS ────────────────────────────────────────────────────────
+
+/// What `HOBBES_DECISIONS` produced. `deliver` is set after a `resolve`: the
+/// dispatch edge hands the answer back to the worker (it owns the chat queue
+/// and the session/fleet lookups) and records the delivery
+/// (`lanes::record_delivery`).
+pub struct DecisionsOutcome {
+    pub status: ToolCallStatus,
+    pub response: String,
+    pub deliver: Option<model::ResolvedDecision>,
+}
+
+impl DecisionsOutcome {
+    fn done(status: ToolCallStatus, response: String) -> Self {
+        Self { status, response, deliver: None }
+    }
+}
+
+/// `HOBBES_DECISIONS`: `list` (default), `ask`, or `resolve`.
+///
+/// `rule_hits_today` is the count of routing calls a trust rule resolved
+/// without asking today (from `context::trust_store`), when derivable.
+/// `caller_name` names the calling chat session (the worker, for `ask`).
+pub fn handle_decisions(
+    state: &mut PlannerState,
+    args: &Value,
+    caller_name: Option<&str>,
+    rule_hits_today: Option<u32>,
+    persist: bool,
+) -> DecisionsOutcome {
+    let now = Utc::now();
+    match args.get("action").and_then(|v| v.as_str()).unwrap_or("list") {
+        "list" => DecisionsOutcome::done(ToolCallStatus::Completed, decisions_list(state, rule_hits_today)),
+        "ask" => {
+            let Some(todo_id) = args.get("todo_id").and_then(|v| v.as_str()) else {
+                return DecisionsOutcome::done(ToolCallStatus::Error, "Provide 'todo_id'.".into());
+            };
+            let question = args.get("question").and_then(|v| v.as_str()).unwrap_or("");
+            let options: Vec<String> = args
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|o| o.as_str()).map(str::to_string).collect())
+                .unwrap_or_default();
+            let est = args.get("est_minutes").and_then(|v| v.as_u64()).map(|n| n.min(240) as u32);
+            let text = |k: &str| {
+                args.get(k)
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|x| !x.is_empty())
+                    .map(str::to_string)
+            };
+            let brief = match (text("did"), text("blocked"), text("next")) {
+                (None, None, None) => None,
+                (did, blocked, next) => Some(model::Brief { did: did.unwrap_or_default(), blocked, next }),
+            };
+            let Some(todo) = state.todo_mut(todo_id) else {
+                return DecisionsOutcome::done(ToolCallStatus::Error, format!("unknown todo id '{}'", todo_id));
+            };
+            let worker = caller_name.map(str::to_string).filter(|w| !w.is_empty());
+            match super::lanes::ask_decision(todo, question, options, est, brief, worker, now) {
+                Ok(()) => {
+                    let line = super::lanes::decision_line(todo).unwrap_or_default();
+                    persist_todo(todo, persist);
+                    DecisionsOutcome::done(
+                        ToolCallStatus::Completed,
+                        format!(
+                            "Queued for the user: {}\nStop here and wait — the answer comes back to this \
+                             conversation as a message.",
+                            line
+                        ),
+                    )
+                }
+                Err(e) => DecisionsOutcome::done(ToolCallStatus::Error, e),
+            }
+        }
+        "resolve" => {
+            let Some(todo_id) = args.get("todo_id").and_then(|v| v.as_str()) else {
+                return DecisionsOutcome::done(ToolCallStatus::Error, "Provide 'todo_id'.".into());
+            };
+            let choice = args.get("choice").and_then(|v| v.as_str()).unwrap_or("");
+            let note = args.get("note").and_then(|v| v.as_str());
+            match super::lanes::resolve_decision(state, todo_id, choice, note, now) {
+                Ok(entry) => {
+                    if let Some(t) = state.todo(todo_id) {
+                        persist_todo(t, persist);
+                    }
+                    if persist {
+                        if let Err(e) = store::save_resolved_decision(&entry) {
+                            tracing::error!("Failed to persist decision {}: {}", entry.id, e);
+                        }
+                    }
+                    DecisionsOutcome {
+                        status: ToolCallStatus::Completed,
+                        response: format!("Recorded: \"{}\" → {}.", entry.question, entry.choice),
+                        deliver: Some(entry),
+                    }
+                }
+                Err(e) => DecisionsOutcome::done(ToolCallStatus::Error, e),
+            }
+        }
+        other => DecisionsOutcome::done(
+            ToolCallStatus::Error,
+            format!("Unknown action '{}' — expected list, ask, or resolve.", other),
+        ),
+    }
+}
+
+fn decisions_list(state: &PlannerState, rule_hits_today: Option<u32>) -> String {
+    let queue = super::lanes::needs_you(&state.todos);
+    let total: u32 = queue
+        .iter()
+        .map(|t| t.decision.as_ref().and_then(|d| d.est_minutes).unwrap_or(1).max(1))
+        .sum();
+    let mut out = if queue.is_empty() {
+        "No decisions waiting.".to_string()
+    } else {
+        format!("{} decision(s) waiting, about {} min in all:", queue.len(), total)
+    };
+    for t in queue.iter().take(MAX_LIST_LINES) {
+        match super::lanes::decision_line(t) {
+            Some(line) => {
+                out.push_str(&format!("\n{}", line));
+                let d = t.decision.as_ref().expect("decision_line implies a decision");
+                if let Some(b) = &d.brief {
+                    let mut parts = Vec::new();
+                    if !b.did.trim().is_empty() {
+                        parts.push(format!("did: {}", truncate_title(&b.did)));
+                    }
+                    if let Some(x) = &b.blocked {
+                        parts.push(format!("blocked: {}", truncate_title(x)));
+                    }
+                    if let Some(x) = &b.next {
+                        parts.push(format!("next: {}", truncate_title(x)));
+                    }
+                    if !parts.is_empty() {
+                        out.push_str(&format!("\n  Brief — {}", parts.join("; ")));
+                    }
+                }
+                out.push_str(&format!("\n  For: {}", truncate_title(&t.title)));
+                if let Some(o) = t.outcome.as_deref() {
+                    out.push_str(&format!(" → {}", truncate_title(o)));
+                }
+            }
+            None => out.push_str(&format!(
+                "\n[{}] {} — waiting on the user (no question recorded; check its worker)",
+                t.id,
+                truncate_title(&t.title)
+            )),
+        }
+    }
+    if let Some(n) = rule_hits_today.filter(|n| *n > 0) {
+        out.push_str(&format!(
+            "\n{} routing call(s) handled by the user's trust rules today (not asked).",
+            n
+        ));
+    }
+    out
+}
+
+// ── HOBBES_TIME_GOALS ───────────────────────────────────────────────────────
+
+/// `HOBBES_TIME_GOALS`: `get` (default) or `set`. `set` upserts goals by
+/// category (case-insensitive) and removes the categories in `remove`.
+/// Both return the goals with this week's progress.
+pub fn handle_time_goals(
+    state: &mut PlannerState,
+    args: &Value,
+    today: NaiveDate,
+    persist: bool,
+) -> (ToolCallStatus, String) {
+    let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("get");
+    let mut notes: Vec<String> = Vec::new();
+    match action {
+        "get" => {}
+        "set" => {
+            let mut errors = Vec::new();
+            if let Some(goals) = args.get("goals").and_then(|v| v.as_array()) {
+                for (i, g) in goals.iter().enumerate() {
+                    let Some(category) = g
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|c| !c.is_empty())
+                    else {
+                        errors.push(format!("goals[{}]: missing 'category'", i));
+                        continue;
+                    };
+                    let minutes = match g.get("weekly_target_minutes").map(parse_estimate) {
+                        Some(Ok(m)) => Some(m),
+                        Some(Err(e)) => {
+                            errors.push(format!("goals[{}]: {}", i, e.replace("estimate_minutes", "weekly_target_minutes")));
+                            continue;
+                        }
+                        None => None,
+                    };
+                    let colour = match g.get("colour").or_else(|| g.get("color")) {
+                        Some(Value::String(c)) if is_hex_colour(c) => Some(Some(c.trim().to_string())),
+                        Some(Value::Null) => Some(None),
+                        Some(other) => {
+                            errors.push(format!("goals[{}]: invalid colour {} — expected #RRGGBB", i, other));
+                            continue;
+                        }
+                        None => None,
+                    };
+                    let next_order = state.time_goals.iter().map(|g| g.sort_order).fold(0.0, f64::max) + SORT_STEP;
+                    let goal = match state.time_goals.iter_mut().find(|x| x.matches(category)) {
+                        Some(existing) => {
+                            if let Some(m) = minutes {
+                                existing.weekly_target_minutes = m;
+                            }
+                            if let Some(c) = colour {
+                                existing.colour = c;
+                            }
+                            existing.clone()
+                        }
+                        None => {
+                            let Some(m) = minutes else {
+                                errors.push(format!("goals[{}]: new goal '{}' needs weekly_target_minutes", i, category));
+                                continue;
+                            };
+                            let mut goal = model::TimeGoal::new(category, m);
+                            goal.colour = colour.flatten();
+                            goal.sort_order = next_order;
+                            state.time_goals.push(goal.clone());
+                            goal
+                        }
+                    };
+                    if persist {
+                        if let Err(e) = store::save_time_goal(&goal) {
+                            tracing::error!("Failed to persist time goal {}: {}", goal.id, e);
+                        }
+                    }
+                }
+            }
+            if let Some(remove) = args.get("remove").and_then(|v| v.as_array()) {
+                for c in remove.iter().filter_map(|v| v.as_str()) {
+                    match state.time_goals.iter().position(|g| g.matches(c)) {
+                        Some(idx) => {
+                            let g = state.time_goals.remove(idx);
+                            notes.push(format!("Removed goal '{}'.", g.category));
+                            if persist {
+                                if let Err(e) = store::delete_time_goal(&g.id) {
+                                    tracing::error!("Failed to delete time goal {}: {}", g.id, e);
+                                }
+                            }
+                        }
+                        None => errors.push(format!("remove: no goal named '{}'", c)),
+                    }
+                }
+            }
+            if !errors.is_empty() {
+                let (_, summary) = handle_time_goals(state, &serde_json::json!({}), today, false);
+                return (
+                    ToolCallStatus::Error,
+                    format!("{}\nFailed (valid changes were applied):\n{}", summary, errors.join("\n")),
+                );
+            }
+        }
+        other => {
+            return (
+                ToolCallStatus::Error,
+                format!("Unknown action '{}' — expected get or set.", other),
+            )
+        }
+    }
+
+    let week = super::measures::your_time_week(
+        &state.time_goals,
+        &state.blocks,
+        &state.todos,
+        &state.focus_sessions,
+        today,
+    );
+    let mut out = if state.time_goals.is_empty() {
+        "No your-time goals yet. Ask the user what their time is for (reading, gaming, getting \
+         outside…) and how many hours a week they want for each."
+            .to_string()
+    } else {
+        format!(
+            "Your time, week of {}: {} of {} goal.",
+            week.week_start,
+            model::format_minutes(week.total_minutes()),
+            model::format_minutes(week.goal_minutes())
+        )
+    };
+    for c in &week.categories {
+        let goal = match c.goal_minutes {
+            Some(g) if c.goal_met() => format!(" / {} goal — met", model::format_minutes(g)),
+            Some(g) => format!(" / {} goal — {} to go", model::format_minutes(g), model::format_minutes(c.remaining())),
+            None => " (no goal)".to_string(),
+        };
+        out.push_str(&format!(
+            "\n- {}: {}{} ({} protected, {} logged)",
+            c.category,
+            model::format_minutes(c.minutes()),
+            goal,
+            model::format_minutes(c.protected_minutes),
+            model::format_minutes(c.focus_minutes)
+        ));
+    }
+    let (protected_today, _) = super::measures::protected_on(&state.blocks, today);
+    if protected_today > 0 {
+        out.push_str(&format!("\nProtected today: {}.", model::format_minutes(protected_today)));
+    }
+    for n in notes {
+        out.push('\n');
+        out.push_str(&n);
+    }
+    (ToolCallStatus::Completed, out)
+}
+
+fn is_hex_colour(c: &str) -> bool {
+    let c = c.trim();
+    c.len() == 7 && c.starts_with('#') && c[1..].chars().all(|x| x.is_ascii_hexdigit())
+}
+
+// ── HOBBES_AGENT_TIME ───────────────────────────────────────────────────────
+
+/// `HOBBES_AGENT_TIME`: `start(intent)`, `log(tool, summary)`,
+/// `propose(kind, title, body)`, `end(summary)`. Refused unless the call
+/// comes from the leased agent-time session and the grant allows it today
+/// (see `agent_time`). Writes through the session, proposal and ledger rows.
+pub fn handle_agent_time(
+    state: &mut PlannerState,
+    args: &Value,
+    session_id: &str,
+    today: NaiveDate,
+    persist: bool,
+) -> (ToolCallStatus, String) {
+    use super::agent_time::AgentTimeRefusal;
+    let now = Utc::now();
+    let text = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let persist_session = |s: &model::AgentTimeSession| {
+        if persist {
+            if let Err(e) = store::save_agent_time_session(s) {
+                tracing::error!("Failed to persist agent-time session {}: {}", s.id, e);
+            }
+        }
+    };
+    // A session found over budget is closed on the record before refusing.
+    if state.is_agent_time_session(session_id) {
+        if let Some(ended) = state.enforce_agent_time_budget(today, now) {
+            persist_session(&ended);
+            if persist {
+                if let Err(e) = store::save_trust_ledger(&state.trust_ledger) {
+                    tracing::error!("Failed to persist trust ledger: {}", e);
+                }
+            }
+        }
+    }
+    let result: Result<String, AgentTimeRefusal> = match text("action") {
+        "start" => state.agent_time_start(session_id, text("intent"), today, now).map(|s| {
+            persist_session(&s);
+            let b = state.agent_time_budget(today, now);
+            format!(
+                "Agent time started (session {}). Intent logged. Budget left today: {} and ${:.2}. \
+                 Outputs are proposals only (propose); anything with an outside effect goes through \
+                 the normal approval gate. Call end(summary) when done.",
+                s.id,
+                model::format_minutes(b.minutes_left()),
+                b.spend_left_usd()
+            )
+        }),
+        "log" => state
+            .agent_time_log(session_id, text("tool"), text("summary"), today, now)
+            .map(|s| {
+                persist_session(&s);
+                "Logged.".to_string()
+            }),
+        "propose" => match super::model::ProposalKind::parse(text("kind")) {
+            None => Err(AgentTimeRefusal::Invalid(
+                "Provide 'kind': note, todo, skill, research, or other.".into(),
+            )),
+            Some(kind) => state
+                .agent_time_propose(session_id, kind, text("title"), text("body"), today, now)
+                .map(|(p, s)| {
+                    persist_session(&s);
+                    if persist {
+                        if let Err(e) = store::save_proposal(&p) {
+                            tracing::error!("Failed to persist proposal {}: {}", p.id, e);
+                        }
+                    }
+                    format!(
+                        "Proposal {} filed ({}: {}). The user will accept, edit, or dismiss it.",
+                        p.id,
+                        p.kind.as_str(),
+                        p.title
+                    )
+                }),
+        },
+        "end" => state.agent_time_end(session_id, text("summary"), now).map(|s| {
+            persist_session(&s);
+            if persist {
+                if let Err(e) = store::save_trust_ledger(&state.trust_ledger) {
+                    tracing::error!("Failed to persist trust ledger: {}", e);
+                }
+            }
+            format!(
+                "Agent time ended after {} with {} proposal(s), {} logged call(s).",
+                model::format_minutes(s.minutes_used(now)),
+                s.outputs.len(),
+                s.tool_calls.len()
+            )
+        }),
+        other => Err(AgentTimeRefusal::Invalid(format!(
+            "Unknown action '{}' — expected start, log, propose, or end.",
+            other
+        ))),
+    };
+    match result {
+        Ok(msg) => (ToolCallStatus::Completed, msg),
+        Err(r) => (ToolCallStatus::Error, r.message()),
+    }
 }
 
 // ── planner_today context injection ─────────────────────────────────────────
@@ -1834,7 +2776,110 @@ pub fn planner_today_context_with_events(
     if agent_done_minutes > 0 {
         ctx["agent_done_minutes"] = serde_json::json!(agent_done_minutes);
     }
+    // Symbiotic additions — each only when it has something to say, and
+    // every minute figure rounded down to the step, so the block (a cached
+    // ledger entry) doesn't re-render every request.
+    if let Some(v) = your_time_context(planner, today, step) {
+        ctx["your_time"] = v;
+    }
+    if let Some(v) = agent_lane_context(planner, today) {
+        ctx["agents"] = v;
+    }
+    if let Some(v) = agent_time_context(planner, today, now, step) {
+        ctx["agent_time"] = v;
+    }
     Some(ctx)
+}
+
+/// Needs-you lines carried in `planner_today.agents`.
+const CTX_MAX_NEEDS_YOU: usize = 3;
+
+/// `{"today": "1h 30m protected (Reading 19:00–20:00)", "week": "Reading
+/// 2h/4h · …"}` — `None` without goals or protected time today.
+fn your_time_context(planner: &PlannerState, today: NaiveDate, step: u32) -> Option<Value> {
+    let (protected, blocks) = super::measures::protected_on(&planner.blocks, today);
+    if planner.time_goals.is_empty() && protected == 0 {
+        return None;
+    }
+    let mut v = serde_json::json!({});
+    if protected > 0 {
+        let list: Vec<String> = blocks
+            .iter()
+            .take(4)
+            .map(|b| {
+                format!(
+                    "{} {}–{}",
+                    b.your_time_category().unwrap_or("your time"),
+                    hhmm(b.start),
+                    hhmm(b.end)
+                )
+            })
+            .collect();
+        v["today"] = serde_json::json!(format!(
+            "{} protected ({}) — plan around it, never over it",
+            model::format_minutes(protected),
+            list.join(", ")
+        ));
+    }
+    let week = super::measures::your_time_week(
+        &planner.time_goals,
+        &planner.blocks,
+        &planner.todos,
+        &planner.focus_sessions,
+        today,
+    );
+    if !week.is_empty() {
+        v["week"] = serde_json::json!(week.compact(step));
+    }
+    Some(v)
+}
+
+/// `{"summary": "2 working · 1 needs you", "needs_you": [...]}` — `None`
+/// when the agent lane is empty.
+fn agent_lane_context(planner: &PlannerState, today: NaiveDate) -> Option<Value> {
+    let lane = super::lanes::agent_lane(&planner.todos, today);
+    if lane.is_empty() {
+        return None;
+    }
+    let mut v = serde_json::json!({ "summary": lane.counts_line() });
+    let needs: Vec<String> = lane
+        .needs_you
+        .iter()
+        .take(CTX_MAX_NEEDS_YOU)
+        .filter_map(|t| super::lanes::decision_line(t))
+        .map(|l| truncate_title(&l))
+        .collect();
+    if !needs.is_empty() {
+        v["needs_you"] = serde_json::json!(needs);
+        v["instruction"] = serde_json::json!(
+            "Agent work waiting on the user's judgment — HOBBES_DECISIONS lists and resolves it."
+        );
+    }
+    Some(v)
+}
+
+/// `"30m of 45m left today"` (+ the running intent) when a grant is on for
+/// today; `None` otherwise.
+fn agent_time_context(
+    planner: &PlannerState,
+    today: NaiveDate,
+    now: DateTime<Utc>,
+    step: u32,
+) -> Option<Value> {
+    let b = planner.agent_time_budget(today, now);
+    if !b.enabled || !b.granted_today {
+        return None;
+    }
+    let left = b.minutes_left() / step * step;
+    let mut line = format!(
+        "{} of {} left today",
+        model::format_minutes(left),
+        model::format_minutes(b.minutes_granted)
+    );
+    if let Some(s) = planner.open_agent_time_session() {
+        line.push_str(&format!(" — running: {}", truncate_title(&s.intent)));
+    }
+    Some(serde_json::json!(line))
 }
 
 #[cfg(test)]
@@ -3589,5 +4634,343 @@ mod tests {
         assert_eq!(status, ToolCallStatus::Completed);
         assert!(resp.contains("Warning — overlaps"), "{resp}");
         assert!(resp.contains("standup"), "{resp}");
+    }
+
+    // ── Symbiotic planner: lanes, protected time, decisions, goals ──────────
+
+    #[test]
+    fn create_takes_lane_kind_and_outcome() {
+        let mut state = PlannerState::default();
+        let (status, out) = create(
+            &mut state,
+            json!({"todos": [
+                {"title": "Pay Comcast", "kind": "chore"},
+                {"title": "Ship app-packs", "lane": "agent", "outcome": "Release tagged, tests passing"},
+                {"title": "Read Dune", "kind": "your_time", "time_category": "Reading"},
+                {"title": "Plain"}
+            ]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        let t = |i: usize| &state.todos[i];
+        assert_eq!((t(0).lane, t(0).kind), (Lane::Human, Some(HumanKind::Chore)));
+        assert_eq!(t(1).lane, Lane::Agent);
+        assert_eq!(t(1).agent_state, Some(model::AgentState::Queued));
+        assert_eq!(t(1).outcome.as_deref(), Some("Release tagged, tests passing"));
+        assert_eq!(t(2).time_category.as_deref(), Some("Reading"));
+        assert_eq!((t(3).lane, t(3).kind), (Lane::Human, None), "human by default");
+        assert!(out.contains("chore") && out.contains("agent: queued") && out.contains("your time: Reading"));
+        assert!(out.contains("→ outcome: Release tagged"));
+
+        let (status, out) = create(&mut state, json!({"todos": [{"title": "x", "lane": "agent", "kind": "chore"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("human to-dos only"), "{out}");
+        let (status, _) = create(&mut state, json!({"todos": [{"title": "x", "lane": "robot"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+    }
+
+    #[test]
+    fn update_patches_lane_fields() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Renew passport", "today");
+        update(&mut state, json!({"updates": [{"id": id, "kind": "chore"}]}));
+        assert_eq!(state.todo(&id).unwrap().kind, Some(HumanKind::Chore));
+        update(&mut state, json!({"updates": [{"id": id, "kind": null}]}));
+        assert_eq!(state.todo(&id).unwrap().kind, None);
+
+        update(&mut state, json!({"updates": [{"id": id, "kind": "chore"}]}));
+        let (status, _) = update(&mut state, json!({"updates": [{"id": id, "lane": "agent", "outcome": "Form submitted"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        let t = state.todo(&id).unwrap();
+        assert_eq!((t.lane, t.kind), (Lane::Agent, None), "entering the agent lane drops the kind");
+        assert_eq!(t.outcome.as_deref(), Some("Form submitted"));
+        let (status, _) = update(&mut state, json!({"updates": [{"id": id, "kind": "chore"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+        update(&mut state, json!({"updates": [{"id": id, "outcome": null, "lane": "human"}]}));
+        let t = state.todo(&id).unwrap();
+        assert_eq!((t.lane, t.agent_state, t.outcome.clone()), (Lane::Human, None, None));
+
+        // Completing an agent to-do marks it Done.
+        update(&mut state, json!({"updates": [{"id": id, "lane": "agent"}]}));
+        update(&mut state, json!({"updates": [{"id": id, "status": "completed"}]}));
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Done));
+    }
+
+    fn goals(state: &mut PlannerState) {
+        let (status, out) = handle_time_goals(
+            state,
+            &json!({"action": "set", "goals": [
+                {"category": "Outside", "weekly_target_minutes": 240, "colour": "#8DBB7A"},
+                {"category": "Reading", "weekly_target_minutes": 180}
+            ]}),
+            today(),
+            false,
+        );
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+    }
+
+    #[test]
+    fn time_goals_set_get_and_remove() {
+        let mut state = PlannerState::default();
+        let (_, out) = handle_time_goals(&mut state, &json!({}), today(), false);
+        assert!(out.contains("No your-time goals yet"));
+        goals(&mut state);
+        assert_eq!(state.time_goals.len(), 2);
+        // Upsert by category, case-insensitively.
+        handle_time_goals(&mut state, &json!({"action": "set", "goals": [{"category": "outside", "weekly_target_minutes": 300}]}), today(), false);
+        assert_eq!(state.time_goals.len(), 2);
+        assert_eq!(state.time_goals[0].weekly_target_minutes, 300);
+        assert_eq!(state.time_goals[0].colour.as_deref(), Some("#8DBB7A"), "untouched fields keep");
+
+        block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Outside", "date": "today", "start": "12:30", "end": "13:30"}));
+        let (status, out) = handle_time_goals(&mut state, &json!({"action": "get"}), today(), false);
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(out.contains("Outside: 1h / 5h goal — 4h to go (1h protected, 0m logged)"), "{out}");
+        assert!(out.contains("Protected today: 1h."), "{out}");
+
+        let (status, out) = handle_time_goals(&mut state, &json!({"action": "set", "remove": ["Reading", "Nope"], "goals": [{"category": "Gaming"}]}), today(), false);
+        assert_eq!(status, ToolCallStatus::Error, "{out}");
+        assert!(out.contains("needs weekly_target_minutes") && out.contains("no goal named 'Nope'"), "{out}");
+        assert_eq!(state.time_goals.len(), 1, "valid removal still applied");
+        let (status, _) = handle_time_goals(&mut state, &json!({"action": "set", "goals": [{"category": "X", "weekly_target_minutes": 60, "colour": "green"}]}), today(), false);
+        assert_eq!(status, ToolCallStatus::Error);
+    }
+
+    #[test]
+    fn protected_your_time_blocks_are_never_moved_without_the_user() {
+        let mut state = PlannerState::default();
+        let (status, out) = block(&mut state, json!({"action": "create", "kind": "your_time", "date": "today", "start": "19:00", "end": "20:00"}));
+        assert_eq!(status, ToolCallStatus::Error, "needs a category: {out}");
+        let (status, out) = block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Reading", "date": "today", "start": "19:00", "end": "20:00"}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        let yt = state.blocks[0].id.clone();
+        assert!(state.blocks[0].is_protected());
+        assert_eq!(state.blocks[0].title, "Reading");
+
+        // Work can't be placed over it…
+        let (status, out) = block(&mut state, json!({"action": "create", "title": "Deep work", "date": "today", "start": "19:30", "end": "20:30"}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("protected your-time"), "{out}");
+        // …unless the user explicitly asked.
+        let (status, _) = block(&mut state, json!({"action": "create", "title": "Deep work", "date": "today", "start": "19:30", "end": "20:30", "override_protected": true}));
+        assert_eq!(status, ToolCallStatus::Completed);
+
+        // Moving or deleting it needs the user's say so.
+        let (status, out) = block(&mut state, json!({"action": "move", "id": yt, "start": "21:00", "end": "22:00"}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("user_confirmed"), "{out}");
+        let (status, _) = block(&mut state, json!({"action": "delete", "id": yt}));
+        assert_eq!(status, ToolCallStatus::Error);
+        let (status, _) = block(&mut state, json!({"action": "move", "id": yt, "start": "21:00", "end": "22:00", "user_confirmed": true}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        let (status, _) = block(&mut state, json!({"action": "delete", "id": yt, "user_confirmed": true}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(state.blocks.iter().all(|b| !b.is_protected()));
+    }
+
+    #[test]
+    fn plan_day_leads_with_your_time_skips_the_agent_lane_and_batches_chores() {
+        let mut state = PlannerState::default();
+        goals(&mut state);
+        block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Outside", "date": "today", "start": "12:30", "end": "13:30"}));
+        create(&mut state, json!({"todos": [
+            {"title": "Draft SOW", "estimate_minutes": 60},
+            {"title": "Pay bill", "kind": "chore", "estimate_minutes": 5},
+            {"title": "Renew plates", "kind": "chore", "estimate_minutes": 10},
+            {"title": "Ship release", "lane": "agent", "estimate_minutes": 600}
+        ]}));
+        let ids: Vec<String> = state.todos.iter().map(|t| t.id.clone()).collect();
+        let items: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+
+        let (status, out) = plan(&mut state, json!({"items": items}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.starts_with("Your time: 1h protected on 2026-08-12 (Outside 12:30–13:30)"), "{out}");
+        assert!(out.contains("this week Outside 1h/4h · Reading 0m/3h"), "{out}");
+        assert!(out.contains("1h 15m planned"), "the agent to-do never costs the person's day: {out}");
+        assert!(out.contains("Not placed on the day (agent lane"), "{out}");
+        assert!(state.todo(&ids[3]).unwrap().scheduled_for.is_none());
+        assert!(out.contains("Agent lane (1 to dispatch)"), "{out}");
+        assert!(out.contains("Chores: 2 on 2026-08-12 (~15m)"), "{out}");
+
+        // A chores slot over protected time is refused…
+        let (status, out) = plan(&mut state, json!({"items": [], "chores_slots": [{"start": "12:00", "end": "12:45"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("overlaps protected your-time"), "{out}");
+        // …a clear one batches them into one Chores block.
+        let (status, out) = plan(&mut state, json!({"items": [], "chores_slots": [{"start": "15:00", "end": "15:30"}]}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("Batched chores: 15:00–15:30 (2 chores)"), "{out}");
+        let chores: Vec<&TimeBlock> = state.blocks.iter().filter(|b| matches!(b.source, BlockSource::Chores { .. })).collect();
+        assert_eq!(chores.len(), 1);
+        // Re-batching replaces, never stacks.
+        plan(&mut state, json!({"items": [], "chores_slots": [{"start": "09:00", "end": "09:05"}, {"start": "16:00", "end": "16:30"}]}));
+        let chores: Vec<&TimeBlock> = state.blocks.iter().filter(|b| matches!(b.source, BlockSource::Chores { .. })).collect();
+        assert_eq!(chores.len(), 2, "5m fits the first slot, the 10m chore spills into the second");
+
+        // Work timeboxed over protected time is flagged.
+        state.blocks.push(TimeBlock {
+            id: "w".into(),
+            todo_id: Some(ids[0].clone()),
+            title: "Draft SOW".into(),
+            start: state.blocks[0].start,
+            end: state.blocks[0].end,
+            source: BlockSource::Manual,
+        });
+        let (_, out) = plan(&mut state, json!({"items": []}));
+        assert!(out.contains("is over protected your-time"), "{out}");
+    }
+
+    #[test]
+    fn plan_day_without_lanes_reads_as_before() {
+        let mut state = PlannerState::default();
+        let id = seed_todo(&mut state, "Write", "today");
+        let (_, out) = plan(&mut state, json!({"items": [{"id": id, "estimate_minutes": 30}]}));
+        assert!(out.starts_with("30m planned"), "{out}");
+        assert!(!out.contains("Your time") && !out.contains("Agent lane") && !out.contains("Chores"), "{out}");
+    }
+
+    fn agent_todo(state: &mut PlannerState, title: &str) -> String {
+        create(state, json!({"todos": [{"title": title, "lane": "agent", "outcome": "done well"}]}));
+        state.todos.last().unwrap().id.clone()
+    }
+
+    #[test]
+    fn decisions_ask_list_and_resolve() {
+        let mut state = PlannerState::default();
+        let empty = handle_decisions(&mut state, &json!({"action": "list"}), None, Some(3), false);
+        assert!(empty.response.starts_with("No decisions waiting."));
+        assert!(empty.response.contains("3 routing call(s) handled by the user's trust rules today"));
+
+        let id = agent_todo(&mut state, "Plan Phase 2 scope");
+        let human = seed_todo(&mut state, "mine", "today");
+        let bad = handle_decisions(&mut state, &json!({"action": "ask", "todo_id": human, "question": "q?"}), None, None, false);
+        assert_eq!(bad.status, ToolCallStatus::Error);
+
+        let asked = handle_decisions(
+            &mut state,
+            &json!({"action": "ask", "todo_id": id, "question": "Keep the PII scrubber in Phase 2?",
+                    "options": ["Keep in Phase 2", "Move to Phase 3"], "est_minutes": 2,
+                    "did": "Drafted the scope", "blocked": "Scrubber pushes past the date", "next": "Finalise the doc"}),
+            Some("Scott Marsh Phase 2"),
+            None,
+            false,
+        );
+        assert_eq!(asked.status, ToolCallStatus::Completed, "{}", asked.response);
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::NeedsYou));
+
+        let listed = handle_decisions(&mut state, &json!({"action": "list"}), None, None, false).response;
+        assert!(listed.starts_with("1 decision(s) waiting, about 2 min in all:"), "{listed}");
+        assert!(listed.contains("1) Keep in Phase 2 / 2) Move to Phase 3; about 2 min; Scott Marsh Phase 2"), "{listed}");
+        assert!(listed.contains("Brief — did: Drafted the scope; blocked: Scrubber pushes past the date; next: Finalise the doc"), "{listed}");
+        assert!(listed.contains("For: Plan Phase 2 scope → done well"), "{listed}");
+
+        let resolved = handle_decisions(&mut state, &json!({"action": "resolve", "todo_id": id, "choice": "2"}), None, None, false);
+        assert_eq!(resolved.status, ToolCallStatus::Completed);
+        let entry = resolved.deliver.expect("the edge delivers it");
+        assert_eq!(entry.choice, "Move to Phase 3");
+        assert_eq!(state.decision_log.len(), 1);
+        let again = handle_decisions(&mut state, &json!({"action": "resolve", "todo_id": id, "choice": "1"}), None, None, false);
+        assert_eq!(again.status, ToolCallStatus::Error);
+        assert!(again.deliver.is_none());
+        let bad = handle_decisions(&mut state, &json!({"action": "explode"}), None, None, false);
+        assert_eq!(bad.status, ToolCallStatus::Error);
+    }
+
+    #[test]
+    fn agent_time_tool_refuses_outside_a_granted_session() {
+        let mut state = PlannerState::default();
+        let (status, out) = handle_agent_time(&mut state, &json!({"action": "start", "intent": "x"}), "chat", today(), false);
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("never in normal chat"), "{out}");
+
+        state.agent_time_grant = model::AgentTimeGrant { enabled: true, daily_minutes: 45, spend_cap_usd: 2.0, ..Default::default() };
+        state.open_agent_time_lease("agent-chat", today(), Utc::now()).unwrap();
+        let (status, _) = handle_agent_time(&mut state, &json!({"action": "start", "intent": "x"}), "normal-chat", today(), false);
+        assert_eq!(status, ToolCallStatus::Error);
+
+        let (status, out) = handle_agent_time(&mut state, &json!({"action": "start", "intent": "Digest KV-cache notes"}), "agent-chat", today(), false);
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("45m and $2.00"), "{out}");
+        let (status, out) = handle_agent_time(&mut state, &json!({"action": "propose", "kind": "digest", "title": "KV-cache: 3 approaches", "body": "…"}), "agent-chat", today(), false);
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        let (status, _) = handle_agent_time(&mut state, &json!({"action": "propose", "kind": "poem", "title": "t"}), "agent-chat", today(), false);
+        assert_eq!(status, ToolCallStatus::Error);
+        let (status, out) = handle_agent_time(&mut state, &json!({"action": "end", "summary": "one digest"}), "agent-chat", today(), false);
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("1 proposal(s)"), "{out}");
+        assert_eq!(state.open_proposals().len(), 1);
+    }
+
+    #[test]
+    fn today_context_gains_your_time_agents_and_agent_time() {
+        let mut state = PlannerState::default();
+        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        assert!(ctx.get("your_time").is_none() && ctx.get("agents").is_none() && ctx.get("agent_time").is_none(),
+            "nothing to say, nothing added");
+
+        goals(&mut state);
+        block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Reading", "date": "today", "start": "19:00", "end": "20:00"}));
+        let id = agent_todo(&mut state, "Ship release");
+        handle_decisions(&mut state, &json!({"action": "ask", "todo_id": id, "question": "Ship four now?"}), None, None, false);
+        agent_todo(&mut state, "Queued one");
+        state.agent_time_grant = model::AgentTimeGrant { enabled: true, daily_minutes: 45, ..Default::default() };
+
+        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        assert_eq!(ctx["your_time"]["today"], "1h protected (Reading 19:00–20:00) — plan around it, never over it");
+        assert_eq!(ctx["your_time"]["week"], "Outside 0m/4h · Reading 1h/3h");
+        assert_eq!(ctx["agents"]["summary"], "1 needs you · 1 to dispatch");
+        assert!(ctx["agents"]["needs_you"][0].as_str().unwrap().contains("Ship four now?"));
+        assert_eq!(ctx["agent_time"], "45m of 45m left today");
+    }
+
+    fn fleet_row(id: &str, status: Value, extra: Value) -> crate::fleet::FleetSession {
+        let mut row = json!({
+            "id": id, "cwd": "/x/puget-app-packs", "name": "puget-app-packs",
+            "status": status, "last_event_at": "2026-08-12T16:00:00Z"
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            row[k] = v.clone();
+        }
+        serde_json::from_value(row).unwrap()
+    }
+
+    #[test]
+    fn fleet_state_drives_agent_state() {
+        let mut state = PlannerState::default();
+        let id = agent_todo(&mut state, "Ship release");
+        state.todo_mut(&id).unwrap().linked_fleet_session = Some("run-1".into());
+        let human = seed_todo(&mut state, "mine", "today");
+        state.todo_mut(&human).unwrap().linked_fleet_session = Some("run-1".into());
+        let now = Utc::now();
+
+        let mut live = crate::fleet::FleetState::default();
+        live.sessions.insert("run-1".into(), fleet_row("run-1", json!("Working"), json!({})));
+        assert_eq!(sync_agent_states(&mut state, &live, &[], now), vec![id.clone()]);
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Working));
+        assert!(state.todo(&human).unwrap().agent_state.is_none(), "human lane untouched");
+
+        // A held gate → needs you, with a synthesized decision.
+        live.sessions.insert(
+            "run-1".into(),
+            fleet_row("run-1", json!({"NeedsAttention": "Gate"}), json!({
+                "pending_gate": {"request_id": "g1", "tool_name": "Bash", "input_summary": "npm publish", "requested_at": "2026-08-12T16:01:00Z"}
+            })),
+        );
+        sync_agent_states(&mut state, &live, &[], now);
+        let t = state.todo(&id).unwrap();
+        assert_eq!(t.agent_state, Some(model::AgentState::NeedsYou));
+        assert!(t.decision.as_ref().unwrap().question.contains("npm publish"));
+
+        // Ended with a blocked brief → stuck (nothing pending).
+        live.sessions.clear();
+        let ended = fleet_row("run-1", json!("Idle"), json!({
+            "ended_at": "2026-08-12T17:00:00Z",
+            "brief": {"headline": "Built 4 of 5 images", "blocked_on": "Llama 4 driver check fails", "generated_at": "2026-08-12T17:00:00Z"}
+        }));
+        let signal = worker_signal_from_fleet(&ended);
+        assert_eq!(signal.brief.as_ref().unwrap().did, "Built 4 of 5 images");
+        sync_agent_states(&mut state, &live, &[ended], now);
+        let t = state.todo(&id).unwrap();
+        assert_eq!(t.agent_state, Some(model::AgentState::Stuck));
+        assert!(t.decision.is_none(), "the gate's synthesized decision cleared");
     }
 }

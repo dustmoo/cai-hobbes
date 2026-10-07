@@ -11,18 +11,24 @@
 //!
 //! See `PLANNER_DESIGN.md` for the full specification.
 //!
+pub mod agent_time;
 pub mod calendar_sync;
 pub mod composio_calendar;
 pub mod dispatch;
 pub mod handlers;
 pub mod ics;
+pub mod lanes;
+pub mod measures;
 pub mod model;
 pub mod project_match;
 pub mod quick_add;
 pub mod store;
 pub mod views;
 
-use model::{Area, DayPlan, FocusActor, FocusEndReason, FocusSession, Project, TimeBlock, Todo};
+use model::{
+    AgentTimeGrant, AgentTimeSession, Area, DayPlan, FocusActor, FocusEndReason, FocusSession,
+    Project, Proposal, ResolvedDecision, ReviewSignals, TimeBlock, TimeGoal, Todo, TrustLedger,
+};
 
 /// The whole planner, hydrated in memory.
 ///
@@ -45,6 +51,26 @@ pub struct PlannerState {
     /// lifecycle methods growing store side effects (handlers pass
     /// `persist: false` in tests and must stay off the database).
     dirty_focus_sessions: Vec<String>,
+
+    // ── Symbiotic planner (SYMBIOTIC_PLANNER.md) ────────────────────────────
+    /// Your-time goals, in display order.
+    pub time_goals: Vec<TimeGoal>,
+    /// The human-granted agent-time budget (off by default).
+    pub agent_time_grant: AgentTimeGrant,
+    /// Every agent-time sitting, oldest first — the full public log.
+    pub agent_time_sessions: Vec<AgentTimeSession>,
+    /// Agent-time outputs, oldest first.
+    pub proposals: Vec<Proposal>,
+    /// Evidence counters. Never grants anything.
+    pub trust_ledger: TrustLedger,
+    /// Review-nudge acted/dismissed counts (style suggestions only).
+    pub review_signals: ReviewSignals,
+    /// Answered agent decisions, oldest first.
+    pub decision_log: Vec<ResolvedDecision>,
+    /// Runtime only, never persisted: the chat session the agent-time
+    /// runtime is currently running in. `HOBBES_AGENT_TIME` is refused from
+    /// any other session (see `agent_time`).
+    pub agent_time_lease: Option<agent_time::AgentTimeLease>,
 }
 
 impl PlannerState {
@@ -64,6 +90,14 @@ impl PlannerState {
         for s in state.take_dirty_focus_sessions() {
             if let Err(e) = store::save_focus_session(&s) {
                 tracing::error!("Failed to persist recovered focus session {}: {}", s.id, e);
+            }
+        }
+        // An agent-time session cannot outlive the process that ran it: close
+        // any found open, on the record, so the log never shows a phantom
+        // live sitting (and so a fresh grant check isn't blocked by it).
+        for s in state.recover_open_agent_time(chrono::Utc::now()) {
+            if let Err(e) = store::save_agent_time_session(&s) {
+                tracing::error!("Failed to persist recovered agent-time session {}: {}", s.id, e);
             }
         }
         state
@@ -457,6 +491,10 @@ impl PlannerState {
         };
         let was_in_progress = t.status == model::TodoStatus::InProgress;
         t.mark_completed(now);
+        // A completed agent to-do's outcome is reached: Done, explicitly.
+        if t.lane == model::Lane::Agent {
+            t.agent_state = Some(model::AgentState::Done);
+        }
         if was_in_progress {
             self.close_focus_rows_for(id, now, FocusEndReason::Completed);
         }

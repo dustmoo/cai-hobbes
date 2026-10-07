@@ -19,7 +19,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::session_store::{next_seq, with_conn};
 
-use super::model::{Area, CalendarEvent, DayPlan, FocusSession, Project, TimeBlock, Todo};
+use super::model::{
+    AgentTimeSession, Area, CalendarEvent, DayPlan, FocusSession, Project, Proposal,
+    ResolvedDecision, TimeBlock, TimeGoal, Todo,
+};
 use super::PlannerState;
 
 // ── Schema & migrations ─────────────────────────────────────────────────────
@@ -133,6 +136,66 @@ const MIGRATION_V4: &str = "
     ALTER TABLE todos ADD COLUMN priority TEXT;
 ";
 
+/// Symbiotic planner (SYMBIOTIC_PLANNER.md §4). The new `Todo` fields (lane,
+/// kind, outcome, agent_state, decision) live in the `todos.data` JSON and
+/// default on read, so todos need no ALTER. Everything here is
+/// `CREATE … IF NOT EXISTS`, so re-running the batch is a no-op.
+///
+/// - `todo_time_goals`: your-time goals, one row per category.
+/// - `todo_agent_time_sessions`: the agent-time log (intent, tool calls,
+///   outputs, cost).
+/// - `todo_proposals`: agent-time outputs and their accept/dismiss status.
+/// - `todo_decisions`: answered agent decisions (judgment count, ground
+///   covered).
+/// - `todo_kv`: planner singletons — the agent-time grant, the trust ledger
+///   and the review-style signals — one JSON document per key.
+const MIGRATION_V5: &str = "
+    CREATE TABLE IF NOT EXISTS todo_time_goals (
+        id         TEXT PRIMARY KEY,
+        category   TEXT NOT NULL,
+        sort_order REAL NOT NULL DEFAULT 0,
+        seq        INTEGER NOT NULL,
+        data       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS todo_agent_time_sessions (
+        id         TEXT PRIMARY KEY,
+        started_at TEXT NOT NULL,
+        ended_at   TEXT,
+        cost_usd   REAL NOT NULL DEFAULT 0,
+        seq        INTEGER NOT NULL,
+        data       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_agent_time_sessions_start
+        ON todo_agent_time_sessions(started_at);
+
+    CREATE TABLE IF NOT EXISTS todo_proposals (
+        id         TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        kind       TEXT NOT NULL,
+        status     TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        data       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_proposals_status ON todo_proposals(status, created_at);
+
+    CREATE TABLE IF NOT EXISTS todo_decisions (
+        id          TEXT PRIMARY KEY,
+        todo_id     TEXT NOT NULL,
+        resolved_at TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        data        TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_decisions_resolved ON todo_decisions(resolved_at);
+
+    CREATE TABLE IF NOT EXISTS todo_kv (
+        key  TEXT PRIMARY KEY,
+        seq  INTEGER NOT NULL,
+        data TEXT NOT NULL
+    );
+";
+
 /// Ordered migrations. Append only — never edit a shipped entry, since
 /// databases in the wild have already recorded it as applied.
 const MIGRATIONS: &[(i32, &str)] = &[
@@ -140,7 +203,13 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (2, MIGRATION_V2),
     (3, MIGRATION_V3),
     (4, MIGRATION_V4),
+    (5, MIGRATION_V5),
 ];
+
+/// `todo_kv` keys.
+pub const KV_AGENT_TIME_GRANT: &str = "agent_time_grant";
+pub const KV_TRUST_LEDGER: &str = "trust_ledger";
+pub const KV_REVIEW_SIGNALS: &str = "review_signals";
 
 /// Create the planner schema and apply any pending migrations.
 ///
@@ -195,6 +264,11 @@ pub(crate) fn max_seq(conn: &Connection) -> i64 {
         "todo_day_plans",
         "todo_calendar_events",
         "todo_focus_sessions",
+        "todo_time_goals",
+        "todo_agent_time_sessions",
+        "todo_proposals",
+        "todo_decisions",
+        "todo_kv",
     ]
         .iter()
         .map(|table| {
@@ -450,6 +524,128 @@ pub fn load_calendar_events_conn(
     Ok(out)
 }
 
+// ── Symbiotic planner writes ────────────────────────────────────────────────
+
+fn to_json<T: serde::Serialize>(v: &T) -> rusqlite::Result<String> {
+    serde_json::to_string(v).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+}
+
+pub fn upsert_time_goal_conn(conn: &Connection, goal: &TimeGoal, seq: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO todo_time_goals (id, category, sort_order, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             category = excluded.category, sort_order = excluded.sort_order,
+             seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_time_goals.seq",
+        params![goal.id, goal.category, goal.sort_order, seq, to_json(goal)?],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_agent_time_session_conn(
+    conn: &Connection,
+    session: &AgentTimeSession,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO todo_agent_time_sessions (id, started_at, ended_at, cost_usd, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(id) DO UPDATE SET
+             started_at = excluded.started_at, ended_at = excluded.ended_at,
+             cost_usd = excluded.cost_usd, seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_agent_time_sessions.seq",
+        params![
+            session.id,
+            fmt_ts(&session.started_at),
+            session.ended_at.as_ref().map(fmt_ts),
+            session.cost_usd,
+            seq,
+            to_json(session)?
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_proposal_conn(conn: &Connection, proposal: &Proposal, seq: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO todo_proposals (id, session_id, kind, status, created_at, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(id) DO UPDATE SET
+             session_id = excluded.session_id, kind = excluded.kind,
+             status = excluded.status, created_at = excluded.created_at,
+             seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_proposals.seq",
+        params![
+            proposal.id,
+            proposal.session_id,
+            proposal.kind.as_str(),
+            proposal.status.as_str(),
+            fmt_ts(&proposal.created_at),
+            seq,
+            to_json(proposal)?
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn upsert_decision_conn(
+    conn: &Connection,
+    decision: &ResolvedDecision,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO todo_decisions (id, todo_id, resolved_at, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             todo_id = excluded.todo_id, resolved_at = excluded.resolved_at,
+             seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_decisions.seq",
+        params![
+            decision.id,
+            decision.todo_id,
+            fmt_ts(&decision.resolved_at),
+            seq,
+            to_json(decision)?
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn put_kv_conn<T: serde::Serialize>(
+    conn: &Connection,
+    key: &str,
+    value: &T,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO todo_kv (key, seq, data) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_kv.seq",
+        params![key, seq, to_json(value)?],
+    )?;
+    Ok(())
+}
+
+/// A `todo_kv` document, or `T::default()` when absent or unreadable (an
+/// unreadable singleton is logged, never fatal — e.g. the grant falls back
+/// to its off-by-default shape).
+pub fn get_kv_conn<T: serde::de::DeserializeOwned + Default>(
+    conn: &Connection,
+    key: &str,
+) -> rusqlite::Result<T> {
+    let raw: Option<String> = conn
+        .query_row("SELECT data FROM todo_kv WHERE key = ?1", params![key], |r| r.get(0))
+        .optional()?;
+    Ok(match raw {
+        Some(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            tracing::error!("Unreadable todo_kv '{}': {}", key, e);
+            T::default()
+        }),
+        None => T::default(),
+    })
+}
+
 fn delete_by_id_conn(conn: &Connection, table: &str, id: &str) -> rusqlite::Result<()> {
     let column = if table == "todo_day_plans" { "date" } else { "id" };
     conn.execute(
@@ -490,6 +686,34 @@ pub fn load_all_conn(conn: &Connection) -> rusqlite::Result<PlannerState> {
         day_plans: load_data_column(conn, "todo_day_plans")?,
         focus_sessions: load_data_column(conn, "todo_focus_sessions")?,
         dirty_focus_sessions: Vec::new(),
+        time_goals: {
+            let mut goals: Vec<TimeGoal> = load_data_column(conn, "todo_time_goals")?;
+            goals.sort_by(|a, b| {
+                a.sort_order
+                    .partial_cmp(&b.sort_order)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            goals
+        },
+        agent_time_grant: get_kv_conn(conn, KV_AGENT_TIME_GRANT)?,
+        agent_time_sessions: {
+            let mut v: Vec<AgentTimeSession> = load_data_column(conn, "todo_agent_time_sessions")?;
+            v.sort_by_key(|s| s.started_at);
+            v
+        },
+        proposals: {
+            let mut v: Vec<Proposal> = load_data_column(conn, "todo_proposals")?;
+            v.sort_by_key(|p| p.created_at);
+            v
+        },
+        trust_ledger: get_kv_conn(conn, KV_TRUST_LEDGER)?,
+        review_signals: get_kv_conn(conn, KV_REVIEW_SIGNALS)?,
+        decision_log: {
+            let mut v: Vec<ResolvedDecision> = load_data_column(conn, "todo_decisions")?;
+            v.sort_by_key(|d| d.resolved_at);
+            v
+        },
+        agent_time_lease: None,
     })
 }
 
@@ -532,6 +756,47 @@ pub fn save_day_plan(plan: &DayPlan) -> Result<(), String> {
 pub fn save_focus_session(session: &FocusSession) -> Result<(), String> {
     let seq = next_seq();
     with_conn(|conn| upsert_focus_session_conn(conn, session, seq))
+}
+
+pub fn save_time_goal(goal: &TimeGoal) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_time_goal_conn(conn, goal, seq))
+}
+
+pub fn delete_time_goal(id: &str) -> Result<(), String> {
+    with_conn(|conn| delete_by_id_conn(conn, "todo_time_goals", id))
+}
+
+pub fn save_agent_time_session(session: &AgentTimeSession) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_agent_time_session_conn(conn, session, seq))
+}
+
+pub fn save_proposal(proposal: &Proposal) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_proposal_conn(conn, proposal, seq))
+}
+
+pub fn save_resolved_decision(decision: &ResolvedDecision) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_decision_conn(conn, decision, seq))
+}
+
+#[allow(dead_code)] // consumer: the Agent time panel (wave 2)
+pub fn save_agent_time_grant(grant: &super::model::AgentTimeGrant) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| put_kv_conn(conn, KV_AGENT_TIME_GRANT, grant, seq))
+}
+
+pub fn save_trust_ledger(ledger: &super::model::TrustLedger) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| put_kv_conn(conn, KV_TRUST_LEDGER, ledger, seq))
+}
+
+#[allow(dead_code)] // consumer: the weekly review (wave 2)
+pub fn save_review_signals(signals: &super::model::ReviewSignals) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| put_kv_conn(conn, KV_REVIEW_SIGNALS, signals, seq))
 }
 
 /// Deleting a todo also deletes its time blocks. The cascade lives here, not
@@ -1305,6 +1570,159 @@ mod tests {
             let loaded = load_all_conn(conn).unwrap();
             assert_eq!(loaded.todos[0].bucket, TodoBucket::Someday);
             assert!(loaded.todos[0].scheduled_for.is_none());
+        });
+    }
+
+    // ── Symbiotic planner (v5) ──────────────────────────────────────────────
+
+    /// A database at v4 (every pre-lanes migration applied, with a todo row
+    /// written before the lane fields existed).
+    fn v4_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                 domain  TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );",
+        )
+        .unwrap();
+        for sql in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3, MIGRATION_V4] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute("INSERT INTO schema_migrations (domain, version) VALUES ('todo', 4)", [])
+            .unwrap();
+        let todo = sample();
+        let mut data = serde_json::to_value(&todo).unwrap();
+        for key in ["lane", "kind", "time_category", "outcome", "agent_state", "decision"] {
+            data.as_object_mut().unwrap().remove(key);
+        }
+        conn.execute(
+            "INSERT INTO todos (id, title, status, bucket, sort_order, updated_at, seq, data)
+             VALUES (?1, ?2, 'open', 'inbox', 0, ?3, 1, ?4)",
+            params![todo.id, todo.title, fmt_ts(&todo.updated_at), data.to_string()],
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn migration_v5_upgrades_a_v4_db_and_old_rows_load_as_human() {
+        use crate::todo::model::Lane;
+        let conn = v4_db();
+        create_schema(&conn).unwrap();
+        let version: i32 = conn
+            .query_row("SELECT version FROM schema_migrations WHERE domain = 'todo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        let loaded = load_all_conn(&conn).unwrap();
+        assert_eq!(loaded.todos.len(), 1);
+        let t = &loaded.todos[0];
+        assert_eq!(t.lane, Lane::Human, "pre-lanes rows are human to-dos");
+        assert!(t.kind.is_none() && t.outcome.is_none() && t.agent_state.is_none() && t.decision.is_none());
+        // Singletons default when absent: the grant is off.
+        assert!(!loaded.agent_time_grant.enabled);
+        assert_eq!(loaded.trust_ledger, Default::default());
+        assert!(loaded.time_goals.is_empty() && loaded.proposals.is_empty());
+    }
+
+    #[test]
+    fn migration_v5_is_idempotent() {
+        let conn = v4_db();
+        create_schema(&conn).unwrap();
+        // Re-running the runner is a no-op, and so is replaying the v5 batch
+        // itself (every statement is IF NOT EXISTS).
+        create_schema(&conn).unwrap();
+        conn.execute_batch(MIGRATION_V5).unwrap();
+        // Even a version row knocked back (e.g. a downgrade then upgrade)
+        // replays cleanly over the existing tables.
+        conn.execute("UPDATE schema_migrations SET version = 4 WHERE domain = 'todo'", [])
+            .unwrap();
+        create_schema(&conn).unwrap();
+        assert_eq!(load_all_conn(&conn).unwrap().todos.len(), 1);
+    }
+
+    #[test]
+    fn symbiotic_rows_round_trip() {
+        use crate::todo::model::*;
+        with_db(|conn| {
+            let now: chrono::DateTime<Utc> = "2026-10-07T17:00:00Z".parse().unwrap();
+            let mut goal = TimeGoal::new("Outside", 240);
+            goal.colour = Some("#8DBB7A".into());
+            upsert_time_goal_conn(conn, &goal, 1).unwrap();
+
+            let session = AgentTimeSession {
+                id: "at_1".into(),
+                intent: "Digest notes".into(),
+                started_at: now,
+                ended_at: Some(now + chrono::Duration::minutes(18)),
+                cost_usd: 0.42,
+                tool_calls: vec![AgentTimeLogEntry { at: now, tool: "notes.search".into(), summary: "6 notes".into() }],
+                outputs: vec!["pr_1".into()],
+                end_reason: Some(AgentTimeEndReason::Completed),
+                summary: Some("one digest".into()),
+                chat_session_id: Some("chat".into()),
+                out_of_scope_attempts: 0,
+            };
+            upsert_agent_time_session_conn(conn, &session, 2).unwrap();
+            let proposal = Proposal {
+                id: "pr_1".into(),
+                kind: ProposalKind::Research,
+                title: "KV-cache digest".into(),
+                body: "…".into(),
+                status: ProposalStatus::Open,
+                created_at: now,
+                resolved_at: None,
+                session_id: "at_1".into(),
+            };
+            upsert_proposal_conn(conn, &proposal, 3).unwrap();
+            let decision = ResolvedDecision {
+                id: "dc_1".into(),
+                todo_id: "td_1".into(),
+                question: "Ship four now?".into(),
+                choice: "Ship four now".into(),
+                note: None,
+                worker: Some("puget".into()),
+                asked_at: now,
+                resolved_at: now,
+                source: DecisionSource::Worker,
+                delivery: Some(DecisionDelivery::NotDelivered { reason: "headless".into() }),
+            };
+            upsert_decision_conn(conn, &decision, 4).unwrap();
+            let grant = AgentTimeGrant { enabled: true, daily_minutes: 45, spend_cap_usd: 2.0, ..Default::default() };
+            put_kv_conn(conn, KV_AGENT_TIME_GRANT, &grant, 5).unwrap();
+            let ledger = TrustLedger { proposals_accepted: 6, ..Default::default() };
+            put_kv_conn(conn, KV_TRUST_LEDGER, &ledger, 6).unwrap();
+            let mut signals = ReviewSignals::default();
+            signals.record(ReviewStyle::Direct, NudgeOutcome::Dismissed);
+            put_kv_conn(conn, KV_REVIEW_SIGNALS, &signals, 7).unwrap();
+            // A stale singleton write never clobbers a newer one.
+            put_kv_conn(conn, KV_AGENT_TIME_GRANT, &AgentTimeGrant::default(), 1).unwrap();
+
+            let mut todo = sample();
+            todo.set_lane(Lane::Agent);
+            todo.outcome = Some("PR open".into());
+            upsert_todo_conn(conn, &todo, 8).unwrap();
+            let block = TimeBlock {
+                id: "blk_yt".into(),
+                todo_id: None,
+                title: "Outside".into(),
+                start: now,
+                end: now + chrono::Duration::hours(1),
+                source: BlockSource::YourTime { category: "Outside".into() },
+            };
+            upsert_block_conn(conn, &block, 9).unwrap();
+
+            let loaded = load_all_conn(conn).unwrap();
+            assert_eq!(loaded.time_goals, vec![goal]);
+            assert_eq!(loaded.agent_time_sessions, vec![session]);
+            assert_eq!(loaded.proposals, vec![proposal]);
+            assert_eq!(loaded.decision_log, vec![decision]);
+            assert_eq!(loaded.agent_time_grant, grant);
+            assert_eq!(loaded.trust_ledger, ledger);
+            assert_eq!(loaded.review_signals, signals);
+            assert_eq!(loaded.todos[0], todo);
+            assert_eq!(loaded.blocks[0], block);
+            assert_eq!(max_seq(conn), 9, "max_seq spans the new tables");
         });
     }
 }

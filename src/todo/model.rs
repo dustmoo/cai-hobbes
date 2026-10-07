@@ -527,6 +527,660 @@ pub struct ChecklistItem {
     pub done: bool,
 }
 
+// ── Symbiotic planner: lanes, kinds, agent state, decisions ────────────────
+//
+// SYMBIOTIC_PLANNER.md §2–4. A to-do is either the person's (time-bound,
+// on the timeline) or an agent's (an outcome, worked asynchronously). All of
+// these default so pre-lanes rows load as untriaged human to-dos.
+
+/// Who spends time on a to-do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Lane {
+    /// The person's own time — on the timeline, against capacity.
+    #[default]
+    Human,
+    /// An outcome handed to an agent; costs the person judgment minutes only.
+    Agent,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl Lane {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Lane::Human => "human",
+            Lane::Agent => "agent",
+        }
+    }
+
+    /// Accepts `human`/`me`/`mine`/`yours` and `agent`/`hobbes`/`delegate`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "human" | "me" | "mine" | "yours" | "person" => Some(Lane::Human),
+            "agent" | "hobbes" | "delegate" | "delegated" => Some(Lane::Agent),
+            _ => None,
+        }
+    }
+}
+
+/// The three kinds of human time (SYMBIOTIC_PLANNER.md §2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanKind {
+    /// Meetings, calls, work that needs you personally.
+    Commitment,
+    /// Quick tasks to make smaller and fewer, and batch.
+    Chore,
+    /// What the rest is *for* — protected, non-commerce time.
+    YourTime,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl HumanKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HumanKind::Commitment => "commitment",
+            HumanKind::Chore => "chore",
+            HumanKind::YourTime => "your_time",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            HumanKind::Commitment => "commitment",
+            HumanKind::Chore => "chore",
+            HumanKind::YourTime => "your time",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().replace(['-', ' '], "_").as_str() {
+            "commitment" | "commit" => Some(HumanKind::Commitment),
+            "chore" | "chores" => Some(HumanKind::Chore),
+            "your_time" | "yourtime" | "my_time" | "mytime" => Some(HumanKind::YourTime),
+            _ => None,
+        }
+    }
+}
+
+/// Where an agent to-do stands. Moves queued → working → needs you → done
+/// (or stuck). Derived from the linked worker wherever possible — see
+/// `lanes::derive_agent_state`. Reported, never judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentState {
+    /// Handed over (or about to be) but no worker is running it yet.
+    Queued,
+    Working,
+    /// Waiting on the person: a decision, a permission gate, or input.
+    NeedsYou,
+    /// The latest brief says blocked and nothing is pending on the person.
+    Stuck,
+    Done,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl AgentState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentState::Queued => "queued",
+            AgentState::Working => "working",
+            AgentState::NeedsYou => "needs_you",
+            AgentState::Stuck => "stuck",
+            AgentState::Done => "done",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentState::Queued => "queued",
+            AgentState::Working => "working",
+            AgentState::NeedsYou => "needs you",
+            AgentState::Stuck => "stuck",
+            AgentState::Done => "done",
+        }
+    }
+}
+
+/// The re-entry brief attached to a decision: what the worker did, what it
+/// is blocked on, and what it will do next. Mirrors the fleet's
+/// `SessionBrief` (headline → `did`, `blocked_on` → `blocked`); `next` only
+/// exists when a worker states it (`HOBBES_DECISIONS ask`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Brief {
+    #[serde(default)]
+    pub did: String,
+    #[serde(default)]
+    pub blocked: Option<String>,
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+/// What raised a decision. Synthesized decisions (gate / attention) clear
+/// themselves when the worker stops waiting; worker-asked ones stay until
+/// the person answers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DecisionSource {
+    /// The worker asked (`HOBBES_DECISIONS ask`).
+    #[default]
+    Worker,
+    /// A held fleet permission gate. Answered by Approve/Deny in the UI
+    /// (`FleetShared::resolve_gate`) — never by the model.
+    Gate { request_id: String },
+    /// A fleet `NeedsAttention` notification (idle prompt, question…).
+    Attention,
+}
+
+/// How a resolved answer reached (or failed to reach) the worker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum DecisionDelivery {
+    /// Queued as a user message to the worker's Hobbes chat session.
+    ChatQueued { session_id: String },
+    /// No channel to the worker exists (e.g. a headless Claude Code run):
+    /// recorded on the to-do and surfaced in its progress line only.
+    NotDelivered { reason: String },
+}
+
+/// The person's answer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecisionAnswer {
+    pub choice: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    pub at: DateTime<Utc>,
+    /// `None` until the dispatch edge has tried to deliver it.
+    #[serde(default)]
+    pub delivery: Option<DecisionDelivery>,
+}
+
+/// A decision an agent needs from the person: a one-line question, the
+/// options, how long answering should take, and the brief behind it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Decision {
+    pub question: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Estimated minutes to decide ("about 2 min").
+    #[serde(default)]
+    pub est_minutes: Option<u32>,
+    #[serde(default)]
+    pub brief: Option<Brief>,
+    pub asked_at: DateTime<Utc>,
+    /// Display name of the worker asking (session title / tab name).
+    #[serde(default)]
+    pub worker: Option<String>,
+    #[serde(default)]
+    pub source: DecisionSource,
+    #[serde(default)]
+    pub resolved: Option<DecisionAnswer>,
+}
+
+impl Decision {
+    pub fn is_open(&self) -> bool {
+        self.resolved.is_none()
+    }
+
+    /// Resolve `choice` against the options: a 1-based index ("2"), an exact
+    /// (case-insensitive) option, or — when the decision offers no options,
+    /// or the person answered in their own words — the text itself.
+    pub fn match_choice(&self, choice: &str) -> String {
+        let c = choice.trim();
+        if let Ok(n) = c.parse::<usize>() {
+            if n >= 1 && n <= self.options.len() {
+                return self.options[n - 1].clone();
+            }
+        }
+        self.options
+            .iter()
+            .find(|o| o.trim().eq_ignore_ascii_case(c))
+            .cloned()
+            .unwrap_or_else(|| c.to_string())
+    }
+}
+
+/// One answered decision, kept for the weekly review's judgment count and
+/// "decisions cleared" (ground covered). Persisted in `todo_decisions`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolvedDecision {
+    pub id: String,
+    pub todo_id: String,
+    pub question: String,
+    pub choice: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub worker: Option<String>,
+    pub asked_at: DateTime<Utc>,
+    pub resolved_at: DateTime<Utc>,
+    #[serde(default)]
+    pub source: DecisionSource,
+    #[serde(default)]
+    pub delivery: Option<DecisionDelivery>,
+}
+
+// ── Your-time goals ─────────────────────────────────────────────────────────
+
+/// A weekly your-time goal for one user-defined category (Reading, Gaming,
+/// Outside…). Personal planner: one set per user (SYMBIOTIC_PLANNER.md §7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimeGoal {
+    pub id: String,
+    pub category: String,
+    #[serde(default)]
+    pub weekly_target_minutes: u32,
+    /// `#RRGGBB`; `None` lets the UI pick from its palette.
+    #[serde(default)]
+    pub colour: Option<String>,
+    #[serde(default)]
+    pub sort_order: f64,
+}
+
+impl TimeGoal {
+    pub fn new(category: impl Into<String>, weekly_target_minutes: u32) -> Self {
+        Self {
+            id: format!("tg_{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+            category: category.into(),
+            weekly_target_minutes,
+            colour: None,
+            sort_order: 0.0,
+        }
+    }
+
+    pub fn matches(&self, category: &str) -> bool {
+        self.category.trim().eq_ignore_ascii_case(category.trim())
+    }
+}
+
+// ── Review feedback style ───────────────────────────────────────────────────
+
+/// How the weekly review speaks (SYMBIOTIC_PLANNER.md §5). The numbers are
+/// the same in every style; only order, wording and the nudge change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStyle {
+    /// Leads with the gap and names the drain, with a firm suggestion.
+    Direct,
+    /// One win, one gap, one next step.
+    #[default]
+    Balanced,
+    /// Leads with what you made room for; the nudge is an invitation.
+    Encouraging,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl ReviewStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReviewStyle::Direct => "direct",
+            ReviewStyle::Balanced => "balanced",
+            ReviewStyle::Encouraging => "encouraging",
+        }
+    }
+
+    /// One step gentler, or `None` at the gentlest.
+    pub fn softer(self) -> Option<Self> {
+        match self {
+            ReviewStyle::Direct => Some(ReviewStyle::Balanced),
+            ReviewStyle::Balanced => Some(ReviewStyle::Encouraging),
+            ReviewStyle::Encouraging => None,
+        }
+    }
+}
+
+/// Acted-on vs dismissed counts for one style's nudges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct NudgeCounts {
+    #[serde(default)]
+    pub acted: u32,
+    #[serde(default)]
+    pub dismissed: u32,
+}
+
+/// The adaptation signal: counts only, per style. Never switches the style
+/// itself — `measures::suggest_review_style` only *suggests*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ReviewSignals {
+    #[serde(default)]
+    pub direct: NudgeCounts,
+    #[serde(default)]
+    pub balanced: NudgeCounts,
+    #[serde(default)]
+    pub encouraging: NudgeCounts,
+    /// Weekly reviews left unopened (the "skipping reviews after hard weeks"
+    /// signal), per style in force at the time.
+    #[serde(default)]
+    pub skipped_direct: u32,
+    #[serde(default)]
+    pub skipped_balanced: u32,
+    #[serde(default)]
+    pub skipped_encouraging: u32,
+}
+
+/// What the person did with one review nudge.
+#[allow(dead_code)] // wave 2: weekly review records it
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NudgeOutcome {
+    Acted,
+    Dismissed,
+    /// The review itself went unopened that week.
+    Skipped,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl ReviewSignals {
+    pub fn counts(&self, style: ReviewStyle) -> NudgeCounts {
+        match style {
+            ReviewStyle::Direct => self.direct,
+            ReviewStyle::Balanced => self.balanced,
+            ReviewStyle::Encouraging => self.encouraging,
+        }
+    }
+
+    pub fn skipped(&self, style: ReviewStyle) -> u32 {
+        match style {
+            ReviewStyle::Direct => self.skipped_direct,
+            ReviewStyle::Balanced => self.skipped_balanced,
+            ReviewStyle::Encouraging => self.skipped_encouraging,
+        }
+    }
+
+    /// Record one outcome under the style that was in force.
+    pub fn record(&mut self, style: ReviewStyle, outcome: NudgeOutcome) {
+        let (counts, skipped) = match style {
+            ReviewStyle::Direct => (&mut self.direct, &mut self.skipped_direct),
+            ReviewStyle::Balanced => (&mut self.balanced, &mut self.skipped_balanced),
+            ReviewStyle::Encouraging => (&mut self.encouraging, &mut self.skipped_encouraging),
+        };
+        match outcome {
+            NudgeOutcome::Acted => counts.acted = counts.acted.saturating_add(1),
+            NudgeOutcome::Dismissed => counts.dismissed = counts.dismissed.saturating_add(1),
+            NudgeOutcome::Skipped => *skipped = skipped.saturating_add(1),
+        }
+    }
+
+    /// Start a style's counts afresh — called when the person switches
+    /// style, so old evidence doesn't immediately re-suggest a switch.
+    pub fn reset(&mut self, style: ReviewStyle) {
+        match style {
+            ReviewStyle::Direct => {
+                self.direct = NudgeCounts::default();
+                self.skipped_direct = 0;
+            }
+            ReviewStyle::Balanced => {
+                self.balanced = NudgeCounts::default();
+                self.skipped_balanced = 0;
+            }
+            ReviewStyle::Encouraging => {
+                self.encouraging = NudgeCounts::default();
+                self.skipped_encouraging = 0;
+            }
+        }
+    }
+}
+
+// ── Agent time ──────────────────────────────────────────────────────────────
+
+/// What agent time may touch (SYMBIOTIC_PLANNER.md §3 "Scoped"). Reads stay
+/// within what the person shared; writes only ever land in Hobbes-owned
+/// space (proposals). The runtime gate applies
+/// `agent_time::agent_time_scope_allows` on every call regardless.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AgentTimeScope {
+    /// Projects agent time may read around. Empty = everything shared.
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+    /// Proposal kinds it may file. Empty = all kinds.
+    #[serde(default)]
+    pub proposal_kinds: Vec<ProposalKind>,
+    /// The person's own words for the scope, shown in the panel.
+    #[serde(default)]
+    pub note: String,
+}
+
+fn default_grant_days() -> [bool; 7] {
+    [true; 7]
+}
+
+fn default_grant_minutes() -> u32 {
+    30
+}
+
+fn default_grant_cap() -> f64 {
+    1.0
+}
+
+/// The human-granted agent-time budget. Off by default; zero is valid.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTimeGrant {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_grant_minutes")]
+    pub daily_minutes: u32,
+    /// Spend cap per day, USD.
+    #[serde(default = "default_grant_cap")]
+    pub spend_cap_usd: f64,
+    /// Granted days, Monday first.
+    #[serde(default = "default_grant_days")]
+    pub days: [bool; 7],
+    #[serde(default)]
+    pub scope: AgentTimeScope,
+}
+
+impl Default for AgentTimeGrant {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            daily_minutes: default_grant_minutes(),
+            spend_cap_usd: default_grant_cap(),
+            days: default_grant_days(),
+            scope: AgentTimeScope::default(),
+        }
+    }
+}
+
+impl AgentTimeGrant {
+    pub fn grants_day(&self, date: NaiveDate) -> bool {
+        use chrono::Datelike;
+        self.days[date.weekday().num_days_from_monday() as usize]
+    }
+}
+
+/// One line of an agent-time session's log.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTimeLogEntry {
+    pub at: DateTime<Utc>,
+    pub tool: String,
+    pub summary: String,
+}
+
+/// Why an agent-time session ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTimeEndReason {
+    /// The agent called `end`.
+    Completed,
+    /// The person paused it.
+    Paused,
+    /// The person stopped it.
+    Stopped,
+    /// Today's granted minutes ran out.
+    BudgetExhausted,
+    /// Today's spend cap was reached.
+    SpendCapReached,
+    /// Found open after an app restart.
+    Recovered,
+}
+
+#[allow(dead_code)] // wave 2: Agent time panel
+impl AgentTimeEndReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentTimeEndReason::Completed => "completed",
+            AgentTimeEndReason::Paused => "paused",
+            AgentTimeEndReason::Stopped => "stopped",
+            AgentTimeEndReason::BudgetExhausted => "budget_exhausted",
+            AgentTimeEndReason::SpendCapReached => "spend_cap_reached",
+            AgentTimeEndReason::Recovered => "recovered",
+        }
+    }
+}
+
+/// One logged agent-time sitting: declared intent, every tool call, what it
+/// produced, and what it cost. Nothing happens off the record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentTimeSession {
+    pub id: String,
+    pub intent: String,
+    pub started_at: DateTime<Utc>,
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub tool_calls: Vec<AgentTimeLogEntry>,
+    /// Proposal ids filed during the session.
+    #[serde(default)]
+    pub outputs: Vec<String>,
+    #[serde(default)]
+    pub end_reason: Option<AgentTimeEndReason>,
+    /// The agent's closing summary (`end(summary)`).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// The Hobbes chat session the runtime ran it in.
+    #[serde(default)]
+    pub chat_session_id: Option<String>,
+    /// Calls the scope gate refused or sent for approval (evidence).
+    #[serde(default)]
+    pub out_of_scope_attempts: u32,
+}
+
+impl AgentTimeSession {
+    pub fn is_open(&self) -> bool {
+        self.ended_at.is_none()
+    }
+
+    /// Wall-clock minutes used, counting a live session up to `now`.
+    pub fn minutes_used(&self, now: DateTime<Utc>) -> u32 {
+        let end = self.ended_at.unwrap_or(now);
+        (end - self.started_at).num_minutes().max(0) as u32
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalKind {
+    Note,
+    Todo,
+    Skill,
+    Research,
+    Other,
+}
+
+impl ProposalKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalKind::Note => "note",
+            ProposalKind::Todo => "todo",
+            ProposalKind::Skill => "skill",
+            ProposalKind::Research => "research",
+            ProposalKind::Other => "other",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "note" | "notes" => Some(ProposalKind::Note),
+            "todo" | "to-do" | "to_do" | "task" => Some(ProposalKind::Todo),
+            "skill" | "draft_skill" => Some(ProposalKind::Skill),
+            "research" | "digest" | "research_digest" => Some(ProposalKind::Research),
+            "other" => Some(ProposalKind::Other),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    #[default]
+    Open,
+    Accepted,
+    /// Accepted after the person edited it.
+    Edited,
+    Dismissed,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl ProposalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProposalStatus::Open => "open",
+            ProposalStatus::Accepted => "accepted",
+            ProposalStatus::Edited => "edited",
+            ProposalStatus::Dismissed => "dismissed",
+        }
+    }
+}
+
+/// An agent-time output. Proposals are the only thing agent time produces;
+/// accepting one is a UI action, never a tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Proposal {
+    pub id: String,
+    pub kind: ProposalKind,
+    pub title: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub status: ProposalStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub resolved_at: Option<DateTime<Utc>>,
+    /// The agent-time session that filed it.
+    pub session_id: String,
+}
+
+/// Trust-ledger evidence (SYMBIOTIC_PLANNER.md §3). Evidence only: it never
+/// grants anything — `measures::suggest_scope_widening` can only suggest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TrustLedger {
+    #[serde(default)]
+    pub proposals_accepted: u32,
+    /// Accepted after editing (counts as accepted for the rate, noted apart).
+    #[serde(default)]
+    pub proposals_edited: u32,
+    #[serde(default)]
+    pub proposals_dismissed: u32,
+    #[serde(default)]
+    pub in_scope_attempts: u32,
+    #[serde(default)]
+    pub out_of_scope_attempts: u32,
+    #[serde(default)]
+    pub promises_kept: u32,
+    #[serde(default)]
+    pub promises_broken: u32,
+    /// Sessions that ended with zero out-of-scope attempts.
+    #[serde(default)]
+    pub clean_sessions: u32,
+}
+
+#[allow(dead_code)] // wave 2: Planner UI / weekly review
+impl TrustLedger {
+    /// Accepted (incl. edited) over everything decided; `None` before any.
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        let ok = self.proposals_accepted + self.proposals_edited;
+        let total = ok + self.proposals_dismissed;
+        (total > 0).then(|| ok as f64 / total as f64)
+    }
+
+    pub fn in_scope_rate(&self) -> Option<f64> {
+        let total = self.in_scope_attempts + self.out_of_scope_attempts;
+        (total > 0).then(|| self.in_scope_attempts as f64 / total as f64)
+    }
+}
+
 // ── Todo ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -589,6 +1243,34 @@ pub struct Todo {
     #[serde(default)]
     pub latest_progress: Option<String>,
 
+    // ── Symbiotic planner (SYMBIOTIC_PLANNER.md §4) ─────────────────────────
+    // Every field defaults, so rows written before the lanes existed load as
+    // untriaged human to-dos.
+    /// Who spends time on it: the person (default) or an agent.
+    #[serde(default)]
+    pub lane: Lane,
+    /// For human to-dos: commitment, chore or your time. `None` = not
+    /// triaged. Ignored (and cleared by the tools) on agent to-dos.
+    #[serde(default)]
+    pub kind: Option<HumanKind>,
+    /// Your-time category ("Reading", "Outside"…) for `kind = YourTime`
+    /// to-dos — matched case-insensitively against `TimeGoal.category`. When
+    /// unset, the first tag naming a goal's category is used instead.
+    #[serde(default)]
+    pub time_category: Option<String>,
+    /// For agent to-dos: the definition of done the agent works toward.
+    #[serde(default)]
+    pub outcome: Option<String>,
+    /// For agent to-dos: where the work stands. Derived from the linked
+    /// worker's fleet status and brief wherever possible (see
+    /// `lanes::derive_agent_state`) — reported, never judged.
+    #[serde(default)]
+    pub agent_state: Option<AgentState>,
+    /// The decision the agent needs from the person (open while
+    /// `resolved` is `None`).
+    #[serde(default)]
+    pub decision: Option<Decision>,
+
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(default)]
@@ -604,6 +1286,38 @@ impl Todo {
             self.bucket = TodoBucket::Anytime;
         }
         self.project_id = project_id;
+    }
+
+    /// Whether an agent is waiting on an unanswered decision.
+    pub fn has_open_decision(&self) -> bool {
+        self.decision.as_ref().is_some_and(Decision::is_open)
+    }
+
+    /// Move the to-do between lanes, keeping the per-lane fields coherent:
+    /// entering the agent lane drops the human `kind` and starts `Queued`
+    /// (unless a state is already known); returning to the human lane
+    /// clears the agent state and any open decision. `outcome` is kept
+    /// either way — it is the person's words.
+    pub fn set_lane(&mut self, lane: Lane) {
+        if self.lane == lane {
+            return;
+        }
+        self.lane = lane;
+        match lane {
+            Lane::Agent => {
+                self.kind = None;
+                self.time_category = None;
+                if self.agent_state.is_none() {
+                    self.agent_state = Some(AgentState::Queued);
+                }
+            }
+            Lane::Human => {
+                self.agent_state = None;
+                if self.has_open_decision() {
+                    self.decision = None;
+                }
+            }
+        }
     }
 
     /// A new todo in the Inbox, sorted to the end.
@@ -630,6 +1344,12 @@ impl Todo {
             origin: TodoOrigin::User,
             linked_fleet_session: None,
             latest_progress: None,
+            lane: Lane::Human,
+            kind: None,
+            time_category: None,
+            outcome: None,
+            agent_state: None,
+            decision: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -708,6 +1428,22 @@ impl Todo {
         for tag in &self.tags {
             parts.push(format!("#{}", tag));
         }
+        // Lane markers only when they say something: an untriaged human
+        // to-do (every pre-lanes row) reads exactly as before.
+        match self.lane {
+            Lane::Agent => parts.push(match self.agent_state {
+                Some(s) => format!("agent: {}", s.label()),
+                None => "agent".to_string(),
+            }),
+            Lane::Human => {
+                if let Some(k) = self.kind {
+                    match (k, self.time_category.as_deref()) {
+                        (HumanKind::YourTime, Some(c)) => parts.push(format!("your time: {}", c)),
+                        _ => parts.push(k.label().to_string()),
+                    }
+                }
+            }
+        }
 
         let mut out = if parts.is_empty() {
             format!("[{}] {} {}", self.id, mark, self.title)
@@ -720,6 +1456,11 @@ impl Todo {
                 parts.join(", ")
             )
         };
+        if self.lane == Lane::Agent {
+            if let Some(o) = self.outcome.as_deref().filter(|o| !o.trim().is_empty()) {
+                out.push_str(&format!(" → outcome: {}", o.trim()));
+            }
+        }
         // Closed work reports its actuals so the AI sees estimate accuracy
         // (groundwork for the shutdown ritual).
         if self.status.is_closed() && self.actual_minutes > 0 {
@@ -820,6 +1561,18 @@ pub enum BlockSource {
         #[serde(default)]
         tentative: bool,
     },
+    /// Protected your-time (SYMBIOTIC_PLANNER.md §4): placed by the person
+    /// (or by the AI when asked), in a your-time category. The planner plans
+    /// around these and never moves or deletes one without the person's say
+    /// so (`HOBBES_TIME_BLOCK` requires `user_confirmed`).
+    YourTime { category: String },
+    /// A batched chores slot: one block holding several quick chore to-dos
+    /// (`todo_ids`), so chores happen together instead of fragmenting the
+    /// day.
+    Chores {
+        #[serde(default)]
+        todo_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -839,6 +1592,19 @@ impl TimeBlock {
     #[allow(dead_code)]
     pub fn duration_minutes(&self) -> u32 {
         (self.end - self.start).num_minutes().max(0) as u32
+    }
+
+    /// Protected your-time: the planner plans around it.
+    pub fn is_protected(&self) -> bool {
+        matches!(self.source, BlockSource::YourTime { .. })
+    }
+
+    /// The your-time category, for protected blocks.
+    pub fn your_time_category(&self) -> Option<&str> {
+        match &self.source {
+            BlockSource::YourTime { category } => Some(category.as_str()),
+            _ => None,
+        }
     }
 
     /// Whether two blocks overlap in time. Touching edges do not overlap, so a
@@ -996,7 +1762,12 @@ pub fn measure_capacity_with_sessions(
     let mut open = 0u32;
     let mut done = 0u32;
     let mut unestimated = 0usize;
-    for todo in todos.iter().filter(|t| t.scheduled_for == Some(date)) {
+    // The agent lane is not the person's day: agent work never consumes
+    // capacity (its cost to the person is judgment minutes, not hours).
+    for todo in todos
+        .iter()
+        .filter(|t| t.scheduled_for == Some(date) && t.lane == Lane::Human)
+    {
         if todo.status.is_closed() {
             let completed_on_day = todo
                 .completed_at
@@ -1079,10 +1850,17 @@ pub fn meeting_planned_minutes(blocks: &[TimeBlock], date: NaiveDate) -> u32 {
             .map(|b| (b.start, b.end))
             .collect(),
     );
+    // Task blocks are the todo timeboxes (and batched chores). Protected
+    // your-time is not work: a meeting over it still costs the day.
     let tasks = merge_intervals(
         blocks
             .iter()
-            .filter(|b| !matches!(b.source, BlockSource::External { .. }))
+            .filter(|b| {
+                matches!(
+                    b.source,
+                    BlockSource::Manual | BlockSource::Auto | BlockSource::Chores { .. }
+                )
+            })
             .filter(on_day)
             .map(|b| (b.start, b.end))
             .collect(),

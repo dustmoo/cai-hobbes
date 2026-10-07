@@ -58,6 +58,9 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_PROJECT_UPSERT",
     "HOBBES_CALENDAR_LIST",
     "HOBBES_DISPATCH",
+    "HOBBES_DECISIONS",
+    "HOBBES_TIME_GOALS",
+    "HOBBES_AGENT_TIME",
 ];
 
 #[allow(dead_code)]
@@ -114,8 +117,27 @@ pub fn is_planner_tool(name: &str) -> bool {
         || matches!(
             name,
             "HOBBES_PLAN_DAY" | "HOBBES_TIME_BLOCK" | "HOBBES_PROJECT_UPSERT"
-                | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH"
+                | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH" | "HOBBES_DECISIONS"
+                | "HOBBES_TIME_GOALS" | "HOBBES_AGENT_TIME"
         )
+}
+
+/// The agent-time tool family. Never offered to an ordinary chat: it is not
+/// in `PlannerClient::list_tools`, and the agent-time runtime adds
+/// `PlannerClient::agent_time_tools()` only to a session for which
+/// [`agent_time_tool_visible`] holds. Dispatch refuses it from any other
+/// session regardless (belt and braces).
+#[cfg_attr(not(test), allow(dead_code))] // consumer: system_context.rs withholding (wave 2)
+pub fn is_agent_time_tool(name: &str) -> bool {
+    name == "HOBBES_AGENT_TIME"
+}
+
+/// Whether `session_id` is the leased agent-time session — the condition
+/// for offering (and dispatching) `HOBBES_AGENT_TIME`. For the prompt-side
+/// tool list (system_context.rs, wave 2).
+#[allow(dead_code)] // consumer: the agent-time runtime's prompt wiring (wave 2)
+pub fn agent_time_tool_visible(planner: &crate::todo::PlannerState, session_id: &str) -> bool {
+    planner.is_agent_time_session(session_id)
 }
 
 /// The app-state signals a built-in handler may need.
@@ -472,6 +494,41 @@ fn run_planner_tool(
         "HOBBES_PROJECT_UPSERT" => {
             handlers::handle_project_upsert(&mut planner.write(), args_json, today, true)
         }
+        "HOBBES_TIME_GOALS" => {
+            handlers::handle_time_goals(&mut planner.write(), args_json, today, true)
+        }
+        "HOBBES_AGENT_TIME" => {
+            // The handler itself refuses unless this session holds the
+            // agent-time lease and the grant allows it today.
+            handlers::handle_agent_time(&mut planner.write(), args_json, session_id, today, true)
+        }
+        "HOBBES_DECISIONS" => {
+            let caller_name = deps
+                .session_state
+                .peek()
+                .sessions
+                .get(session_id)
+                .map(|s| s.name.clone());
+            // "N handled by your rules today": trust-rule hits from the gate
+            // log (empty when the store is unavailable).
+            let rule_hits = Some(crate::todo::measures::routing_rule_hits_on(
+                &crate::context::trust_store::recent(500),
+                today,
+            ));
+            let outcome = handlers::handle_decisions(
+                &mut planner.write(),
+                args_json,
+                caller_name.as_deref(),
+                rule_hits,
+                true,
+            );
+            let mut response = outcome.response;
+            if let Some(entry) = outcome.deliver {
+                response.push('\n');
+                response.push_str(&deliver_decision(deps, &entry));
+            }
+            (outcome.status, response)
+        }
         "HOBBES_CALENDAR_LIST" => {
             // Read-only over the calendar cache — no planner mutation, so no
             // state/persist. Subscription roster and sync errors are resolved
@@ -498,6 +555,91 @@ fn run_planner_tool(
             ),
         ),
     }
+}
+
+/// Hand a resolved decision back to its worker, through whatever channel
+/// exists, and record how it went (`lanes::record_delivery`).
+///
+/// - A Hobbes chat worker (the linked session is a chat): the answer is
+///   queued as a user message to that session (`CHAT_QUEUE`); it sends when
+///   that tab is next active.
+/// - A headless Claude Code run: the fleet has no input channel into a
+///   running or finished `claude -p`, so the answer is recorded on the to-do
+///   and surfaced in its progress line, and the to-do returns to `Queued`
+///   for a resume.
+fn deliver_decision(
+    deps: BuiltinToolCtx,
+    entry: &crate::todo::model::ResolvedDecision,
+) -> String {
+    use crate::todo::model::DecisionDelivery;
+    let mut planner = deps.planner;
+    let linked = planner
+        .peek()
+        .todo(&entry.todo_id)
+        .and_then(|t| t.linked_fleet_session.clone());
+    let is_chat = |sid: &str| {
+        deps.session_state.peek().sessions.contains_key(sid)
+            || crate::session_store::contains(sid)
+            || crate::fleet::shared()
+                .snapshot()
+                .sessions
+                .get(sid)
+                .is_some_and(|r| r.origin == crate::fleet::FleetOrigin::Hobbes)
+    };
+    let (delivery, msg) = match linked.as_deref() {
+        Some(sid) if is_chat(sid) => {
+            crate::components::chat_queue::queue_push(
+                &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+                sid,
+                crate::components::chat_queue::QueuedMessage::new(
+                    crate::todo::lanes::answer_message(entry),
+                    vec![],
+                ),
+            );
+            crate::components::chat_queue::request_drain();
+            (
+                DecisionDelivery::ChatQueued { session_id: sid.to_string() },
+                "Handed back to the worker's chat as a message; it sends when that tab is next \
+                 active."
+                    .to_string(),
+            )
+        }
+        Some(_) => (
+            DecisionDelivery::NotDelivered {
+                reason: "the worker is a headless Claude Code run; the fleet has no channel to \
+                         send it input"
+                    .into(),
+            },
+            "Not delivered: this worker is a headless Claude Code run and the fleet has no \
+             channel to send it input. The answer is recorded on the to-do (shown in its \
+             progress) and the to-do is back in the queue — re-dispatch it to continue with \
+             the answer."
+                .to_string(),
+        ),
+        None => (
+            DecisionDelivery::NotDelivered { reason: "no worker is linked to this to-do".into() },
+            "Not delivered: no worker is linked to this to-do. The answer is recorded on it; \
+             dispatch it to continue."
+                .to_string(),
+        ),
+    };
+    let updated = crate::todo::lanes::record_delivery(
+        &mut planner.write(),
+        &entry.id,
+        delivery,
+        chrono::Utc::now(),
+    );
+    if let Some(d) = updated {
+        if let Err(e) = crate::todo::store::save_resolved_decision(&d) {
+            tracing::error!("Failed to persist decision delivery {}: {}", d.id, e);
+        }
+    }
+    if let Some(t) = planner.peek().todo(&entry.todo_id) {
+        if let Err(e) = crate::todo::store::save_todo(t) {
+            tracing::error!("Failed to persist todo {}: {}", t.id, e);
+        }
+    }
+    msg
 }
 
 /// The model-invocation path for skills: execute the skill (capability
@@ -762,6 +904,31 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    /// HOBBES_AGENT_TIME is dispatchable and planner-gated, but never
+    /// advertised by `list_tools` — ordinary chats must not see it.
+    #[test]
+    fn agent_time_tool_is_dispatchable_but_withheld() {
+        let listed: Vec<String> = crate::mcp::planner_client::PlannerClient::new()
+            .list_tools()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        for tool in crate::mcp::planner_client::PlannerClient::agent_time_tools() {
+            assert!(is_builtin_tool(&tool.name));
+            assert!(is_planner_tool(&tool.name));
+            assert!(is_agent_time_tool(&tool.name));
+            assert!(!listed.contains(&tool.name.to_string()), "{} must not be in list_tools", tool.name);
+        }
+        let mut planner = crate::todo::PlannerState::default();
+        assert!(!agent_time_tool_visible(&planner, "chat"));
+        planner.agent_time_lease = Some(crate::todo::agent_time::AgentTimeLease {
+            chat_session_id: "chat".into(),
+            opened_at: chrono::Utc::now(),
+        });
+        assert!(agent_time_tool_visible(&planner, "chat"));
+        assert!(!agent_time_tool_visible(&planner, "other"));
     }
 
     #[test]
