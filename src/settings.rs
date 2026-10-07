@@ -671,6 +671,77 @@ impl ComposioToolkitConfig {
 /// Matches the 10-model-slot / digit-hotkey idiom used elsewhere.
 pub const MAX_LLM_CONNECTORS: usize = 10;
 
+/// One model the user has made available for delegated work
+/// ([`Settings::allowed_models`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedModel {
+    pub connector_id: String,
+    pub connector_name: String,
+    pub provider: LlmProvider,
+    pub model: String,
+}
+
+impl AllowedModel {
+    pub fn choice(&self) -> ModelChoice {
+        ModelChoice {
+            connector_id: self.connector_id.clone(),
+            connector_name: self.connector_name.clone(),
+            provider: self.provider,
+            model: Some(self.model.clone()),
+        }
+    }
+}
+
+/// A validated connector (+ optional model) to pin a session to
+/// ([`Settings::resolve_model_choice`]). `model: None` = the connector's own
+/// active model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub connector_id: String,
+    pub connector_name: String,
+    pub provider: LlmProvider,
+    pub model: Option<String>,
+}
+
+/// `"Claude: claude-haiku-5-5, claude-opus-5-5; Gemini: gemini-3.7-flash"`:
+/// the allowed list grouped by connector, in the list's (stable) order.
+pub fn allowed_models_listing(allowed: &[AllowedModel]) -> String {
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for a in allowed {
+        match groups.last_mut() {
+            Some((id, models)) if *id == a.connector_id => models.push(&a.model),
+            _ => groups.push((a.connector_id.clone(), vec![&a.model])),
+        }
+    }
+    groups
+        .iter()
+        .map(|(id, models)| {
+            let name = allowed
+                .iter()
+                .find(|a| &a.connector_id == id)
+                .map(|a| a.connector_name.as_str())
+                .unwrap_or("");
+            format!("{name}: {}", models.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// A short human label for a model slug, as a card or toast shows it:
+/// `claude-haiku-5-5` → "Haiku 5.5", `gemini-3.7-flash` → "Gemini 3.7
+/// Flash"; anything else is shown as-is.
+pub fn short_model_label(slug: &str) -> String {
+    let s = slug.trim();
+    if s.starts_with("claude-") {
+        let name = crate::llm::claude_models::ClaudeModel::from_slug(s).display_name();
+        return name.strip_prefix("Claude ").unwrap_or(&name).to_string();
+    }
+    if s.starts_with("gemini") || s.starts_with("models/gemini") {
+        return crate::llm::gemini::GeminiModel::from_slug(s).display_name();
+    }
+    s.to_string()
+}
+
 /// A named LLM connector instance ("flavor") — one configured endpoint/key
 /// combination of a given provider kind. Mirrors the ComposioProfile pattern.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1426,6 +1497,135 @@ impl Settings {
             ProviderInstanceConfig::Claude(c) => {
                 c.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
             }
+        }
+    }
+
+    /// The models the user has made available for delegated work (a
+    /// dispatched chat, agent time): for each configured connector, its
+    /// non-empty quick-switch slots plus its active and summary models.
+    /// Sorted by connector name (then id), then model slug, and deduplicated,
+    /// so the list is stable: it rides in the cached tool prefix and must
+    /// change only when the settings do.
+    pub fn allowed_models(&self) -> Vec<AllowedModel> {
+        let mut out: Vec<AllowedModel> = Vec::new();
+        for inst in self.llm_connectors.iter().filter(|c| self.is_connector_configured(c)) {
+            let summary = match &inst.config {
+                ProviderInstanceConfig::Gemini(c) => Some(c.summary_model.clone()),
+                ProviderInstanceConfig::OpenAiCompat(c) => c.summary_model.clone(),
+                ProviderInstanceConfig::Claude(c) => c.summary_model.clone(),
+            };
+            let candidates = inst
+                .config
+                .model_slots()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(inst.config.chat_model()))
+                .chain(summary);
+            for m in candidates {
+                let m = m.trim();
+                if m.is_empty() {
+                    continue;
+                }
+                out.push(AllowedModel {
+                    connector_id: inst.id.clone(),
+                    connector_name: inst.name.trim().to_string(),
+                    provider: inst.provider(),
+                    model: m.to_string(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.connector_name
+                .to_lowercase()
+                .cmp(&b.connector_name.to_lowercase())
+                .then_with(|| a.connector_id.cmp(&b.connector_id))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        out.dedup_by(|a, b| a.connector_id == b.connector_id && a.model == b.model);
+        out
+    }
+
+    /// Validate a model choice for delegated work against
+    /// [`Self::allowed_models`]. `connector` is a connector instance name
+    /// (case-insensitive) or id; `model` a model slug.
+    ///
+    /// - neither: `Ok(None)` (the user's default applies);
+    /// - connector only: that connector with its own active model;
+    /// - model only: the connector offering it (the global active connector
+    ///   when it does, else the first in list order);
+    /// - both: the model must be one of that connector's.
+    ///
+    /// Anything else is an error naming what is allowed: never a silent
+    /// fallback to some other connector or model.
+    pub fn resolve_model_choice(
+        &self,
+        connector: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<ModelChoice>, String> {
+        let connector = connector.map(str::trim).filter(|c| !c.is_empty());
+        let model = model.map(str::trim).filter(|m| !m.is_empty());
+        if connector.is_none() && model.is_none() {
+            return Ok(None);
+        }
+        let allowed = self.allowed_models();
+        let listing = || {
+            if allowed.is_empty() {
+                "no connector is configured".to_string()
+            } else {
+                format!("allowed: {}", allowed_models_listing(&allowed))
+            }
+        };
+        let inst = match connector {
+            Some(c) => {
+                let found = self
+                    .llm_connectors
+                    .iter()
+                    .find(|i| i.id == c)
+                    .or_else(|| self.llm_connectors.iter().find(|i| i.name.trim().eq_ignore_ascii_case(c)));
+                match found {
+                    Some(i) if self.is_connector_configured(i) => Some(i),
+                    Some(i) => {
+                        return Err(format!(
+                            "connector '{}' isn't configured (no API key or endpoint); {}",
+                            i.name,
+                            listing()
+                        ))
+                    }
+                    None => return Err(format!("unknown connector '{c}'; {}", listing())),
+                }
+            }
+            None => None,
+        };
+        match (inst, model) {
+            (Some(i), None) => Ok(Some(ModelChoice {
+                connector_id: i.id.clone(),
+                connector_name: i.name.clone(),
+                provider: i.provider(),
+                model: None,
+            })),
+            (Some(i), Some(m)) => allowed
+                .iter()
+                .find(|a| a.connector_id == i.id && a.model.eq_ignore_ascii_case(m))
+                .map(|a| Some(a.choice()))
+                .ok_or_else(|| {
+                    format!(
+                        "model '{m}' isn't available on connector '{}'; {}",
+                        i.name,
+                        listing()
+                    )
+                }),
+            (None, Some(m)) => {
+                let active = self.active_connector().map(|a| a.id.clone());
+                let offering: Vec<&AllowedModel> =
+                    allowed.iter().filter(|a| a.model.eq_ignore_ascii_case(m)).collect();
+                offering
+                    .iter()
+                    .find(|a| Some(&a.connector_id) == active.as_ref())
+                    .or_else(|| offering.first())
+                    .map(|a| Some(a.choice()))
+                    .ok_or_else(|| format!("model '{m}' isn't one the user has made available; {}", listing()))
+            }
+            (None, None) => Ok(None),
         }
     }
 
@@ -3078,5 +3278,101 @@ mod tests {
         let restored: HotkeySettings = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.toggle_fleet, default_toggle_fleet());
         assert_eq!(restored.quick_capture, "CmdOrCtrl+K");
+    }
+}
+
+/// Test fixture for delegation model choice: a configured Claude connector
+/// (default slots: Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1; summary
+/// Haiku 5.5), a configured local OpenAI-compatible one ("qwen-3.6", no
+/// slots), and an unconfigured one (no endpoint). Claude is the global
+/// active connector.
+#[cfg(test)]
+pub(crate) fn test_delegation_settings() -> Settings {
+    let mut s = Settings::default();
+    let local = OpenAiCompatConfig {
+        endpoint: "http://localhost:8000/v1".to_string(),
+        model: "qwen-3.6".to_string(),
+        ..Default::default()
+    };
+    s.add_connector("Local", ProviderInstanceConfig::OpenAiCompat(local)).unwrap();
+    s.add_connector("Unset", ProviderInstanceConfig::OpenAiCompat(OpenAiCompatConfig::default()))
+        .unwrap();
+    let claude = ClaudeConfig { api_key: Some("test-key".to_string()), ..Default::default() };
+    s.add_connector("Claude", ProviderInstanceConfig::Claude(claude)).unwrap();
+    s
+}
+
+#[cfg(test)]
+mod allowed_model_tests {
+    use super::*;
+
+    fn pairs(s: &Settings) -> Vec<(String, String)> {
+        s.allowed_models().into_iter().map(|a| (a.connector_name, a.model)).collect()
+    }
+
+    #[test]
+    fn allowed_list_is_slots_plus_active_and_summary_sorted_and_stable() {
+        let s = test_delegation_settings();
+        let p = pairs(&s);
+        let expect: Vec<(String, String)> = [
+            ("Claude", "claude-fable-5-1"),
+            ("Claude", "claude-haiku-5-5"),
+            ("Claude", "claude-opus-5-5"),
+            ("Claude", "claude-sonnet-5-5"),
+            ("Local", "qwen-3.6"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert_eq!(p, expect, "unconfigured connectors and empty slots are left out");
+
+        // Connector order in settings doesn't matter: the list is sorted.
+        let mut reordered = s.clone();
+        reordered.llm_connectors.reverse();
+        assert_eq!(pairs(&reordered), expect);
+        // Same input, same output.
+        assert_eq!(s.allowed_models(), s.allowed_models());
+        assert_eq!(
+            allowed_models_listing(&s.allowed_models()),
+            "Claude: claude-fable-5-1, claude-haiku-5-5, claude-opus-5-5, claude-sonnet-5-5; \
+             Local: qwen-3.6"
+        );
+    }
+
+    #[test]
+    fn model_choice_validates_against_the_allowed_list() {
+        let s = test_delegation_settings();
+        assert_eq!(s.resolve_model_choice(None, None).unwrap(), None);
+
+        let c = s.resolve_model_choice(Some("claude"), Some("claude-haiku-5-5")).unwrap().unwrap();
+        assert_eq!(c.connector_name, "Claude");
+        assert_eq!(c.provider, LlmProvider::Claude);
+        assert_eq!(c.model.as_deref(), Some("claude-haiku-5-5"));
+
+        // Model only: found on the connector offering it.
+        let c = s.resolve_model_choice(None, Some("qwen-3.6")).unwrap().unwrap();
+        assert_eq!(c.connector_name, "Local");
+        // Connector only (by id): its own active model.
+        let local_id = s.llm_connectors.iter().find(|c| c.name == "Local").unwrap().id.clone();
+        let c = s.resolve_model_choice(Some(&local_id), None).unwrap().unwrap();
+        assert_eq!((c.connector_id.as_str(), c.model.as_deref()), (local_id.as_str(), None));
+
+        // Errors list what is allowed; never a silent fallback.
+        let e = s.resolve_model_choice(None, Some("gpt-9")).unwrap_err();
+        assert!(e.contains("gpt-9") && e.contains("Claude: claude-fable-5-1"), "{e}");
+        let e = s.resolve_model_choice(Some("Bedrock"), Some("claude-haiku-5-5")).unwrap_err();
+        assert!(e.contains("unknown connector 'Bedrock'") && e.contains("allowed:"), "{e}");
+        let e = s.resolve_model_choice(Some("Local"), Some("claude-haiku-5-5")).unwrap_err();
+        assert!(e.contains("isn't available on connector 'Local'"), "{e}");
+        let e = s.resolve_model_choice(Some("Unset"), None).unwrap_err();
+        assert!(e.contains("isn't configured"), "{e}");
+    }
+
+    #[test]
+    fn short_labels_read_like_names() {
+        assert_eq!(short_model_label("claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(short_model_label("gemini-3.7-flash"), "Gemini 3.7 Flash");
+        assert_eq!(short_model_label("qwen-3.6"), "qwen-3.6");
+        assert_eq!(short_model_label("sonnet"), "sonnet");
     }
 }

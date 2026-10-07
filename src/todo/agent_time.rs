@@ -498,12 +498,39 @@ impl PlannerState {
         today: NaiveDate,
         now: DateTime<Utc>,
     ) -> Result<(Proposal, AgentTimeSession), AgentTimeRefusal> {
+        self.agent_time_propose_in(caller, kind, title, body, None, today, now)
+    }
+
+    /// [`Self::agent_time_propose`] with the lane of a suggested to-do:
+    /// `Some(Lane::Agent)` when the agent files it as its own work (accepting
+    /// it can then start it); ignored for every kind but `Todo`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_time_propose_in(
+        &mut self,
+        caller: &str,
+        kind: ProposalKind,
+        title: &str,
+        body: &str,
+        lane: Option<Lane>,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> Result<(Proposal, AgentTimeSession), AgentTimeRefusal> {
         if kind == ProposalKind::Offer {
             return Err(AgentTimeRefusal::Invalid(
                 "An offer needs the 'todo_id' of the task you offer to take.".into(),
             ));
         }
-        self.file_proposal(caller, kind, title, body, None, today, now)
+        let lane = lane.filter(|l| kind == ProposalKind::Todo && *l == Lane::Agent);
+        let filed = self.file_proposal(caller, kind, title, body, None, today, now)?;
+        if lane.is_none() {
+            return Ok(filed);
+        }
+        let (mut p, s) = filed;
+        p.lane = lane;
+        if let Some(stored) = self.proposals.iter_mut().find(|x| x.id == p.id) {
+            stored.lane = lane;
+        }
+        Ok((p, s))
     }
 
     /// `propose(kind: offer, todo_id, body)`: offer to take one of the
@@ -578,6 +605,7 @@ impl PlannerState {
             resolved_at: None,
             session_id,
             todo_id,
+            lane: None,
         };
         let s = self
             .open_agent_time_session_mut()
@@ -687,6 +715,15 @@ impl PlannerState {
         usd: f64,
     ) -> Option<AgentTimeSession> {
         let in_chat = |s: &AgentTimeSession| s.chat_session_id.as_deref() == Some(chat_session_id);
+        // While a lease on this chat is held, only a session started under
+        // that lease takes the fallback: the chat is reused across the day's
+        // runs, and a new run's spend before its `start` must stay pending,
+        // not land on the previous run's record.
+        let lease_opened = self
+            .agent_time_lease
+            .as_ref()
+            .filter(|l| l.chat_session_id == chat_session_id)
+            .map(|l| l.opened_at);
         let idx = self
             .agent_time_sessions
             .iter()
@@ -696,6 +733,7 @@ impl PlannerState {
                     .iter()
                     .enumerate()
                     .filter(|(_, s)| in_chat(s))
+                    .filter(|(_, s)| lease_opened.is_none_or(|at| s.started_at >= at))
                     .max_by_key(|(_, s)| s.started_at)
                     .map(|(i, _)| i)
             })?;
@@ -910,12 +948,151 @@ pub fn agent_time_context(lists: &AgentTimeTaskLists, owner: &str) -> String {
     out
 }
 
-/// An accepted `Todo` proposal as a new human to-do in the Inbox. Pure; the
-/// UI upserts and persists it.
+/// An accepted `Todo` proposal as a new to-do. A suggestion for the person
+/// lands in the Inbox as a human to-do with the body as notes; one the agent
+/// filed as its own work (`Proposal::lane == Some(Agent)`) lands in the agent
+/// lane, `Queued`, with the body as its outcome. Pure; the UI upserts and
+/// persists it.
 pub fn proposal_to_todo(p: &Proposal, sort_order: f64) -> super::model::Todo {
     let mut t = super::model::Todo::new(p.title.clone(), sort_order);
-    t.notes = p.body.clone();
+    if p.lane == Some(Lane::Agent) {
+        t.set_lane(Lane::Agent);
+        t.agent_state = Some(AgentState::Queued);
+        t.outcome = Some(p.body.trim().to_string()).filter(|b| !b.is_empty());
+    } else {
+        t.notes = p.body.clone();
+    }
     t
+}
+
+/// Whether accepting `p` can start work: an offer (the to-do moves to the
+/// agent lane) or a suggested to-do the agent filed as its own work. Notes,
+/// research, skills and plain suggestions are saved and start nothing.
+pub fn proposal_starts_work(p: &Proposal) -> bool {
+    match p.kind {
+        ProposalKind::Offer => true,
+        ProposalKind::Todo => p.lane == Some(Lane::Agent),
+        _ => false,
+    }
+}
+
+/// What "Accept & start" does with the accepted to-do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcceptStartRoute {
+    /// An agent-time run is active with budget left: hand the to-do to the
+    /// run in this chat.
+    HandToRun { chat_id: String },
+    /// Otherwise: dispatch it to a new chat worker (user-initiated, so it
+    /// uses no agent time).
+    NewChat,
+}
+
+/// **Pure.** Route an "Accept & start": the running agent-time chat when a
+/// lease is held and today's budget has room, else a new chat worker.
+pub fn accept_start_route(planner: &PlannerState, today: NaiveDate, now: DateTime<Utc>) -> AcceptStartRoute {
+    match &planner.agent_time_lease {
+        Some(l) if planner.agent_time_budget(today, now).refusal().is_none() => {
+            AcceptStartRoute::HandToRun { chat_id: l.chat_session_id.clone() }
+        }
+        _ => AcceptStartRoute::NewChat,
+    }
+}
+
+/// What accepting a proposal changed, for the UI to persist and show.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AcceptedProposal {
+    pub proposal: Proposal,
+    /// The to-do created (a `Todo` proposal) or handed over (an `Offer`).
+    pub todo: Option<Todo>,
+}
+
+impl PlannerState {
+    /// **UI action.** Accept (or accept-after-edit) a proposal and apply it:
+    /// an offer hands the person's to-do to the agent lane (`Queued`); a
+    /// suggested to-do is created ([`proposal_to_todo`]); every other kind is
+    /// only marked accepted. Starting work is a separate step ("Accept &
+    /// start"). Returns what changed; persist the proposal, the to-do and the
+    /// trust ledger.
+    pub fn accept_proposal(
+        &mut self,
+        id: &str,
+        edited: Option<(String, String)>,
+        now: DateTime<Utc>,
+    ) -> Option<AcceptedProposal> {
+        let p = self.resolve_proposal(id, ProposalStatus::Accepted, edited, now)?;
+        let todo = match p.kind {
+            ProposalKind::Offer => self.apply_accepted_offer(&p, now),
+            ProposalKind::Todo => {
+                let t = proposal_to_todo(&p, self.next_sort_order());
+                self.upsert_todo(t.clone());
+                Some(t)
+            }
+            _ => None,
+        };
+        Some(AcceptedProposal { proposal: p, todo })
+    }
+
+    /// **UI action** ("Accept & start" while agent time runs): hand to-do
+    /// `todo_id` to the agent-time run in `chat_id`. When the run has
+    /// declared its intent and has no to-do yet, the to-do becomes its
+    /// session's `todo_id`; either way the hand-off is an `Event` on the log.
+    /// Returns the message to queue into the chat and the session to persist
+    /// (`None` before `start`: the message tells the model to start on it).
+    pub fn hand_todo_to_run(
+        &mut self,
+        chat_id: &str,
+        todo_id: &str,
+        owner: &str,
+        offer: bool,
+        now: DateTime<Utc>,
+    ) -> Option<(String, Option<AgentTimeSession>)> {
+        if !self.is_agent_time_session(chat_id) {
+            return None;
+        }
+        let t = self.todo(todo_id)?;
+        let (title, id) = (t.title.clone(), t.id.clone());
+        let done_when = t
+            .outcome
+            .as_deref()
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(|o| format!(" Done when: {o}."))
+            .unwrap_or_default();
+        let what = if offer { "your offer" } else { "your proposed to-do" };
+        let mut msg = format!("{owner} accepted {what}: work on {title} (todo {id}).{done_when}");
+        let session = match self
+            .agent_time_sessions
+            .iter_mut()
+            .find(|s| s.is_open() && s.chat_session_id.as_deref() == Some(chat_id))
+        {
+            Some(s) => {
+                if s.todo_id.is_none() {
+                    s.todo_id = Some(id.clone());
+                    msg.push_str(" It is now this run's to-do; carry on.");
+                } else {
+                    msg.push_str(
+                        " Take it up when you finish your current to-do, or end this session and \
+                         start a new one with its todo_id.",
+                    );
+                }
+                Self::push_line(
+                    s,
+                    AgentTimeLogKind::Event,
+                    "runtime",
+                    &format!("{owner} accepted and handed over: {title}"),
+                    now,
+                );
+                Some(s.clone())
+            }
+            None => {
+                msg.push_str(&format!(
+                    " Declare your intent with HOBBES_AGENT_TIME start (todo_id: {id}) and work on it."
+                ));
+                None
+            }
+        };
+        Some((msg, session))
+    }
 }
 
 // ── Scope gate ──────────────────────────────────────────────────────────────
@@ -1767,5 +1944,114 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(sess.todo_id, None);
+    }
+
+    // ── accepting starts work ───────────────────────────────────────────
+
+    #[test]
+    fn a_todo_the_agent_files_as_its_own_work_lands_in_the_agent_lane() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        let (mine, _) = s
+            .agent_time_propose_in("chat-at", ProposalKind::Todo, "Digest the KV notes", "A one-page digest in Notes", Some(Lane::Agent), today(), now)
+            .unwrap();
+        assert_eq!(mine.lane, Some(Lane::Agent));
+        assert_eq!(s.proposals.iter().find(|p| p.id == mine.id).unwrap().lane, Some(Lane::Agent), "stored too");
+        assert!(proposal_starts_work(&mine));
+        let t = proposal_to_todo(&mine, 1.0);
+        assert_eq!(t.lane, Lane::Agent);
+        assert_eq!(t.agent_state, Some(AgentState::Queued));
+        assert_eq!(t.outcome.as_deref(), Some("A one-page digest in Notes"));
+
+        // A suggestion for the person stays a human Inbox to-do.
+        let (yours, _) = s
+            .agent_time_propose_in("chat-at", ProposalKind::Todo, "Renew passport", "Expires in May", None, today(), now)
+            .unwrap();
+        assert!(!proposal_starts_work(&yours));
+        let t = proposal_to_todo(&yours, 1.0);
+        assert_eq!((t.lane, t.notes.as_str(), t.outcome.clone()), (Lane::Human, "Expires in May", None));
+        // A lane on anything but a to-do is ignored; notes never start work.
+        let (note, _) = s
+            .agent_time_propose_in("chat-at", ProposalKind::Note, "n", "b", Some(Lane::Agent), today(), now)
+            .unwrap();
+        assert_eq!(note.lane, None);
+        assert!(!proposal_starts_work(&note));
+    }
+
+    #[test]
+    fn accept_only_leaves_the_work_queued() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        // Offer: the person's to-do moves to the agent lane, Queued.
+        let human = todo_in(&mut s, "Draft the release notes", Lane::Human, None);
+        let (offer, _) = s.agent_time_offer("chat-at", &human, "From the changelog.", today(), now).unwrap();
+        let done = s.accept_proposal(&offer.id, None, now).unwrap();
+        let t = done.todo.expect("handed over");
+        assert_eq!((t.id.as_str(), t.lane, t.agent_state), (human.as_str(), Lane::Agent, Some(AgentState::Queued)));
+        assert_eq!(t.linked_fleet_session, None, "no worker started");
+        // Agent-lane to-do proposal: created Queued.
+        let (mine, _) = s
+            .agent_time_propose_in("chat-at", ProposalKind::Todo, "Digest", "Digest in Notes", Some(Lane::Agent), today(), now)
+            .unwrap();
+        let done = s.accept_proposal(&mine.id, None, now).unwrap();
+        let t = done.todo.unwrap();
+        assert_eq!((t.lane, t.agent_state), (Lane::Agent, Some(AgentState::Queued)));
+        assert!(s.todo(&t.id).is_some(), "created in the planner");
+        // Research: saved, nothing made.
+        let (r, _) = s.agent_time_propose("chat-at", ProposalKind::Research, "r", "b", today(), now).unwrap();
+        let done = s.accept_proposal(&r.id, None, now).unwrap();
+        assert_eq!((done.proposal.status, done.todo), (ProposalStatus::Accepted, None));
+        assert_eq!(s.trust_ledger.proposals_accepted, 3);
+        assert!(s.accept_proposal(&r.id, None, now).is_none(), "only once");
+    }
+
+    #[test]
+    fn accept_and_start_goes_to_the_running_session_or_a_new_chat() {
+        let now = Utc::now();
+        // A run with budget left takes it.
+        let s = leased();
+        assert_eq!(
+            accept_start_route(&s, today(), now),
+            AcceptStartRoute::HandToRun { chat_id: "chat-at".into() }
+        );
+        // No run: a new chat worker.
+        let idle = PlannerState { agent_time_grant: granted(), ..Default::default() };
+        assert_eq!(accept_start_route(&idle, today(), now), AcceptStartRoute::NewChat);
+        // A run whose budget is spent doesn't take more work.
+        let mut spent = leased();
+        spent.agent_time_start("chat-at", "x", today(), now).unwrap();
+        spent.add_agent_time_cost(5.0);
+        assert_eq!(accept_start_route(&spent, today(), now), AcceptStartRoute::NewChat);
+    }
+
+    #[test]
+    fn handing_a_todo_to_the_run_sets_its_todo_and_logs_an_event() {
+        let now = Utc::now();
+        let mut s = leased();
+        let id = todo_in(&mut s, "Draft the release notes", Lane::Agent, Some(AgentState::Queued));
+        s.todo_mut(&id).unwrap().outcome = Some("Notes drafted in the repo".into());
+        // Before `start`: the message asks for start with the todo_id.
+        let (msg, sess) = s.hand_todo_to_run("chat-at", &id, "Dustin", true, now).unwrap();
+        assert!(sess.is_none());
+        assert!(msg.starts_with(&format!(
+            "Dustin accepted your offer: work on Draft the release notes (todo {id}). Done when: Notes drafted in the repo."
+        )), "{msg}");
+        assert!(msg.contains(&format!("start (todo_id: {id})")), "{msg}");
+
+        // After `start` with no to-do: it becomes the run's to-do.
+        s.agent_time_start("chat-at", "Tidy notes", today(), now).unwrap();
+        let (msg, sess) = s.hand_todo_to_run("chat-at", &id, "Dustin", false, now).unwrap();
+        let sess = sess.unwrap();
+        assert_eq!(sess.todo_id.as_deref(), Some(id.as_str()));
+        assert!(msg.contains("accepted your proposed to-do") && msg.contains("carry on"), "{msg}");
+        let last = sess.tool_calls.last().unwrap();
+        assert_eq!(last.kind, AgentTimeLogKind::Event);
+        assert!(last.summary.contains("handed over: Draft the release notes"));
+        assert_eq!(sess.call_count(), 1, "the event is not a call");
+
+        // Only the leased chat.
+        assert!(s.hand_todo_to_run("other-chat", &id, "Dustin", true, now).is_none());
     }
 }

@@ -2577,7 +2577,11 @@ pub fn handle_agent_time_for(
                     let pitch = if text("body").trim().is_empty() { text("title") } else { text("body") };
                     state.agent_time_offer(session_id, text("todo_id"), pitch, today, now)
                 } else {
-                    state.agent_time_propose(session_id, kind, text("title"), text("body"), today, now)
+                    let lane = match text("lane").trim().to_ascii_lowercase().as_str() {
+                        "agent" | "hobbes" | "mine" => Some(model::Lane::Agent),
+                        _ => None,
+                    };
+                    state.agent_time_propose_in(session_id, kind, text("title"), text("body"), lane, today, now)
                 };
                 filed.map(|(p, s)| {
                     persist_session(&s);

@@ -245,12 +245,10 @@ pub struct BuiltinToolCtx {
 /// path, never a second hand-rolled copy at a call site). Hook-shaped — call
 /// it unconditionally at the top of a component body.
 ///
-/// Currently unused: the planner row's dispatch handler moved to routing
-/// through `ChatCommand::DispatchTodoToAgent` (handled in main.rs, which
-/// assembles its own `BuiltinToolCtx` from root-scope signals rather than
-/// `use_context`, since the root isn't a descendant of anything). Kept for
-/// the next component-tree call site rather than deleted.
-#[allow(dead_code)]
+/// Used by the Agent time panel's "Accept & start" (it dispatches through
+/// `todo::dispatch::dispatch_to_chat`). main.rs assembles its own
+/// `BuiltinToolCtx` from root-scope signals rather than `use_context`, since
+/// the root isn't a descendant of anything.
 pub(crate) fn builtin_ctx_from_tree() -> BuiltinToolCtx {
     BuiltinToolCtx {
         session_state: use_context(),

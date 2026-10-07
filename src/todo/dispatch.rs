@@ -12,6 +12,7 @@
 use dioxus::prelude::{Readable, Writable};
 
 use crate::components::builtin_tools::BuiltinToolCtx;
+use crate::settings::ModelChoice;
 use crate::todo::model::{AgentState, Lane, Project, Todo, TodoStatus};
 
 /// Dispatching IS handing the to-do to an agent: it joins the agent lane and
@@ -136,10 +137,173 @@ pub fn build_assignment_prompt(
     out
 }
 
+/// The open to-do `todo_id` and its project, or why it can't be dispatched.
+fn dispatchable(deps: &BuiltinToolCtx, todo_id: &str) -> Result<(Todo, Option<Project>), String> {
+    let planner = deps.planner.read();
+    let todo = planner
+        .todo(todo_id)
+        .ok_or_else(|| format!("unknown todo id '{todo_id}'"))?
+        .clone();
+    if matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled) {
+        return Err(format!("todo '{}' is already closed", todo.title));
+    }
+    let project = todo
+        .project_id
+        .as_deref()
+        .and_then(|pid| planner.projects.iter().find(|p| p.id == pid))
+        .cloned();
+    Ok((todo, project))
+}
+
+/// Pin `session` to a validated connector/model choice, exactly as the chat
+/// bar's model switch does (`ChatCommand::SwitchModel` / `SwitchConnector`
+/// in main.rs): the connector id, the legacy provider mirror, and the model
+/// (`None` = the connector's own model).
+pub fn pin_session_model(session: &mut crate::session::Session, choice: &ModelChoice) {
+    session.llm_connector_id = Some(choice.connector_id.clone());
+    session.llm_provider = Some(choice.provider);
+    session.chat_model = choice.model.clone();
+}
+
+/// Clear a session's connector/model pin (back to the user's default).
+pub fn unpin_session_model(session: &mut crate::session::Session) {
+    session.llm_connector_id = None;
+    session.llm_provider = None;
+    session.chat_model = None;
+}
+
+/// Journal a pin so the session's event log replays it.
+pub fn log_pin(session_id: &str, choice: Option<&ModelChoice>) {
+    crate::session_events::log_event(
+        session_id,
+        crate::session_events::SessionEvent::ConnectorPinned {
+            connector_id: choice.map(|c| c.connector_id.clone()),
+            provider: choice.map(|c| format!("{:?}", c.provider)),
+            model: choice.and_then(|c| c.model.clone()),
+        },
+    );
+}
+
+/// How [`dispatch_to_chat`] opens the worker.
+#[derive(Debug, Clone, Default)]
+pub struct ChatDispatchOpts<'a> {
+    /// Extra guidance appended to the assignment.
+    pub instructions: Option<&'a str>,
+    /// A validated model choice to pin the new tab to (`None` = the user's
+    /// default).
+    pub choice: Option<ModelChoice>,
+    /// The chat that asked: its Composio profile is inherited.
+    pub parent_session_id: Option<&'a str>,
+    /// Switch to the new tab (the model's dispatch does). `false` leaves the
+    /// user where they are; the caller opens the tab in the background.
+    pub focus: bool,
+}
+
+/// What [`dispatch_to_chat`] started.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatDispatched {
+    pub session_id: String,
+    pub title: String,
+    /// The model the new chat runs on (its pin, else the default).
+    pub model: String,
+}
+
+/// **The chat branch of `HOBBES_DISPATCH`, reusable**: open a new tab
+/// (project-tagged, pinned to `opts.choice` when given), mark the to-do
+/// dispatched (agent lane, `Working`, linked, `worker_model` recorded) and
+/// queue the assignment, which the background drain sends.
+pub fn dispatch_to_chat(
+    mut deps: BuiltinToolCtx,
+    todo_id: &str,
+    opts: ChatDispatchOpts,
+) -> Result<ChatDispatched, String> {
+    let (todo, project) = dispatchable(&deps, todo_id)?;
+    let mut prompt = build_assignment_prompt(&todo, project.as_ref(), opts.instructions);
+    // Inherit the dispatching tab's Composio profile (else the global
+    // default), as every UI path that opens a tab does. A tab with no
+    // profile would see every profile's Composio tools, which collide by
+    // name ("Duplicate function declaration").
+    let profile = opts
+        .parent_session_id
+        .and_then(|pid| {
+            deps.session_state
+                .peek()
+                .sessions
+                .get(pid)
+                .and_then(|s| s.composio_profile.clone())
+        })
+        .or_else(|| deps.settings.peek().get_active_profile().map(|p| p.id.clone()));
+    let new_id = {
+        let mut state = deps.session_state.write();
+        // create_session makes the new tab the active session; an unfocused
+        // dispatch keeps the user where they are.
+        let previous_active = state.active_session_id.clone();
+        let id = state.create_session(profile);
+        if let Some(s) = state.sessions.get_mut(&id) {
+            s.project_id = todo.project_id.clone();
+            if let Some(c) = &opts.choice {
+                pin_session_model(s, c);
+            }
+        }
+        if !opts.focus && !previous_active.is_empty() {
+            state.active_session_id = previous_active;
+        }
+        id
+    };
+    crate::session_events::log_event(
+        &new_id,
+        crate::session_events::SessionEvent::ProjectTagged {
+            project_id: todo.project_id.clone(),
+            user_set: false,
+        },
+    );
+    if let Some(c) = &opts.choice {
+        log_pin(&new_id, Some(c));
+    }
+    crate::session::SessionState::save_signal(&deps.session_state, None);
+    let model = {
+        let settings = deps.settings.peek();
+        let state = deps.session_state.peek();
+        state
+            .sessions
+            .get(&new_id)
+            .map(|s| settings.chat_model_for_session(s))
+            .unwrap_or_else(|| settings.active_chat_model())
+    };
+    {
+        let mut planner = deps.planner.write();
+        if let Some(t) = planner.todo_mut(todo_id) {
+            mark_dispatched(t, &new_id);
+            t.worker_model = Some(model.clone()).filter(|m| !m.trim().is_empty());
+        }
+    }
+    prompt.push_str(&chat_worker_note(todo_id));
+    if let Some(t) = deps.planner.peek().todo(todo_id) {
+        let _ = crate::todo::store::save_todo(t);
+    }
+    crate::components::chat_queue::queue_push(
+        &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+        &new_id,
+        crate::components::chat_queue::QueuedMessage::new(prompt, vec![]),
+    );
+    if opts.focus {
+        deps.chat_command.set(Some(
+            crate::components::chat_input::ChatCommand::SwitchToSession(new_id.clone()),
+        ));
+    }
+    crate::components::chat_queue::request_drain();
+    Ok(ChatDispatched { session_id: new_id, title: todo.title, model })
+}
+
 /// The HOBBES_DISPATCH handler. Returns (status-ok?, response) like the
 /// other planner handlers; the dispatch layer persists on success.
 /// `parent_session_id` is the chat session the tool call came from — the
 /// conversation that gets handed the result when the run finishes.
+///
+/// `target: "chat"` takes an optional `connector` / `model`, validated
+/// against `Settings::allowed_models` (an invalid choice is an error listing
+/// what is allowed, never a silent fallback). `target: "claude_code"` passes
+/// `model` straight to `claude --model`.
 pub fn handle_dispatch(
     mut deps: BuiltinToolCtx,
     args: &serde_json::Value,
@@ -160,83 +324,32 @@ pub fn handle_dispatch(
         .and_then(|v| v.as_str())
         .map(str::to_string);
 
-    let (todo, project) = {
-        let planner = deps.planner.read();
-        let todo = planner
-            .todo(todo_id)
-            .ok_or_else(|| format!("unknown todo id '{todo_id}'"))?
-            .clone();
-        if matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled) {
-            return Err(format!("todo '{}' is already closed", todo.title));
-        }
-        let project = todo
-            .project_id
-            .as_deref()
-            .and_then(|pid| planner.projects.iter().find(|p| p.id == pid))
-            .cloned();
-        (todo, project)
-    };
-    let mut prompt = build_assignment_prompt(&todo, project.as_ref(), instructions);
+    let (todo, project) = dispatchable(&deps, todo_id)?;
 
     match target {
         "chat" => {
-            // New tab, project-tagged, linked, seeded, focused. Focus-steal
-            // is v1-accepted; background drain is out of scope (the queue
-            // drain only serves the active session).
-            // Inherit the dispatching tab's Composio profile (else the
-            // global default), as every UI path that opens a tab does. A
-            // tab with no profile would see every profile's Composio tools,
-            // which collide by name ("Duplicate function declaration").
-            let profile = parent_session_id
-                .and_then(|pid| {
-                    deps.session_state
-                        .peek()
-                        .sessions
-                        .get(pid)
-                        .and_then(|s| s.composio_profile.clone())
-                })
-                .or_else(|| deps.settings.peek().get_active_profile().map(|p| p.id.clone()));
-            let new_id = deps.session_state.write().create_session(profile);
-            {
-                let mut state = deps.session_state.write();
-                if let Some(s) = state.sessions.get_mut(&new_id) {
-                    s.project_id = todo.project_id.clone();
-                }
-            }
-            crate::session_events::log_event(
-                &new_id,
-                crate::session_events::SessionEvent::ProjectTagged {
-                    project_id: todo.project_id.clone(),
-                    user_set: false,
-                },
-            );
-            crate::session::SessionState::save_signal(&deps.session_state, None);
-            {
-                let mut planner = deps.planner.write();
-                if let Some(t) = planner.todo_mut(todo_id) {
-                    mark_dispatched(t, &new_id);
-                }
-            }
-            prompt.push_str(&chat_worker_note(todo_id));
-            if let Some(t) = deps.planner.peek().todo(todo_id) {
-                let _ = crate::todo::store::save_todo(t);
-            }
-            crate::components::chat_queue::queue_push(
-                &mut crate::components::chat_queue::CHAT_QUEUE.write(),
-                &new_id,
-                crate::components::chat_queue::QueuedMessage::new(prompt, vec![]),
-            );
-            deps.chat_command.set(Some(
-                crate::components::chat_input::ChatCommand::SwitchToSession(new_id.clone()),
-            ));
-            crate::components::chat_queue::request_drain();
+            let connector = args.get("connector").and_then(|v| v.as_str());
+            let choice = deps
+                .settings
+                .peek()
+                .resolve_model_choice(connector, model.as_deref())
+                .map_err(|e| format!("Not dispatched: {e}. Omit connector and model for the user's default."))?;
+            // New tab, project-tagged, pinned, linked, seeded, focused.
+            let d = dispatch_to_chat(
+                deps,
+                todo_id,
+                ChatDispatchOpts { instructions, choice, parent_session_id, focus: true },
+            )?;
             Ok(format!(
-                "Dispatched '{}' to a new chat tab (session {new_id}). The assignment \
+                "Dispatched '{}' to a new chat tab (session {}) on {}. The assignment \
                  sends automatically; progress will flow back onto the todo.",
-                todo.title
+                d.title,
+                d.session_id,
+                crate::settings::short_model_label(&d.model)
             ))
         }
         "claude_code" => {
+            let prompt = build_assignment_prompt(&todo, project.as_ref(), instructions);
             let project =
                 project.ok_or_else(|| {
                     format!(
@@ -263,6 +376,7 @@ pub fn handle_dispatch(
                 let mut planner = deps.planner.write();
                 if let Some(t) = planner.todo_mut(todo_id) {
                     mark_dispatched(t, &run_id);
+                    t.worker_model = model.clone().filter(|m| !m.trim().is_empty());
                 }
             }
             if let Some(t) = deps.planner.peek().todo(todo_id) {
@@ -353,10 +467,15 @@ mod tests {
     }
 
     fn test_ctx(planner: crate::todo::PlannerState) -> BuiltinToolCtx {
+        test_ctx_with(planner, crate::settings::Settings::default())
+    }
+
+    fn test_ctx_with(planner: crate::todo::PlannerState, settings: crate::settings::Settings) -> BuiltinToolCtx {
         use dioxus::prelude::Signal;
+        let sessions = crate::session::SessionState { save_disabled: true, ..Default::default() };
         BuiltinToolCtx {
-            session_state: Signal::new(crate::session::SessionState::default()),
-            settings: Signal::new(crate::settings::Settings::default()),
+            session_state: Signal::new(sessions),
+            settings: Signal::new(settings),
             skill_registry: Signal::new(crate::skills::SkillRegistry::default()),
             permission_manager: Signal::new(crate::context::permissions::PermissionManager::new(
                 Signal::new(crate::settings::Settings::default()),
@@ -505,6 +624,129 @@ mod tests {
             assert_eq!(t.kind, None, "kinds belong to human to-dos");
             let req = spawner.0.lock().unwrap().last().cloned().unwrap();
             assert!(req.prompt.contains("Definition of done: Results table in Notes"));
+
+            dioxus::prelude::rsx! { div {} }
+        });
+        dom.rebuild_in_place();
+    }
+
+    fn planner_with(title: &str) -> (crate::todo::PlannerState, String) {
+        let mut planner = crate::todo::PlannerState::default();
+        let todo = Todo::new(title, 1.0);
+        let id = todo.id.clone();
+        planner.todos.push(todo);
+        (planner, id)
+    }
+
+    #[test]
+    fn a_chat_dispatch_validates_and_pins_the_chosen_model() {
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let spawner = RecordingSpawner(Default::default());
+            let settings = crate::settings::test_delegation_settings();
+            let claude_id = settings.llm_connectors.iter().find(|c| c.name == "Claude").unwrap().id.clone();
+
+            // Allowed: the new tab is pinned like the chat bar pins one.
+            let (planner, id) = planner_with("Summarise the thread");
+            let ctx = test_ctx_with(planner, settings.clone());
+            let ok = handle_dispatch(
+                ctx,
+                &serde_json::json!({"todo_id": id, "target": "chat", "connector": "Claude", "model": "claude-haiku-5-5"}),
+                &spawner,
+                None,
+            )
+            .unwrap();
+            assert!(ok.contains("on Haiku 5.5"), "{ok}");
+            let t = ctx.planner.peek().todo(&id).cloned().unwrap();
+            assert_eq!(t.worker_model.as_deref(), Some("claude-haiku-5-5"));
+            assert_eq!((t.lane, t.agent_state), (Lane::Agent, Some(AgentState::Working)));
+            let sid = t.linked_fleet_session.clone().unwrap();
+            let state = ctx.session_state.peek();
+            let s = state.sessions.get(&sid).expect("new tab");
+            assert_eq!(s.llm_connector_id.as_deref(), Some(claude_id.as_str()));
+            assert_eq!(s.llm_provider, Some(crate::settings::LlmProvider::Claude));
+            assert_eq!(s.chat_model.as_deref(), Some("claude-haiku-5-5"));
+            drop(state);
+            assert!(crate::components::chat_queue::CHAT_QUEUE.peek().get(&sid).is_some_and(|q| q.len() == 1));
+
+            // Unknown model / unknown connector: refused with the allowed
+            // list, nothing opened, the to-do untouched.
+            for (args, needle) in [
+                (serde_json::json!({"target": "chat", "model": "gpt-9"}), "gpt-9"),
+                (serde_json::json!({"target": "chat", "connector": "Bedrock"}), "unknown connector 'Bedrock'"),
+                (serde_json::json!({"target": "chat", "connector": "Local", "model": "claude-haiku-5-5"}), "isn't available on connector 'Local'"),
+            ] {
+                let (planner, id) = planner_with("Look something up");
+                let ctx = test_ctx_with(planner, settings.clone());
+                let mut args = args;
+                args["todo_id"] = serde_json::Value::String(id.clone());
+                let err = handle_dispatch(ctx, &args, &spawner, None).unwrap_err();
+                assert!(err.contains(needle) && err.contains("Claude: claude-fable-5-1"), "{err}");
+                assert!(ctx.session_state.peek().sessions.is_empty(), "no tab opened");
+                let t = ctx.planner.peek().todo(&id).cloned().unwrap();
+                assert_eq!((t.lane, t.linked_fleet_session), (Lane::Human, None));
+            }
+
+            // No choice: the user's default, no pin.
+            let (planner, id) = planner_with("Format the table");
+            let ctx = test_ctx_with(planner, settings.clone());
+            handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, None).unwrap();
+            let t = ctx.planner.peek().todo(&id).cloned().unwrap();
+            let sid = t.linked_fleet_session.clone().unwrap();
+            assert_eq!(ctx.session_state.peek().sessions.get(&sid).unwrap().llm_connector_id, None);
+            assert_eq!(t.worker_model.as_deref(), Some("claude-opus-5-5"), "the default model is recorded");
+
+            // claude_code keeps its own model param: no validation.
+            let mut planner = crate::todo::PlannerState::default();
+            let project = Project {
+                id: "proj-m".into(),
+                title: "Bench".into(),
+                notes: String::new(),
+                area_id: None,
+                status: TodoStatus::Open,
+                deadline: None,
+                sort_order: 0.0,
+                path: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            let mut todo = Todo::new("Run the suite", 1.0);
+            todo.project_id = Some(project.id.clone());
+            let id = todo.id.clone();
+            planner.projects.push(project);
+            planner.todos.push(todo);
+            let ctx = test_ctx_with(planner, settings);
+            handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "claude_code", "model": "sonnet"}), &spawner, None)
+                .unwrap();
+            let req = spawner.0.lock().unwrap().last().cloned().unwrap();
+            assert_eq!(req.model.as_deref(), Some("sonnet"));
+            assert_eq!(ctx.planner.peek().todo(&id).unwrap().worker_model.as_deref(), Some("sonnet"));
+
+            dioxus::prelude::rsx! { div {} }
+        });
+        dom.rebuild_in_place();
+    }
+
+    #[test]
+    fn an_unfocused_chat_dispatch_keeps_the_user_where_they_are() {
+        // The Planner's "Accept & start" when no agent time runs: a new chat
+        // worker on the grant's model, opened in the background.
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let settings = crate::settings::test_delegation_settings();
+            let choice = settings.resolve_model_choice(Some("Claude"), Some("claude-haiku-5-5")).unwrap();
+            let mut planner = crate::todo::PlannerState::default();
+            let mut todo = Todo::new("Draft the release notes", 1.0);
+            todo.set_lane(Lane::Agent);
+            let id = todo.id.clone();
+            planner.todos.push(todo);
+            let mut ctx = test_ctx_with(planner, settings);
+            let here = ctx.session_state.write().create_session_raw(None);
+            let d = dispatch_to_chat(ctx, &id, ChatDispatchOpts { choice, focus: false, ..Default::default() }).unwrap();
+            assert_eq!(d.model, "claude-haiku-5-5");
+            assert_eq!(ctx.session_state.peek().active_session_id, here, "focus stays put");
+            assert_eq!(*ctx.chat_command.peek(), None, "no tab switch");
+            let t = ctx.planner.peek().todo(&id).cloned().unwrap();
+            assert_eq!(t.agent_state, Some(AgentState::Working));
+            assert_eq!(t.linked_fleet_session.as_deref(), Some(d.session_id.as_str()));
 
             dioxus::prelude::rsx! { div {} }
         });

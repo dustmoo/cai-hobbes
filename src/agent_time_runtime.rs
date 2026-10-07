@@ -10,9 +10,12 @@
 //!
 //! 1. **Start** (`ChatCommand::AgentTimeStart`, user-initiated only):
 //!    [`start_now`] checks the grant and today's budget ([`start_check`]),
-//!    opens a dedicated chat ("Agent time · <date>") — or reuses today's
-//!    paused one — takes the lease on it, and queues the opening message
-//!    ([`seed_message`]). The model must then call `HOBBES_AGENT_TIME start`.
+//!    opens a dedicated chat ("Agent time · <date>") — or continues today's
+//!    one, whatever its last run's end reason ([`todays_chat`]: one chat a
+//!    day) — pins it to the grant's model, takes a new lease on it, and
+//!    queues the opening (or short continuation) message ([`seed_message`]).
+//!    The model must then call `HOBBES_AGENT_TIME start`, which opens a new
+//!    session record on the same chat.
 //! 2. **Gate**: every tool call from an agent-time chat passes
 //!    [`gate_decision`] before the normal permission flow, on both the
 //!    streaming path and the approval-resume path
@@ -34,7 +37,9 @@
 //!
 //! After the lease is gone the chat stays marked ([`is_agent_time_chat`]):
 //! its tool calls are refused and its tool loop does not continue, so
-//! nothing it started can keep running outside agent time.
+//! nothing it started can keep running outside agent time. A later Start
+//! takes a new lease on the same chat, which lifts that refusal for the new
+//! run only: the gate keys on the lease, so closing it restores the refusal.
 
 use std::collections::HashSet;
 
@@ -244,17 +249,29 @@ pub fn tick_action(planner: &PlannerState, today: NaiveDate, now: DateTime<Utc>)
     TickAction::Idle
 }
 
-/// The chat a Start resumes: the latest agent-time session started today,
-/// if it ended `Paused`.
-pub fn resumable_chat(planner: &PlannerState, today: NaiveDate) -> Option<String> {
+/// The chat a Start continues: today's agent-time chat, whatever its last
+/// run's end reason (one agent-time chat per day). That is the chat of the
+/// latest session started today, else `leased_today` (the chat leased
+/// earlier today in this process whose model never called `start`, so no
+/// session names it).
+pub fn todays_chat(
+    planner: &PlannerState,
+    leased_today: Option<&(NaiveDate, String)>,
+    today: NaiveDate,
+) -> Option<String> {
     planner
         .agent_time_sessions
         .iter()
         .filter(|s| s.started_at.with_timezone(&chrono::Local).date_naive() == today)
+        .filter(|s| s.chat_session_id.is_some())
         .max_by_key(|s| s.started_at)
-        .filter(|s| s.end_reason == Some(AgentTimeEndReason::Paused))
         .and_then(|s| s.chat_session_id.clone())
+        .or_else(|| leased_today.filter(|(d, _)| *d == today).map(|(_, id)| id.clone()))
 }
+
+/// The last chat leased in this process and the day it was leased on: the
+/// fallback for [`todays_chat`] when a run ended before its `start`.
+static LAST_LEASED: std::sync::Mutex<Option<(NaiveDate, String)>> = std::sync::Mutex::new(None);
 
 /// The chat title for a run on `date`.
 pub fn chat_title(date: NaiveDate) -> String {
@@ -266,24 +283,24 @@ pub fn chat_title(date: NaiveDate) -> String {
 /// from the agent lane (`context`, built by
 /// `todo::agent_time::agent_time_context`) or Hobbes-owned space, never
 /// `owner`'s own tasks.
-pub fn seed_message(budget: &AgentTimeBudget, resumed: bool, context: &str, owner: &str) -> String {
+pub fn seed_message(budget: &AgentTimeBudget, continued: bool, context: &str, owner: &str) -> String {
     let minutes = crate::todo::model::format_minutes(budget.minutes_left());
     let spend = budget.spend_left_usd();
-    let opening = if resumed {
-        format!(
-            "[Agent time resumed: Hobbes opened this on the user's behalf]\n\n\
-             The user paused your agent time earlier and has resumed it. You have up to \
-             {minutes} left today, with ${spend:.2} of spend. Your earlier session was closed \
-             when it was paused, so declare your intent again (the same one is fine if you \
-             still choose it)."
-        )
-    } else {
-        format!(
-            "[Agent time: Hobbes opened this on the user's behalf]\n\n\
-             The user has granted you self-directed time: up to {minutes} today, with \
-             ${spend:.2} of spend. Nothing here is assigned. What you do with it is your choice."
-        )
-    };
+    if continued {
+        // Today's chat already carries the rules; a new run in it gets a
+        // short note and the fresh lists.
+        return format!(
+            "[New agent-time run: Hobbes started this on the user's behalf]\n\n\
+             New agent-time run: {minutes}, ${spend:.2} left. Same rules; declare your intent \
+             with start (your earlier run in this chat is closed).\n\n\
+             {context}"
+        );
+    }
+    let opening = format!(
+        "[Agent time: Hobbes opened this on the user's behalf]\n\n\
+         The user has granted you self-directed time: up to {minutes} today, with \
+         ${spend:.2} of spend. Nothing here is assigned. What you do with it is your choice."
+    );
     format!(
         "{opening}\n\n\
          What is yours, and what is not:\n\
@@ -507,9 +524,15 @@ pub fn start_now(
         ));
     }
     let budget = start_check(&planner.peek(), today, now)?;
+    // The grant's model, validated before anything opens: a stale choice is
+    // refused with what is allowed, never swapped for another model.
+    let choice = grant_model_choice(&planner.peek().agent_time_grant, &settings.peek())
+        .map_err(AgentTimeRefusal::Invalid)?;
 
-    // Resume today's paused chat when it can be found; otherwise a new one.
-    let resumed = resumable_chat(&planner.peek(), today).filter(|id| {
+    // Continue today's agent-time chat when it can be found (one chat per
+    // day, whatever its last run's end reason); otherwise a new one.
+    let last_leased = LAST_LEASED.lock().ok().and_then(|g| g.clone());
+    let resumed = todays_chat(&planner.peek(), last_leased.as_ref(), today).filter(|id| {
         if session_state.peek().sessions.contains_key(id) {
             return true;
         }
@@ -561,8 +584,29 @@ pub fn start_now(
         }
     };
 
+    // Pin the chat to the grant's model (or back to the user's default),
+    // the way the chat bar's model switch pins a tab.
+    {
+        let mut state = session_state.write();
+        if let Some(s) = state.sessions.get_mut(&chat_id) {
+            let before = (s.llm_connector_id.clone(), s.chat_model.clone());
+            match &choice {
+                Some(c) => crate::todo::dispatch::pin_session_model(s, c),
+                None => crate::todo::dispatch::unpin_session_model(s),
+            }
+            if before != (s.llm_connector_id.clone(), s.chat_model.clone()) {
+                drop(state);
+                crate::todo::dispatch::log_pin(&chat_id, choice.as_ref());
+                crate::session::SessionState::save_signal(&session_state, None);
+            }
+        }
+    }
+
     planner.write().open_agent_time_lease(&chat_id, today, now)?;
     LEASED_CHATS.write().insert(chat_id.clone());
+    if let Ok(mut g) = LAST_LEASED.lock() {
+        *g = Some((today, chat_id.clone()));
+    }
     let baseline = session_state
         .peek()
         .sessions
@@ -754,7 +798,69 @@ pub fn on_turn_complete(
     if !planner.peek().is_agent_time_session(chat_id) {
         return;
     }
+    // A message queued for the run (a to-do the user just handed over)
+    // drives the model on: the run continues instead of closing.
+    let queued = crate::components::chat_queue::CHAT_QUEUE
+        .peek()
+        .get(chat_id)
+        .is_some_and(|q| !q.is_empty());
+    if !closes_on_turn_end(queued) {
+        return;
+    }
     close_finished(planner, session_state, chat_id, "turn ended without end(summary); closed by the runtime");
+}
+
+/// Whether a run closes when its model's turn ends: unless something is
+/// queued to send into it (that message drives the next turn).
+pub fn closes_on_turn_end(queued: bool) -> bool {
+    !queued
+}
+
+/// The grant's validated model choice: `Ok(None)` for "Same as your chats",
+/// an error naming what is allowed when the saved choice no longer is.
+pub fn grant_model_choice(
+    grant: &crate::todo::model::AgentTimeGrant,
+    settings: &crate::settings::Settings,
+) -> Result<Option<crate::settings::ModelChoice>, String> {
+    if grant.connector_id.is_none() && grant.model.is_none() {
+        return Ok(None);
+    }
+    settings
+        .resolve_model_choice(grant.connector_id.as_deref(), grant.model.as_deref())
+        .map_err(|e| format!("The agent-time model is no longer available ({e}). Pick another in the grant."))
+}
+
+/// **Accept & start, while agent time runs.** Hand to-do `todo_id` to the
+/// running agent-time chat: queue the hand-off message through the chat
+/// queue (as the runtime's own messages go), set the run's `todo_id` when it
+/// has none, and log a runtime `Event`. The run continues. Returns the chat
+/// id, or `None` when no run holds the lease (the caller dispatches a new
+/// chat instead).
+pub fn hand_to_run(
+    mut planner: Signal<PlannerState>,
+    settings: Signal<crate::settings::Settings>,
+    todo_id: &str,
+    offer: bool,
+) -> Option<String> {
+    let chat_id = planner.peek().agent_time_lease.as_ref().map(|l| l.chat_session_id.clone())?;
+    let owner = settings
+        .peek()
+        .user_name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "The user".to_string());
+    let (msg, session) = planner.write().hand_todo_to_run(&chat_id, todo_id, &owner, offer, Utc::now())?;
+    if let Some(s) = &session {
+        persist_session(s);
+    }
+    crate::components::chat_queue::queue_push(
+        &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+        &chat_id,
+        crate::components::chat_queue::QueuedMessage::new(msg, Vec::new()),
+    );
+    crate::components::chat_queue::request_drain();
+    tracing::info!(chat_id = %chat_id, todo_id, "Accepted to-do handed to the agent-time run");
+    Some(chat_id)
 }
 
 /// Close a run that finished on its own: a still-open session (no `end`
@@ -1107,14 +1213,114 @@ mod tests {
     }
 
     #[test]
-    fn resume_picks_todays_paused_chat_only() {
+    fn start_continues_todays_chat_whatever_the_last_end_reason() {
+        assert_eq!(todays_chat(&granted(), None, today()), None, "first run of the day opens a tab");
+        for reason in [
+            AgentTimeEndReason::Completed,
+            AgentTimeEndReason::Paused,
+            AgentTimeEndReason::Stopped,
+            AgentTimeEndReason::BudgetExhausted,
+        ] {
+            let mut p = started("c");
+            p.close_agent_time_lease(Utc::now(), reason);
+            assert_eq!(todays_chat(&p, None, today()).as_deref(), Some("c"), "{reason:?}");
+        }
+        // The latest of today's runs names the chat.
+        let mut p = started("old");
+        p.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Completed);
+        p.agent_time_sessions[0].started_at = Utc::now() - chrono::Duration::seconds(30);
+        p.open_agent_time_lease("new", today(), Utc::now()).unwrap();
+        p.agent_time_start("new", "x", today(), Utc::now()).unwrap();
+        p.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Stopped);
+        assert_eq!(todays_chat(&p, None, today()).as_deref(), Some("new"));
+        // A run that ended before `start` leaves no session: the lease record
+        // from earlier today covers it; yesterday's doesn't.
+        let q = granted();
+        let leased = (today(), "fresh".to_string());
+        assert_eq!(todays_chat(&q, Some(&leased), today()).as_deref(), Some("fresh"));
+        let yesterday = (today() - chrono::Duration::days(1), "stale".to_string());
+        assert_eq!(todays_chat(&q, Some(&yesterday), today()), None);
+        // Yesterday's sessions don't count.
+        let mut r = started("y");
+        r.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Completed);
+        r.agent_time_sessions[0].started_at = Utc::now() - chrono::Duration::days(1);
+        assert_eq!(todays_chat(&r, None, today()), None);
+    }
+
+    #[test]
+    fn a_new_lease_on_todays_chat_lifts_the_ended_refusal_only_while_it_runs() {
+        let none = json!({});
+        let start = json!({"action": "start", "intent": "second run"});
+        // Run 1 ends: the chat refuses everything and stops looping.
         let mut p = started("c");
-        assert_eq!(resumable_chat(&p, today()), None, "still running");
-        p.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Paused);
-        assert_eq!(resumable_chat(&p, today()).as_deref(), Some("c"));
-        let mut q = started("d");
-        q.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Stopped);
-        assert_eq!(resumable_chat(&q, today()), None);
+        p.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Completed);
+        assert!(matches!(
+            gate_decision(&input(&p, "c", "notes.search", &none, false)),
+            GateDecision::Refuse { ref message, .. } if message == ENDED_MESSAGE
+        ));
+        assert!(continuation_blocked(&p, &HashSet::new(), "c"));
+
+        // Run 2: a new lease on the same chat. The earlier session stays
+        // closed, so the model must declare a fresh intent first.
+        p.open_agent_time_lease("c", today(), Utc::now()).unwrap();
+        assert!(!continuation_blocked(&p, &HashSet::new(), "c"), "the run may loop");
+        assert!(!intent_declared(&p, "c"));
+        assert!(matches!(
+            gate_decision(&input(&p, "c", "notes.search", &none, false)),
+            GateDecision::Refuse { ref message, .. } if message == NO_INTENT_MESSAGE
+        ));
+        assert_eq!(
+            gate_decision(&input(&p, "c", AGENT_TIME_TOOL, &start, false)),
+            GateDecision::Proceed { record: None }
+        );
+        p.agent_time_start("c", "second run", today(), Utc::now()).unwrap();
+        assert_eq!(p.agent_time_sessions.len(), 2, "a new session record on the same chat");
+        assert!(p.agent_time_sessions.iter().all(|s| s.chat_session_id.as_deref() == Some("c")));
+        assert_eq!(
+            gate_decision(&input(&p, "c", "notes.search", &none, false)),
+            GateDecision::Proceed { record: Some(ScopeVerdict::Allow) }
+        );
+        // The intent-grace check counts only the new run's start.
+        assert_eq!(tick_action(&p, today(), Utc::now()), TickAction::Idle);
+
+        // Run 2 ends: the refusal is back.
+        p.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Stopped);
+        assert!(matches!(
+            gate_decision(&input(&p, "c", "notes.search", &none, true)),
+            GateDecision::Refuse { ref message, .. } if message == ENDED_MESSAGE
+        ));
+        assert!(continuation_blocked(&p, &HashSet::new(), "c"));
+    }
+
+    #[test]
+    fn a_new_runs_spend_before_start_stays_off_the_previous_record() {
+        let mut p = started("c");
+        p.agent_time_end("c", "done", Utc::now()).unwrap();
+        p.close_agent_time_lease(Utc::now(), AgentTimeEndReason::Completed);
+        p.open_agent_time_lease("c", today(), Utc::now() + chrono::Duration::seconds(1)).unwrap();
+        assert!(p.add_agent_time_cost_for_chat("c", 0.2).is_none(), "pending until the new start");
+        assert_eq!(p.agent_time_sessions[0].cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_queued_hand_off_keeps_the_run_going_past_its_turn() {
+        assert!(closes_on_turn_end(false));
+        assert!(!closes_on_turn_end(true));
+    }
+
+    #[test]
+    fn the_grant_model_is_validated_never_swapped() {
+        let settings = crate::settings::test_delegation_settings();
+        let mut grant = AgentTimeGrant::default();
+        assert_eq!(grant_model_choice(&grant, &settings).unwrap(), None, "same as your chats");
+        let claude = settings.llm_connectors.iter().find(|c| c.name == "Claude").unwrap().id.clone();
+        grant.connector_id = Some(claude.clone());
+        grant.model = Some("claude-haiku-5-5".into());
+        let c = grant_model_choice(&grant, &settings).unwrap().unwrap();
+        assert_eq!((c.connector_id.as_str(), c.model.as_deref()), (claude.as_str(), Some("claude-haiku-5-5")));
+        grant.model = Some("claude-retired-1".into());
+        let e = grant_model_choice(&grant, &settings).unwrap_err();
+        assert!(e.contains("no longer available") && e.contains("allowed:"), "{e}");
     }
 
     #[test]
@@ -1136,7 +1342,12 @@ mod tests {
         // Calls are recorded by the runtime; nothing asks the model to log them.
         assert!(m.contains("recorded on the log automatically"));
         assert!(!m.contains("action \"log\""), "no instruction to log before calls");
-        assert!(seed_message(&b, true, ctx, "Dustin").contains("resumed"));
+        // A later run in today's chat gets the short continuation note and
+        // the fresh lists, not the full rules again.
+        let c = seed_message(&b, true, ctx, "Dustin");
+        assert!(c.contains("New agent-time run: 45m, $2.00 left. Same rules; declare your intent with start"), "{c}");
+        assert!(c.contains("[t1] Digest notes"));
+        assert!(c.len() < m.len());
     }
 
     // ── held for approval ───────────────────────────────────────────────

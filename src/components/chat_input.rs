@@ -63,6 +63,9 @@ pub enum ChatCommand {
     SwitchToSettingsTab(crate::settings::SettingsTab, Option<String>),
     SwitchTab(usize),
     SwitchToSession(String),
+    /// Add a chat to the open tabs without switching to it (a worker the
+    /// Planner just started; the user stays where they are).
+    OpenTabInBackground(String),
     /// Switch the current session's profile to the profile at this index.
     SwitchProfile(usize),
     /// Switch the current session's model to the model at this index in the available models list.
@@ -336,6 +339,7 @@ pub fn ChatInput(
                 | ChatCommand::SwitchToSettingsTab(_, _)
                 | ChatCommand::SwitchTab(_)
                 | ChatCommand::SwitchToSession(_)
+                | ChatCommand::OpenTabInBackground(_)
                 | ChatCommand::NewChat
                 | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)

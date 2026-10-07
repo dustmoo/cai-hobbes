@@ -24,6 +24,45 @@ const LANE_NOTE: &str = "To-dos are in the human lane (the user's own time) by d
     outcome is clear and no human presence is needed you may SUGGEST handing it to an agent, but \
     create human to-dos unless the user said to delegate.";
 
+/// The static part of `HOBBES_DISPATCH`'s description. The allowed models
+/// are appended per request by [`annotate_dispatch_models`].
+const DISPATCH_DESCRIPTION: &str = "Send a todo to a worker. target 'chat' opens a new Hobbes tab \
+    that starts on the assignment immediately; target 'claude_code' launches a headless Claude \
+    Code run in the todo's project directory (the project must have a path). Either way the todo \
+    joins the agent lane, links to the worker, and its state (working / needs you / stuck / done) \
+    and progress flow back onto it automatically; a headless run's permission requests appear in \
+    the Fleet for approval. Set the todo's 'outcome' first so the worker knows what done looks \
+    like. For target 'chat' you may pick the worker's model (connector + model): a cheaper, faster \
+    model (e.g. a Haiku) for routine lookups, summaries and formatting; a stronger one for \
+    multi-step reasoning or code. The choice must come from the allowed list; anything else is \
+    refused.";
+
+/// Append the user's allowed models to `HOBBES_DISPATCH`'s description in
+/// the per-request tool list. The list comes from
+/// `Settings::allowed_models` (sorted, deduplicated), so the description,
+/// which sits in the cached tool prefix, changes only when the connector
+/// settings do.
+pub fn annotate_dispatch_models(
+    tools: &mut [crate::llm::types::ToolDefinition],
+    settings: &crate::settings::Settings,
+) {
+    let Some(tool) = tools.iter_mut().find(|t| t.name == "HOBBES_DISPATCH") else {
+        return;
+    };
+    tool.description = dispatch_description(&settings.allowed_models());
+}
+
+/// `HOBBES_DISPATCH`'s description with the allowed list for `target: chat`.
+pub fn dispatch_description(allowed: &[crate::settings::AllowedModel]) -> String {
+    if allowed.is_empty() {
+        return format!("{DISPATCH_DESCRIPTION} No models are configured for choice; omit connector and model.");
+    }
+    format!(
+        "{DISPATCH_DESCRIPTION} Allowed for target 'chat' (connector: models): {}.",
+        crate::settings::allowed_models_listing(allowed)
+    )
+}
+
 impl PlannerClient {
     pub fn new() -> Self {
         Self
@@ -290,17 +329,7 @@ impl PlannerClient {
             },
             Tool {
                 name: "HOBBES_DISPATCH".into(),
-                description: Some(
-                    "Send a todo to a worker. target 'chat' opens a new Hobbes tab that \
-                    starts on the assignment immediately; target 'claude_code' launches a \
-                    headless Claude Code run in the todo's project directory (the project \
-                    must have a path). Either way the todo joins the agent lane, links to the \
-                    worker, and its state (working / needs you / stuck / done) and progress \
-                    flow back onto it automatically; a headless run's permission requests \
-                    appear in the Fleet for approval. Set the todo's 'outcome' first so the \
-                    worker knows what done looks like."
-                        .into(),
-                ),
+                description: Some(DISPATCH_DESCRIPTION.into()),
                 input_schema: Arc::new(
                     serde_json::from_value(serde_json::json!({
                         "type": "object",
@@ -308,7 +337,8 @@ impl PlannerClient {
                             "todo_id": { "type": "string", "description": "The todo to dispatch." },
                             "target": { "type": "string", "enum": ["chat", "claude_code"], "description": "Where the work runs." },
                             "instructions": { "type": "string", "description": "Extra guidance appended to the assignment." },
-                            "model": { "type": "string", "description": "Model for claude_code runs (e.g. 'sonnet', 'opus')." }
+                            "connector": { "type": "string", "description": "chat only: the connector to run the new tab on (a connector name from the allowed list). Omit for the user's default." },
+                            "model": { "type": "string", "description": "chat: a model slug from the allowed list (omit for the user's default). claude_code: the Claude Code model (e.g. 'sonnet', 'opus')." }
                         },
                         "required": ["todo_id", "target"]
                     }))
@@ -464,8 +494,8 @@ impl PlannerClient {
                 propose(kind: offer, todo_id, body) and only their acceptance hands it over). Every tool call you make is recorded on the log automatically, \
                 so don't log calls yourself. log(summary) is an optional note on why you're \
                 taking the next step (it attaches to that call). propose(kind, title, body) files \
-                an output (note, todo, skill, research, other) for the user to accept, edit or \
-                dismiss — proposals are your ONLY output; never change the user's to-dos, plan \
+                an output (note, todo, skill, research, other; a todo with lane 'agent' is work you \
+                would do yourself) for the user to accept, edit or dismiss — proposals are your ONLY output; never change the user's to-dos, plan \
                 or anything outside Hobbes directly. end(summary) closes the session. Refused \
                 when the grant, day, minutes or spend cap don't allow it."
                     .into(),
@@ -479,6 +509,7 @@ impl PlannerClient {
                         "summary": { "type": "string", "description": "log (optional note, attached to your next call) / end: one line." },
                         "kind": { "type": "string", "enum": ["note", "todo", "skill", "research", "other", "offer"], "description": "propose. offer = offer to take one of the user's tasks (needs todo_id)." },
                         "todo_id": { "type": "string", "description": "start: the agent-lane to-do you work on (optional). propose(offer): the user's to-do you offer to take." },
+                        "lane": { "type": "string", "enum": ["agent", "human"], "description": "propose(todo): 'agent' when it is work you would do yourself (it lands in the agent lane, and accepting it can start it); 'human' (default) for a suggestion for the user." },
                         "title": { "type": "string", "description": "propose: one line." },
                         "body": { "type": "string", "description": "propose: the content (markdown)." }
                     },
@@ -492,5 +523,41 @@ impl PlannerClient {
             icons: None,
             meta: None,
         }]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_description_names_the_allowed_models_stably() {
+        let settings = crate::settings::test_delegation_settings();
+        let mut tools: Vec<crate::llm::types::ToolDefinition> = PlannerClient::new()
+            .list_tools()
+            .iter()
+            .map(|t| crate::llm::types::ToolDefinition::from_mcp(t, "hobbes-planner"))
+            .collect();
+        let before: Vec<String> = tools.iter().map(|t| t.description.clone()).collect();
+        annotate_dispatch_models(&mut tools, &settings);
+        let d = &tools.iter().find(|t| t.name == "HOBBES_DISPATCH").unwrap().description;
+        assert!(d.contains("a cheaper, faster model (e.g. a Haiku)"), "{d}");
+        assert!(d.contains("must come from the allowed list"), "{d}");
+        assert!(d.ends_with(
+            "Allowed for target 'chat' (connector: models): Claude: claude-fable-5-1, \
+             claude-haiku-5-5, claude-opus-5-5, claude-sonnet-5-5; Local: qwen-3.6."
+        ), "{d}");
+        // Only HOBBES_DISPATCH changes, and re-annotating is a no-op (the
+        // cached tool prefix stays byte-identical across requests).
+        for (t, b) in tools.iter().zip(&before) {
+            if t.name != "HOBBES_DISPATCH" {
+                assert_eq!(&t.description, b);
+            }
+        }
+        let once = d.clone();
+        annotate_dispatch_models(&mut tools, &settings);
+        assert_eq!(tools.iter().find(|t| t.name == "HOBBES_DISPATCH").unwrap().description, once);
+        // No connectors: says so instead of listing nothing.
+        assert!(dispatch_description(&[]).contains("No models are configured"));
     }
 }

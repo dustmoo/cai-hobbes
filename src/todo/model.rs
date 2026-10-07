@@ -966,6 +966,14 @@ pub struct AgentTimeGrant {
     pub days: [bool; 7],
     #[serde(default)]
     pub scope: AgentTimeScope,
+    /// The connector agent time runs on (a `Settings::llm_connectors` id).
+    /// `None` = "Same as your chats" (the user's default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<String>,
+    /// The model agent time runs on, from that connector's allowed models
+    /// (`Settings::allowed_models`). `None` = the connector's own model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl Default for AgentTimeGrant {
@@ -976,6 +984,8 @@ impl Default for AgentTimeGrant {
             spend_cap_usd: default_grant_cap(),
             days: default_grant_days(),
             scope: AgentTimeScope::default(),
+            connector_id: None,
+            model: None,
         }
     }
 }
@@ -1191,6 +1201,11 @@ pub struct Proposal {
     /// every other kind (and on rows saved before offers existed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_id: Option<String>,
+    /// `Todo`: the lane the suggested to-do belongs in. `Some(Agent)` when
+    /// the agent filed it as its own work (`propose(kind: todo, lane:
+    /// agent)`); absent = a suggestion for the person (human lane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<Lane>,
 }
 
 /// Trust-ledger evidence (SYMBIOTIC_PLANNER.md §3). Evidence only: it never
@@ -1321,6 +1336,11 @@ pub struct Todo {
     /// `resolved` is `None`).
     #[serde(default)]
     pub decision: Option<Decision>,
+    /// For agent to-dos: the model its worker runs on (a slug, e.g.
+    /// `claude-haiku-5-5`), recorded at dispatch so the lane card can show
+    /// it. `None` when unknown (a Claude Code run on its default model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -1401,6 +1421,7 @@ impl Todo {
             outcome: None,
             agent_state: None,
             decision: None,
+            worker_model: None,
             created_at: now,
             updated_at: now,
             completed_at: None,
@@ -2026,6 +2047,26 @@ pub fn format_minutes(minutes: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_grant_saved_before_model_choice_means_same_as_your_chats() {
+        let old = r#"{"enabled":true,"daily_minutes":45,"spend_cap_usd":2.0,"days":[true,true,true,true,true,true,true]}"#;
+        let g: AgentTimeGrant = serde_json::from_str(old).unwrap();
+        assert_eq!((g.connector_id, g.model), (None, None));
+        // Unset fields stay out of the saved JSON; set ones round-trip.
+        let json = serde_json::to_string(&AgentTimeGrant::default()).unwrap();
+        assert!(!json.contains("connector_id") && !json.contains("\"model\""), "{json}");
+        let g = AgentTimeGrant {
+            connector_id: Some("c1".into()),
+            model: Some("claude-haiku-5-5".into()),
+            ..Default::default()
+        };
+        let back: AgentTimeGrant = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back, g);
+        // Old to-do and proposal rows load without the new fields too.
+        let t: Todo = serde_json::from_value(serde_json::to_value(Todo::new("x", 0.0)).unwrap()).unwrap();
+        assert_eq!(t.worker_model, None);
+    }
 
     #[test]
     fn filing_an_inbox_todo_into_a_project_triages_it() {

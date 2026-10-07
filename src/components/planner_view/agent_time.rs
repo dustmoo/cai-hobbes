@@ -16,7 +16,10 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 use crate::agent_time_runtime::{held_approvals, HeldApproval};
 use crate::components::chat_input::ChatCommand;
 use crate::session::SessionState;
-use crate::todo::agent_time::{proposal_to_todo, AgentTimeBudget};
+use crate::settings::{short_model_label, AllowedModel, Settings};
+use crate::todo::agent_time::{
+    accept_start_route, proposal_starts_work, AcceptStartRoute, AgentTimeBudget,
+};
 use crate::todo::measures;
 use crate::todo::model::{
     AgentTimeLogKind, AgentTimeSession, Proposal, ProposalKind, ProposalStatus, TrustLedger,
@@ -165,6 +168,61 @@ pub(crate) fn answer_held(session_state: Signal<SessionState>, h: &HeldApproval,
     done
 }
 
+/// The grant's model select value: `""` for "Same as your chats", else
+/// `"<connector id>|<model>"` (the model may be empty: the connector's own
+/// model).
+pub(crate) fn grant_select_value(connector_id: Option<&str>, model: Option<&str>) -> String {
+    match connector_id {
+        Some(c) => format!("{c}|{}", model.unwrap_or("")),
+        None => String::new(),
+    }
+}
+
+/// The inverse of [`grant_select_value`]: (connector id, model).
+pub(crate) fn parse_grant_select(v: &str) -> (Option<String>, Option<String>) {
+    match v.split_once('|') {
+        Some((c, m)) if !c.is_empty() => {
+            (Some(c.to_string()), Some(m.to_string()).filter(|m| !m.is_empty()))
+        }
+        _ => (None, None),
+    }
+}
+
+/// One select option: (value, label).
+type ModelOption = (String, String);
+
+/// The select's options, grouped by connector in the allowed list's (stable)
+/// order: (connector name, options).
+pub(crate) fn model_option_groups(allowed: &[AllowedModel]) -> Vec<(String, Vec<ModelOption>)> {
+    // (connector id, connector name, options)
+    let mut groups: Vec<(String, String, Vec<ModelOption>)> = Vec::new();
+    for a in allowed {
+        let opt = (
+            grant_select_value(Some(&a.connector_id), Some(&a.model)),
+            short_model_label(&a.model),
+        );
+        match groups.last_mut() {
+            Some((id, _, opts)) if *id == a.connector_id => opts.push(opt),
+            _ => groups.push((a.connector_id.clone(), a.connector_name.clone(), vec![opt])),
+        }
+    }
+    groups.into_iter().map(|(_, name, opts)| (name, opts)).collect()
+}
+
+/// What an accepted proposal turned into, shown in place of its card.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AcceptedLine {
+    pub proposal_id: String,
+    pub title: String,
+    /// "Started in a new chat · Haiku 5.5 · uses no agent time", "Queued…".
+    pub text: String,
+    /// The chat doing the work, to open.
+    pub chat_id: Option<String>,
+    /// The to-do it made or moved, to open.
+    pub todo_id: Option<String>,
+    pub error: bool,
+}
+
 fn persist_grant(planner: &Signal<PlannerState>) {
     if let Err(e) = store::save_agent_time_grant(&planner.peek().agent_time_grant) {
         tracing::error!("planner: failed to save agent-time grant: {}", e);
@@ -190,8 +248,13 @@ const DAY_NAMES: [(&str, &str); 7] = [
 pub(crate) fn AgentTimeView() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let session_state = use_context::<Signal<SessionState>>();
+    let settings = use_context::<Signal<Settings>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut todo_detail = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
+    // The dispatch path "Accept & start" shares with HOBBES_DISPATCH (P-015).
+    let dispatch_ctx = crate::components::builtin_tools::builtin_ctx_from_tree();
+    // Proposals accepted in this sitting, shown as one line each.
+    let mut accepted = use_signal(Vec::<AcceptedLine>::new);
     // Calls the run is waiting on the user for. A memo, so a chunk streaming
     // into any chat re-runs only this scan, not the panel.
     let held = use_memo(move || held_approvals(&planner.read(), &session_state.read()));
@@ -260,6 +323,21 @@ pub(crate) fn AgentTimeView() -> Element {
             .collect::<Vec<_>>()
             .join(", ")
     };
+    let allowed = settings.read().allowed_models();
+    let grant_value = grant_select_value(grant.connector_id.as_deref(), grant.model.as_deref());
+    let groups = model_option_groups(&allowed);
+    // A saved choice no longer allowed still shows (and Start refuses it).
+    let stale_choice = (!grant_value.is_empty()
+        && !groups.iter().any(|(_, opts)| opts.iter().any(|(v, _)| *v == grant_value)))
+    .then(|| {
+        let label = grant
+            .model
+            .as_deref()
+            .map(short_model_label)
+            .unwrap_or_else(|| "connector default".to_string());
+        format!("{label} (no longer available)")
+    });
+    let accepted_lines = accepted.read().clone();
     let reads_label = if projects.is_empty() {
         "notes, the planner, and what you've shared".to_string()
     } else {
@@ -478,8 +556,32 @@ pub(crate) fn AgentTimeView() -> Element {
                                         }
                                     }
                                 }
-                                span { class: "text-fg-muted", "Connector" }
-                                span { class: "text-fg", "Same as your chats" }
+                                span { class: "text-fg-muted", "Model" }
+                                select {
+                                    class: "h-6 min-w-0 rounded border border-faint bg-input px-1.5 text-xs text-fg outline-none",
+                                    "aria-label": "Model agent time runs on",
+                                    title: "Agent time runs on this model; its spend follows the model's pricing.",
+                                    onchange: move |e| {
+                                        let (c, m) = parse_grant_select(&e.value());
+                                        {
+                                            let mut state = planner.write();
+                                            state.agent_time_grant.connector_id = c;
+                                            state.agent_time_grant.model = m;
+                                        }
+                                        persist_grant(&planner);
+                                    },
+                                    option { value: "", selected: grant_value.is_empty(), "Same as your chats" }
+                                    if let Some(label) = stale_choice.clone() {
+                                        option { value: "{grant_value}", selected: true, "{label}" }
+                                    }
+                                    for (name, opts) in groups.iter().cloned() {
+                                        optgroup { key: "{name}", label: "{name}",
+                                            for (v, label) in opts {
+                                                option { key: "{v}", value: "{v}", selected: v == grant_value, "{label}" }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             div { class: "h-px bg-[var(--color-border-muted)]" }
                             p { class: "text-xs text-fg", span { class: "font-semibold", "Reads " } span { class: "text-fg-muted", "{reads_label}" } }
@@ -497,13 +599,43 @@ pub(crate) fn AgentTimeView() -> Element {
                                     if proposals.is_empty() { "none open" } else { "{proposals.len()} open" }
                                 }
                             }
-                            if proposals.is_empty() {
+                            for line in accepted_lines.iter().cloned() {
+                                div {
+                                    key: "acc-{line.proposal_id}",
+                                    class: "flex min-w-0 items-center gap-2 rounded-md border border-faint px-2.5 py-1.5 text-[11.5px]",
+                                    if line.error {
+                                        span { class: "shrink-0 text-yellow-300", Icon { width: 12, height: 12, icon: fi_icons::FiAlertTriangle } }
+                                    } else {
+                                        span { class: "shrink-0 text-primary-300", Icon { width: 12, height: 12, icon: fi_icons::FiCheck } }
+                                    }
+                                    span { class: "min-w-0 truncate text-fg", title: "{line.title}", "{line.title}" }
+                                    span { class: "min-w-0 shrink truncate text-fg-muted", title: "{line.text}", "\u{b7} {line.text}" }
+                                    div { class: "flex-1" }
+                                    if let Some(chat) = line.chat_id.clone() {
+                                        button {
+                                            class: "shrink-0 text-primary-300 hover:text-fg",
+                                            title: "Open the chat doing the work",
+                                            onclick: move |_| chat_command.set(Some(ChatCommand::SwitchToSession(chat.clone()))),
+                                            "Open chat"
+                                        }
+                                    } else if let Some(tid) = line.todo_id.clone() {
+                                        button {
+                                            class: "shrink-0 text-primary-300 hover:text-fg",
+                                            title: "Open the to-do",
+                                            onclick: move |_| todo_detail.set(Some(tid.clone())),
+                                            "Open to-do"
+                                        }
+                                    }
+                                }
+                            }
+                            if proposals.is_empty() && accepted_lines.is_empty() {
                                 p { class: "{EMPTY}", "No proposals. Whatever agent time makes lands here as a suggestion you accept, edit or dismiss." }
                             }
                             for p in proposals {
                                 {
                                     let is_editing = editing.read().as_ref().is_some_and(|(id, _, _)| *id == p.id);
                                     let pid = p.id.clone();
+                                    let starts = proposal_starts_work(&p);
                                     rsx! {
                                         div {
                                             key: "{p.id}",
@@ -542,7 +674,9 @@ pub(crate) fn AgentTimeView() -> Element {
                                                             let pid = pid.clone();
                                                             move |_| {
                                                                 let edited = editing.peek().clone().map(|(_, t, b)| (t, b));
-                                                                resolve(planner, &pid, ProposalStatus::Accepted, edited);
+                                                                if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, edited, false) {
+                                                                    accepted.write().push(line);
+                                                                }
                                                                 editing.set(None);
                                                             }
                                                         },
@@ -554,13 +688,49 @@ pub(crate) fn AgentTimeView() -> Element {
                                                         "Cancel"
                                                     }
                                                 } else {
-                                                    button {
-                                                        class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
-                                                        onclick: {
-                                                            let pid = pid.clone();
-                                                            move |_| resolve(planner, &pid, ProposalStatus::Accepted, None)
-                                                        },
-                                                        "Accept"
+                                                    if starts {
+                                                        button {
+                                                            class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
+                                                            title: if running { "Accept and hand it to the running agent-time session" } else { "Accept and start it in a new chat (uses no agent time)" },
+                                                            onclick: {
+                                                                let pid = pid.clone();
+                                                                move |_| {
+                                                                    if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, None, true) {
+                                                                        if let Some(chat) = line.chat_id.clone().filter(|_| !line.error) {
+                                                                            chat_command.set(Some(ChatCommand::OpenTabInBackground(chat)));
+                                                                        }
+                                                                        accepted.write().push(line);
+                                                                    }
+                                                                }
+                                                            },
+                                                            "Accept & start"
+                                                        }
+                                                        button {
+                                                            class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
+                                                            title: "Accept and leave it queued in the agent lane",
+                                                            onclick: {
+                                                                let pid = pid.clone();
+                                                                move |_| {
+                                                                    if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, None, false) {
+                                                                        accepted.write().push(line);
+                                                                    }
+                                                                }
+                                                            },
+                                                            "Accept only"
+                                                        }
+                                                    } else {
+                                                        button {
+                                                            class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
+                                                            onclick: {
+                                                                let pid = pid.clone();
+                                                                move |_| {
+                                                                    if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, None, false) {
+                                                                        accepted.write().push(line);
+                                                                    }
+                                                                }
+                                                            },
+                                                            "Accept"
+                                                        }
                                                     }
                                                     if p.kind != ProposalKind::Offer {
                                                         button {
@@ -576,7 +746,7 @@ pub(crate) fn AgentTimeView() -> Element {
                                                         class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
                                                         onclick: {
                                                             let pid = pid.clone();
-                                                            move |_| resolve(planner, &pid, ProposalStatus::Dismissed, None)
+                                                            move |_| dismiss(planner, &pid)
                                                         },
                                                         "Dismiss"
                                                     }
@@ -766,32 +936,112 @@ pub(crate) fn AgentTimeView() -> Element {
     }
 }
 
-/// Accept / edit / dismiss a proposal, persist it and the ledger, and turn
-/// an accepted `Todo` proposal into an Inbox to-do.
-fn resolve(mut planner: Signal<PlannerState>, id: &str, status: ProposalStatus, edited: Option<(String, String)>) {
-    let resolved = planner.write().resolve_proposal(id, status, edited, Utc::now());
-    let Some(p) = resolved else { return };
-    if let Err(e) = store::save_proposal(&p) {
+fn persist_resolved(planner: &Signal<PlannerState>, p: &Proposal) {
+    if let Err(e) = store::save_proposal(p) {
         tracing::error!("planner: failed to save proposal {}: {}", p.id, e);
     }
     if let Err(e) = store::save_trust_ledger(&planner.peek().trust_ledger) {
         tracing::error!("planner: failed to save trust ledger: {}", e);
     }
-    // An accepted offer hands the person's to-do to the agent lane (Queued);
-    // a dismissed one leaves it untouched.
-    let handed = planner.write().apply_accepted_offer(&p, Utc::now());
-    if let Some(t) = handed {
-        if let Err(e) = store::save_todo(&t) {
-            tracing::error!("planner: failed to save offered to-do {}: {}", t.id, e);
+}
+
+/// Dismiss a proposal; persist it and the ledger.
+fn dismiss(mut planner: Signal<PlannerState>, id: &str) {
+    let resolved = planner.write().resolve_proposal(id, ProposalStatus::Dismissed, None, Utc::now());
+    if let Some(p) = resolved {
+        persist_resolved(&planner, &p);
+    }
+}
+
+/// Accept a proposal (`PlannerState::accept_proposal`: an offer moves the
+/// to-do to the agent lane, a suggested to-do is created) and persist it.
+/// With `start`, also start the work ("Accept & start"): hand it to the
+/// running agent-time session when one has budget left, else dispatch it
+/// to a new chat worker on the grant's model, which is user-initiated and
+/// uses no agent time. Returns the line shown in place of the card.
+fn accept(
+    mut planner: Signal<PlannerState>,
+    settings: Signal<Settings>,
+    ctx: crate::components::builtin_tools::BuiltinToolCtx,
+    id: &str,
+    edited: Option<(String, String)>,
+    start: bool,
+) -> Option<AcceptedLine> {
+    let done = planner.write().accept_proposal(id, edited, Utc::now())?;
+    persist_resolved(&planner, &done.proposal);
+    if let Some(t) = &done.todo {
+        if let Err(e) = store::save_todo(t) {
+            tracing::error!("planner: failed to save accepted proposal's to-do {}: {}", t.id, e);
         }
     }
-    if p.kind == ProposalKind::Todo && matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Edited) {
-        let todo = proposal_to_todo(&p, planner.peek().next_sort_order());
-        if let Err(e) = store::save_todo(&todo) {
-            tracing::error!("planner: failed to save accepted proposal to-do: {}", e);
-        }
-        planner.write().upsert_todo(todo);
+    let p = &done.proposal;
+    let todo_id = done.todo.as_ref().map(|t| t.id.clone());
+    let mut line = AcceptedLine {
+        proposal_id: p.id.clone(),
+        title: proposal_headline(p),
+        text: String::new(),
+        chat_id: None,
+        todo_id: todo_id.clone(),
+        error: false,
+    };
+    if !proposal_starts_work(p) {
+        line.text = match p.kind {
+            ProposalKind::Todo => "Added to your Inbox".to_string(),
+            _ => "Accepted".to_string(),
+        };
+        return Some(line);
     }
+    let Some(todo_id) = todo_id else {
+        line.text = "Accepted; the to-do was already moved or closed, so nothing started".to_string();
+        line.error = true;
+        return Some(line);
+    };
+    if !start {
+        line.text = "Queued in the agent lane".to_string();
+        return Some(line);
+    }
+    match accept_start_route(&planner.peek(), today(), Utc::now()) {
+        AcceptStartRoute::HandToRun { .. } => {
+            let offer = p.kind == ProposalKind::Offer;
+            match crate::agent_time_runtime::hand_to_run(planner, settings, &todo_id, offer) {
+                Some(chat) => {
+                    line.text = "Started \u{b7} handed to the running agent-time session".to_string();
+                    line.chat_id = Some(chat);
+                }
+                None => {
+                    line.text = "Queued; agent time stopped before it could take it".to_string();
+                    line.error = true;
+                }
+            }
+        }
+        AcceptStartRoute::NewChat => {
+            let choice = crate::agent_time_runtime::grant_model_choice(
+                &planner.peek().agent_time_grant,
+                &settings.peek(),
+            );
+            let started = choice.and_then(|choice| {
+                crate::todo::dispatch::dispatch_to_chat(
+                    ctx,
+                    &todo_id,
+                    crate::todo::dispatch::ChatDispatchOpts { choice, focus: false, ..Default::default() },
+                )
+            });
+            match started {
+                Ok(d) => {
+                    line.text = format!(
+                        "Started in a new chat \u{b7} {} \u{b7} uses no agent time",
+                        short_model_label(&d.model)
+                    );
+                    line.chat_id = Some(d.session_id);
+                }
+                Err(e) => {
+                    line.text = format!("Queued; couldn't start: {e}");
+                    line.error = true;
+                }
+            }
+        }
+    }
+    Some(line)
 }
 
 #[cfg(test)]
@@ -842,6 +1092,21 @@ mod tests {
     }
 
     #[test]
+    fn the_model_select_round_trips_and_groups_by_connector() {
+        assert_eq!(grant_select_value(None, None), "");
+        assert_eq!(parse_grant_select(""), (None, None));
+        let v = grant_select_value(Some("c1"), Some("claude-haiku-5-5"));
+        assert_eq!(parse_grant_select(&v), (Some("c1".into()), Some("claude-haiku-5-5".into())));
+        assert_eq!(parse_grant_select("c1|"), (Some("c1".into()), None));
+        let s = crate::settings::test_delegation_settings();
+        let groups = model_option_groups(&s.allowed_models());
+        let names: Vec<&str> = groups.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["Claude", "Local"]);
+        let labels: Vec<&str> = groups[0].1.iter().map(|(_, l)| l.as_str()).collect();
+        assert_eq!(labels, ["Fable 5.1", "Haiku 5.5", "Opus 5.5", "Sonnet 5.5"]);
+    }
+
+    #[test]
     fn offers_read_as_offers() {
         let p = Proposal {
             id: "p".into(),
@@ -853,6 +1118,7 @@ mod tests {
             resolved_at: None,
             session_id: "s".into(),
             todo_id: Some("t".into()),
+            lane: None,
         };
         assert_eq!(proposal_headline(&p), "Hobbes offers to take: Draft the release notes");
         assert_eq!(kind_label(ProposalKind::Offer), "Offer to take");

@@ -81,6 +81,15 @@ pub(crate) fn resolve_worker(linked: bool, f: &WorkerFacts) -> Option<WorkerLabe
     }
 }
 
+/// The card's model label ("Haiku 5.5") from the model dispatch recorded.
+pub(crate) fn worker_model_label(t: &Todo) -> Option<String> {
+    t.worker_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(crate::settings::short_model_label)
+}
+
 /// `"just now"` / `"9m"` / `"1h 05m"` between two instants.
 pub(crate) fn fmt_since(from: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let m = (now - from).num_minutes().max(0) as u32;
@@ -266,6 +275,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                 .and_then(|d| d.brief.as_ref())
                 .and_then(|b| b.blocked.clone()),
             meta: card_meta(t, w.as_ref(), now),
+            model: w.as_ref().and(worker_model_label(t)),
             worker: w,
         }
     };
@@ -448,6 +458,8 @@ struct CardData {
     blocked: Option<String>,
     meta: String,
     worker: Option<WorkerLabel>,
+    /// The worker's model ("Haiku 5.5"), when dispatch recorded one.
+    model: Option<String>,
 }
 
 #[component]
@@ -481,6 +493,9 @@ fn LaneCard(data: CardData, need: bool, on_open: EventHandler<String>) -> Elemen
                             Icon { width: 11, height: 11, icon: fi_icons::FiTerminal }
                         }
                         span { class: "truncate", "{w.name}" }
+                    }
+                    if let Some(m) = data.model.clone() {
+                        span { class: "min-w-0 shrink truncate font-mono text-[10px] text-fg-muted", title: "Model", "\u{b7} {m}" }
                     }
                 } else {
                     span { class: "font-mono text-[10px] text-fg-muted", "no worker yet" }
@@ -626,6 +641,16 @@ mod tests {
         let label = WorkerLabel { name: "x".into(), chat: true, cost_usd: Some(1.12), active_minutes: Some(65) };
         assert_eq!(card_meta(&w, Some(&label), now), "1h 5m \u{b7} $1.12");
         assert_eq!(card_meta(&w, None, now), "");
+    }
+
+    #[test]
+    fn the_card_names_the_workers_model() {
+        let mut t = Todo::new("Digest", 0.0);
+        assert_eq!(worker_model_label(&t), None);
+        t.worker_model = Some("claude-haiku-5-5".into());
+        assert_eq!(worker_model_label(&t).as_deref(), Some("Haiku 5.5"));
+        t.worker_model = Some("sonnet".into());
+        assert_eq!(worker_model_label(&t).as_deref(), Some("sonnet"));
     }
 
     #[test]

@@ -1675,6 +1675,7 @@ mod tests {
                 resolved_at: None,
                 session_id: "at_1".into(),
                 todo_id: None,
+                lane: None,
             };
             upsert_proposal_conn(conn, &proposal, 3).unwrap();
             let decision = ResolvedDecision {

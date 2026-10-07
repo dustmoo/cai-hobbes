@@ -157,6 +157,9 @@ impl<'a> PromptBuilder<'a> {
             );
         }
         let mut tools = sort_and_dedupe_tools(tools);
+        // HOBBES_DISPATCH names the models the user allows for a chat worker.
+        // Derived from settings only (sorted), so the cached prefix holds.
+        crate::mcp::planner_client::annotate_dispatch_models(&mut tools, self.settings);
 
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();

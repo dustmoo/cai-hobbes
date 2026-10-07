@@ -3304,6 +3304,16 @@ fn app() -> Element {
                         }
                     }
                 }
+                ChatCommand::OpenTabInBackground(session_id) => {
+                    // As AgentTimeStart does for its own tab: listed, not focused.
+                    if session_state.peek().sessions.contains_key(&session_id) {
+                        let mut tabs = open_tabs.read().clone();
+                        if !tabs.contains(&session_id) {
+                            tabs.push(session_id);
+                            open_tabs.set(tabs);
+                        }
+                    }
+                }
                 ChatCommand::NewChat => {
                     new_tab_fn();
                 }
