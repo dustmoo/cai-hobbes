@@ -59,6 +59,7 @@ The direction here is a third lane: **agent time**. It is a small, human-granted
 - **Logged in full.** Every agent-time session leaves a readable record: its intent, the tools it called, what it produced, and what it cost. Nothing happens off the record.
 - **Interruptible.** The human can pause, stop or narrow it at any moment, and a pause always takes effect immediately.
 - **Outputs are proposals.** What agent time produces lands as suggestions the human can accept, edit or dismiss. Accepting one is a trust signal; dismissing one teaches it too.
+- **Your tasks are yours.** Agent time works only on agent-lane to-dos (queued or stuck, with no worker attached) and in Hobbes-owned space. Human-lane to-dos are the person's: agent time may read them for context, but not act on them. To help with one, it files an **offer** proposal ("Hobbes offers to take: …"), and only accepting it moves the task into the agent lane. *(Learned in the first live run: agent time picked up a personal call Dustin was preparing and started researching the person involved.)*
 
 ### Trust ledger
 
