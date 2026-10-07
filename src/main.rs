@@ -3171,6 +3171,12 @@ fn app() -> Element {
                 ChatCommand::TidyTabs => {
                     show_tidy.set(true);
                 }
+                // Agent-time runtime controls: wired by the runtime (wave 2).
+                ChatCommand::AgentTimeStart
+                | ChatCommand::AgentTimePause
+                | ChatCommand::AgentTimeStop => {
+                    tracing::debug!("agent-time control not wired yet");
+                }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
                         if settings.peek().confirm_on_delete {

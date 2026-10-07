@@ -88,6 +88,12 @@ pub enum ChatCommand {
     PrevTabGroup,
     /// Open the Tidy tabs sheet.
     TidyTabs,
+    /// Start an agent-time session now (within the user's grant).
+    AgentTimeStart,
+    /// Pause the running agent-time session immediately.
+    AgentTimePause,
+    /// Stop the running agent-time session immediately.
+    AgentTimeStop,
 }
 
 /// Distinguishes which autocomplete context is active in the chat input.
@@ -340,7 +346,10 @@ pub fn ChatInput(
                 | ChatCommand::PrevTab
                 | ChatCommand::NextTabGroup
                 | ChatCommand::PrevTabGroup
-                | ChatCommand::TidyTabs => {
+                | ChatCommand::TidyTabs
+                | ChatCommand::AgentTimeStart
+                | ChatCommand::AgentTimePause
+                | ChatCommand::AgentTimeStop => {
                     // Handled globally in main.rs
                 }
                 ChatCommand::NewChatWithMemory => {
