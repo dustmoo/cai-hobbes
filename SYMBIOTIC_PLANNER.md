@@ -122,6 +122,18 @@ See the design canvas. In short:
 3. **Capture** — the add-to-do bar understands `@me` / `@hobbes` (or a worker name) and `!chore` / `!mine`, and suggests a lane when the text reads like an outcome.
 4. **Agent time panel** — the grant (minutes, cap, days, scope), today's declared intent, the live log, proposals to accept or dismiss, and pause/stop.
 5. **Weekly review** — your time by category against goals; agent leverage (agent minutes per engaged minute, building on the existing exocortex figure); judgment calls against routing calls; agent-time proposals accepted.
+6. **Tidy tabs.** Tabs are workspaces for to-dos and agent work, so they pile up as work moves async. A tidy pass suggests changes and you review them:
+   - close tabs whose linked to-do is done
+   - close tabs idle 7+ days with no open to-do
+   - file unsorted tabs into a project, using the existing `TabGroupBy::Project` grouping
+
+   Closed tabs stay in History; nothing is deleted. It's **manual by default**: a broom button in the sidebar header, or a step in the end-of-day ritual. An optional nudge comes when more than 20 tabs are open.
+7. **Tab navigation follows what you see.** Today `next_tab` / `prev_tab` (⇧⌘] / ⇧⌘[) cycle the top strip's open order (chats, then Planner, then Fleet; `cycle_tab_fn` in `main.rs`). In sidebar mode the list is sorted and grouped (`tab_list::arrange_tabs`), so the shortcuts jump around. The change:
+   - ⇧⌘] / ⇧⌘[ cycle the sidebar's arranged order, with Planner and Fleet first and collapsed groups skipped
+   - new ⌥⇧⌘] / ⌥⇧⌘[ jump to the next or previous group
+   - ⌘1–9 count positions in the sidebar
+
+   This is a small fix that can ship before the rest.
 
 ## 5. Measures that matter
 
