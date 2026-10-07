@@ -456,6 +456,7 @@ pub(crate) fn WeeklyReview() -> Element {
         (ProposalKind::Skill, "Draft skills"),
         (ProposalKind::Note, "Notes"),
         (ProposalKind::Other, "Other"),
+        (ProposalKind::Offer, "Offers to take a task"),
     ];
     let prop_rows: Vec<(&str, u32, u32)> = kinds
         .iter()

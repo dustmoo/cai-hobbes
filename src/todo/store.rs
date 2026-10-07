@@ -1656,12 +1656,13 @@ mod tests {
                 started_at: now,
                 ended_at: Some(now + chrono::Duration::minutes(18)),
                 cost_usd: 0.42,
-                tool_calls: vec![AgentTimeLogEntry { at: now, tool: "notes.search".into(), summary: "6 notes".into() }],
+                tool_calls: vec![AgentTimeLogEntry { at: now, tool: "notes.search".into(), summary: "6 notes".into(), kind: Default::default(), note: None }],
                 outputs: vec!["pr_1".into()],
                 end_reason: Some(AgentTimeEndReason::Completed),
                 summary: Some("one digest".into()),
                 chat_session_id: Some("chat".into()),
                 out_of_scope_attempts: 0,
+                todo_id: None,
             };
             upsert_agent_time_session_conn(conn, &session, 2).unwrap();
             let proposal = Proposal {
@@ -1673,6 +1674,7 @@ mod tests {
                 created_at: now,
                 resolved_at: None,
                 session_id: "at_1".into(),
+                todo_id: None,
             };
             upsert_proposal_conn(conn, &proposal, 3).unwrap();
             let decision = ResolvedDecision {

@@ -32,8 +32,8 @@
 use chrono::{DateTime, NaiveDate, Utc};
 
 use super::model::{
-    AgentTimeEndReason, AgentTimeGrant, AgentTimeLogEntry, AgentTimeSession, Proposal,
-    ProposalKind, ProposalStatus,
+    AgentState, AgentTimeEndReason, AgentTimeGrant, AgentTimeLogEntry, AgentTimeLogKind,
+    AgentTimeSession, Lane, Proposal, ProposalKind, ProposalStatus, Todo,
 };
 use super::PlannerState;
 
@@ -180,6 +180,22 @@ fn clip(s: &str, max: usize) -> String {
     }
 }
 
+/// Remove the trailing `Note` rows (the model's `log` notes no call has
+/// followed yet) and return their text, joined, for the call about to be
+/// recorded.
+fn take_trailing_notes(s: &mut AgentTimeSession) -> Option<String> {
+    let keep = s
+        .tool_calls
+        .iter()
+        .rposition(|e| e.kind != AgentTimeLogKind::Note)
+        .map_or(0, |i| i + 1);
+    if keep == s.tool_calls.len() {
+        return None;
+    }
+    let notes: Vec<String> = s.tool_calls.drain(keep..).map(|e| e.summary).collect();
+    Some(clip(&notes.join(" \u{b7} "), MAX_LOG_SUMMARY_CHARS))
+}
+
 fn short_id(prefix: &str) -> String {
     format!("{}_{}", prefix, &uuid::Uuid::new_v4().simple().to_string()[..8])
 }
@@ -303,15 +319,39 @@ impl PlannerState {
         self.end_open_agent_time(now, reason, None)
     }
 
+    /// Append a tool call to the log. A `log` note the model wrote just
+    /// before it (trailing `Note` rows) is folded into this call's `note`
+    /// instead of standing as a row of its own, so one call is one row.
     fn push_log(s: &mut AgentTimeSession, tool: &str, summary: &str, now: DateTime<Utc>) {
+        let note = take_trailing_notes(s);
         s.tool_calls.push(AgentTimeLogEntry {
             at: now,
             tool: clip(tool, 80),
             summary: clip(summary, MAX_LOG_SUMMARY_CHARS),
+            kind: AgentTimeLogKind::Call,
+            note,
         });
     }
 
-    /// `start(intent)`: declare the intent and open a logged session.
+    /// Append a non-call line (`Note` or `Event`).
+    fn push_line(
+        s: &mut AgentTimeSession,
+        kind: AgentTimeLogKind,
+        tool: &str,
+        summary: &str,
+        now: DateTime<Utc>,
+    ) {
+        s.tool_calls.push(AgentTimeLogEntry {
+            at: now,
+            tool: clip(tool, 80),
+            summary: clip(summary, MAX_LOG_SUMMARY_CHARS),
+            kind,
+            note: None,
+        });
+    }
+
+    /// `start(intent)`: declare the intent and open a logged session of
+    /// Hobbes-space work (no to-do).
     pub fn agent_time_start(
         &mut self,
         caller: &str,
@@ -319,7 +359,28 @@ impl PlannerState {
         today: NaiveDate,
         now: DateTime<Utc>,
     ) -> Result<AgentTimeSession, AgentTimeRefusal> {
+        self.agent_time_start_on(caller, intent, None, &|_: &str| false, today, now)
+    }
+
+    /// `start(intent, todo_id?)`: as [`Self::agent_time_start`], optionally
+    /// on one agent-lane to-do, which must be [`agent_time_eligible`]
+    /// (`worker_live` says whether a linked worker is running now). A
+    /// human-lane to-do is refused: it is the person's, and agent time may
+    /// only offer to take it (`propose` kind `offer`).
+    pub fn agent_time_start_on(
+        &mut self,
+        caller: &str,
+        intent: &str,
+        todo_id: Option<&str>,
+        worker_live: &dyn Fn(&str) -> bool,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> Result<AgentTimeSession, AgentTimeRefusal> {
         let budget = self.agent_time_gate(caller, today, now)?;
+        let todo_id = todo_id.map(str::trim).filter(|t| !t.is_empty());
+        if let Some(id) = todo_id {
+            self.check_workable(id, worker_live)?;
+        }
         if self.open_agent_time_session().is_some() {
             return Err(AgentTimeRefusal::AlreadyRunning);
         }
@@ -341,14 +402,20 @@ impl PlannerState {
             summary: None,
             chat_session_id: Some(caller.to_string()),
             out_of_scope_attempts: 0,
+            todo_id: todo_id.map(str::to_string),
         };
+        let on = todo_id
+            .and_then(|id| self.todo(id))
+            .map(|t| format!(" · working on {}", t.title))
+            .unwrap_or_default();
         Self::push_log(
             &mut s,
             "HOBBES_AGENT_TIME.start",
             &format!(
-                "intent declared · grant ok · {} min, ${:.2} left",
+                "intent declared · grant ok · {} min, ${:.2} left{}",
                 budget.minutes_left(),
-                budget.spend_left_usd()
+                budget.spend_left_usd(),
+                on
             ),
             now,
         );
@@ -356,7 +423,11 @@ impl PlannerState {
         Ok(s)
     }
 
-    /// `log(tool, summary)`: the agent's own note in the log.
+    /// `log(summary)`: the agent's own optional note. The runtime records
+    /// every call itself, so this is never a call row: it waits as a `Note`
+    /// and the next recorded call absorbs it as that call's note; a note no
+    /// call follows stays a (muted) note row. `tool` is only a fallback text
+    /// when `summary` is empty.
     pub fn agent_time_log(
         &mut self,
         caller: &str,
@@ -369,12 +440,55 @@ impl PlannerState {
         let s = self
             .open_agent_time_session_mut()
             .ok_or(AgentTimeRefusal::NoOpenSession)?;
-        let tool = if tool.trim().is_empty() { "note" } else { tool };
-        Self::push_log(s, tool, summary, now);
+        let text = if summary.trim().is_empty() { tool } else { summary };
+        if text.trim().is_empty() {
+            return Err(AgentTimeRefusal::Invalid("log needs a 'summary'.".into()));
+        }
+        Self::push_line(s, AgentTimeLogKind::Note, "note", text, now);
         Ok(s.clone())
     }
 
+    /// Why agent time may not work on to-do `id`, if it may not.
+    fn check_workable(
+        &self,
+        id: &str,
+        worker_live: &dyn Fn(&str) -> bool,
+    ) -> Result<(), AgentTimeRefusal> {
+        let Some(t) = self.todo(id) else {
+            return Err(AgentTimeRefusal::Invalid(format!(
+                "No to-do '{id}'. Pick one from \"Agent lane: yours to work on\", or omit todo_id \
+                 to work in Hobbes-owned space."
+            )));
+        };
+        if t.lane == Lane::Human {
+            return Err(AgentTimeRefusal::Invalid(format!(
+                "'{}' is the user's own task (human lane), not yours to work on. You may offer to \
+                 take it with propose(kind: \"offer\", todo_id: \"{}\", body: why you could help); \
+                 only the user's acceptance hands it over.",
+                t.title, t.id
+            )));
+        }
+        if !agent_time_eligible(t, worker_live) {
+            let why = if t.status.is_closed() {
+                "it is closed".to_string()
+            } else if t.linked_fleet_session.as_deref().is_some_and(worker_live) {
+                "a worker is already running it".to_string()
+            } else {
+                format!(
+                    "it is {}, and agent time takes only queued or stuck ones",
+                    t.agent_state.map(|s| s.label()).unwrap_or("not started")
+                )
+            };
+            return Err(AgentTimeRefusal::Invalid(format!(
+                "'{}' isn't available to agent time: {why}.",
+                t.title
+            )));
+        }
+        Ok(())
+    }
+
     /// `propose(kind, title, body)`: file an output as an open proposal.
+    /// For kind `Offer` use [`Self::agent_time_offer`].
     pub fn agent_time_propose(
         &mut self,
         caller: &str,
@@ -384,9 +498,63 @@ impl PlannerState {
         today: NaiveDate,
         now: DateTime<Utc>,
     ) -> Result<(Proposal, AgentTimeSession), AgentTimeRefusal> {
+        if kind == ProposalKind::Offer {
+            return Err(AgentTimeRefusal::Invalid(
+                "An offer needs the 'todo_id' of the task you offer to take.".into(),
+            ));
+        }
+        self.file_proposal(caller, kind, title, body, None, today, now)
+    }
+
+    /// `propose(kind: offer, todo_id, body)`: offer to take one of the
+    /// person's own to-dos into the agent lane. The to-do must be open and in
+    /// the human lane; the offer changes nothing until the person accepts it
+    /// ([`Self::apply_accepted_offer`]). Allowed whatever the grant's
+    /// proposal kinds: it is a question, not an output.
+    pub fn agent_time_offer(
+        &mut self,
+        caller: &str,
+        todo_id: &str,
+        pitch: &str,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> Result<(Proposal, AgentTimeSession), AgentTimeRefusal> {
+        self.agent_time_gate(caller, today, now)?;
+        let id = todo_id.trim();
+        let t = self.todo(id).ok_or_else(|| {
+            AgentTimeRefusal::Invalid(format!("No to-do '{id}' to offer to take."))
+        })?;
+        if t.status.is_closed() {
+            return Err(AgentTimeRefusal::Invalid(format!(
+                "'{}' is already closed; there is nothing to take.",
+                t.title
+            )));
+        }
+        if t.lane == Lane::Agent {
+            return Err(AgentTimeRefusal::Invalid(format!(
+                "'{}' is already in the agent lane. If it is queued or stuck, start on it with \
+                 start(todo_id) instead of offering.",
+                t.title
+            )));
+        }
+        let (title, id) = (t.title.clone(), t.id.clone());
+        self.file_proposal(caller, ProposalKind::Offer, &title, pitch, Some(id), today, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn file_proposal(
+        &mut self,
+        caller: &str,
+        kind: ProposalKind,
+        title: &str,
+        body: &str,
+        todo_id: Option<String>,
+        today: NaiveDate,
+        now: DateTime<Utc>,
+    ) -> Result<(Proposal, AgentTimeSession), AgentTimeRefusal> {
         self.agent_time_gate(caller, today, now)?;
         let allowed = &self.agent_time_grant.scope.proposal_kinds;
-        if !allowed.is_empty() && !allowed.contains(&kind) {
+        if kind != ProposalKind::Offer && !allowed.is_empty() && !allowed.contains(&kind) {
             return Err(AgentTimeRefusal::Invalid(format!(
                 "The grant's scope does not include '{}' proposals.",
                 kind.as_str()
@@ -409,6 +577,7 @@ impl PlannerState {
             created_at: now,
             resolved_at: None,
             session_id,
+            todo_id,
         };
         let s = self
             .open_agent_time_session_mut()
@@ -504,7 +673,7 @@ impl PlannerState {
             .agent_time_sessions
             .iter_mut()
             .find(|s| s.is_open() && s.chat_session_id.as_deref() == Some(chat_session_id))?;
-        Self::push_log(s, tool, summary, now);
+        Self::push_line(s, AgentTimeLogKind::Event, tool, summary, now);
         Some(s.clone())
     }
 
@@ -580,6 +749,27 @@ impl PlannerState {
         Some(out)
     }
 
+    /// **UI action**, after [`Self::resolve_proposal`] accepted an `Offer`:
+    /// hand the to-do over — it moves to the agent lane as `Queued`
+    /// (`Todo::set_lane`). Dispatching it still happens the normal way.
+    /// Only an accepted (or edited-then-accepted) offer of an open,
+    /// human-lane to-do moves anything. Returns the to-do to persist.
+    pub fn apply_accepted_offer(&mut self, p: &Proposal, now: DateTime<Utc>) -> Option<Todo> {
+        if p.kind != ProposalKind::Offer
+            || !matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Edited)
+        {
+            return None;
+        }
+        let t = self.todo_mut(p.todo_id.as_deref()?)?;
+        if t.status.is_closed() || t.lane == Lane::Agent {
+            return None;
+        }
+        t.set_lane(Lane::Agent);
+        t.agent_state = Some(AgentState::Queued);
+        t.updated_at = now;
+        Some(t.clone())
+    }
+
     /// Record a promise the agent made ("ready by Friday") as kept or broken.
     /// Evidence only. No automatic source exists yet — the UI (or a later
     /// promise tracker) calls this. Persist the ledger afterwards.
@@ -614,6 +804,110 @@ impl PlannerState {
         v.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         v
     }
+}
+
+// ── What agent time may work on ─────────────────────────────────────────────
+
+/// Whether agent time may work on `t`: an open agent-lane to-do that is
+/// `Queued` or `Stuck` with no live worker attached (`worker_live` says
+/// whether its linked fleet session is running now). Human-lane to-dos are
+/// the person's: never eligible (agent time may only offer to take them).
+pub fn agent_time_eligible(t: &Todo, worker_live: &dyn Fn(&str) -> bool) -> bool {
+    t.lane == Lane::Agent
+        && !t.status.is_closed()
+        && matches!(t.agent_state, Some(AgentState::Queued) | Some(AgentState::Stuck))
+        && !t.linked_fleet_session.as_deref().is_some_and(worker_live)
+}
+
+/// Most of the person's own to-dos listed in the agent-time context.
+pub const MAX_HUMAN_TASKS_LISTED: usize = 10;
+
+/// The two lists agent time is shown: what is its to work on, and what is
+/// the person's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentTimeTaskLists {
+    /// Eligible agent-lane to-dos: (id, title, outcome).
+    pub agent: Vec<(String, String, Option<String>)>,
+    /// The person's open to-dos, overdue and today first: (id, title).
+    pub human: Vec<(String, String)>,
+    /// Open human to-dos beyond [`MAX_HUMAN_TASKS_LISTED`].
+    pub human_more: usize,
+}
+
+/// Overdue first, then today, then the rest (each by list order).
+fn human_rank(t: &Todo, today: NaiveDate) -> u8 {
+    let overdue = t.deadline.is_some_and(|d| d < today) || t.scheduled_for.is_some_and(|d| d < today);
+    let due_today = t.deadline == Some(today) || t.scheduled_for == Some(today);
+    if overdue {
+        0
+    } else if due_today {
+        1
+    } else {
+        2
+    }
+}
+
+/// **Pure.** Build the two lists from the planner.
+pub fn agent_time_task_lists(
+    planner: &PlannerState,
+    today: NaiveDate,
+    worker_live: &dyn Fn(&str) -> bool,
+) -> AgentTimeTaskLists {
+    let agent = planner
+        .todos
+        .iter()
+        .filter(|t| agent_time_eligible(t, worker_live))
+        .map(|t| (t.id.clone(), t.title.clone(), t.outcome.clone().filter(|o| !o.trim().is_empty())))
+        .collect();
+    let mut human: Vec<&Todo> = planner
+        .todos
+        .iter()
+        .filter(|t| t.lane == Lane::Human && !t.status.is_closed())
+        .collect();
+    human.sort_by(|a, b| {
+        human_rank(a, today)
+            .cmp(&human_rank(b, today))
+            .then(a.sort_order.partial_cmp(&b.sort_order).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let human_more = human.len().saturating_sub(MAX_HUMAN_TASKS_LISTED);
+    let human = human
+        .into_iter()
+        .take(MAX_HUMAN_TASKS_LISTED)
+        .map(|t| (t.id.clone(), t.title.clone()))
+        .collect();
+    AgentTimeTaskLists { agent, human, human_more }
+}
+
+/// **Pure.** The two-list context block for the opening message and the
+/// `start` result. `owner` is how the person is named ("Dustin", or "the
+/// user"). The wording draws the boundary: the agent lane is agent time's;
+/// the owner's tasks are not, and may only be offered for.
+pub fn agent_time_context(lists: &AgentTimeTaskLists, owner: &str) -> String {
+    let mut out = String::from("Agent lane: yours to work on (start with todo_id to take one)\n");
+    if lists.agent.is_empty() {
+        out.push_str("- (none queued or stuck right now; work in Hobbes-owned space instead)\n");
+    }
+    for (id, title, outcome) in &lists.agent {
+        match outcome {
+            Some(o) => out.push_str(&format!("- [{id}] {title} \u{2014} done when: {o}\n")),
+            None => out.push_str(&format!("- [{id}] {title}\n")),
+        }
+    }
+    out.push_str(&format!(
+        "\n{owner}'s tasks: NOT yours. Don't work on them, research them or act on them. You may \
+         offer help with propose(kind: \"offer\", todo_id, body: why you could take it); only \
+         {owner}'s acceptance hands one over.\n"
+    ));
+    if lists.human.is_empty() {
+        out.push_str("- (none open)\n");
+    }
+    for (id, title) in &lists.human {
+        out.push_str(&format!("- [{id}] {title}\n"));
+    }
+    if lists.human_more > 0 {
+        out.push_str(&format!("- \u{2026}and {} more\n", lists.human_more));
+    }
+    out
 }
 
 /// An accepted `Todo` proposal as a new human to-do in the Inbox. Pure; the
@@ -667,6 +961,66 @@ const DESTRUCTIVE_TOKENS: &[&str] = &[
     "kill", "terminate", "uninstall", "reset", "rm", "rmdir", "force",
 ];
 
+/// Name tokens that mark a lookup of a specific person's personal
+/// information (profiles, contact details, enrichment). During agent time
+/// these ask first even when the verb is a read: a person who never shared
+/// anything with Hobbes is not "what the user has shared". `email` is not
+/// listed because it is already an outside-effect token (so `find_email`
+/// asks either way).
+const PERSON_TOKENS: &[&str] = &[
+    "person", "persons", "people", "profile", "profiles", "contact", "contacts", "phone",
+    "phones", "linkedin", "enrich", "enrichment", "prospect", "prospects", "whois",
+];
+
+/// Words in a free-text argument that ask for someone's contact details.
+const CONTACT_WORDS: &[&str] = &[
+    "phone", "phones", "telephone", "cell", "mobile", "email", "emails", "mail", "address",
+    "addresses", "contact", "contacts", "whatsapp",
+];
+
+/// A double-quoted span that reads like a person's name: two to four words,
+/// each starting with an uppercase letter (`"Sophie Asher"`).
+fn has_quoted_name(text: &str) -> bool {
+    let mut parts = text.split('"');
+    parts.next(); // before the first quote
+    let mut inside = parts.step_by(2);
+    inside.any(|q| {
+        let words: Vec<&str> = q.split_whitespace().collect();
+        (2..=4).contains(&words.len())
+            && words.iter().all(|w| {
+                w.chars().next().is_some_and(|c| c.is_uppercase())
+                    && w.chars().all(|c| c.is_alphabetic() || c == '-' || c == '\'' || c == '.')
+            })
+    })
+}
+
+/// **Heuristic, deliberately simple.** Whether a free-text argument (a web
+/// search query, say) targets a named individual's contact details: it holds
+/// a quoted person-like name (see [`has_quoted_name`]) AND a contact word
+/// (phone, email, address, contact…). Generic searches never match; a name
+/// without a contact word, or contact words without a quoted name, don't
+/// either.
+pub fn targets_personal_contact(text: &str) -> bool {
+    if !has_quoted_name(text) {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    lower.contains("e-mail")
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .any(|w| CONTACT_WORDS.contains(&w))
+}
+
+/// Every string in `args` (nested objects and arrays included).
+fn arg_strings(args: &serde_json::Value, out: &mut Vec<String>) {
+    match args {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|v| arg_strings(v, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|v| arg_strings(v, out)),
+        _ => {}
+    }
+}
+
 /// Split a tool name into lowercase word tokens: separators (`_ - . : /`
 /// and the `__` server prefix) and camelCase boundaries both split.
 fn name_tokens(name: &str) -> Vec<String> {
@@ -701,11 +1055,51 @@ fn action_of(args: &serde_json::Value) -> String {
         .to_ascii_lowercase()
 }
 
+/// Why a call got its verdict — for the approval card ("why it asks") and
+/// the refusal text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeReason {
+    /// A Hobbes built-in agent time may use.
+    HobbesAllowed,
+    /// The person's own plan / lists / workers / timers.
+    HobbesOffLimits,
+    /// A destructive verb in the name.
+    Destructive,
+    /// Looks up a specific person's personal information (by tool name, or a
+    /// query aimed at a named person's contact details).
+    PersonLookup,
+    /// An outside-effect verb in the name.
+    OutsideEffect,
+    /// A read of shared data.
+    Read,
+    /// No recognisable verb: treated as an outside effect.
+    Unrecognised,
+}
+
+impl ScopeReason {
+    /// One line for the "why it asks" text on an approval card.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ScopeReason::HobbesAllowed => "a Hobbes tool agent time may use",
+            ScopeReason::HobbesOffLimits => "your plan, lists, workers and timers are off limits",
+            ScopeReason::Destructive => "destructive, never allowed during agent time",
+            ScopeReason::PersonLookup => "looks up a specific person's personal information",
+            ScopeReason::OutsideEffect => "has an outside effect",
+            ScopeReason::Read => "reads what you've shared",
+            ScopeReason::Unrecognised => "unrecognised tool, treated as an outside effect",
+        }
+    }
+}
+
 /// **The agent-time scope check** — pure, applied by the runtime's tool gate
 /// to every call made during agent time (`tool` is the tool name as the
-/// model emitted it; `args` its arguments).
-///
-/// Rules, first match wins:
+/// model emitted it; `args` its arguments). See [`agent_time_scope`] for
+/// the rules.
+pub fn agent_time_scope_allows(tool: &str, args: &serde_json::Value) -> ScopeVerdict {
+    agent_time_scope(tool, args).0
+}
+
+/// The scope verdict with its reason. Rules, first match wins:
 ///
 /// 1. Hobbes built-ins are classified explicitly:
 ///    - Allow: `HOBBES_AGENT_TIME` (its own grant checks still apply),
@@ -722,41 +1116,59 @@ fn action_of(args: &serde_json::Value) -> String {
 ///      `HOBBES_TIME_GOALS set`), answering or raising decisions, launching
 ///      workers (`HOBBES_DISPATCH`) and timers (`HOBBES_SET_TIMER`,
 ///      `HOBBES_CANCEL_TIMER`). Agent time files a proposal instead.
-/// 2. Any other tool (MCP, Composio, terminal) by the verbs in its name:
-///    a destructive verb → Deny; an outside-effect verb → NeedsApproval; a
-///    read verb → Allow; no recognisable verb → NeedsApproval (unknown is
-///    treated as an outside effect, never as a read).
-pub fn agent_time_scope_allows(tool: &str, args: &serde_json::Value) -> ScopeVerdict {
+/// 2. Any other tool (MCP, Composio, terminal) by the tokens in its name:
+///    a destructive verb → Deny; a person-lookup token (person, people,
+///    profile, contact, phone, linkedin, enrich…, see `PERSON_TOKENS`) →
+///    NeedsApproval; an outside-effect verb → NeedsApproval; a read verb →
+///    Allow, unless one of its string arguments targets a named person's
+///    contact details ([`targets_personal_contact`]: a quoted person-like
+///    name plus phone / email / address / contact) → NeedsApproval; no
+///    recognisable verb → NeedsApproval (unknown is treated as an outside
+///    effect, never as a read).
+pub fn agent_time_scope(tool: &str, args: &serde_json::Value) -> (ScopeVerdict, ScopeReason) {
+    use ScopeReason as R;
     use ScopeVerdict::*;
     match tool {
         "HOBBES_AGENT_TIME" | "HOBBES_TODO_LIST" | "HOBBES_CALENDAR_LIST"
         | "HOBBES_FLEET_STATUS" | "HOBBES_LIST_TIMERS" | "HOBBES_PAGE_RESULT"
         | "HOBBES_UPDATE_SCRATCHPAD" | "HOBBES_INVOKE_SKILL" | "HOBBES_UNLOAD_SKILL"
-        | "MCP_LOAD_SERVER_TOOLS" | "MCP_UNLOAD_SERVER_TOOLS" => return Allow,
+        | "MCP_LOAD_SERVER_TOOLS" | "MCP_UNLOAD_SERVER_TOOLS" => return (Allow, R::HobbesAllowed),
         "HOBBES_DECISIONS" => {
-            return if action_of(args) == "list" { Allow } else { Deny };
+            return if action_of(args) == "list" {
+                (Allow, R::HobbesAllowed)
+            } else {
+                (Deny, R::HobbesOffLimits)
+            };
         }
         "HOBBES_TIME_GOALS" => {
             return if action_of(args) == "get" || action_of(args).is_empty() {
-                Allow
+                (Allow, R::HobbesAllowed)
             } else {
-                Deny
+                (Deny, R::HobbesOffLimits)
             };
         }
-        t if t.starts_with("HOBBES_") => return Deny,
+        t if t.starts_with("HOBBES_") => return (Deny, R::HobbesOffLimits),
         _ => {}
     }
 
     let tokens = name_tokens(tool);
     let has = |set: &[&str]| tokens.iter().any(|t| set.contains(&t.as_str()));
     if has(DESTRUCTIVE_TOKENS) {
-        Deny
+        (Deny, R::Destructive)
+    } else if has(PERSON_TOKENS) {
+        (NeedsApproval, R::PersonLookup)
     } else if has(WRITE_TOKENS) {
-        NeedsApproval
+        (NeedsApproval, R::OutsideEffect)
     } else if has(READ_TOKENS) {
-        Allow
+        let mut texts = Vec::new();
+        arg_strings(args, &mut texts);
+        if texts.iter().any(|t| targets_personal_contact(t)) {
+            (NeedsApproval, R::PersonLookup)
+        } else {
+            (Allow, R::Read)
+        }
     } else {
-        NeedsApproval
+        (NeedsApproval, R::Unrecognised)
     }
 }
 
@@ -856,7 +1268,9 @@ mod tests {
         let ended = s.agent_time_end("chat-at", "Filed one digest", now).unwrap();
         assert_eq!(ended.end_reason, Some(AgentTimeEndReason::Completed));
         assert_eq!(ended.summary.as_deref(), Some("Filed one digest"));
-        assert_eq!(ended.tool_calls.len(), 4, "start, log, propose, end");
+        assert_eq!(ended.tool_calls.len(), 3, "start, propose (carrying the log note), end");
+        assert_eq!(ended.tool_calls[1].note.as_deref(), Some("6 notes"));
+        assert_eq!(ended.call_count(), 3);
         assert_eq!(s.trust_ledger.clean_sessions, 1);
         assert_eq!(
             s.agent_time_log("chat-at", "x", "y", today(), now).unwrap_err(),
@@ -894,6 +1308,7 @@ mod tests {
             summary: None,
             chat_session_id: None,
             out_of_scope_attempts: 0,
+            todo_id: None,
         });
         let b = s.agent_time_budget(today(), now);
         // The fixture may straddle local midnight; only assert when it didn't.
@@ -1034,5 +1449,323 @@ mod tests {
                   "git_push_force", "list_and_delete"] {
             assert_eq!(agent_time_scope_allows(t, &none), Deny, "{t}");
         }
+    }
+
+    // ── log notes fold into the next call ───────────────────────────────
+
+    #[test]
+    fn a_log_note_attaches_to_the_next_recorded_call() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        // The model logs, then calls the tool; the gate records the call.
+        s.agent_time_log("chat-at", "web-search_brave_web_search", "Look for fleet blockers", today(), now)
+            .unwrap();
+        let sess = s
+            .record_agent_time_tool_call("chat-at", "brave_web_search", "query=fleet", ScopeVerdict::Allow, now)
+            .unwrap();
+        assert_eq!(sess.tool_calls.len(), 2, "start + one row for the search, not two");
+        let row = sess.tool_calls.last().unwrap();
+        assert_eq!(row.tool, "brave_web_search", "the gate's plain tool name, not the model's");
+        assert_eq!(row.kind, AgentTimeLogKind::Call);
+        assert_eq!(row.note.as_deref(), Some("Look for fleet blockers"));
+        assert_eq!(sess.call_count(), 2);
+    }
+
+    #[test]
+    fn a_trailing_log_note_stays_a_note_row_and_is_not_a_call() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        s.record_agent_time_tool_call("chat-at", "notes.search", "q", ScopeVerdict::Allow, now);
+        s.agent_time_log("chat-at", "", "Wrapping up", today(), now).unwrap();
+        let sess = s.agent_time_log("chat-at", "", "Nothing else worth doing", today(), now).unwrap();
+        let notes: Vec<_> = sess.tool_calls.iter().filter(|e| e.kind == AgentTimeLogKind::Note).collect();
+        assert_eq!(notes.len(), 2);
+        assert_eq!(sess.call_count(), 2, "start + notes.search");
+        // Runtime events are neither calls nor merged into the next call.
+        s.note_agent_time("chat-at", "runtime", "approved by the user", now);
+        let sess = s
+            .record_agent_time_tool_call("chat-at", "repo.read", "f", ScopeVerdict::Allow, now)
+            .unwrap();
+        assert_eq!(sess.call_count(), 3);
+        assert!(sess.tool_calls.last().unwrap().note.is_none(), "an event sits between the notes and the call");
+        assert!(s.agent_time_log("chat-at", "", "  ", today(), now).is_err());
+    }
+
+    #[test]
+    fn consecutive_notes_join_onto_one_call() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        s.agent_time_log("chat-at", "", "first", today(), now).unwrap();
+        s.agent_time_log("chat-at", "", "second", today(), now).unwrap();
+        let (_, sess) = s
+            .agent_time_propose("chat-at", ProposalKind::Note, "t", "", today(), now)
+            .unwrap();
+        assert_eq!(sess.tool_calls.len(), 2);
+        assert_eq!(sess.tool_calls[1].note.as_deref(), Some("first \u{b7} second"));
+    }
+
+    #[test]
+    fn old_log_rows_deserialize_as_calls() {
+        let e: AgentTimeLogEntry = serde_json::from_value(json!({
+            "at": "2026-10-07T14:42:00Z", "tool": "x", "summary": "y"
+        }))
+        .unwrap();
+        assert_eq!(e.kind, AgentTimeLogKind::Call);
+        assert!(e.note.is_none());
+        // And a call row serializes without the new fields.
+        let v = serde_json::to_value(&e).unwrap();
+        assert!(v.get("kind").is_none() && v.get("note").is_none());
+    }
+
+    // ── people lookups ask first ────────────────────────────────────────
+
+    #[test]
+    fn person_lookups_need_approval_even_as_reads() {
+        use ScopeVerdict::*;
+        let none = json!({});
+        // The exact call from the Oct 7 session.
+        assert_eq!(
+            agent_time_scope("linkedin_get_person_profile", &json!({"linkedin_url": "https://www.linkedin.com/in/x"})),
+            (NeedsApproval, ScopeReason::PersonLookup)
+        );
+        for t in [
+            "linkedin_get_person_profile", "apollo_people_search", "get_user_profile",
+            "GOOGLE_CONTACTS_LIST", "lookup_phone_number", "clearbit_enrichment",
+            "people_data_labs_enrich_person", "hunter_email_finder", "whois_lookup",
+        ] {
+            assert_eq!(agent_time_scope_allows(t, &none), NeedsApproval, "{t}");
+        }
+        // Destructive still wins.
+        assert_eq!(agent_time_scope_allows("delete_contact", &none), Deny);
+    }
+
+    #[test]
+    fn searches_for_a_named_persons_contact_details_need_approval() {
+        use ScopeVerdict::*;
+        // The exact search from the Oct 7 session.
+        let q = json!({"query": "\"Sophie Asher\" attorney Seattle phone OR email contact", "count": 10});
+        assert_eq!(
+            agent_time_scope("brave_web_search", &q),
+            (NeedsApproval, ScopeReason::PersonLookup)
+        );
+        // Generic searches stay allowed.
+        assert_eq!(agent_time_scope_allows("brave_web_search", &json!({"query": "rust dioxus signals"})), Allow);
+        // A quoted name without a contact word, or contact words without a
+        // quoted name, are ordinary research.
+        assert_eq!(
+            agent_time_scope_allows("brave_web_search", &json!({"query": "\"Ada Lovelace\" analytical engine"})),
+            Allow
+        );
+        assert_eq!(
+            agent_time_scope_allows("brave_web_search", &json!({"query": "how to change email address in git"})),
+            Allow
+        );
+        assert_eq!(
+            agent_time_scope_allows("brave_web_search", &json!({"query": "\"rust signals\" email"})),
+            Allow,
+            "a quoted lowercase phrase is not a name"
+        );
+        // Nested arguments count.
+        assert_eq!(
+            agent_time_scope_allows("web_search", &json!({"params": {"q": "\"Jane Q. Doe\" home address"}})),
+            NeedsApproval
+        );
+    }
+
+    #[test]
+    fn contact_heuristic_unit_cases() {
+        assert!(targets_personal_contact("\"Sophie Asher\" phone"));
+        assert!(targets_personal_contact("find the e-mail for \"Bob O'Neil\""));
+        assert!(!targets_personal_contact("\"Sophie\" phone"), "one word is not a full name");
+        assert!(!targets_personal_contact("Sophie Asher phone"), "unquoted");
+        assert!(!targets_personal_contact("\"Sophie Asher\" biography"));
+    }
+
+    // ── agent tasks vs the person's tasks ───────────────────────────────
+
+    fn todo_in(s: &mut PlannerState, title: &str, lane: Lane, state: Option<AgentState>) -> String {
+        let mut t = Todo::new(title, s.todos.len() as f64);
+        t.lane = lane;
+        t.agent_state = state;
+        let id = t.id.clone();
+        s.todos.push(t);
+        id
+    }
+
+    #[test]
+    fn start_takes_only_an_eligible_agent_lane_todo() {
+        let none = |_: &str| false;
+        let mut s = leased();
+        let now = Utc::now();
+        let queued = todo_in(&mut s, "Digest the KV-cache notes", Lane::Agent, Some(AgentState::Queued));
+        let stuck = todo_in(&mut s, "Fix the flaky test", Lane::Agent, Some(AgentState::Stuck));
+        let working = todo_in(&mut s, "Ship release", Lane::Agent, Some(AgentState::Working));
+        let human = todo_in(&mut s, "Sophie Asher Probate Consult", Lane::Human, None);
+        let mut done = Todo::new("Old agent task", 9.0);
+        done.lane = Lane::Agent;
+        done.agent_state = Some(AgentState::Queued);
+        done.status = crate::todo::model::TodoStatus::Completed;
+        let done_id = done.id.clone();
+        s.todos.push(done);
+        // A queued to-do whose linked worker is live right now.
+        let mut live = Todo::new("Being worked", 10.0);
+        live.lane = Lane::Agent;
+        live.agent_state = Some(AgentState::Queued);
+        live.linked_fleet_session = Some("w1".into());
+        let live_id = live.id.clone();
+        s.todos.push(live);
+        let w1_live = |sid: &str| sid == "w1";
+
+        // The person's task: refused, pointing at the offer flow.
+        let err = s.agent_time_start_on("chat-at", "help", Some(&human), &none, today(), now).unwrap_err();
+        match err {
+            AgentTimeRefusal::Invalid(m) => {
+                assert!(m.contains("not yours") && m.contains("\"offer\""), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+        for id in [&working, &done_id, &"nope".to_string()] {
+            assert!(s.agent_time_start_on("chat-at", "x", Some(id), &none, today(), now).is_err(), "{id}");
+        }
+        assert!(s.agent_time_start_on("chat-at", "x", Some(&live_id), &w1_live, today(), now).is_err());
+        assert!(s.open_agent_time_session().is_none(), "no session opened by a refusal");
+
+        // Eligible: queued, or stuck.
+        let started = s.agent_time_start_on("chat-at", "Digest", Some(&queued), &none, today(), now).unwrap();
+        assert_eq!(started.todo_id.as_deref(), Some(queued.as_str()));
+        assert!(started.tool_calls[0].summary.contains("working on Digest the KV-cache notes"));
+        s.agent_time_end("chat-at", "", now).unwrap();
+        assert!(s.agent_time_start_on("chat-at", "Fix", Some(&stuck), &none, today(), now).is_ok());
+        s.agent_time_end("chat-at", "", now).unwrap();
+        // No to-do: Hobbes-space work.
+        assert_eq!(s.agent_time_start("chat-at", "Tidy notes", today(), now).unwrap().todo_id, None);
+    }
+
+    #[test]
+    fn an_accepted_offer_moves_the_todo_to_the_agent_lane_as_queued() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        let human = todo_in(&mut s, "Draft the release notes", Lane::Human, None);
+        let (offer, _) = s.agent_time_offer("chat-at", &human, "I can draft these from the changelog.", today(), now).unwrap();
+        assert_eq!(offer.kind, ProposalKind::Offer);
+        assert_eq!(offer.todo_id.as_deref(), Some(human.as_str()));
+        assert_eq!(offer.title, "Draft the release notes");
+        assert_eq!(offer.body, "I can draft these from the changelog.");
+        // Filing it changes nothing.
+        assert_eq!(s.todo(&human).unwrap().lane, Lane::Human);
+        // Not applied while open, or when dismissed.
+        assert!(s.apply_accepted_offer(&offer, now).is_none());
+
+        let accepted = s.resolve_proposal(&offer.id, ProposalStatus::Accepted, None, now).unwrap();
+        let t = s.apply_accepted_offer(&accepted, now).expect("handed over");
+        assert_eq!(t.lane, Lane::Agent);
+        assert_eq!(t.agent_state, Some(AgentState::Queued));
+        assert_eq!(s.todo(&human).unwrap().lane, Lane::Agent);
+        assert_eq!(s.trust_ledger.proposals_accepted, 1, "counted as accepted");
+        assert!(s.apply_accepted_offer(&accepted, now).is_none(), "only once");
+
+        // Dismissed: the to-do is untouched.
+        let other = todo_in(&mut s, "Call the bank", Lane::Human, None);
+        let (o2, _) = s.agent_time_offer("chat-at", &other, "pitch", today(), now).unwrap();
+        let dismissed = s.resolve_proposal(&o2.id, ProposalStatus::Dismissed, None, now).unwrap();
+        assert!(s.apply_accepted_offer(&dismissed, now).is_none());
+        assert_eq!(s.todo(&other).unwrap().lane, Lane::Human);
+    }
+
+    #[test]
+    fn an_offer_for_an_agent_lane_or_closed_todo_is_refused() {
+        let mut s = leased();
+        // Offers are allowed whatever proposal kinds the grant lists.
+        s.agent_time_grant.scope.proposal_kinds = vec![ProposalKind::Research];
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        let agent = todo_in(&mut s, "Agent thing", Lane::Agent, Some(AgentState::Queued));
+        let mut closed = Todo::new("Done thing", 5.0);
+        closed.status = crate::todo::model::TodoStatus::Completed;
+        let closed_id = closed.id.clone();
+        s.todos.push(closed);
+        assert!(matches!(
+            s.agent_time_offer("chat-at", &agent, "p", today(), now),
+            Err(AgentTimeRefusal::Invalid(m)) if m.contains("already in the agent lane")
+        ));
+        assert!(matches!(
+            s.agent_time_offer("chat-at", &closed_id, "p", today(), now),
+            Err(AgentTimeRefusal::Invalid(m)) if m.contains("closed")
+        ));
+        assert!(s.agent_time_offer("chat-at", "missing", "p", today(), now).is_err());
+        // propose() won't file an offer without a to-do.
+        assert!(s.agent_time_propose("chat-at", ProposalKind::Offer, "t", "", today(), now).is_err());
+        let human = todo_in(&mut s, "Mine", Lane::Human, None);
+        assert!(s.agent_time_offer("chat-at", &human, "p", today(), now).is_ok());
+    }
+
+    #[test]
+    fn the_context_lists_agent_work_as_yours_and_the_persons_as_not() {
+        let mut s = PlannerState::default();
+        let none = |_: &str| false;
+        let d = today();
+        let a = todo_in(&mut s, "Digest the KV-cache notes", Lane::Agent, Some(AgentState::Queued));
+        s.todo_mut(&a).unwrap().outcome = Some("a one-page digest".into());
+        todo_in(&mut s, "Ship release", Lane::Agent, Some(AgentState::Working));
+        // Human: one later, one today, one overdue — overdue and today first.
+        todo_in(&mut s, "Someday reading", Lane::Human, None);
+        let t = todo_in(&mut s, "Sophie Asher Probate Consult", Lane::Human, None);
+        s.todo_mut(&t).unwrap().scheduled_for = Some(d);
+        let o = todo_in(&mut s, "File the taxes", Lane::Human, None);
+        s.todo_mut(&o).unwrap().deadline = Some(d - chrono::Duration::days(2));
+
+        let lists = agent_time_task_lists(&s, d, &none);
+        assert_eq!(lists.agent.len(), 1, "only eligible agent work");
+        assert_eq!(lists.agent[0].1, "Digest the KV-cache notes");
+        let titles: Vec<&str> = lists.human.iter().map(|(_, t)| t.as_str()).collect();
+        assert_eq!(titles, vec!["File the taxes", "Sophie Asher Probate Consult", "Someday reading"]);
+
+        let ctx = agent_time_context(&lists, "Dustin");
+        let (yours, not_yours) = ctx.split_once("Dustin's tasks").expect("two sections");
+        assert!(yours.starts_with("Agent lane: yours to work on"));
+        assert!(yours.contains("Digest the KV-cache notes") && yours.contains("done when: a one-page digest"));
+        assert!(!yours.contains("Probate"), "the person's task is never listed as agent work");
+        assert!(not_yours.contains("NOT yours") && not_yours.contains("\"offer\""));
+        assert!(not_yours.contains("Sophie Asher Probate Consult"));
+        assert!(!not_yours.contains("Digest the KV-cache"));
+        assert!(!ctx.contains("Ship release"), "a working to-do is not offered");
+
+        // Capped at ten, with a count of the rest.
+        for i in 0..12 {
+            todo_in(&mut s, &format!("Chore {i}"), Lane::Human, None);
+        }
+        let lists = agent_time_task_lists(&s, d, &none);
+        assert_eq!(lists.human.len(), MAX_HUMAN_TASKS_LISTED);
+        assert_eq!(lists.human_more, 5);
+        assert!(agent_time_context(&lists, "Dustin").contains("and 5 more"));
+        // Nothing eligible: say so.
+        let empty = agent_time_context(&agent_time_task_lists(&PlannerState::default(), d, &none), "the user");
+        assert!(empty.contains("none queued or stuck") && empty.contains("the user's tasks"));
+    }
+
+    #[test]
+    fn old_proposals_and_sessions_load_without_the_new_fields() {
+        let p: Proposal = serde_json::from_value(json!({
+            "id": "pr_1", "kind": "research", "title": "t", "created_at": "2026-10-01T10:00:00Z",
+            "session_id": "at_1"
+        }))
+        .unwrap();
+        assert_eq!(p.todo_id, None);
+        let offer: Proposal = serde_json::from_value(json!({
+            "id": "pr_2", "kind": "offer", "title": "t", "created_at": "2026-10-01T10:00:00Z",
+            "session_id": "at_1", "todo_id": "td_1"
+        }))
+        .unwrap();
+        assert_eq!((offer.kind, offer.todo_id.as_deref()), (ProposalKind::Offer, Some("td_1")));
+        assert_eq!(ProposalKind::parse("offer"), Some(ProposalKind::Offer));
+        let sess: AgentTimeSession = serde_json::from_value(json!({
+            "id": "at_1", "intent": "x", "started_at": "2026-10-01T10:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(sess.todo_id, None);
     }
 }

@@ -2475,10 +2475,12 @@ fn is_hex_colour(c: &str) -> bool {
 
 // ── HOBBES_AGENT_TIME ───────────────────────────────────────────────────────
 
-/// `HOBBES_AGENT_TIME`: `start(intent)`, `log(tool, summary)`,
+/// `HOBBES_AGENT_TIME`: `start(intent)`, `log(summary)` (optional note),
 /// `propose(kind, title, body)`, `end(summary)`. Refused unless the call
 /// comes from the leased agent-time session and the grant allows it today
 /// (see `agent_time`). Writes through the session, proposal and ledger rows.
+/// The app calls [`handle_agent_time_for`] with the person's name.
+#[cfg(test)]
 pub fn handle_agent_time(
     state: &mut PlannerState,
     args: &Value,
@@ -2486,7 +2488,35 @@ pub fn handle_agent_time(
     today: NaiveDate,
     persist: bool,
 ) -> (ToolCallStatus, String) {
+    handle_agent_time_for(state, args, session_id, today, persist, "the user")
+}
+
+/// Whether a fleet session is running now (a live worker on a to-do).
+pub fn fleet_worker_live(snapshot: &crate::fleet::FleetState, session_id: &str) -> bool {
+    snapshot.sessions.get(session_id).is_some_and(|r| {
+        r.ended_at.is_none()
+            && matches!(
+                r.status,
+                crate::fleet::FleetStatus::Working
+                    | crate::fleet::FleetStatus::WorkingBackground
+                    | crate::fleet::FleetStatus::NeedsAttention(_)
+            )
+    })
+}
+
+/// [`handle_agent_time`] with the person's name (`owner`) for the
+/// agent-time context lists ("Dustin's tasks: NOT yours").
+pub fn handle_agent_time_for(
+    state: &mut PlannerState,
+    args: &Value,
+    session_id: &str,
+    today: NaiveDate,
+    persist: bool,
+    owner: &str,
+) -> (ToolCallStatus, String) {
     use super::agent_time::AgentTimeRefusal;
+    let fleet = crate::fleet::shared().snapshot();
+    let worker_live = |sid: &str| fleet_worker_live(&fleet, sid);
     let now = Utc::now();
     let text = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
     let persist_session = |s: &model::AgentTimeSession| {
@@ -2508,31 +2538,48 @@ pub fn handle_agent_time(
         }
     }
     let result: Result<String, AgentTimeRefusal> = match text("action") {
-        "start" => state.agent_time_start(session_id, text("intent"), today, now).map(|s| {
-            persist_session(&s);
-            let b = state.agent_time_budget(today, now);
-            format!(
-                "Agent time started (session {}). Intent logged. Budget left today: {} and ${:.2}. \
-                 Outputs are proposals only (propose); anything with an outside effect goes through \
-                 the normal approval gate. Call end(summary) when done.",
-                s.id,
-                model::format_minutes(b.minutes_left()),
-                b.spend_left_usd()
-            )
-        }),
+        "start" => {
+            let todo_id = Some(text("todo_id")).filter(|t| !t.trim().is_empty());
+            state
+                .agent_time_start_on(session_id, text("intent"), todo_id, &worker_live, today, now)
+                .map(|s| {
+                    persist_session(&s);
+                    let b = state.agent_time_budget(today, now);
+                    let on = match s.todo_id.as_deref().and_then(|id| state.todo(id)) {
+                        Some(t) => format!("Working on: {} [{}].", t.title, t.id),
+                        None => "Working in Hobbes-owned space (no to-do).".to_string(),
+                    };
+                    let lists = super::agent_time::agent_time_task_lists(state, today, &worker_live);
+                    format!(
+                        "Agent time started (session {}). Intent logged. {on} Budget left today: {} and \
+                         ${:.2}. Outputs are proposals only (propose); anything with an outside effect \
+                         goes through the normal approval gate. Every tool call is recorded for you. \
+                         Call end(summary) when done.\n\n{}",
+                        s.id,
+                        model::format_minutes(b.minutes_left()),
+                        b.spend_left_usd(),
+                        super::agent_time::agent_time_context(&lists, owner)
+                    )
+                })
+        }
         "log" => state
             .agent_time_log(session_id, text("tool"), text("summary"), today, now)
             .map(|s| {
                 persist_session(&s);
-                "Logged.".to_string()
+                "Noted. (Optional: every tool call is already recorded automatically.)".to_string()
             }),
         "propose" => match super::model::ProposalKind::parse(text("kind")) {
             None => Err(AgentTimeRefusal::Invalid(
-                "Provide 'kind': note, todo, skill, research, or other.".into(),
+                "Provide 'kind': note, todo, skill, research, other, or offer (with todo_id).".into(),
             )),
-            Some(kind) => state
-                .agent_time_propose(session_id, kind, text("title"), text("body"), today, now)
-                .map(|(p, s)| {
+            Some(kind) => {
+                let filed = if kind == super::model::ProposalKind::Offer {
+                    let pitch = if text("body").trim().is_empty() { text("title") } else { text("body") };
+                    state.agent_time_offer(session_id, text("todo_id"), pitch, today, now)
+                } else {
+                    state.agent_time_propose(session_id, kind, text("title"), text("body"), today, now)
+                };
+                filed.map(|(p, s)| {
                     persist_session(&s);
                     if persist {
                         if let Err(e) = store::save_proposal(&p) {
@@ -2545,7 +2592,8 @@ pub fn handle_agent_time(
                         p.kind.as_str(),
                         p.title
                     )
-                }),
+                })
+            }
         },
         "end" => state.agent_time_end(session_id, text("summary"), now).map(|s| {
             persist_session(&s);
@@ -2555,10 +2603,10 @@ pub fn handle_agent_time(
                 }
             }
             format!(
-                "Agent time ended after {} with {} proposal(s), {} logged call(s).",
+                "Agent time ended after {} with {} proposal(s), {} tool call(s).",
                 model::format_minutes(s.minutes_used(now)),
                 s.outputs.len(),
-                s.tool_calls.len()
+                s.call_count()
             )
         }),
         other => Err(AgentTimeRefusal::Invalid(format!(
@@ -4898,6 +4946,41 @@ mod tests {
         assert_eq!(status, ToolCallStatus::Completed, "{out}");
         assert!(out.contains("1 proposal(s)"), "{out}");
         assert_eq!(state.open_proposals().len(), 1);
+    }
+
+    #[test]
+    fn agent_time_start_lists_both_lanes_and_offers_go_through_propose() {
+        let mut state = PlannerState {
+            agent_time_grant: model::AgentTimeGrant { enabled: true, daily_minutes: 45, spend_cap_usd: 2.0, ..Default::default() },
+            ..Default::default()
+        };
+        state.open_agent_time_lease("agent-chat", today(), Utc::now()).unwrap();
+        let agent_id = agent_todo(&mut state, "Digest the KV-cache notes");
+        state.todo_mut(&agent_id).unwrap().agent_state = Some(model::AgentState::Queued);
+        let mut mine = model::Todo::new("Sophie Asher Probate Consult", 99.0);
+        mine.scheduled_for = Some(today());
+        let mine_id = mine.id.clone();
+        state.todos.push(mine);
+
+        // The person's to-do can't be started on.
+        let (status, out) = handle_agent_time_for(&mut state, &json!({"action": "start", "intent": "help", "todo_id": mine_id}), "agent-chat", today(), false, "Dustin");
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("not yours"), "{out}");
+
+        let (status, out) = handle_agent_time_for(&mut state, &json!({"action": "start", "intent": "Digest", "todo_id": agent_id}), "agent-chat", today(), false, "Dustin");
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("Working on: Digest the KV-cache notes"), "{out}");
+        let (yours, not_yours) = out.split_once("Dustin's tasks: NOT yours").expect("both lists: {out}");
+        assert!(yours.contains("Agent lane: yours to work on") && yours.contains("Digest the KV-cache notes"));
+        assert!(not_yours.contains("Sophie Asher Probate Consult"));
+
+        let (status, out) = handle_agent_time_for(&mut state, &json!({"action": "propose", "kind": "offer", "todo_id": mine_id, "body": "I can prepare a question list."}), "agent-chat", today(), false, "Dustin");
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        let offer = state.open_proposals()[0].clone();
+        assert_eq!(offer.kind, model::ProposalKind::Offer);
+        assert_eq!(offer.todo_id.as_deref(), Some(mine_id.as_str()));
+        let (status, _) = handle_agent_time_for(&mut state, &json!({"action": "propose", "kind": "offer", "todo_id": agent_id, "body": "x"}), "agent-chat", today(), false, "Dustin");
+        assert_eq!(status, ToolCallStatus::Error, "already agent-lane");
     }
 
     #[test]

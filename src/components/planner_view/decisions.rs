@@ -7,7 +7,9 @@
 //! it as a queued message; a Claude Code run can't receive input, so the
 //! answer is recorded and the to-do returns to the queue). A permission
 //! gate is answered through `FleetShared::resolve_gate` — never as a
-//! decision the model could resolve.
+//! decision the model could resolve. A call the agent-time run is waiting
+//! on your approval for shows here as a gate card too, answered through the
+//! chat's own approve / deny path (`agent_time::answer_held`).
 
 use chrono::{NaiveDate, Utc};
 use dioxus::prelude::*;
@@ -24,6 +26,7 @@ use crate::todo::store;
 use crate::todo::PlannerState;
 
 use super::agent_lane::{fmt_since, queue_minutes};
+use crate::agent_time_runtime::{held_approvals, HeldApproval};
 use super::{persist_todo, today};
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
@@ -79,6 +82,34 @@ pub(crate) fn queue_header(count: usize, minutes: u32) -> String {
         0 => "No decisions waiting".to_string(),
         1 => format!("1 decision \u{b7} about {minutes} min"),
         n => format!("{n} decisions \u{b7} about {minutes} min"),
+    }
+}
+
+/// Card ids for held agent-time calls (never a to-do id).
+const HELD_CARD_PREFIX: &str = "agent-time:";
+
+/// The decision card for a call the agent-time run is waiting on.
+fn held_card(h: &HeldApproval, intent: Option<&str>, now: chrono::DateTime<Utc>) -> DecisionCard {
+    let what = if h.short_args.is_empty() {
+        h.tool.clone()
+    } else {
+        format!("{} {}", h.tool, h.short_args)
+    };
+    DecisionCard {
+        todo_id: format!("{HELD_CARD_PREFIX}{}", h.execution_id),
+        context: match intent {
+            Some(i) => format!("Agent time \u{b7} {i}"),
+            None => "Agent time".to_string(),
+        },
+        question: format!("Waiting for your approval: {what}"),
+        options: Vec::new(),
+        gate: Some(h.execution_id.clone()),
+        est: lanes::est_label(Some(1)),
+        worker: Some("agent time".to_string()),
+        waiting: fmt_since(h.asked_at, now),
+        did: None,
+        blocked: Some(h.reason.clone()),
+        next: Some("Approve runs it and the run carries on; Deny records it as denied.".to_string()),
     }
 }
 
@@ -195,6 +226,9 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
     let mut expanded = use_signal(|| Option::<String>::None);
     // Results of answers given while the drawer is open (newest first).
     let mut results = use_signal(Vec::<(String, String, bool)>::new);
+    // Calls the agent-time run is waiting on (memo: chat streaming doesn't
+    // re-render the drawer).
+    let held = use_memo(move || held_approvals(&planner.read(), &session_state.read()));
 
     // Trust-rule hits are a SQLite read: sampled when the drawer opens (and
     // after each answer), not on every render.
@@ -237,7 +271,12 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
                 }
             })
             .collect();
-        (cards, minutes)
+        let intent = state.open_agent_time_session().map(|s| s.intent.clone());
+        let mut all: Vec<DecisionCard> =
+            held.read().iter().map(|h| held_card(h, intent.as_deref(), now)).collect();
+        let minutes = minutes + all.len() as u32;
+        all.extend(cards);
+        (all, minutes)
     };
     let header = queue_header(cards.len(), minutes);
     let count = cards.len();
@@ -331,6 +370,18 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
                             expanded.set(if cur.as_deref() == Some(id.as_str()) { None } else { Some(id) });
                         },
                         on_answer: move |(id, choice): (String, String)| {
+                            if let Some(exec) = id.strip_prefix(HELD_CARD_PREFIX) {
+                                let allow = choice.eq_ignore_ascii_case("approve");
+                                let h = held.peek().iter().find(|h| h.execution_id == exec).cloned();
+                                let ok = h.is_some_and(|h| super::agent_time::answer_held(session_state, &h, allow));
+                                let line = match (ok, allow) {
+                                    (true, true) => "Approved \u{2014} the agent-time run carries on.",
+                                    (true, false) => "Denied \u{2014} the call won't run.",
+                                    (false, _) => "Already answered.",
+                                };
+                                on_result((id, line.to_string(), ok));
+                                return;
+                            }
                             let gate = planner.peek().todo(&id).and_then(|t| t.decision.as_ref()).and_then(|d| match &d.source {
                                 DecisionSource::Gate { request_id } if d.is_open() => Some(request_id.clone()),
                                 _ => None,
@@ -503,6 +554,26 @@ mod tests {
         assert!(delivery_line(&DeliveryRoute::Headless).contains("Claude Code runs can't receive answers"));
         assert!(matches!(DeliveryRoute::Headless.delivery(), DecisionDelivery::NotDelivered { .. }));
         assert!(matches!(DeliveryRoute::Chat("s".into()).delivery(), DecisionDelivery::ChatQueued { .. }));
+    }
+
+    #[test]
+    fn a_held_agent_time_call_is_a_gate_card() {
+        let now = Utc::now();
+        let h = HeldApproval {
+            chat_id: "c".into(),
+            execution_id: "e1".into(),
+            server: "hobbes-core".into(),
+            tool: "HOBBES_INVOKE_SKILL".into(),
+            short_args: "github-security".into(),
+            reason: "The skill's permission is set to Ask.".into(),
+            asked_at: now,
+        };
+        let c = held_card(&h, Some("Analyze fleet blockers"), now);
+        assert_eq!(c.todo_id, "agent-time:e1");
+        assert!(c.gate.is_some(), "rendered with Approve / Deny");
+        assert_eq!(c.question, "Waiting for your approval: HOBBES_INVOKE_SKILL github-security");
+        assert_eq!(c.context, "Agent time \u{b7} Analyze fleet blockers");
+        assert_eq!(c.blocked.as_deref(), Some("The skill's permission is set to Ask."));
     }
 
     #[test]

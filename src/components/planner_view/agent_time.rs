@@ -3,18 +3,24 @@
 //!
 //! Off by default. The panel edits the grant, shows the live status with
 //! prominent Pause / Stop (sent as `ChatCommand`s to the agent-time
-//! runtime), today's declared intent, the full log, the proposals to
-//! accept / edit / dismiss, and the trust ledger. Evidence only ever
-//! *suggests* a wider scope; allowing one records the person's choice.
+//! runtime), any call the run is waiting on your approval for (answered
+//! here through the chat's own approve / deny path), today's declared
+//! intent, the full log, the proposals to accept / edit / dismiss, and the
+//! trust ledger. Evidence only ever *suggests* a wider scope; allowing one
+//! records the person's choice.
 
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+use crate::agent_time_runtime::{held_approvals, HeldApproval};
 use crate::components::chat_input::ChatCommand;
+use crate::session::SessionState;
 use crate::todo::agent_time::{proposal_to_todo, AgentTimeBudget};
 use crate::todo::measures;
-use crate::todo::model::{AgentTimeSession, Proposal, ProposalKind, ProposalStatus, TrustLedger};
+use crate::todo::model::{
+    AgentTimeLogKind, AgentTimeSession, Proposal, ProposalKind, ProposalStatus, TrustLedger,
+};
 use crate::todo::store;
 use crate::todo::PlannerState;
 
@@ -22,15 +28,22 @@ use super::today;
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
 
-/// The header status pill and its spend line.
-pub(crate) fn status_line(b: &AgentTimeBudget, running: bool) -> (String, Option<String>) {
+/// The header status pill and its spend line. `waiting`: the run is held on
+/// a call that needs the user's approval.
+pub(crate) fn status_line(b: &AgentTimeBudget, running: bool, waiting: bool) -> (String, Option<String>) {
     if !b.enabled {
         return ("Off \u{b7} 0 min granted".to_string(), None);
     }
     if !b.granted_today {
         return ("Not a granted day".to_string(), None);
     }
-    let state = if running { "Running" } else { "Idle" };
+    let state = if running && waiting {
+        "Waiting on you"
+    } else if running {
+        "Running"
+    } else {
+        "Idle"
+    };
     (
         format!("{state} \u{b7} {} of {} min today", b.minutes_used, b.minutes_granted),
         Some(format!("${:.2} of ${:.2} cap", b.spend_used_usd, b.spend_cap_usd)),
@@ -63,9 +76,10 @@ pub(crate) fn trust_stats(l: &TrustLedger) -> [(String, String); 3] {
     [accepted, in_scope, kept]
 }
 
-/// `"18m · $0.42 · 9 tool calls"` for the log header.
+/// `"18m · $0.42 · 9 tool calls"` for the log header. Counts real calls
+/// only: the model's notes and the runtime's own lines are not calls.
 pub(crate) fn log_meta(s: &AgentTimeSession, now: DateTime<Utc>) -> String {
-    let calls = s.tool_calls.len();
+    let calls = s.call_count();
     format!(
         "{}m \u{b7} ${:.2} \u{b7} {} tool call{}",
         s.minutes_used(now),
@@ -82,6 +96,17 @@ pub(crate) fn kind_label(k: ProposalKind) -> &'static str {
         ProposalKind::Skill => "Draft skill",
         ProposalKind::Note => "Note",
         ProposalKind::Other => "Proposal",
+        ProposalKind::Offer => "Offer to take",
+    }
+}
+
+/// A proposal card's headline: an offer names the person's to-do it would
+/// take; everything else shows its title.
+pub(crate) fn proposal_headline(p: &Proposal) -> String {
+    if p.kind == ProposalKind::Offer {
+        format!("Hobbes offers to take: {}", p.title)
+    } else {
+        p.title.clone()
     }
 }
 
@@ -103,6 +128,41 @@ fn hhmmss(t: DateTime<Utc>) -> String {
 
 fn hhmm(t: DateTime<Utc>) -> String {
     t.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
+/// The live log's last line while a run is open.
+pub(crate) fn live_tail(held: &[HeldApproval]) -> String {
+    match held.first() {
+        Some(h) => format!("waiting for your approval \u{b7} {}", h.tool),
+        None => "working".to_string(),
+    }
+}
+
+/// Answer a held agent-time call through the chat's own approve / deny
+/// path (`tool_call_display::approve_held_call` / `deny_held_call`), so the
+/// approval-resume effect in chat.rs runs it with `user_approved = true`
+/// exactly as a click in the chat would. Also logs the trust decision the
+/// chat's permission prompt logs (skill loads log none there either).
+pub(crate) fn answer_held(session_state: Signal<SessionState>, h: &HeldApproval, allow: bool) -> bool {
+    use crate::components::tool_call_display::{approve_held_call, deny_held_call, DENIED_BY_USER};
+    let done = if allow {
+        approve_held_call(session_state, &h.chat_id, &h.execution_id)
+    } else {
+        deny_held_call(session_state, &h.chat_id, &h.execution_id, DENIED_BY_USER)
+    };
+    if done && h.tool != "HOBBES_INVOKE_SKILL" {
+        use crate::context::trust_store::{log_decision, DecisionKind, TrustDecision};
+        log_decision(TrustDecision::new(
+            if allow { DecisionKind::Approved } else { DecisionKind::Denied },
+            &h.server,
+            &h.tool,
+            h.short_args.clone(),
+            Some(h.chat_id.clone()),
+            None,
+            None,
+        ));
+    }
+    done
 }
 
 fn persist_grant(planner: &Signal<PlannerState>) {
@@ -129,7 +189,12 @@ const DAY_NAMES: [(&str, &str); 7] = [
 #[component]
 pub(crate) fn AgentTimeView() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
+    let session_state = use_context::<Signal<SessionState>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
+    let mut todo_detail = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
+    // Calls the run is waiting on the user for. A memo, so a chunk streaming
+    // into any chat re-runs only this scan, not the panel.
+    let held = use_memo(move || held_approvals(&planner.read(), &session_state.read()));
     let mut widening_dismissed = use_signal(|| false);
     let mut editing = use_signal(|| Option::<(String, String, String)>::None);
     let mut cap_text = use_signal(|| format!("{:.2}", planner.peek().agent_time_grant.spend_cap_usd));
@@ -152,6 +217,14 @@ pub(crate) fn AgentTimeView() -> Element {
     let open_session = state.open_agent_time_session().cloned();
     let running = open_session.is_some() || state.agent_time_lease.is_some();
     let session = current_session(&state.agent_time_sessions).cloned();
+    // "Working on: <to-do>" for a session started on an agent-lane to-do.
+    let working_on: Option<(String, String)> = session
+        .as_ref()
+        .and_then(|s| s.todo_id.clone())
+        .map(|id| {
+            let title = state.todo(&id).map(|t| t.title.clone()).unwrap_or_else(|| "a deleted to-do".to_string());
+            (id, title)
+        });
     let proposals: Vec<Proposal> = state.open_proposals().into_iter().cloned().collect();
     let ledger = state.trust_ledger;
     let projects: Vec<String> = grant
@@ -162,7 +235,16 @@ pub(crate) fn AgentTimeView() -> Element {
         .collect();
     drop(state);
 
-    let (status, spend) = status_line(&budget, open_session.is_some());
+    let held = held.read().clone();
+    let waiting = running && !held.is_empty();
+    let (status, spend) = status_line(&budget, open_session.is_some(), waiting);
+    let pill_class = if waiting {
+        "inline-flex h-6 items-center gap-1.5 rounded-full border border-yellow-600 px-2.5 text-xs text-yellow-200"
+    } else if open_session.is_some() {
+        "inline-flex h-6 items-center gap-1.5 rounded-full border border-primary-400 px-2.5 text-xs text-fg"
+    } else {
+        "inline-flex h-6 items-center gap-1.5 rounded-full border border-faint px-2.5 text-xs text-fg-muted"
+    };
     let refusal = budget.refusal().map(|r| r.message());
     let stats = trust_stats(&ledger);
     let widening = measures::suggest_scope_widening(&ledger).filter(|_| !*widening_dismissed.read());
@@ -194,12 +276,10 @@ pub(crate) fn AgentTimeView() -> Element {
                     class: "flex flex-wrap items-center gap-3",
                     h1 { class: "text-xl font-semibold", "Agent time" }
                     span {
-                        class: if open_session.is_some() {
-                            "inline-flex h-6 items-center gap-1.5 rounded-full border border-primary-400 px-2.5 text-xs text-fg"
-                        } else {
-                            "inline-flex h-6 items-center gap-1.5 rounded-full border border-faint px-2.5 text-xs text-fg-muted"
-                        },
-                        if open_session.is_some() {
+                        class: "{pill_class}",
+                        if waiting {
+                            span { class: "h-[7px] w-[7px] rounded-full bg-yellow-400" }
+                        } else if open_session.is_some() {
                             span { class: "h-[7px] w-[7px] rounded-full bg-primary-400 animate-pulse" }
                         }
                         "{status}"
@@ -242,6 +322,52 @@ pub(crate) fn AgentTimeView() -> Element {
                                 persist_grant(&planner);
                             },
                             "Grant agent time"
+                        }
+                    }
+                }
+                // ── Waiting for your approval ────────────────────────────
+                for h in held.iter().cloned() {
+                    div {
+                        key: "{h.execution_id}",
+                        role: "alert",
+                        class: "flex flex-wrap items-center gap-3 rounded-lg border border-yellow-700 bg-yellow-900/40 px-3.5 py-3",
+                        span { class: "shrink-0 text-yellow-300", Icon { width: 16, height: 16, icon: fi_icons::FiShield } }
+                        div { class: "flex min-w-[240px] flex-1 flex-col gap-0.5",
+                            div { class: "flex min-w-0 items-baseline gap-2 text-sm text-yellow-100",
+                                span { class: "shrink-0 font-medium", "Waiting for your approval:" }
+                                span { class: "shrink-0 font-mono text-[13px]", "{h.tool}" }
+                                if !h.short_args.is_empty() {
+                                    span { class: "min-w-0 truncate font-mono text-xs text-yellow-200/80", title: "{h.short_args}", "{h.short_args}" }
+                                }
+                            }
+                            span { class: "text-xs text-yellow-200/80",
+                                "{h.reason} Asked {hhmm(h.asked_at)}; the run waits, and waiting uses its minutes."
+                            }
+                        }
+                        button {
+                            class: "rounded-md px-2.5 py-1 text-xs text-yellow-200/80 hover:text-yellow-100",
+                            title: "Open the agent-time chat",
+                            onclick: {
+                                let id = h.chat_id.clone();
+                                move |_| chat_command.set(Some(ChatCommand::SwitchToSession(id.clone())))
+                            },
+                            "Open chat"
+                        }
+                        button {
+                            class: "rounded-md bg-input px-3 py-1.5 text-[13px] text-fg hover:bg-gray-500",
+                            onclick: {
+                                let h = h.clone();
+                                move |_| { answer_held(session_state, &h, false); }
+                            },
+                            "Deny"
+                        }
+                        button {
+                            class: "rounded-md bg-green-600 px-3 py-1.5 text-[13px] font-medium text-fg hover:bg-green-500",
+                            onclick: {
+                                let h = h.clone();
+                                move |_| { answer_held(session_state, &h, true); }
+                            },
+                            "Approve"
                         }
                     }
                 }
@@ -383,7 +509,11 @@ pub(crate) fn AgentTimeView() -> Element {
                                             key: "{p.id}",
                                             class: "flex flex-col gap-1.5 rounded-md border border-faint bg-card px-2.5 py-2",
                                             div { class: "flex items-center gap-2",
-                                                span { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "{kind_label(p.kind)}" }
+                                                if p.kind == ProposalKind::Offer {
+                                                    span { class: "rounded-full border border-primary-400 px-1.5 text-[10px] uppercase leading-4 tracking-[0.08em] text-primary-300", "{kind_label(p.kind)}" }
+                                                } else {
+                                                    span { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "{kind_label(p.kind)}" }
+                                                }
                                                 div { class: "flex-1" }
                                                 span { class: "font-mono text-[10.5px] text-fg-muted", "{hhmm(p.created_at)}" }
                                             }
@@ -399,7 +529,7 @@ pub(crate) fn AgentTimeView() -> Element {
                                                     oninput: move |e| if let Some(ed) = editing.write().as_mut() { ed.2 = e.value() },
                                                 }
                                             } else {
-                                                div { class: "text-[13px] leading-[18px] text-fg", "{p.title}" }
+                                                div { class: "text-[13px] leading-[18px] text-fg", "{proposal_headline(&p)}" }
                                                 if !p.body.trim().is_empty() {
                                                     div { class: "line-clamp-3 whitespace-pre-line text-[11.5px] leading-4 text-fg-muted", "{p.body}" }
                                                 }
@@ -432,13 +562,15 @@ pub(crate) fn AgentTimeView() -> Element {
                                                         },
                                                         "Accept"
                                                     }
-                                                    button {
-                                                        class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
-                                                        onclick: {
-                                                            let seed = (p.id.clone(), p.title.clone(), p.body.clone());
-                                                            move |_| editing.set(Some(seed.clone()))
-                                                        },
-                                                        "Edit"
+                                                    if p.kind != ProposalKind::Offer {
+                                                        button {
+                                                            class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
+                                                            onclick: {
+                                                                let seed = (p.id.clone(), p.title.clone(), p.body.clone());
+                                                                move |_| editing.set(Some(seed.clone()))
+                                                            },
+                                                            "Edit"
+                                                        }
                                                     }
                                                     button {
                                                         class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
@@ -459,8 +591,9 @@ pub(crate) fn AgentTimeView() -> Element {
                     // ── Right: intent + live log ─────────────────────────
                     div {
                         class: "flex min-w-[300px] flex-1 flex-col gap-3",
+                        // The intent stays in view above the log while it scrolls.
                         div {
-                            class: "{PANEL}",
+                            class: "{PANEL} sticky top-0 z-10 shadow-md",
                             div { class: "flex items-center gap-2",
                                 span { class: "{EYEBROW}", if open_session.is_some() { "Today\u{2019}s intent" } else { "Last intent" } }
                                 div { class: "flex-1" }
@@ -471,6 +604,22 @@ pub(crate) fn AgentTimeView() -> Element {
                             match &session {
                                 Some(s) => rsx! {
                                     div { class: "text-sm leading-[21px] text-fg", "\u{201c}{s.intent}\u{201d}" }
+                                    match working_on.clone() {
+                                        Some((id, title)) => rsx! {
+                                            div { class: "flex min-w-0 items-baseline gap-1.5 text-xs",
+                                                span { class: "shrink-0 text-fg-muted", "Working on:" }
+                                                button {
+                                                    class: "min-w-0 truncate text-left text-primary-300 hover:text-fg",
+                                                    title: "Open the to-do",
+                                                    onclick: move |_| todo_detail.set(Some(id.clone())),
+                                                    "{title}"
+                                                }
+                                            }
+                                        },
+                                        None => rsx! {
+                                            div { class: "text-xs text-fg-muted", "Working in Hobbes-owned space (no to-do)." }
+                                        },
+                                    }
                                     if let Some(sum) = s.summary.clone().filter(|x| !x.trim().is_empty()) {
                                         div { class: "text-xs text-fg-muted", "Summary: {sum}" }
                                     }
@@ -500,8 +649,25 @@ pub(crate) fn AgentTimeView() -> Element {
                                                 key: "{i}",
                                                 class: "grid grid-cols-[64px_minmax(0,200px)_minmax(0,1fr)] items-baseline gap-x-3 border-b border-faint py-1.5 text-xs",
                                                 span { class: "font-mono text-[11px] text-fg-muted", "{hhmmss(e.at)}" }
-                                                span { class: "truncate font-mono text-[11px] text-fg", "{e.tool}" }
-                                                span { class: "min-w-0 truncate text-fg-muted", title: "{e.summary}", "{e.summary}" }
+                                                if e.kind.is_call() {
+                                                    span { class: "truncate font-mono text-[11px] text-fg", "{e.tool}" }
+                                                } else {
+                                                    span { class: "truncate font-mono text-[11px] text-fg-muted", "{e.tool}" }
+                                                }
+                                                match (e.kind, e.note.clone()) {
+                                                    (AgentTimeLogKind::Call, Some(n)) => rsx! {
+                                                        span { class: "min-w-0 truncate", title: "{n}\n{e.summary}",
+                                                            span { class: "text-fg", "{n}" }
+                                                            span { class: "text-fg-muted", " \u{b7} {e.summary}" }
+                                                        }
+                                                    },
+                                                    (AgentTimeLogKind::Call, None) => rsx! {
+                                                        span { class: "min-w-0 truncate text-fg-muted", title: "{e.summary}", "{e.summary}" }
+                                                    },
+                                                    _ => rsx! {
+                                                        span { class: "min-w-0 truncate italic text-fg-muted opacity-80", title: "{e.summary}", "{e.summary}" }
+                                                    },
+                                                }
                                             }
                                         }
                                         if s.tool_calls.is_empty() {
@@ -511,11 +677,20 @@ pub(crate) fn AgentTimeView() -> Element {
                                             div {
                                                 class: "grid grid-cols-[64px_minmax(0,200px)_minmax(0,1fr)] items-baseline gap-x-3 py-1.5 text-xs",
                                                 span { class: "font-mono text-[11px] text-fg-muted", "{hhmmss(now)}" }
-                                                span { class: "inline-flex items-center gap-1.5 font-mono text-[11px] text-fg",
-                                                    span { class: "h-1.5 w-1.5 rounded-full bg-primary-400 animate-pulse" }
-                                                    "working"
+                                                if held.is_empty() {
+                                                    span { class: "inline-flex items-center gap-1.5 font-mono text-[11px] text-fg",
+                                                        span { class: "h-1.5 w-1.5 rounded-full bg-primary-400 animate-pulse" }
+                                                        "{live_tail(&held)}"
+                                                    }
+                                                } else {
+                                                    span { class: "col-span-2 inline-flex min-w-0 items-center gap-1.5 font-mono text-[11px] text-yellow-200",
+                                                        span { class: "h-1.5 w-1.5 shrink-0 rounded-full bg-yellow-400" }
+                                                        span { class: "truncate", "{live_tail(&held)}" }
+                                                    }
                                                 }
-                                                span {}
+                                                if held.is_empty() {
+                                                    span {}
+                                                }
                                             }
                                         }
                                     }
@@ -602,6 +777,14 @@ fn resolve(mut planner: Signal<PlannerState>, id: &str, status: ProposalStatus, 
     if let Err(e) = store::save_trust_ledger(&planner.peek().trust_ledger) {
         tracing::error!("planner: failed to save trust ledger: {}", e);
     }
+    // An accepted offer hands the person's to-do to the agent lane (Queued);
+    // a dismissed one leaves it untouched.
+    let handed = planner.write().apply_accepted_offer(&p, Utc::now());
+    if let Some(t) = handed {
+        if let Err(e) = store::save_todo(&t) {
+            tracing::error!("planner: failed to save offered to-do {}: {}", t.id, e);
+        }
+    }
     if p.kind == ProposalKind::Todo && matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Edited) {
         let todo = proposal_to_todo(&p, planner.peek().next_sort_order());
         if let Err(e) = store::save_todo(&todo) {
@@ -628,14 +811,53 @@ mod tests {
 
     #[test]
     fn status_reads_like_the_design() {
-        assert_eq!(status_line(&budget(false), false), ("Off \u{b7} 0 min granted".to_string(), None));
-        let (s, spend) = status_line(&budget(true), true);
+        assert_eq!(status_line(&budget(false), false, false), ("Off \u{b7} 0 min granted".to_string(), None));
+        let (s, spend) = status_line(&budget(true), true, false);
         assert_eq!(s, "Running \u{b7} 18 of 45 min today");
         assert_eq!(spend.as_deref(), Some("$0.42 of $2.00 cap"));
-        assert!(status_line(&budget(true), false).0.starts_with("Idle"));
+        assert!(status_line(&budget(true), false, false).0.starts_with("Idle"));
         let mut not_today = budget(true);
         not_today.granted_today = false;
-        assert_eq!(status_line(&not_today, false).0, "Not a granted day");
+        assert_eq!(status_line(&not_today, false, false).0, "Not a granted day");
+    }
+
+    #[test]
+    fn status_and_tail_say_waiting_on_you_while_a_call_is_held() {
+        let (s, _) = status_line(&budget(true), true, true);
+        assert_eq!(s, "Waiting on you \u{b7} 18 of 45 min today", "waiting still counts minutes");
+        // A held call with nothing running (never happens once the lease
+        // closes and expires it) doesn't claim a run.
+        assert!(status_line(&budget(true), false, true).0.starts_with("Idle"));
+        assert_eq!(live_tail(&[]), "working");
+        let h = HeldApproval {
+            chat_id: "c".into(),
+            execution_id: "e".into(),
+            server: "hobbes-core".into(),
+            tool: "HOBBES_INVOKE_SKILL".into(),
+            short_args: "github-security".into(),
+            reason: "The skill's permission is set to Ask.".into(),
+            asked_at: Utc::now(),
+        };
+        assert_eq!(live_tail(&[h]), "waiting for your approval \u{b7} HOBBES_INVOKE_SKILL");
+    }
+
+    #[test]
+    fn offers_read_as_offers() {
+        let p = Proposal {
+            id: "p".into(),
+            kind: ProposalKind::Offer,
+            title: "Draft the release notes".into(),
+            body: "pitch".into(),
+            status: ProposalStatus::Open,
+            created_at: Utc::now(),
+            resolved_at: None,
+            session_id: "s".into(),
+            todo_id: Some("t".into()),
+        };
+        assert_eq!(proposal_headline(&p), "Hobbes offers to take: Draft the release notes");
+        assert_eq!(kind_label(ProposalKind::Offer), "Offer to take");
+        let note = Proposal { kind: ProposalKind::Note, todo_id: None, ..p };
+        assert_eq!(proposal_headline(&note), "Draft the release notes");
     }
 
     #[test]
@@ -673,8 +895,15 @@ mod tests {
             summary: None,
             chat_session_id: None,
             out_of_scope_attempts: 0,
+            todo_id: None,
         };
         assert_eq!(log_meta(&s, now), "18m \u{b7} $0.42 \u{b7} 0 tool calls");
+        // Only real calls count: not the model's notes or the runtime's lines.
+        use crate::todo::model::AgentTimeLogEntry;
+        let line = |kind| AgentTimeLogEntry { at: now, tool: "t".into(), summary: "s".into(), kind, note: None };
+        let mut s = s;
+        s.tool_calls = vec![line(AgentTimeLogKind::Call), line(AgentTimeLogKind::Note), line(AgentTimeLogKind::Event), line(AgentTimeLogKind::Call)];
+        assert_eq!(log_meta(&s, now), "18m \u{b7} $0.42 \u{b7} 2 tool calls");
         assert_eq!(kind_label(ProposalKind::Research), "Research digest");
     }
 }

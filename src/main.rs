@@ -3219,12 +3219,14 @@ fn app() -> Element {
                 ChatCommand::AgentTimePause => {
                     agent_time_runtime::halt(
                         planner_state,
+                        session_state,
                         crate::todo::model::AgentTimeEndReason::Paused,
                     );
                 }
                 ChatCommand::AgentTimeStop => {
                     agent_time_runtime::halt(
                         planner_state,
+                        session_state,
                         crate::todo::model::AgentTimeEndReason::Stopped,
                     );
                 }

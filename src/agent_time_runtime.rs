@@ -20,10 +20,17 @@
 //! 3. **Meter**: each usage event attributes the chat's new spend to the open
 //!    session ([`on_usage`]) and re-checks the budget; a 30 s tick
 //!    ([`tick`]) does the same for minutes.
-//! 4. **End**: the model's `end`, the turn ending (nothing drives the model
+//! 4. **Wait**: a call held for the user's approval (an outside effect the
+//!    gate forced, a skill whose permission is Ask, an MCP permission) parks
+//!    the run. [`held_approvals`] finds it so the Agent time panel, the
+//!    decision queue and the tab sidebar can show it and answer it through
+//!    the chat's own approve / deny path. Waiting still uses the run's
+//!    minutes.
+//! 5. **End**: the model's `end`, the turn ending (nothing drives the model
 //!    after it stops — [`on_turn_complete`] closes the lease), Pause / Stop
 //!    ([`halt`]: lease closed and stream cancelled at once), or the budget
-//!    running out.
+//!    running out. Whatever is still held for approval when the lease closes
+//!    is expired ([`expire_held_calls`]), never left dangling.
 //!
 //! After the lease is gone the chat stays marked ([`is_agent_time_chat`]):
 //! its tool calls are refused and its tool loop does not continue, so
@@ -35,9 +42,11 @@ use chrono::{DateTime, NaiveDate, Utc};
 use dioxus::prelude::*;
 use serde_json::Value;
 
+use crate::components::shared::{MessageContent, ToolCall};
 use crate::session::SessionState;
 use crate::todo::agent_time::{
-    agent_time_scope_allows, AgentTimeBudget, AgentTimeRefusal, ScopeVerdict,
+    agent_time_scope, agent_time_scope_allows, AgentTimeBudget, AgentTimeRefusal, ScopeReason,
+    ScopeVerdict,
 };
 use crate::todo::model::{AgentTimeEndReason, AgentTimeSession};
 use crate::todo::PlannerState;
@@ -61,6 +70,9 @@ static SPEND_CURSOR: std::sync::Mutex<Option<(String, f64)>> = std::sync::Mutex:
 pub const ENDED_MESSAGE: &str = "Agent time in this chat has ended (it was paused, stopped, \
     finished, or ran out of budget). Tools are not available here; the user can start agent \
     time again from the Planner, or open a new chat.";
+/// The result written into a call still held for approval when the run's
+/// lease closes.
+pub const EXPIRED_MESSAGE: &str = "Agent time ended before this was approved; it did not run.";
 pub const NO_INTENT_MESSAGE: &str = "Declare your intent first: call HOBBES_AGENT_TIME with \
     action \"start\" and an intent (what you will do and why, in one or two lines). No other \
     tool runs until you do.";
@@ -136,8 +148,8 @@ pub enum GateDecision {
     /// approval even if a trust rule or always-allow would skip the prompt.
     /// Record `NeedsApproval`.
     ForceApproval,
-    /// An outside effect the user has just approved: run it (no second
-    /// ledger count — it was counted when it was held).
+    /// A held call the user has just approved: run it (no second log row or
+    /// ledger count — it was recorded when it was held).
     ApprovedByUser,
     /// Refuse with `message` as the tool error; record `record` if set.
     Refuse { message: String, record: Option<ScopeVerdict> },
@@ -160,6 +172,9 @@ pub fn gate_decision(i: &GateInput) -> GateDecision {
         return GateDecision::Proceed { record: None };
     }
     match agent_time_scope_allows(i.tool, i.args) {
+        // In scope but held anyway (a skill set to Ask, an MCP permission):
+        // the streaming path already recorded it.
+        ScopeVerdict::Allow if i.user_approved => GateDecision::ApprovedByUser,
         ScopeVerdict::Allow => GateDecision::Proceed { record: Some(ScopeVerdict::Allow) },
         ScopeVerdict::NeedsApproval if i.user_approved => GateDecision::ApprovedByUser,
         ScopeVerdict::NeedsApproval => GateDecision::ForceApproval,
@@ -247,8 +262,11 @@ pub fn chat_title(date: NaiveDate) -> String {
 }
 
 /// The opening message of an agent-time chat. It states the grant, the rules
-/// and the controls, and deliberately suggests no task: the model picks.
-pub fn seed_message(budget: &AgentTimeBudget, resumed: bool) -> String {
+/// and the controls, and deliberately suggests no task: the model picks —
+/// from the agent lane (`context`, built by
+/// `todo::agent_time::agent_time_context`) or Hobbes-owned space, never
+/// `owner`'s own tasks.
+pub fn seed_message(budget: &AgentTimeBudget, resumed: bool, context: &str, owner: &str) -> String {
     let minutes = crate::todo::model::format_minutes(budget.minutes_left());
     let spend = budget.spend_left_usd();
     let opening = if resumed {
@@ -268,20 +286,184 @@ pub fn seed_message(budget: &AgentTimeBudget, resumed: bool) -> String {
     };
     format!(
         "{opening}\n\n\
+         What is yours, and what is not:\n\
+         - Yours: the agent-lane to-dos listed below (queued or stuck, no worker running), \
+         and Hobbes-owned space: notes, research digests, draft skills, your own housekeeping.\n\
+         - Not yours: {owner}'s own tasks. Don't work on them or act on them; you may offer to \
+         take one (propose with kind \"offer\" and its todo_id), and only {owner}'s acceptance \
+         hands it over.\n\n\
+         {context}\n\
          How it works:\n\
          1. First call HOBBES_AGENT_TIME with action \"start\" and an intent: one or two lines \
-         on what you choose to do and why. No other tool runs until you do.\n\
+         on what you choose to do and why. Add todo_id when you take an agent-lane to-do. No \
+         other tool runs until you do.\n\
          2. You may read what the user has shared with you.\n\
          3. Your only output is proposals, filed with HOBBES_AGENT_TIME action \"propose\" \
-         (kind: note, todo, skill, research or other). The user will accept, edit or dismiss \
-         each one. You can't change their to-dos, plan or anything else directly.\n\
-         4. Anything with an outside effect (sending, posting, buying, changing a repo, \
-         running a command) stops and asks the user first.\n\
-         5. When you're done, call HOBBES_AGENT_TIME with action \"end\" and a short summary.\n\n\
-         The user can pause or stop you at any time, and every tool call is logged where they \
-         can read it. Deciding there is nothing worth doing and ending straight away is also \
-         fine."
+         (kind: note, todo, skill, research, other, or offer). The user will accept, edit or \
+         dismiss each one. You can't change their to-dos, plan or anything else directly.\n\
+         4. Reading {owner}'s tasks is fine for context; acting on them is not.\n\
+         5. Anything with an outside effect (sending, posting, buying, changing a repo, \
+         running a command), and looking up a specific person's personal details, stops and \
+         asks the user first.\n\
+         6. If a step needs the user's approval, end your turn after asking rather than \
+         leaving the run open: file your proposals first and make that call last. The run \
+         waits for the user, and waiting still uses your minutes.\n\
+         7. When you're done, call HOBBES_AGENT_TIME with action \"end\" and a short summary.\n\n\
+         Every tool call you make is recorded on the log automatically; you don't need to log \
+         calls yourself. The user can pause or stop you at any time. Deciding there is nothing \
+         worth doing and ending straight away is also fine."
     )
+}
+
+// ── Held for approval ───────────────────────────────────────────────────────
+
+/// A call in the agent-time chat that is waiting for the user's approval
+/// (a `PermissionRequest` message), as the panel, the decision queue and
+/// the sidebar show it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldApproval {
+    pub chat_id: String,
+    pub execution_id: String,
+    pub server: String,
+    pub tool: String,
+    /// One line of the arguments (the skill name, the query, the command…).
+    pub short_args: String,
+    /// Why it asks, in a sentence.
+    pub reason: String,
+    pub asked_at: DateTime<Utc>,
+}
+
+/// The calls held for approval in `session`, oldest first.
+pub fn held_calls(session: &crate::session::Session) -> Vec<(DateTime<Utc>, &ToolCall)> {
+    session
+        .messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::PermissionRequest(tc) => Some((m.created_at, tc)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn clip_line(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        s
+    } else {
+        format!("{}\u{2026}", s.chars().take(max - 1).collect::<String>())
+    }
+}
+
+/// One line of a held call's arguments: the most telling field when there
+/// is one, else the compact JSON.
+pub fn short_args(args: &Value) -> String {
+    let pick = ["name", "query", "q", "command", "url", "path", "to", "title"]
+        .iter()
+        .find_map(|k| args.get(*k).and_then(|v| v.as_str()).filter(|v| !v.trim().is_empty()));
+    match pick {
+        Some(v) => clip_line(v, 90),
+        None if args.as_object().is_some_and(|o| o.is_empty()) || args.is_null() => String::new(),
+        None => clip_line(&args.to_string(), 90),
+    }
+}
+
+/// Why a held call asks, in a sentence.
+pub fn held_reason(tool: &str, args: &Value) -> String {
+    if tool == "HOBBES_INVOKE_SKILL" {
+        return "The skill's permission is set to Ask.".into();
+    }
+    match agent_time_scope(tool, args) {
+        (ScopeVerdict::NeedsApproval, ScopeReason::PersonLookup) => {
+            "It looks up a specific person's personal information.".into()
+        }
+        (ScopeVerdict::NeedsApproval, ScopeReason::Unrecognised) => {
+            "An unrecognised tool, treated as an outside effect.".into()
+        }
+        (ScopeVerdict::NeedsApproval, _) => "It has an outside effect.".into(),
+        _ => "Your tool permissions ask before this runs.".into(),
+    }
+}
+
+/// The calls the running agent-time chat is waiting on the user for: the
+/// leased chat's `PermissionRequest`s, oldest first. Empty when no run is
+/// leased (a closed run's held calls are expired by [`expire_held_calls`]).
+pub fn held_approvals(planner: &PlannerState, state: &SessionState) -> Vec<HeldApproval> {
+    let Some(chat_id) = planner.agent_time_lease.as_ref().map(|l| l.chat_session_id.as_str()) else {
+        return Vec::new();
+    };
+    let Some(session) = state.sessions.get(chat_id) else {
+        return Vec::new();
+    };
+    held_calls(session)
+        .into_iter()
+        .map(|(at, tc)| {
+            let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+            HeldApproval {
+                chat_id: chat_id.to_string(),
+                execution_id: tc.execution_id.clone(),
+                server: tc.server_name.clone(),
+                tool: tc.tool_name.clone(),
+                short_args: short_args(&args),
+                reason: held_reason(&tc.tool_name, &args),
+                asked_at: at,
+            }
+        })
+        .collect()
+}
+
+/// **Pure.** Expire every call still held for approval in `chat_id`: each
+/// becomes an error result ([`EXPIRED_MESSAGE`]) that never runs, through
+/// the same resolver the chat's Deny uses. Returns the resolved messages.
+pub fn expire_held_calls(state: &mut SessionState, chat_id: &str) -> Vec<crate::components::chat::Message> {
+    let ids: Vec<String> = match state.sessions.get(chat_id) {
+        Some(s) => held_calls(s).into_iter().map(|(_, tc)| tc.execution_id.clone()).collect(),
+        None => return Vec::new(),
+    };
+    let deny = crate::components::tool_call_display::HeldResolution::Deny(EXPIRED_MESSAGE.into());
+    ids.iter()
+        .filter_map(|id| {
+            crate::components::tool_call_display::resolve_held_call(state, chat_id, id, &deny)
+        })
+        .collect()
+}
+
+/// [`expire_held_calls`] on the live state: writes only when something is
+/// held, notes it on the run's log (while the session is still open), and
+/// persists the chat.
+fn expire_held_in_chat(
+    planner: &mut Signal<PlannerState>,
+    session_state: &mut Signal<SessionState>,
+    chat_id: &str,
+) {
+    let any = session_state
+        .peek()
+        .sessions
+        .get(chat_id)
+        .is_some_and(|s| !held_calls(s).is_empty());
+    if !any {
+        return;
+    }
+    let expired = expire_held_calls(&mut session_state.write(), chat_id);
+    if expired.is_empty() {
+        return;
+    }
+    planner.write().note_agent_time(
+        chat_id,
+        "runtime",
+        &format!(
+            "{} call{} held for approval expired: agent time ended before you answered",
+            expired.len(),
+            if expired.len() == 1 { "" } else { "s" }
+        ),
+        Utc::now(),
+    );
+    for message in expired {
+        crate::session_events::log_event(
+            chat_id,
+            crate::session_events::SessionEvent::ToolResult { message },
+        );
+    }
+    SessionState::save_signal(session_state, None);
 }
 
 // ── Persistence ─────────────────────────────────────────────────────────────
@@ -390,11 +572,23 @@ pub fn start_now(
     if let Ok(mut c) = SPEND_CURSOR.lock() {
         *c = Some((chat_id.clone(), baseline));
     }
+    let owner = settings
+        .peek()
+        .user_name
+        .clone()
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| "the user".to_string());
+    let context = {
+        let fleet = crate::fleet::shared().snapshot();
+        let live = |sid: &str| crate::todo::handlers::fleet_worker_live(&fleet, sid);
+        let lists = crate::todo::agent_time::agent_time_task_lists(&planner.peek(), today, &live);
+        crate::todo::agent_time::agent_time_context(&lists, &owner)
+    };
     crate::components::chat_queue::queue_push(
         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
         &chat_id,
         crate::components::chat_queue::QueuedMessage::new(
-            seed_message(&budget, is_resume),
+            seed_message(&budget, is_resume, &context, &owner),
             Vec::new(),
         ),
     );
@@ -404,15 +598,21 @@ pub fn start_now(
 }
 
 /// **Pause / Stop / budget stop.** Closes the lease (ending the open session
-/// with `reason`) at once, persists, drops the chat's queued messages and
-/// asks the stream bridge to cancel its stream. Returns the chat id, or
-/// `None` when nothing was running.
-pub fn halt(mut planner: Signal<PlannerState>, reason: AgentTimeEndReason) -> Option<String> {
+/// with `reason`) at once, expires any call still held for approval in the
+/// chat, persists, drops the chat's queued messages and asks the stream
+/// bridge to cancel its stream. Returns the chat id, or `None` when nothing
+/// was running.
+pub fn halt(
+    mut planner: Signal<PlannerState>,
+    mut session_state: Signal<SessionState>,
+    reason: AgentTimeEndReason,
+) -> Option<String> {
     let chat_id = planner
         .peek()
         .agent_time_lease
         .as_ref()
         .map(|l| l.chat_session_id.clone())?;
+    expire_held_in_chat(&mut planner, &mut session_state, &chat_id);
     let now = Utc::now();
     let closed = planner.write().close_agent_time_lease(now, reason);
     if let Some(s) = &closed {
@@ -430,15 +630,15 @@ pub fn halt(mut planner: Signal<PlannerState>, reason: AgentTimeEndReason) -> Op
 
 /// Run the budget-stop decision now; stops the run when it says so.
 /// Returns whether it stopped.
-pub fn enforce_now(planner: Signal<PlannerState>) -> bool {
+pub fn enforce_now(planner: Signal<PlannerState>, session_state: Signal<SessionState>) -> bool {
     let (today, now) = today_now();
     let action = tick_action(&planner.peek(), today, now);
     match action {
         TickAction::Idle => false,
-        TickAction::Stop(reason) => halt(planner, reason).is_some(),
+        TickAction::Stop(reason) => halt(planner, session_state, reason).is_some(),
         TickAction::RevokeNoIntent => {
             tracing::info!("Agent time: no intent declared within the grace period; revoking");
-            halt(planner, AgentTimeEndReason::Stopped).is_some()
+            halt(planner, session_state, AgentTimeEndReason::Stopped).is_some()
         }
     }
 }
@@ -475,7 +675,7 @@ pub fn tick(
         IDLE_TICKS.store(0, Ordering::Relaxed);
         return;
     };
-    if enforce_now(planner) {
+    if enforce_now(planner, session_state) {
         IDLE_TICKS.store(0, Ordering::Relaxed);
         return;
     }
@@ -498,7 +698,7 @@ pub fn tick(
     }
     if IDLE_TICKS.fetch_add(1, Ordering::Relaxed) + 1 >= IDLE_TICKS_TO_CLOSE {
         IDLE_TICKS.store(0, Ordering::Relaxed);
-        close_finished(planner, &chat_id, "run idle (nothing streaming or awaiting approval); closed by the runtime");
+        close_finished(planner, session_state, &chat_id, "run idle (nothing streaming or awaiting approval); closed by the runtime");
     }
 }
 
@@ -539,23 +739,33 @@ pub fn on_usage(
             }
         }
     }
-    enforce_now(planner);
+    enforce_now(planner, session_state);
 }
 
 /// The model's turn in `chat_id` ended (no tool calls left to run). Nothing
 /// drives the model after that, so the run is over: close the lease. A
 /// session still open (the model never called `end`) closes as `completed`
 /// with a note saying the runtime closed it.
-pub fn on_turn_complete(planner: Signal<PlannerState>, chat_id: &str) {
+pub fn on_turn_complete(
+    planner: Signal<PlannerState>,
+    session_state: Signal<SessionState>,
+    chat_id: &str,
+) {
     if !planner.peek().is_agent_time_session(chat_id) {
         return;
     }
-    close_finished(planner, chat_id, "turn ended without end(summary); closed by the runtime");
+    close_finished(planner, session_state, chat_id, "turn ended without end(summary); closed by the runtime");
 }
 
 /// Close a run that finished on its own: a still-open session (no `end`
 /// call) ends `completed` with `why` on its log; the lease is revoked.
-fn close_finished(mut planner: Signal<PlannerState>, chat_id: &str, why: &str) {
+fn close_finished(
+    mut planner: Signal<PlannerState>,
+    mut session_state: Signal<SessionState>,
+    chat_id: &str,
+    why: &str,
+) {
+    expire_held_in_chat(&mut planner, &mut session_state, chat_id);
     let now = Utc::now();
     let closed = {
         let mut p = planner.write();
@@ -910,10 +1120,131 @@ mod tests {
     #[test]
     fn seed_message_states_the_rules_without_a_task() {
         let b = start_check(&granted(), today(), Utc::now()).unwrap();
-        let m = seed_message(&b, false);
-        for needle in ["HOBBES_AGENT_TIME", "\"start\"", "\"propose\"", "\"end\"", "pause or stop", "asks the user", "$2.00"] {
+        let ctx = "Agent lane: yours to work on\n- [t1] Digest notes\n";
+        let m = seed_message(&b, false, ctx, "Dustin");
+        for needle in [
+            "HOBBES_AGENT_TIME", "\"start\"", "\"propose\"", "\"end\"", "pause or stop", "asks the user", "$2.00",
+            // Approval: end the turn rather than leave the run open.
+            "end your turn after asking",
+            // The boundary between agent work and the person's tasks.
+            "Not yours: Dustin's own tasks",
+            "Reading Dustin's tasks is fine for context; acting on them is not.",
+            "[t1] Digest notes",
+        ] {
             assert!(m.contains(needle), "missing {needle}: {m}");
         }
-        assert!(seed_message(&b, true).contains("resumed"));
+        // Calls are recorded by the runtime; nothing asks the model to log them.
+        assert!(m.contains("recorded on the log automatically"));
+        assert!(!m.contains("action \"log\""), "no instruction to log before calls");
+        assert!(seed_message(&b, true, ctx, "Dustin").contains("resumed"));
+    }
+
+    // ── held for approval ───────────────────────────────────────────────
+
+    #[test]
+    fn a_held_in_scope_call_resumes_without_a_second_log_row() {
+        let p = started("c");
+        let skill = json!({"name": "github-security"});
+        // Held by the skill's Ask permission, then approved: the gate notes
+        // the approval instead of recording the call again.
+        assert_eq!(
+            gate_decision(&input(&p, "c", "HOBBES_INVOKE_SKILL", &skill, true)),
+            GateDecision::ApprovedByUser
+        );
+        // A person lookup is held on the streaming path.
+        let li = json!({"linkedin_url": "https://linkedin.com/in/x"});
+        assert_eq!(
+            gate_decision(&input(&p, "c", "linkedin_get_person_profile", &li, false)),
+            GateDecision::ForceApproval
+        );
+    }
+
+    fn msg(content: MessageContent) -> crate::components::chat::Message {
+        crate::components::chat::Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".into(),
+            content,
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn held_tc(exec: &str, tool: &str, args: &str) -> ToolCall {
+        ToolCall {
+            execution_id: exec.into(),
+            server_name: "hobbes-core".into(),
+            tool_name: tool.into(),
+            arguments: args.into(),
+            status: crate::components::shared::ToolCallStatus::Running,
+            ..Default::default()
+        }
+    }
+
+    /// A chat whose last message is the held `github-security` skill load
+    /// from the Oct 7 session.
+    fn chat_with_held_skill() -> (SessionState, String) {
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        s.messages.push(msg(MessageContent::ToolCall(ToolCall {
+            status: crate::components::shared::ToolCallStatus::Completed,
+            ..held_tc("e0", "HOBBES_FLEET_STATUS", "{}")
+        })));
+        s.messages.push(msg(MessageContent::PermissionRequest(held_tc(
+            "e1",
+            "HOBBES_INVOKE_SKILL",
+            r#"{"name":"github-security"}"#,
+        ))));
+        (state, id)
+    }
+
+    #[test]
+    fn the_running_chats_held_call_is_found_with_its_reason() {
+        let (state, chat) = chat_with_held_skill();
+        let p = started(&chat);
+        let held = held_approvals(&p, &state);
+        assert_eq!(held.len(), 1);
+        let h = &held[0];
+        assert_eq!((h.chat_id.as_str(), h.execution_id.as_str()), (chat.as_str(), "e1"));
+        assert_eq!(h.tool, "HOBBES_INVOKE_SKILL");
+        assert_eq!(h.short_args, "github-security");
+        assert_eq!(h.reason, "The skill's permission is set to Ask.");
+        // Nothing is "waiting" for a chat that isn't leased.
+        assert!(held_approvals(&started("other"), &state).is_empty());
+        assert!(held_approvals(&PlannerState::default(), &state).is_empty());
+        // Reasons for the other held kinds.
+        assert!(held_reason("linkedin_get_person_profile", &json!({})).contains("personal information"));
+        assert!(held_reason("GMAIL_SEND_EMAIL", &json!({})).contains("outside effect"));
+        assert!(held_reason("notes.search", &json!({})).contains("tool permissions"));
+    }
+
+    #[test]
+    fn closing_the_lease_expires_held_calls_without_running_them() {
+        let (mut state, chat) = chat_with_held_skill();
+        let expired = expire_held_calls(&mut state, &chat);
+        assert_eq!(expired.len(), 1);
+        let s = state.sessions.get(&chat).unwrap();
+        assert!(held_calls(s).is_empty(), "nothing left dangling");
+        match &s.messages.last().unwrap().content {
+            MessageContent::ToolCall(tc) => {
+                assert_eq!(tc.execution_id, "e1");
+                assert_eq!(tc.status, crate::components::shared::ToolCallStatus::Error, "never Running");
+                assert_eq!(tc.response, EXPIRED_MESSAGE);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Idempotent, and a no-op for other chats.
+        assert!(expire_held_calls(&mut state, &chat).is_empty());
+        assert!(expire_held_calls(&mut state, "missing").is_empty());
+    }
+
+    #[test]
+    fn short_args_pick_the_telling_field() {
+        assert_eq!(short_args(&json!({"query": "rust   dioxus\nsignals", "count": 5})), "rust dioxus signals");
+        assert_eq!(short_args(&json!({})), "");
+        assert_eq!(short_args(&json!({"a": 1})), r#"{"a":1}"#);
+        assert!(short_args(&json!({"query": "x".repeat(200)})).chars().count() <= 90);
     }
 }

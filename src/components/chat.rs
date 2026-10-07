@@ -169,7 +169,11 @@ pub fn ChatWindow(
     // Per-session, not global: a comment or an approval belongs to the tab it
     // was made in, and both survive a tab switch while work is in flight.
     let mut has_new_comments = use_signal(std::collections::HashSet::<String>::new);
-    let mut has_pending_approvals = use_signal(std::collections::HashSet::<String>::new);
+    // The global approval signal (see `tool_call_display::APPROVED_SESSIONS`),
+    // so Approve clicks outside this tree (Agent time panel, decision queue)
+    // reach the same resume effect below. Still provided as context for the
+    // existing consumers under this component.
+    let mut has_pending_approvals = crate::components::tool_call_display::APPROVED_SESSIONS.signal();
     // Tool-call message ids currently being executed by the approval effect.
     // Approval-pending and executing calls are both `ToolCallStatus::Running`
     // (the status enum is matched in ~190 places, so a new variant is not

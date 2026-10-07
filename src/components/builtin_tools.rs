@@ -169,7 +169,7 @@ pub fn agent_time_gate(
     // tick: an over-budget run is stopped here, and the call below is then
     // refused as an ended run.
     if deps.planner.peek().is_agent_time_session(session_id) {
-        rt::enforce_now(deps.planner);
+        rt::enforce_now(deps.planner, deps.session_state);
     }
     let decision = {
         let planner = deps.planner.peek();
@@ -584,7 +584,21 @@ fn run_planner_tool(
         "HOBBES_AGENT_TIME" => {
             // The handler itself refuses unless this session holds the
             // agent-time lease and the grant allows it today.
-            handlers::handle_agent_time(&mut planner.write(), args_json, session_id, today, true)
+            let owner = deps
+                .settings
+                .peek()
+                .user_name
+                .clone()
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| "the user".to_string());
+            handlers::handle_agent_time_for(
+                &mut planner.write(),
+                args_json,
+                session_id,
+                today,
+                true,
+                &owner,
+            )
         }
         "HOBBES_DECISIONS" => {
             let caller_name = deps

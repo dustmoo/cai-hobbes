@@ -123,6 +123,15 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
         let _activity = stream_manager.stream_activity.read();
         stream_manager.streaming_sessions.read().clone()
     });
+    // The agent-time chat while it waits on the user's approval: a "needs
+    // you" dot, in the fleet row's amber, so a background run is never
+    // stuck unseen.
+    let needs_you = use_memo(move || {
+        crate::agent_time_runtime::held_approvals(&planner.read(), &session_state.read())
+            .into_iter()
+            .map(|h| h.chat_id)
+            .collect::<std::collections::HashSet<String>>()
+    });
 
     // ── Display order (a lens: never written to open_tabs) ─────────────────
     let group_options = move || {
@@ -263,6 +272,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                 && !props.planner_active
                                 && !props.fleet_active;
                             let is_streaming = streaming.read().contains(&tab.session_id);
+                            let waits_on_you = needs_you.read().contains(&tab.session_id);
                             let label = tab.topic.clone().unwrap_or_else(|| tab.title.clone());
                             let glyph = rail_glyph(tab.emoji.as_deref(), tab.topic.as_deref());
                             let on_select = props.on_select_tab;
@@ -291,7 +301,13 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                             }
                                         },
                                     }
-                                    if is_streaming {
+                                    if waits_on_you {
+                                        span {
+                                            class: "absolute bottom-1 right-1.5 w-1.5 h-1.5 rounded-full",
+                                            style: "background-color: #f59e0b;",
+                                            title: "Needs you: waiting for your approval",
+                                        }
+                                    } else if is_streaming {
                                         div { class: "absolute bottom-1 right-1.5 w-1.5 h-1.5 rounded-full bg-primary-400 animate-pulse" }
                                     }
                                     button {
@@ -467,6 +483,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     && !props.planner_active
                                     && !props.fleet_active;
                                 let is_streaming = streaming.read().contains(&tab.session_id);
+                                let waits_on_you = needs_you.read().contains(&tab.session_id);
                                 let is_editing = editing_tab_id.read().as_deref() == Some(tab.session_id.as_str());
                                 // Same identity layers as the strip's tooltip.
                                 let tooltip = {
@@ -551,7 +568,14 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                                 },
                                                 "{label}"
                                             }
-                                            if show_date {
+                                            if waits_on_you {
+                                                span {
+                                                    class: "shrink-0 rounded-full px-1.5 text-[10px] font-medium leading-4",
+                                                    style: "color: #f59e0b; border: 1px solid #f59e0b;",
+                                                    title: "Waiting for your approval",
+                                                    "needs you"
+                                                }
+                                            } else if show_date {
                                                 span { class: "font-mono text-[11px] text-fg-muted tabular-nums shrink-0", "{tab.date}" }
                                             }
                                             button {

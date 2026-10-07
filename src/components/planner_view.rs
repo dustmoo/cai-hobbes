@@ -649,6 +649,13 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
     // Rail mode's projects popover (hook declared before the rail early-return).
     let mut projects_open = use_signal(|| false);
+    // Calls the agent-time run is waiting on the user for (a memo, so chat
+    // streaming doesn't re-render the rail).
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
+    let held_count = use_memo(move || {
+        crate::agent_time_runtime::held_approvals(&planner.read(), &session_state.read()).len()
+    });
+    let held_count = *held_count.read();
     let day = today();
 
     let state = planner.read();
@@ -699,10 +706,12 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
     let sel = selection.read().clone();
     let is_view = |v: TodoView| sel == PlannerSelection::View(v);
     let mut drawer = use_context::<DecisionsDrawerContext>().0;
-    let decisions_count = crate::todo::lanes::needs_you(&state.todos).len();
+    let decisions_count = crate::todo::lanes::needs_you(&state.todos).len() + held_count;
     let agent_time_label = {
         let b = state.agent_time_budget(day, Utc::now());
-        if !b.enabled {
+        if held_count > 0 {
+            Some("needs you".to_string())
+        } else if !b.enabled {
             Some("off".to_string())
         } else if b.minutes_used > 0 {
             Some(format!("{}m", b.minutes_used))
@@ -892,7 +901,7 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                 icon: fi_icons::FiClock,
                 label: "Agent time",
                 tag: agent_time_label,
-                warn: false,
+                warn: held_count > 0,
                 selected: is_panel(PlannerPanel::AgentTime),
                 onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
             }

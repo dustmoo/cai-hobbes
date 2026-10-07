@@ -458,8 +458,12 @@ impl PlannerClient {
             name: "HOBBES_AGENT_TIME".into(),
             description: Some(
                 "Your granted agent time: a small budget in which you choose your own work, \
-                in the open. start(intent) first — declare what you will do and why, in one \
-                or two lines. log(tool, summary) notes a step. propose(kind, title, body) files \
+                in the open. start(intent, todo_id?) first — declare what you will do and why, \
+                in one or two lines; pass todo_id only for a queued or stuck agent-lane to-do \
+                (the user's own, human-lane tasks are not yours: offer to take one with \
+                propose(kind: offer, todo_id, body) and only their acceptance hands it over). Every tool call you make is recorded on the log automatically, \
+                so don't log calls yourself. log(summary) is an optional note on why you're \
+                taking the next step (it attaches to that call). propose(kind, title, body) files \
                 an output (note, todo, skill, research, other) for the user to accept, edit or \
                 dismiss — proposals are your ONLY output; never change the user's to-dos, plan \
                 or anything outside Hobbes directly. end(summary) closes the session. Refused \
@@ -472,9 +476,9 @@ impl PlannerClient {
                     "properties": {
                         "action": { "type": "string", "enum": ["start", "log", "propose", "end"] },
                         "intent": { "type": "string", "description": "start: what you will do and why, one or two lines." },
-                        "tool": { "type": "string", "description": "log: the tool or step." },
-                        "summary": { "type": "string", "description": "log / end: one line." },
-                        "kind": { "type": "string", "enum": ["note", "todo", "skill", "research", "other"], "description": "propose." },
+                        "summary": { "type": "string", "description": "log (optional note, attached to your next call) / end: one line." },
+                        "kind": { "type": "string", "enum": ["note", "todo", "skill", "research", "other", "offer"], "description": "propose. offer = offer to take one of the user's tasks (needs todo_id)." },
+                        "todo_id": { "type": "string", "description": "start: the agent-lane to-do you work on (optional). propose(offer): the user's to-do you offer to take." },
                         "title": { "type": "string", "description": "propose: one line." },
                         "body": { "type": "string", "description": "propose: the content (markdown)." }
                     },

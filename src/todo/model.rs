@@ -993,6 +993,43 @@ pub struct AgentTimeLogEntry {
     pub at: DateTime<Utc>,
     pub tool: String,
     pub summary: String,
+    /// What the line records. Rows saved before this field read as `Call`.
+    #[serde(default, skip_serializing_if = "AgentTimeLogKind::is_call")]
+    pub kind: AgentTimeLogKind,
+    /// The model's own `log` note for this call: a note it wrote just before
+    /// the call is folded in here instead of standing as its own row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// What an agent-time log line records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTimeLogKind {
+    /// A tool call the model made (recorded by the runtime gate, or a
+    /// `HOBBES_AGENT_TIME` start / propose / end). The only kind counted as
+    /// a tool call.
+    #[default]
+    Call,
+    /// The model's optional `log` note that no call has followed yet. The
+    /// next recorded call absorbs it (see `AgentTimeLogEntry::note`).
+    Note,
+    /// The runtime's own line (approval given, held calls expired, run
+    /// closed). Never merged, never counted.
+    Event,
+}
+
+impl AgentTimeLogKind {
+    pub fn is_call(&self) -> bool {
+        *self == AgentTimeLogKind::Call
+    }
+}
+
+impl AgentTimeSession {
+    /// Real tool calls on the log (notes and runtime events excluded).
+    pub fn call_count(&self) -> usize {
+        self.tool_calls.iter().filter(|e| e.kind.is_call()).count()
+    }
 }
 
 /// Why an agent-time session ended.
@@ -1054,6 +1091,10 @@ pub struct AgentTimeSession {
     /// Calls the scope gate refused or sent for approval (evidence).
     #[serde(default)]
     pub out_of_scope_attempts: u32,
+    /// The agent-lane to-do this session works on (`start(todo_id)`);
+    /// `None` = work in Hobbes-owned space.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_id: Option<String>,
 }
 
 impl AgentTimeSession {
@@ -1076,6 +1117,10 @@ pub enum ProposalKind {
     Skill,
     Research,
     Other,
+    /// An offer to take one of the person's own (human-lane) to-dos into the
+    /// agent lane. `Proposal::todo_id` names it; only the person's
+    /// acceptance hands it over.
+    Offer,
 }
 
 impl ProposalKind {
@@ -1086,6 +1131,7 @@ impl ProposalKind {
             ProposalKind::Skill => "skill",
             ProposalKind::Research => "research",
             ProposalKind::Other => "other",
+            ProposalKind::Offer => "offer",
         }
     }
 
@@ -1096,6 +1142,7 @@ impl ProposalKind {
             "skill" | "draft_skill" => Some(ProposalKind::Skill),
             "research" | "digest" | "research_digest" => Some(ProposalKind::Research),
             "other" => Some(ProposalKind::Other),
+            "offer" | "offer_to_take" => Some(ProposalKind::Offer),
             _ => None,
         }
     }
@@ -1140,6 +1187,10 @@ pub struct Proposal {
     pub resolved_at: Option<DateTime<Utc>>,
     /// The agent-time session that filed it.
     pub session_id: String,
+    /// `Offer`: the person's to-do agent time offers to take. Absent on
+    /// every other kind (and on rows saved before offers existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todo_id: Option<String>,
 }
 
 /// Trust-ledger evidence (SYMBIOTIC_PLANNER.md §3). Evidence only: it never

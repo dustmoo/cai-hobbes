@@ -206,6 +206,108 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     }
 }
 
+/// Session ids whose approved tool calls are ready to run. The approval-resume
+/// effect in `ChatWindow` (chat.rs) drains it and runs every `Running` call
+/// in those sessions with `user_approved = true`.
+///
+/// A global (not a `ChatWindow` context signal) so approvals given outside
+/// the chat — the Agent time panel and the decision queue, which are mounted
+/// beside `ChatWindow`, not under it — reach the same resume path. Every
+/// approval, wherever it is clicked, goes through [`approve_held_call`].
+pub static APPROVED_SESSIONS: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// How a held call (a `PermissionRequest` message) is resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeldResolution {
+    /// Turn it back into a `Running` ToolCall for the resume path to execute.
+    Approve,
+    /// Record it as an error result with this text; it never runs.
+    Deny(String),
+}
+
+/// The response written into a call the user denied.
+pub const DENIED_BY_USER: &str = "Denied by user.";
+
+/// **Pure.** Resolve the held call `execution_id` in `session_id`. Returns the
+/// resolved message, or `None` when the session or a still-held call with
+/// that id isn't there (already answered, or never held).
+pub fn resolve_held_call(
+    state: &mut crate::session::SessionState,
+    session_id: &str,
+    execution_id: &str,
+    resolution: &HeldResolution,
+) -> Option<crate::components::chat::Message> {
+    let session = state.sessions.get_mut(session_id)?;
+    let msg = message_mut_by_execution_id(session, execution_id)?;
+    let super::shared::MessageContent::PermissionRequest(tc) = &msg.content else {
+        return None;
+    };
+    let mut resolved = tc.clone();
+    match resolution {
+        HeldResolution::Approve => resolved.status = ToolCallStatus::Running,
+        HeldResolution::Deny(text) => {
+            resolved.status = ToolCallStatus::Error;
+            resolved.response = text.clone();
+        }
+    }
+    msg.content = super::shared::MessageContent::ToolCall(resolved);
+    Some(msg.clone())
+}
+
+/// **The approve path** every Approve button uses (the chat's permission and
+/// skill prompts, the Agent time panel, the decision queue): flip the held
+/// call to `Running` and hand its session to the approval-resume effect in
+/// chat.rs, which runs it through `agent_time_gate(.., user_approved = true)`
+/// and `dispatch_builtin_tool` / `use_mcp_tool` exactly as for any approval.
+/// Returns whether a held call was found.
+pub fn approve_held_call(
+    mut session_state: Signal<crate::session::SessionState>,
+    session_id: &str,
+    execution_id: &str,
+) -> bool {
+    let found = resolve_held_call(
+        &mut session_state.write(),
+        session_id,
+        execution_id,
+        &HeldResolution::Approve,
+    )
+    .is_some();
+    if found {
+        APPROVED_SESSIONS.write().insert(session_id.to_string());
+    } else {
+        tracing::warn!(
+            "approve: no held call {execution_id} in session {session_id}; nothing to run"
+        );
+    }
+    found
+}
+
+/// **The deny path** every Deny button uses: record the held call as an
+/// error result (`text`, normally [`DENIED_BY_USER`]) without running it.
+/// Like a chat Deny, it does not resume the model. Returns whether a held
+/// call was found.
+pub fn deny_held_call(
+    mut session_state: Signal<crate::session::SessionState>,
+    session_id: &str,
+    execution_id: &str,
+    text: &str,
+) -> bool {
+    let found = resolve_held_call(
+        &mut session_state.write(),
+        session_id,
+        execution_id,
+        &HeldResolution::Deny(text.to_string()),
+    )
+    .is_some();
+    if found {
+        crate::session::SessionState::save_signal(&session_state, None);
+    } else {
+        tracing::warn!("deny: no held call {execution_id} in session {session_id}");
+    }
+    found
+}
+
 /// The message carrying this execution id, within one session.
 fn message_mut_by_execution_id<'a>(
     session: &'a mut crate::session::Session,
@@ -233,10 +335,6 @@ pub struct PermissionPromptProps {
 #[component]
 pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
-    // Carries the session ids whose approved tool calls are ready to run — the
-    // approving tab owns the call even if the user switches away mid-flight.
-    let has_pending_approvals =
-        consume_context::<Signal<std::collections::HashSet<String>>>();
     let mut settings = consume_context::<Signal<crate::settings::Settings>>();
     let settings_manager = consume_context::<Signal<crate::settings::SettingsManager>>();
     let planner = consume_context::<Signal<crate::todo::PlannerState>>();
@@ -425,37 +523,14 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
                     onclick: move |_| {
                         log_on_deny(crate::context::trust_store::DecisionKind::Denied, None);
-                        // Deny: Convert to error/skipped state so UI can clean up
-                        spawn({
-                            let tool_call_deny = tool_call_deny.clone();
-                            let owning_session_id = owning_session_id_deny.clone();
-                            let mut session_state = session_state;
-                            async move {
-                                {
-                                    let mut state = session_state.write();
-                                    match state.sessions.get_mut(&owning_session_id) {
-                                        Some(session) => {
-                                            if let Some(msg) = message_mut_by_execution_id(
-                                                session,
-                                                &tool_call_deny.execution_id,
-                                            ) {
-                                                if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                                    let mut denied_tc = tc.clone();
-                                                    denied_tc.status = ToolCallStatus::Error;
-                                                    denied_tc.response = "Denied by user.".to_string();
-                                                    msg.content = super::shared::MessageContent::ToolCall(denied_tc);
-                                                }
-                                            }
-                                        }
-                                        None => {
-                                            tracing::warn!(
-                                                "PermissionPrompt deny: session {owning_session_id} not found in state; dropping instead of scanning"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        });
+                        // Deny: the shared deny path (also used by the
+                        // Agent time panel and the decision queue).
+                        deny_held_call(
+                            session_state,
+                            &owning_session_id_deny,
+                            &tool_call_deny.execution_id,
+                            DENIED_BY_USER,
+                        );
                     },
                     "Deny"
                 }
@@ -490,51 +565,14 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                                 None,
                             );
                         }
-                        // Approve: Mark as ready for execution, signal pending approvals
-                        // The lifecycle (Submit button) will handle actual execution
-                        spawn({
-                            let tool_call = tool_call.clone();
-                            let owning_session_id = owning_session_id.clone();
-                            let mut session_state = session_state;
-                            let mut has_pending_approvals = has_pending_approvals;
-                            async move {
-                                // The owning session is the tab this prompt is
-                                // rendered in (captured from context at click
-                                // time, see PermissionPromptProps::session_id) —
-                                // the executor may run after the user has
-                                // switched tabs, so this must not be re-derived
-                                // from the (possibly now-different) active tab.
-                                let found = {
-                                    let mut state = session_state.write();
-                                    match state.sessions.get_mut(&owning_session_id) {
-                                        Some(session) => {
-                                            if let Some(msg) = message_mut_by_execution_id(
-                                                session,
-                                                &tool_call.execution_id,
-                                            ) {
-                                                if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                                    let mut approved_tc = tc.clone();
-                                                    approved_tc.status = ToolCallStatus::Running;
-                                                    msg.content = super::shared::MessageContent::ToolCall(approved_tc);
-                                                }
-                                            }
-                                            true
-                                        }
-                                        None => {
-                                            tracing::warn!(
-                                                "PermissionPrompt approve: session {owning_session_id} not found in state; dropping instead of scanning"
-                                            );
-                                            false
-                                        }
-                                    }
-                                };
-                                // Signal that this session has approved tools
-                                // ready for execution.
-                                if found {
-                                    has_pending_approvals.write().insert(owning_session_id);
-                                }
-                            }
-                        });
+                        // Approve: the shared approve path — flips the call
+                        // to Running and signals the resume effect in chat.rs.
+                        // The owning session is the tab this prompt is
+                        // rendered in (captured from context at click time,
+                        // see PermissionPromptProps::session_id) — the
+                        // executor may run after the user has switched tabs,
+                        // so this must not be re-derived from the active tab.
+                        approve_held_call(session_state, &owning_session_id, &tool_call.execution_id);
                     },
                     "Approve"
                 }
@@ -586,8 +624,6 @@ pub struct SkillToolPermissionPromptProps {
 #[component]
 pub fn SkillToolPermissionPrompt(props: SkillToolPermissionPromptProps) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let has_pending_approvals =
-        consume_context::<Signal<std::collections::HashSet<String>>>();
     let skill_call = skill_call_from_invoke(&props.tool_call);
 
     rsx! {
@@ -602,42 +638,13 @@ pub fn SkillToolPermissionPrompt(props: SkillToolPermissionPromptProps) -> Eleme
                 on_approve: {
                     let session_id = props.session_id.clone();
                     move |execution_id: String| {
-                        let mut session_state = session_state;
-                        let mut has_pending_approvals = has_pending_approvals;
-                        let mut found = false;
-                        {
-                            let mut state = session_state.write();
-                            if let Some(session) = state.sessions.get_mut(&session_id) {
-                                found = true;
-                                if let Some(msg) = message_mut_by_execution_id(session, &execution_id) {
-                                    if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                        let mut approved_tc = tc.clone();
-                                        approved_tc.status = ToolCallStatus::Running;
-                                        msg.content = super::shared::MessageContent::ToolCall(approved_tc);
-                                    }
-                                }
-                            }
-                        }
-                        if found {
-                            has_pending_approvals.write().insert(session_id.clone());
-                        }
+                        approve_held_call(session_state, &session_id, &execution_id);
                     }
                 },
                 on_deny: {
                     let session_id = props.session_id.clone();
                     move |execution_id: String| {
-                        let mut session_state = session_state;
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&session_id) {
-                            if let Some(msg) = message_mut_by_execution_id(session, &execution_id) {
-                                if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                    let mut denied_tc = tc.clone();
-                                    denied_tc.status = ToolCallStatus::Error;
-                                    denied_tc.response = "Denied by user.".to_string();
-                                    msg.content = super::shared::MessageContent::ToolCall(denied_tc);
-                                }
-                            }
-                        }
+                        deny_held_call(session_state, &session_id, &execution_id, DENIED_BY_USER);
                     }
                 },
             }

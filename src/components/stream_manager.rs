@@ -1864,7 +1864,11 @@ impl StreamManagerContext {
 
             // Agent time: the model stopped (no tool calls left), so nothing
             // drives it further — the run is over; close the lease.
-            crate::agent_time_runtime::on_turn_complete(self.planner_state, &session_id);
+            crate::agent_time_runtime::on_turn_complete(
+                self.planner_state,
+                self.session_state,
+                &session_id,
+            );
 
             on_complete();
             self.streaming_sessions.write().remove(&session_id);
