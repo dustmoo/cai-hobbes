@@ -2539,7 +2539,7 @@ mod tests {
             rsx! { div {} }
         });
 
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         dom.wait_for_suspense().await;
     }
 
@@ -2603,7 +2603,7 @@ mod tests {
             rsx! { div {} }
         });
 
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         dom.wait_for_suspense().await;
     }
 
@@ -2696,7 +2696,7 @@ mod tests {
             rsx! { div {} }
         });
 
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         dom.wait_for_suspense().await;
     }
 }

@@ -33,7 +33,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 
 use super::model::{
     AgentState, AgentTimeEndReason, AgentTimeGrant, AgentTimeLogEntry, AgentTimeLogKind,
-    AgentTimeSession, Lane, Proposal, ProposalKind, ProposalStatus, Todo,
+    AgentTimeSession, Lane, Proposal, ProposalKind, ProposalRevision, ProposalStatus, Todo,
 };
 use super::PlannerState;
 
@@ -606,6 +606,8 @@ impl PlannerState {
             session_id,
             todo_id,
             lane: None,
+            revisions: Vec::new(),
+            removed: false,
         };
         let s = self
             .open_agent_time_session_mut()
@@ -808,6 +810,60 @@ impl PlannerState {
         Some(t.clone())
     }
 
+    /// **UI action** (Trust ledger → Review): change a resolved proposal's
+    /// verdict after the fact, or take it off the ledger (`to: None`). The
+    /// ledger counts move with it and the change is kept on the proposal as
+    /// a [`ProposalRevision`] (with the person's note) so the agent sees it.
+    /// Changes the record only: a to-do an accepted proposal created or
+    /// handed over stays where it is. Persist the proposal and the ledger
+    /// afterwards.
+    pub fn revise_proposal(
+        &mut self,
+        id: &str,
+        to: Option<ProposalStatus>,
+        note: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Proposal, String> {
+        if to == Some(ProposalStatus::Open) {
+            return Err("a proposal can't be reopened".into());
+        }
+        let p = self
+            .proposals
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or("no such proposal")?;
+        if p.status == ProposalStatus::Open {
+            return Err("still open; accept or dismiss it first".into());
+        }
+        if p.removed {
+            return Err("already removed from the ledger".into());
+        }
+        let from = p.status;
+        let counts_same = |a: ProposalStatus, b: ProposalStatus| {
+            a == b || (a != ProposalStatus::Dismissed && b != ProposalStatus::Dismissed)
+        };
+        if to.is_some_and(|t| counts_same(from, t)) {
+            return Err("that is already the verdict".into());
+        }
+        let l = &mut self.trust_ledger;
+        match from {
+            ProposalStatus::Accepted => l.proposals_accepted = l.proposals_accepted.saturating_sub(1),
+            ProposalStatus::Edited => l.proposals_edited = l.proposals_edited.saturating_sub(1),
+            ProposalStatus::Dismissed => l.proposals_dismissed = l.proposals_dismissed.saturating_sub(1),
+            ProposalStatus::Open => {}
+        }
+        match to {
+            Some(ProposalStatus::Dismissed) => l.proposals_dismissed = l.proposals_dismissed.saturating_add(1),
+            Some(_) => l.proposals_accepted = l.proposals_accepted.saturating_add(1),
+            None => p.removed = true,
+        }
+        if let Some(t) = to {
+            p.status = t;
+        }
+        p.revisions.push(ProposalRevision { at: now, from, to, note: note.trim().to_string() });
+        Ok(p.clone())
+    }
+
     /// Record a promise the agent made ("ready by Friday") as kept or broken.
     /// Evidence only. No automatic source exists yet — the UI (or a later
     /// promise tracker) calls this. Persist the ledger afterwards.
@@ -870,6 +926,9 @@ pub struct AgentTimeTaskLists {
     pub human: Vec<(String, String)>,
     /// Open human to-dos beyond [`MAX_HUMAN_TASKS_LISTED`].
     pub human_more: usize,
+    /// The person's after-the-fact changes to recent proposals, newest
+    /// first (title, line), so the agent learns from them.
+    pub revisions: Vec<(String, String)>,
 }
 
 /// Overdue first, then today, then the rest (each by list order).
@@ -913,7 +972,42 @@ pub fn agent_time_task_lists(
         .take(MAX_HUMAN_TASKS_LISTED)
         .map(|t| (t.id.clone(), t.title.clone()))
         .collect();
-    AgentTimeTaskLists { agent, human, human_more }
+    let revisions = proposal_revision_lines(planner, MAX_REVISIONS_LISTED);
+    AgentTimeTaskLists { agent, human, human_more, revisions }
+}
+
+/// Revised proposals listed in the agent-time context.
+pub const MAX_REVISIONS_LISTED: usize = 6;
+
+fn verdict_word(s: ProposalStatus) -> &'static str {
+    match s {
+        ProposalStatus::Dismissed => "dismissed",
+        ProposalStatus::Open => "open",
+        _ => "accepted",
+    }
+}
+
+/// **Pure.** One line per revised proposal (its latest revision), newest
+/// first: `("title", "changed from accepted to dismissed: <note>")`.
+pub fn proposal_revision_lines(planner: &PlannerState, max: usize) -> Vec<(String, String)> {
+    let mut revised: Vec<(&Proposal, &ProposalRevision)> = planner
+        .proposals
+        .iter()
+        .filter_map(|p| p.revisions.last().map(|r| (p, r)))
+        .collect();
+    revised.sort_by(|a, b| b.1.at.cmp(&a.1.at));
+    revised
+        .into_iter()
+        .take(max)
+        .map(|(p, r)| {
+            let what = match r.to {
+                Some(to) => format!("changed from {} to {}", verdict_word(r.from), verdict_word(to)),
+                None => format!("was {}, then removed from your trust ledger", verdict_word(r.from)),
+            };
+            let line = if r.note.is_empty() { what } else { format!("{what}: \u{201c}{}\u{201d}", r.note) };
+            (p.title.clone(), line)
+        })
+        .collect()
 }
 
 /// **Pure.** The two-list context block for the opening message and the
@@ -944,6 +1038,14 @@ pub fn agent_time_context(lists: &AgentTimeTaskLists, owner: &str) -> String {
     }
     if lists.human_more > 0 {
         out.push_str(&format!("- \u{2026}and {} more\n", lists.human_more));
+    }
+    if !lists.revisions.is_empty() {
+        out.push_str(&format!(
+            "\n{owner} revisited some of your earlier proposals. Take the reasons into account:\n"
+        ));
+        for (title, line) in &lists.revisions {
+            out.push_str(&format!("- {title}: {line}\n"));
+        }
     }
     out
 }
@@ -1561,6 +1663,59 @@ mod tests {
         assert!((l.acceptance_rate().unwrap() - 2.0 / 3.0).abs() < 1e-9);
         let t = proposal_to_todo(&a, 1.0);
         assert_eq!(t.title, "Book node");
+    }
+
+    #[test]
+    fn revising_a_verdict_moves_the_ledger_and_leaves_a_record_for_the_agent() {
+        let mut s = leased();
+        let now = Utc::now();
+        s.agent_time_start("chat-at", "x", today(), now).unwrap();
+        let (a, _) = s.agent_time_propose("chat-at", ProposalKind::Research, "GPU digest", "", today(), now).unwrap();
+        let (b, _) = s.agent_time_propose("chat-at", ProposalKind::Note, "Edited note", "", today(), now).unwrap();
+        let (c, _) = s.agent_time_propose("chat-at", ProposalKind::Note, "Thin note", "", today(), now).unwrap();
+        let (d, _) = s.agent_time_propose("chat-at", ProposalKind::Note, "Still open", "", today(), now).unwrap();
+        s.resolve_proposal(&a.id, ProposalStatus::Accepted, None, now).unwrap();
+        s.resolve_proposal(&b.id, ProposalStatus::Accepted, Some(("Edited note".into(), "b".into())), now).unwrap();
+        s.resolve_proposal(&c.id, ProposalStatus::Dismissed, None, now).unwrap();
+        let counts = |s: &PlannerState| {
+            let l = s.trust_ledger;
+            (l.proposals_accepted, l.proposals_edited, l.proposals_dismissed)
+        };
+        assert_eq!(counts(&s), (1, 1, 1));
+
+        // Accepted → dismissed, with a reason.
+        let later = now + chrono::Duration::minutes(5);
+        let p = s.revise_proposal(&a.id, Some(ProposalStatus::Dismissed), " too shallow ", later).unwrap();
+        assert_eq!(p.status, ProposalStatus::Dismissed);
+        assert_eq!(p.revisions.len(), 1);
+        assert_eq!(p.revisions[0].from, ProposalStatus::Accepted);
+        assert_eq!(p.revisions[0].note, "too shallow");
+        assert_eq!(counts(&s), (0, 1, 2));
+        // An edited acceptance counts as accepted: flipping it to dismissed
+        // takes it out of `edited`; flipping it to accepted is a no-op error.
+        assert!(s.revise_proposal(&b.id, Some(ProposalStatus::Accepted), "", later).is_err());
+        // Dismissed → accepted.
+        s.revise_proposal(&c.id, Some(ProposalStatus::Accepted), "", later).unwrap();
+        assert_eq!(counts(&s), (1, 1, 1));
+        // Remove: stops counting, keeps the record.
+        let r = s.revise_proposal(&b.id, None, "duplicate", later + chrono::Duration::minutes(1)).unwrap();
+        assert!(r.removed);
+        assert_eq!(r.status, ProposalStatus::Edited, "status kept for the record");
+        assert_eq!(counts(&s), (1, 0, 1));
+        assert!(s.revise_proposal(&b.id, Some(ProposalStatus::Dismissed), "", later).is_err(), "removed is final");
+        assert!(s.revise_proposal(&d.id, Some(ProposalStatus::Dismissed), "", later).is_err(), "open can't be revised");
+        assert!(s.revise_proposal(&c.id, Some(ProposalStatus::Open), "", later).is_err());
+
+        // The agent's next opening context lists the changes, newest first.
+        let lines = proposal_revision_lines(&s, MAX_REVISIONS_LISTED);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], ("Edited note".to_string(), "was accepted, then removed from your trust ledger: \u{201c}duplicate\u{201d}".to_string()));
+        assert!(lines.iter().any(|(t, l)| t == "GPU digest" && l == "changed from accepted to dismissed: \u{201c}too shallow\u{201d}"));
+        assert!(lines.iter().any(|(t, l)| t == "Thin note" && l == "changed from dismissed to accepted"));
+        let lists = agent_time_task_lists(&s, today(), &|_| false);
+        let ctx = agent_time_context(&lists, "Dustin");
+        assert!(ctx.contains("Dustin revisited some of your earlier proposals"), "{ctx}");
+        assert!(ctx.contains("- GPU digest: changed from accepted to dismissed"), "{ctx}");
     }
 
     #[test]

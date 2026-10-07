@@ -464,13 +464,13 @@ pub(crate) fn WeeklyReview() -> Element {
             let acc = state
                 .proposals
                 .iter()
-                .filter(|p| p.kind == *k && in_week(p))
+                .filter(|p| p.kind == *k && in_week(p) && !p.removed)
                 .filter(|p| matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Edited))
                 .count() as u32;
             let dis = state
                 .proposals
                 .iter()
-                .filter(|p| p.kind == *k && in_week(p) && p.status == ProposalStatus::Dismissed)
+                .filter(|p| p.kind == *k && in_week(p) && !p.removed && p.status == ProposalStatus::Dismissed)
                 .count() as u32;
             (*label, acc, dis)
         })

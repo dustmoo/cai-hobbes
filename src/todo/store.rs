@@ -1676,6 +1676,8 @@ mod tests {
                 session_id: "at_1".into(),
                 todo_id: None,
                 lane: None,
+                revisions: Vec::new(),
+                removed: false,
             };
             upsert_proposal_conn(conn, &proposal, 3).unwrap();
             let decision = ResolvedDecision {

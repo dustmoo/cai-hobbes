@@ -1206,6 +1206,28 @@ pub struct Proposal {
     /// agent)`); absent = a suggestion for the person (human lane).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
+    /// The person's later changes to the verdict, oldest first. The agent
+    /// sees them (with any note) in the next run's opening context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revisions: Vec<ProposalRevision>,
+    /// Taken off the trust ledger by the person: it no longer counts and
+    /// leaves the lists, but stays on disk with its revision record.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+}
+
+/// One after-the-fact change to a resolved proposal (Trust ledger → Review).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProposalRevision {
+    pub at: DateTime<Utc>,
+    /// The verdict before the change.
+    pub from: ProposalStatus,
+    /// The verdict after it; `None` = removed from the ledger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<ProposalStatus>,
+    /// The person's reason, for the agent. May be empty.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
 }
 
 /// Trust-ledger evidence (SYMBIOTIC_PLANNER.md §3). Evidence only: it never

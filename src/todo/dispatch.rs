@@ -443,7 +443,7 @@ pub fn handle_dispatch(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::todo::model::ChecklistItem;
     use dioxus::prelude::*;
@@ -470,7 +470,7 @@ mod tests {
         test_ctx_with(planner, crate::settings::Settings::default())
     }
 
-    fn test_ctx_with(planner: crate::todo::PlannerState, settings: crate::settings::Settings) -> BuiltinToolCtx {
+    pub(crate) fn test_ctx_with(planner: crate::todo::PlannerState, settings: crate::settings::Settings) -> BuiltinToolCtx {
         use dioxus::prelude::Signal;
         let sessions = crate::session::SessionState { save_disabled: true, ..Default::default() };
         BuiltinToolCtx {
@@ -583,7 +583,7 @@ mod tests {
 
             dioxus::prelude::rsx! { div {} }
         });
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[test]
@@ -627,7 +627,7 @@ mod tests {
 
             dioxus::prelude::rsx! { div {} }
         });
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     fn planner_with(title: &str) -> (crate::todo::PlannerState, String) {
@@ -723,7 +723,7 @@ mod tests {
 
             dioxus::prelude::rsx! { div {} }
         });
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[test]
@@ -750,7 +750,7 @@ mod tests {
 
             dioxus::prelude::rsx! { div {} }
         });
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[test]

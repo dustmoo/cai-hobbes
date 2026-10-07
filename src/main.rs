@@ -55,6 +55,8 @@ mod session_store;
 mod str_utils;
 mod tab_list;
 mod tab_tidy;
+#[cfg(test)]
+mod test_support;
 mod timers;
 mod todo;
 mod usage_log;
@@ -3806,7 +3808,7 @@ mod stream_bridge_cancel_tests {
     #[test]
     fn cancel_request_inserted_after_mount_is_drained() {
         let mut dom = VirtualDom::new(CancelProbe);
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         pump(&mut dom);
 
         // Mount run sees nothing pending.
@@ -3841,7 +3843,7 @@ mod stream_bridge_cancel_tests {
     #[test]
     fn idle_effect_runs_do_not_loop_forever() {
         let mut dom = VirtualDom::new(CancelProbe);
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         pump(&mut dom);
         dom.in_runtime(|| {
             CANCEL_STREAM_REQUEST.write().insert("a".to_string());

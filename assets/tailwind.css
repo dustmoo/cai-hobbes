@@ -2377,6 +2377,10 @@ video {
   flex-basis: 16rem;
 }
 
+.basis-full {
+  flex-basis: 100%;
+}
+
 .table-auto {
   table-layout: auto;
 }

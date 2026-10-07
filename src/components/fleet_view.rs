@@ -1253,7 +1253,7 @@ mod fresh_rollup_effect_tests {
     #[test]
     fn rollup_staged_after_mount_is_picked_up() {
         let mut dom = VirtualDom::new(RollupProbe);
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         pump(&mut dom);
 
         assert_eq!(
@@ -1293,7 +1293,7 @@ mod fresh_rollup_effect_tests {
     #[test]
     fn idle_effect_runs_do_not_loop_forever() {
         let mut dom = VirtualDom::new(RollupProbe);
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         pump(&mut dom);
         dom.in_runtime(|| {
             *FLEET_ROLLUP_FRESH.write() = Some(rollup("2026-09-09"));

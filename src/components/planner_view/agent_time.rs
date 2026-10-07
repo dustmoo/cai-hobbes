@@ -260,6 +260,10 @@ pub(crate) fn AgentTimeView() -> Element {
     let held = use_memo(move || held_approvals(&planner.read(), &session_state.read()));
     let mut widening_dismissed = use_signal(|| false);
     let mut editing = use_signal(|| Option::<(String, String, String)>::None);
+    // Trust ledger → Review: the list is open; the change being made
+    // (proposal id, new verdict or None = remove, the note).
+    let mut ledger_open = use_signal(|| false);
+    let mut revising = use_signal(|| Option::<(String, Option<ProposalStatus>, String)>::None);
     let mut cap_text = use_signal(|| format!("{:.2}", planner.peek().agent_time_grant.spend_cap_usd));
 
     // The running clock and spend move while a session is open.
@@ -290,6 +294,7 @@ pub(crate) fn AgentTimeView() -> Element {
         });
     let proposals: Vec<Proposal> = state.open_proposals().into_iter().cloned().collect();
     let ledger = state.trust_ledger;
+    let resolved = ledger_review_rows(&state.proposals);
     let projects: Vec<String> = grant
         .scope
         .project_ids
@@ -930,9 +935,135 @@ pub(crate) fn AgentTimeView() -> Element {
                             "No evidence yet. Accepted proposals, kept promises and in-scope sessions add up here; Hobbes can only suggest a wider grant, never take one."
                         }
                     }
+                    if !resolved.is_empty() {
+                        button {
+                            class: "ml-auto rounded border border-faint px-2.5 py-1 text-[11px] text-fg hover:bg-input",
+                            title: "Change or remove past verdicts. Hobbes sees what you change, with your note.",
+                            onclick: move |_| {
+                                let open = !*ledger_open.peek();
+                                ledger_open.set(open);
+                                revising.set(None);
+                            },
+                            if *ledger_open.read() { "Done" } else { "Review" }
+                        }
+                    }
+                    if *ledger_open.read() && !resolved.is_empty() {
+                        div { class: "flex basis-full flex-col gap-1.5 border-t border-faint pt-3",
+                            span { class: "text-[11px] text-fg-muted",
+                                "Changing a verdict changes the record only; any to-do it created stays where it is. Hobbes sees each change and your note at its next agent time."
+                            }
+                            for row in resolved.iter().cloned() {
+                                {
+                                    let id = row.id.clone();
+                                    let dismissed = row.status == ProposalStatus::Dismissed;
+                                    let flip_to = if dismissed { ProposalStatus::Accepted } else { ProposalStatus::Dismissed };
+                                    let flip_label = if dismissed { "Count as accepted" } else { "Count as dismissed" };
+                                    let this_revision = revising.read().as_ref().filter(|r| r.0 == id).map(|r| (r.1, r.2.clone()));
+                                    let verdict_class = if dismissed {
+                                        "shrink-0 rounded-full border border-faint px-2 text-[10.5px] text-fg-muted"
+                                    } else {
+                                        "shrink-0 rounded-full border border-primary-400 px-2 text-[10.5px] text-fg"
+                                    };
+                                    let verdict = match row.status {
+                                        ProposalStatus::Edited => "accepted \u{b7} edited",
+                                        ProposalStatus::Dismissed => "dismissed",
+                                        _ => "accepted",
+                                    };
+                                    let when = row.resolved_at.map(|t| t.with_timezone(&chrono::Local).format("%b %-d").to_string()).unwrap_or_default();
+                                    let last_note = row.revisions.last().map(|r| {
+                                        let what = format!("you changed it from {}", if r.from == ProposalStatus::Dismissed { "dismissed" } else { "accepted" });
+                                        if r.note.is_empty() { what } else { format!("{what}: \u{201c}{}\u{201d}", r.note) }
+                                    });
+                                    rsx! {
+                                        div { key: "{id}", class: "flex flex-col gap-1 rounded border border-faint px-2.5 py-1.5",
+                                            div { class: "flex items-center gap-2",
+                                                span { class: "{verdict_class}", "{verdict}" }
+                                                span { class: "min-w-0 flex-1 truncate text-[12.5px] text-fg", title: "{row.title}", "{proposal_headline(&row)}" }
+                                                span { class: "shrink-0 font-mono text-[10.5px] text-fg-muted", "{kind_label(row.kind)} \u{b7} {when}" }
+                                                if this_revision.is_none() {
+                                                    button {
+                                                        class: "shrink-0 rounded border border-faint px-2 py-0.5 text-[11px] text-fg hover:bg-input",
+                                                        onclick: {
+                                                            let id = id.clone();
+                                                            move |_| revising.set(Some((id.clone(), Some(flip_to), String::new())))
+                                                        },
+                                                        "{flip_label}"
+                                                    }
+                                                    button {
+                                                        class: "shrink-0 rounded border border-faint px-2 py-0.5 text-[11px] text-fg-muted hover:bg-input",
+                                                        title: "Take it off the ledger: it stops counting either way",
+                                                        onclick: {
+                                                            let id = id.clone();
+                                                            move |_| revising.set(Some((id.clone(), None, String::new())))
+                                                        },
+                                                        "Remove"
+                                                    }
+                                                }
+                                            }
+                                            if let Some(note) = last_note {
+                                                span { class: "text-[11px] text-fg-muted", "{note}" }
+                                            }
+                                            if let Some((to, note)) = this_revision {
+                                                div { class: "flex items-center gap-1.5",
+                                                    input {
+                                                        class: "min-w-0 flex-1 rounded border border-faint bg-input px-2 py-0.5 text-xs text-fg outline-none",
+                                                        placeholder: "Why? Hobbes sees this note (optional)",
+                                                        value: "{note}",
+                                                        oninput: move |e| if let Some(r) = revising.write().as_mut() { r.2 = e.value() },
+                                                    }
+                                                    button {
+                                                        class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
+                                                        onclick: {
+                                                            let id = id.clone();
+                                                            move |_| {
+                                                                let note = revising.peek().as_ref().map(|r| r.2.clone()).unwrap_or_default();
+                                                                revise(planner, &id, to, &note);
+                                                                revising.set(None);
+                                                            }
+                                                        },
+                                                        if to.is_some() { "{flip_label}" } else { "Remove from ledger" }
+                                                    }
+                                                    button {
+                                                        class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
+                                                        onclick: move |_| revising.set(None),
+                                                        "Cancel"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
+}
+
+/// Resolved proposals still on the ledger, most recently decided first,
+/// for Trust ledger → Review.
+const LEDGER_REVIEW_ROWS: usize = 30;
+
+fn ledger_review_rows(proposals: &[Proposal]) -> Vec<Proposal> {
+    let mut rows: Vec<Proposal> = proposals
+        .iter()
+        .filter(|p| p.status != ProposalStatus::Open && !p.removed)
+        .cloned()
+        .collect();
+    rows.sort_by(|a, b| b.resolved_at.cmp(&a.resolved_at));
+    rows.truncate(LEDGER_REVIEW_ROWS);
+    rows
+}
+
+/// Change a past verdict (`to`) or remove it from the ledger (`None`);
+/// persist the proposal and the ledger.
+fn revise(mut planner: Signal<PlannerState>, id: &str, to: Option<ProposalStatus>, note: &str) {
+    let revised = planner.write().revise_proposal(id, to, note, Utc::now());
+    match revised {
+        Ok(p) => persist_resolved(&planner, &p),
+        Err(e) => tracing::warn!("planner: couldn't revise proposal {}: {}", id, e),
     }
 }
 
@@ -1000,7 +1131,10 @@ fn accept(
         line.text = "Queued in the agent lane".to_string();
         return Some(line);
     }
-    match accept_start_route(&planner.peek(), today(), Utc::now()) {
+    // Bind the route first: a `peek()` in the match scrutinee would hold the
+    // planner's read guard across both arms, and each arm writes the planner.
+    let route = accept_start_route(&planner.peek(), today(), Utc::now());
+    match route {
         AcceptStartRoute::HandToRun { .. } => {
             let offer = p.kind == ProposalKind::Offer;
             match crate::agent_time_runtime::hand_to_run(planner, settings, &todo_id, offer) {
@@ -1047,6 +1181,45 @@ fn accept(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accept_and_start_on_an_offer_dispatches_without_a_borrow_panic() {
+        // Regression: `match accept_start_route(&planner.peek(), ..)` held the
+        // planner's read guard across the arms, and dispatch_to_chat's
+        // `planner.write()` panicked (crash on "Accept & start", 2026-10-07).
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            use crate::todo::model::{AgentState, Lane, Proposal, ProposalKind, ProposalStatus, Todo};
+            let mut state = PlannerState::default();
+            let todo = Todo::new("Compare Threadripper Halo vs DGX Station", 1.0);
+            let todo_id = todo.id.clone();
+            state.todos.push(todo);
+            state.proposals.push(Proposal {
+                id: "pr-offer".into(),
+                kind: ProposalKind::Offer,
+                title: "Hobbes offers to take it".into(),
+                body: String::new(),
+                status: ProposalStatus::Open,
+                created_at: Utc::now(),
+                resolved_at: None,
+                session_id: "ats-1".into(),
+                todo_id: Some(todo_id.clone()),
+                lane: None,
+                revisions: Vec::new(),
+                removed: false,
+            });
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(state, Settings::default());
+            let line = accept(ctx.planner, ctx.settings, ctx, "pr-offer", None, true).expect("accepted");
+            assert!(!line.error, "{}", line.text);
+            let chat = line.chat_id.expect("a chat started");
+            let t = ctx.planner.peek().todo(&todo_id).cloned().unwrap();
+            assert_eq!(t.lane, Lane::Agent);
+            assert_eq!(t.agent_state, Some(AgentState::Working));
+            assert_eq!(t.linked_fleet_session.as_deref(), Some(chat.as_str()));
+
+            dioxus::prelude::rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
 
     fn budget(enabled: bool) -> AgentTimeBudget {
         AgentTimeBudget {
@@ -1119,6 +1292,8 @@ mod tests {
             session_id: "s".into(),
             todo_id: Some("t".into()),
             lane: None,
+            revisions: Vec::new(),
+            removed: false,
         };
         assert_eq!(proposal_headline(&p), "Hobbes offers to take: Draft the release notes");
         assert_eq!(kind_label(ProposalKind::Offer), "Offer to take");
