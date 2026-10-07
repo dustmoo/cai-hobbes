@@ -125,6 +125,13 @@ See the design canvas. In short:
 
 ## 5. Measures that matter
 
+**A magic mirror, not a plain one.** It's an open question how much people want to face their reality head-on. Dustin wants the mirror that helps him be a better version of himself. So the numbers stay honest and one tap away, but the framing stays on the person's side:
+- measure against the person's own intentions ("6 of 8 hours protected"), not raw totals
+- open with what went right
+- end with one concrete nudge for next week, not a report card
+
+The measures below are what the mirror is built from, not what it leads with.
+
 - **Your time protected and spent**, per category, against the weekly goal. The headline number.
 - **Leverage**: agent minutes per engaged human minute (already measured as "exocortex"), alongside **ground covered** (outcomes reached, decisions cleared), so busyness isn't mistaken for progress.
 - **Judgment ratio**: judgment calls against routing calls surfaced to the human. Routing should trend to zero.
