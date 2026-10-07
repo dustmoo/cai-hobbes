@@ -141,7 +141,7 @@ See the design canvas. In short:
 ## 7. Open questions
 
 - Does agent time draw from the same model and connector as the user's chats, or from a cheaper one chosen in the grant?
-- Should your-time categories be shared between people in one household, so a partner's reading time is visible and protected too?
+- ~~Should your-time categories be shared between people in one household?~~ **Decided (2026-10-07): Hobbes stays a personal planner for now.** Household sharing implies a cloud version of Hobbes with SSO (accounts, invites, shared vs private items, conflicts). That is a future-phase direction, not part of these phases. If any household view ships earlier, other people are simple local profiles (a name and a colour, no accounts or permissions) that could later map to SSO identities.
 - How do we show "getting outside", the category that keeps losing, so it gets protected first rather than last?
 - Where does agent time's output live long-term: Notes, a Proposals inbox, or the to-do list?
 - What is the smallest scope widening worth suggesting first? Probably "file accepted research digests without asking".
