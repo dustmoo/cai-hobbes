@@ -130,6 +130,13 @@ See the design canvas. In short:
 - open with what went right
 - end with one concrete nudge for next week, not a report card
 
+**Feedback style fits the person.** People differ: some thrive on criticism (think of an activity ring telling you you're behind), others do better with encouragement. The review has a feedback style:
+- **Direct:** leads with the gap and names the drain, with a firm suggestion.
+- **Balanced** (default): one win, one gap, one next step.
+- **Encouraging:** leads with what you made room for; the nudge is an invitation.
+
+The numbers and bars are the same in every style; only the order, wording and nudge change. Hobbes asks once ("How do you like feedback?") and then adapts quietly. Acting on blunt nudges keeps them; skipping reviews after hard weeks softens them. The style is always visible and changeable.
+
 The measures below are what the mirror is built from, not what it leads with.
 
 - **Your time protected and spent**, per category, against the weekly goal. The headline number.
