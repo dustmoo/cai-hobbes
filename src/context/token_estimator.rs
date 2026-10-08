@@ -62,8 +62,11 @@ pub fn estimate_message_tokens_with_ratio(message: &ChatMessage, chars_per_token
                 tokens += (content_str.chars().count() as f64 / json_ratio).ceil() as usize;
             }
             ContentBlock::Image { .. } => {
-                // Images vary wildly; use a conservative fixed estimate
-                tokens += 256;
+                // Images vary wildly; use a conservative fixed estimate.
+                // Attachments are capped at 1568px on the long edge
+                // (chat_input::MAX_ATTACHMENT_EDGE), which costs ~1.6k
+                // tokens on Claude and up to ~2.4k on Qwen-VL style models.
+                tokens += 1600;
             }
             ContentBlock::Thinking { text, .. } => {
                 tokens += estimate_tokens_with_ratio(text, chars_per_token);

@@ -2079,6 +2079,28 @@ pub fn ChatInput(
     }
 }
 
+/// Longest edge, in pixels, of an image attachment as stored and sent to the
+/// model. The stored copy IS what every provider sees (the chat UI only shows
+/// it as a CSS-sized thumbnail), so it must stay legible: a 200px cap made
+/// phone screenshots unreadable and models hallucinated their contents.
+/// 1568 is Claude's no-downscale limit and keeps text sharp for Gemini and
+/// local vision models (Qwen) without blowing up the context.
+const MAX_ATTACHMENT_EDGE: u32 = 1568;
+
+/// Shrink `img` so its longest edge is at most `MAX_ATTACHMENT_EDGE`,
+/// preserving aspect ratio. Images already within the limit are untouched.
+fn fit_attachment(img: DynamicImage) -> DynamicImage {
+    if img.width().max(img.height()) > MAX_ATTACHMENT_EDGE {
+        img.resize(
+            MAX_ATTACHMENT_EDGE,
+            MAX_ATTACHMENT_EDGE,
+            imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img
+    }
+}
+
 async fn process_image_data(
     file_name: String,
     mime_type: String,
@@ -2086,11 +2108,7 @@ async fn process_image_data(
 ) -> Option<Attachment> {
     tokio::task::spawn_blocking(move || {
         image::load_from_memory(&file_data).ok().and_then(|img| {
-            let resized_img = if img.height() > 200 {
-                img.resize(u32::MAX, 200, imageops::FilterType::Lanczos3)
-            } else {
-                img
-            };
+            let resized_img = fit_attachment(img);
             let format = match mime_type.as_str() {
                 "image/png" => ImageFormat::Png,
                 "image/jpeg" => ImageFormat::Jpeg,
@@ -2122,12 +2140,7 @@ async fn process_clipboard_image(image_data: arboard::ImageData<'_>) -> Option<A
     tokio::task::spawn_blocking(move || {
         image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(width, height, bytes).and_then(
             |img_buf| {
-                let resized_img: DynamicImage = if img_buf.height() > 200 {
-                    let dynamic_image: DynamicImage = img_buf.into();
-                    dynamic_image.resize(u32::MAX, 200, imageops::FilterType::Lanczos3)
-                } else {
-                    img_buf.into()
-                };
+                let resized_img = fit_attachment(img_buf.into());
 
                 let mut buffer = Cursor::new(Vec::new());
                 resized_img
@@ -2431,6 +2444,28 @@ fn resolve_seed_target(current_session_id: &str, draft_session_id: &str) -> Seed
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fit_attachment_keeps_phone_screenshots_legible() {
+        // iPhone screenshot: tall portrait. The old 200px-tall cap made it 92x200.
+        let img = DynamicImage::new_rgba8(1179, 2556);
+        let out = fit_attachment(img);
+        assert_eq!(out.height(), MAX_ATTACHMENT_EDGE);
+        assert!(out.width() > 700, "width {} too small to read", out.width());
+    }
+
+    #[test]
+    fn fit_attachment_caps_wide_images_on_width() {
+        let out = fit_attachment(DynamicImage::new_rgba8(3840, 1080));
+        assert_eq!(out.width(), MAX_ATTACHMENT_EDGE);
+        assert!(out.height() < MAX_ATTACHMENT_EDGE);
+    }
+
+    #[test]
+    fn fit_attachment_leaves_small_images_alone() {
+        let out = fit_attachment(DynamicImage::new_rgba8(900, 1200));
+        assert_eq!((out.width(), out.height()), (900, 1200));
+    }
 
     fn att(name: &str) -> Attachment {
         Attachment {
