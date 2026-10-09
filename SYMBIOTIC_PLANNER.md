@@ -120,12 +120,12 @@ This document was written with a model, so one honest line belongs here: a model
 - **Your-time goals:** `TimeGoal { category, weekly_target_minutes, colour }`. Categories are user-defined (Reading, Watching, Experimenting, Gaming, Outside…).
 - `Block.kind` gains `YourTime { category }`. These blocks are **protected**: `HOBBES_PLAN_DAY` plans around them and never moves them without asking.
 - **Agent time:**
-  - `AgentTimeGrant { window_minutes, spend_cap, days, scope, schedule }`. `schedule` is a time of day, or manual only.
-  - `AgentTimeWindow { trigger: Scheduled|Manual, started_at, ended_at, minutes_used, spend, jobs, run_log }`. Every tool call lands in `run_log`.
-  - `AgentTimeResult { job: Prepare|Finish|Notice|Tend, body, grade: Unreviewed|Keep|NeedsWork|Discard, linked_todo }`. Deliverables and Notices both use this.
-  - `AgentTimeQuestion { body, options, answer: Option<String> }`. Answers are read at the start of the next window.
-  - `AgentTimeNote { result_id, body }`. Chat-rail comments, kept with the run.
-  - `TrustVerdict` rows, so a past grade can be recounted or removed, with a note.
+  - `AgentTimeGrant { daily_minutes, spend_cap_usd, days, scope, connector_id, model, window_start }`. `window_start` is a local time of day; `None` means it only starts by hand.
+  - `AgentTimeSession` is one run: intent, log (every tool call), outputs, end reason, and `reviewed_at` once the person marks the review read.
+  - Results and Notices are both `Proposal`s, told apart by `job: Prepare | Finish | Notice | Tend`. A graded result (every job but Notice) is Keep (`Accepted`), Needs work (`NeedsWork`) or Discard (`Dismissed`); a Notice is accepted or dismissed. A Tend result can be a `correction`. `notes` holds the person's comments from the chat rail; `revisions` and `removed` record later changes to a verdict.
+  - `AgentQuestion { question, options, answer, consumed }`. Answers go into the next run's opening message once, then are marked consumed.
+  - `Todo.prep_requested`: the person's "Prep this" flag. Only the person sets it.
+  - `TrustLedger` adds `results_kept`, `results_needs_work`, `results_discarded` and `corrections_delivered` beside the proposal counters.
 
 ### AI tools (`src/mcp/planner_client.rs`, handlers in `src/todo/handlers.rs`)
 
@@ -138,11 +138,12 @@ This document was written with a model, so one honest line belongs here: a model
 - **New `HOBBES_DECISIONS`** — the decision queue. It lists agent to-dos in `NeedsYou` with their one-line question, options and estimated time, and resolves one, which hands the answer back to the worker. This is the "decision queue with re-entry briefs" from the chief-of-staff direction.
 - **New `HOBBES_TIME_GOALS`** — read and update your-time goals and this week's progress.
 - **New `HOBBES_AGENT_TIME`** — used only by the harness during a granted window:
-  - `start(window)` checks the grant and budget and opens the window and its one agent-time chat
-  - `declare(job, intent)` states the intent for a job before it runs
-  - `deliver(job, body)` files a Finish or Prepare result; `notice(body)` files a Notice or an offer
-  - `ask(body, options)` saves a question for the review instead of stopping
-  - `end(summary)` closes the window and writes the review
+  - `start(intent, todo_id?)` declares what it will do and why; no other tool runs until it does
+  - `deliver(job, kind, title, body, todo_id?, correction?)` files a finished Prepare, Finish or Tend result for the review
+  - `propose(kind, title, body, todo_id?)` files a Notice: a suggestion, or with `kind: "offer"` an offer to take one of the person's tasks
+  - `ask(question, options)` saves a question for the review instead of stopping the run
+  - `log(note)` adds a note to the run log
+  - `end(summary)` closes the run
 
   It refuses outside a granted window. It is never available in normal chat.
 - `planner_today` context (now a ledger entry, so it is cached) gains:
@@ -195,7 +196,7 @@ The measures below are what the mirror is built from, not what it leads with.
 - **Leverage**: agent minutes per engaged human minute (already measured as "exocortex"), alongside **ground covered** (outcomes reached, decisions cleared), so busyness isn't mistaken for progress.
 - **Judgment ratio**: judgment calls against routing calls surfaced to the human. Routing should trend to zero.
 - **Chore load**: chore minutes per week, trending down.
-- **Trust**: the Keep rate on graded deliverables, corrections caught by Tend, in-scope rate, and kept promises.
+- **Trust**: the keep rate on graded results, corrections caught by Tend, in-scope rate, and kept promises.
 
 ## 6. Phasing
 
