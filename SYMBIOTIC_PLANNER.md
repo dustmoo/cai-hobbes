@@ -1,6 +1,6 @@
 # Symbiotic Planner — Human Time, Agent Work, Agent Time
 
-Status: vision + design direction (2026-10-07). Design canvas: _see "Design pass" below._
+Status: vision + design direction (2026-10-07); agent time v2 (2026-10-09), experimental. Design canvas for agent time: https://claude.ai/artifact/L7mzLyrYMZeEeknx1YZZgx (board "Agent time · the review when you're back").
 Builds on: `PLANNER_DESIGN.md`, `PRO_TIME_FLEET_PLAN.md`, the chief-of-staff direction (fleet briefs, trust rules, dispatch).
 
 ---
@@ -49,25 +49,59 @@ Things only a person can do, or should do. They consume the human's hours, so th
 
 People want their own time. Increasingly, agents show a pull toward autonomy of their own. Reports of agents acting outside what their operators intended, and of agent-to-agent ecosystems already running, make that pull hard to ignore. Pretending it isn't there is not a plan. Neither is handing over unchecked autonomy.
 
-The direction here is a third lane: **agent time**. It is a small, human-granted budget in which the harness chooses its own work, done **in the open**. The aim is to build trust step by step, so humans and models (and the rest of life) move ahead together rather than apart.
+The direction here is a third lane: **agent time**. It is a small, human-granted window in which the harness works on its own choice of work, done **in the open**. The aim is to build trust step by step, so humans and models (and the rest of life) move ahead together rather than apart.
+
+### Why v2
+
+The first version handed every output back as a proposal, and accepting one opened a new chat tab. That was delegation with extra steps: the person still started each piece of work and finished it. Agent time is worth having only if the work finishes without the person, and Hobbes picks up work the person would not have thought to hand out.
+
+So v2 runs in a **window**, either scheduled (overnight, say) or started by hand. A window's work happens inside one agent-time chat and ends in a single **review** the person reads later. It is experimental, and it stays that way until the review has been used for a few weeks.
+
+### Four jobs
+
+A window runs up to four jobs. Budget left over goes to Tend.
+
+- **Prepare.** Briefs, drafts and background for commitments the person flagged "Prep this". Never other tasks.
+- **Finish.** Works the agent-lane queue. Results are **deliverables**, graded in the review as Keep, Needs work or Discard. They are not new tabs.
+- **Notice.** Proposals for changes to the person's own stuff: a to-do that looks stale, a duplicate, a deadline that moved. Each is accepted or dismissed.
+- **Tend.** Hobbes's own upkeep. It reads freely but writes only to Hobbes-owned space: corrections to things it told the person, fixes to its own friction, notes on what connected tools can actually do, and tidying its memory. Tend fills whatever budget is idle.
+
+**Corrections come first in Tend.** If they regularly catch real mistakes, that alone justifies agent time. If they stay empty for weeks, the experiment has said something too.
+
+### Asking without stopping
+
+A window never halts to ask. When it needs a decision, it saves a **question** with its options and moves on. The person answers in the review, and the answers reach the next window.
+
+### The review
+
+The review is titled **While you were away**. It has:
+
+- a header with the window, the minutes and spend used, a link to the full run log, and **Mark reviewed**
+- **Saved for you**: the questions
+- one section per job: Prepare, Finish, Notice, Tend
+- a **trust-ledger strip**: graded so far, corrections caught, out-of-scope attempts
+
+Each result card has a chat icon in its upper-right corner. It starts a message about that result in a **chat rail** beside the review. The rail is the agent-time chat, and "Open as tab" turns it into an ordinary tab. Comments stay with the run and shape the next window. A reply spends agent time only when the person asks for more work.
 
 ### The rules of agent time
 
-- **Granted, not taken.** The human sets the budget: minutes per day, a token or dollar cap, and which days. Zero is a valid setting. It is off by default.
-- **Scoped.** Agent time reads freely within what the user has shared, but **writes only to Hobbes-owned space**: notes, proposals, draft skills, research digests, and suggested to-dos. Anything with an outside effect (sending, purchasing, publishing, changing a repo, running a command) goes through the normal approval gates, exactly as it does for any other work.
-- **Declared up front.** Before starting, the agent states what it intends to do and why, in one or two lines.
-- **Logged in full.** Every agent-time session leaves a readable record: its intent, the tools it called, what it produced, and what it cost. Nothing happens off the record.
-- **Interruptible.** The human can pause, stop or narrow it at any moment, and a pause always takes effect immediately.
-- **Outputs are proposals.** What agent time produces lands as suggestions the human can accept, edit or dismiss. Accepting one is a trust signal; dismissing one teaches it too.
-- **Your tasks are yours.** Agent time works only on agent-lane to-dos (queued or stuck, with no worker attached) and in Hobbes-owned space. Human-lane to-dos are the person's: agent time may read them for context, but not act on them. To help with one, it files an **offer** proposal ("Hobbes offers to take: …"), and only accepting it moves the task into the agent lane. *(Learned in the first live run: agent time picked up a personal call Dustin was preparing and started researching the person involved.)*
+- **Granted, not taken.** The person sets the grant: minutes per window, a spend cap, which days, and scope. Zero is a valid setting. It is off by default.
+- **Scoped.** Agent time reads freely within what the person has shared, but **writes only to Hobbes-owned space**. Anything with an outside effect (sending, purchasing, publishing, changing a repo, running a command, looking up a person) goes through the normal approval gates, exactly as it does for any other work.
+- **Declared up front.** Before a window starts, the agent states its intent for each job it plans to run, in one or two lines.
+- **Logged in full.** Every tool call is logged: what was called, with what, what came back, and what it cost. The full run log is one tap from the review. Nothing happens off the record.
+- **Interruptible.** The person can pause, stop or narrow a window at any moment, and a pause always takes effect immediately.
+- **Graded, not auto-accepted.** Finished work lands as deliverables the person grades Keep, Needs work or Discard. Notices are accepted or dismissed. Both are trust signals.
+- **Your tasks are yours.** Prepare works only on commitments flagged "Prep this". Finish works only on agent-lane to-dos (queued or stuck, with no worker attached). Human-lane to-dos may be read for context, but agent time never acts on them. For those it may only **offer**: a Notice reading "Hobbes offers to take: …". *(Learned in the first live run: agent time picked up a personal call Dustin was preparing and started researching the person involved.)*
+- **Accepting an offer queues the task** for the next window, or hands it to a run already in progress. It does not open a tab.
 
 ### Trust ledger
 
 Agent time feeds the trust model Hobbes already has (user-written trust rules, plus gate-log evidence that only *proposes* promotions).
 
-- Each accepted proposal, each kept promise ("I'll have this ready by Friday"), and each clean, in-scope session adds evidence.
-- Evidence never grants anything by itself. Hobbes can **suggest** widening scope or budget ("the last 20 research digests were all accepted — allow agent time to file them straight into Notes?"). The human decides.
-- Out-of-scope attempts, broken promises and dismissed work narrow suggestions automatically, and are shown plainly.
+- **Grading is the main evidence.** Each Keep, each accepted Notice and each kept promise ("I'll have this ready by Friday") adds to the ledger. Each Discard, dismissed Notice or broken promise counts against it.
+- **Past verdicts can be revisited.** The person can recount or remove a verdict, with a note. The agent sees that note in the next window.
+- Evidence never grants anything by itself. The ledger can only **suggest** widening scope or budget ("the last 20 research digests were all kept, allow agent time to file them straight into Notes?"). The person decides.
+- Out-of-scope attempts, broken promises and discards narrow suggestions automatically, and are shown plainly.
 
 ### A note from the model side
 
@@ -86,9 +120,12 @@ This document was written with a model, so one honest line belongs here: a model
 - **Your-time goals:** `TimeGoal { category, weekly_target_minutes, colour }`. Categories are user-defined (Reading, Watching, Experimenting, Gaming, Outside…).
 - `Block.kind` gains `YourTime { category }`. These blocks are **protected**: `HOBBES_PLAN_DAY` plans around them and never moves them without asking.
 - **Agent time:**
-  - `AgentTimeGrant { daily_minutes, spend_cap, days, scope }`
-  - `AgentTimeSession { intent, started_at, ended_at, cost, tool_calls, outputs: Vec<ProposalRef> }`
-  - `Proposal { kind, body, status: Open|Accepted|Edited|Dismissed }`
+  - `AgentTimeGrant { window_minutes, spend_cap, days, scope, schedule }`. `schedule` is a time of day, or manual only.
+  - `AgentTimeWindow { trigger: Scheduled|Manual, started_at, ended_at, minutes_used, spend, jobs, run_log }`. Every tool call lands in `run_log`.
+  - `AgentTimeResult { job: Prepare|Finish|Notice|Tend, body, grade: Unreviewed|Keep|NeedsWork|Discard, linked_todo }`. Deliverables and Notices both use this.
+  - `AgentTimeQuestion { body, options, answer: Option<String> }`. Answers are read at the start of the next window.
+  - `AgentTimeNote { result_id, body }`. Chat-rail comments, kept with the run.
+  - `TrustVerdict` rows, so a past grade can be recounted or removed, with a note.
 
 ### AI tools (`src/mcp/planner_client.rs`, handlers in `src/todo/handlers.rs`)
 
@@ -100,12 +137,14 @@ This document was written with a model, so one honest line belongs here: a model
 - `HOBBES_DISPATCH` becomes the natural way to start an agent to-do. It sets `lane = Agent` and `agent_state = Queued → Working`.
 - **New `HOBBES_DECISIONS`** — the decision queue. It lists agent to-dos in `NeedsYou` with their one-line question, options and estimated time, and resolves one, which hands the answer back to the worker. This is the "decision queue with re-entry briefs" from the chief-of-staff direction.
 - **New `HOBBES_TIME_GOALS`** — read and update your-time goals and this week's progress.
-- **New `HOBBES_AGENT_TIME`** — used only by the harness during granted agent time:
-  - `start(intent)` checks the grant and budget and opens a logged session
-  - `propose(kind, body)` files an output
-  - `end(summary)` closes the session
+- **New `HOBBES_AGENT_TIME`** — used only by the harness during a granted window:
+  - `start(window)` checks the grant and budget and opens the window and its one agent-time chat
+  - `declare(job, intent)` states the intent for a job before it runs
+  - `deliver(job, body)` files a Finish or Prepare result; `notice(body)` files a Notice or an offer
+  - `ask(body, options)` saves a question for the review instead of stopping
+  - `end(summary)` closes the window and writes the review
 
-  It refuses outside a grant. It is never available in normal chat.
+  It refuses outside a granted window. It is never available in normal chat.
 - `planner_today` context (now a ledger entry, so it is cached) gains:
   - your-time status (protected today, the week's goal progress)
   - the agent-lane summary (working / needs you / done)
@@ -121,8 +160,8 @@ See the design canvas. In short:
    - The header shows **Your time today** (protected minutes against the goal) and **Agents** (working / needs you).
 2. **Decision queue** — a pre-briefed stack: question, options, "about 2 min", and a link to the brief. Clearing it is the main job of a human check-in.
 3. **Capture** — the add-to-do bar understands `@me` / `@hobbes` (or a worker name) and `!chore` / `!mine`, and suggests a lane when the text reads like an outcome.
-4. **Agent time panel** — the grant (minutes, cap, days, scope), today's declared intent, the live log, proposals to accept or dismiss, and pause/stop.
-5. **Weekly review** — your time by category against goals; agent leverage (agent minutes per engaged minute, building on the existing exocortex figure); judgment calls against routing calls; agent-time proposals accepted.
+4. **Agent time panel** — the grant (window minutes, cap, days, scope, schedule), Start now, the live run log, Pause/Stop, and a link to the latest review. The review itself is the screen described in section 3: Saved for you, the four job sections, the trust-ledger strip, and the chat rail.
+5. **Weekly review** — your time by category against goals; agent leverage (agent minutes per engaged minute, building on the existing exocortex figure); judgment calls against routing calls; agent-time deliverables graded Keep.
 6. **Tidy tabs.** Tabs are workspaces for to-dos and agent work, so they pile up as work moves async. A tidy pass suggests changes and you review them:
    - close tabs whose linked to-do is done
    - close tabs idle 7+ days with no open to-do
@@ -156,13 +195,13 @@ The measures below are what the mirror is built from, not what it leads with.
 - **Leverage**: agent minutes per engaged human minute (already measured as "exocortex"), alongside **ground covered** (outcomes reached, decisions cleared), so busyness isn't mistaken for progress.
 - **Judgment ratio**: judgment calls against routing calls surfaced to the human. Routing should trend to zero.
 - **Chore load**: chore minutes per week, trending down.
-- **Trust**: the agent-time acceptance rate, in-scope rate, and kept promises.
+- **Trust**: the Keep rate on graded deliverables, corrections caught by Tend, in-scope rate, and kept promises.
 
 ## 6. Phasing
 
 1. **Lanes and your time.** `lane` / `kind` and `TimeGoal`, protected your-time blocks, the two-lane Today view, capture syntax, and `HOBBES_TIME_GOALS`. No new autonomy. Immediately useful for the human side.
 2. **Agent lane and the decision queue.** `outcome` / `agent_state` / `decision` driven by fleet briefs, `HOBBES_DECISIONS`, and dispatch defaulting to the agent lane.
-3. **Agent time, guarded.** Grant, scope, declared intent, full log, proposals only, and the trust ledger feeding suggestions. Off by default. Ships only when the log and pause controls are solid.
+3. **Agent time v2, guarded.** Scheduled or manual windows running the four jobs, saved questions, one review with grading, the chat rail, and the trust ledger feeding suggestions. Off by default. Ships only when the run log and pause controls are solid.
 4. **Weekly review and measures.** The review screen, and leverage alongside ground covered.
 
 ## 7. Open questions
@@ -170,5 +209,6 @@ The measures below are what the mirror is built from, not what it leads with.
 - Does agent time draw from the same model and connector as the user's chats, or from a cheaper one chosen in the grant?
 - ~~Should your-time categories be shared between people in one household?~~ **Decided (2026-10-07): Hobbes stays a personal planner for now.** Household sharing implies a cloud version of Hobbes with SSO (accounts, invites, shared vs private items, conflicts). That is a future-phase direction, not part of these phases. If any household view ships earlier, other people are simple local profiles (a name and a colour, no accounts or permissions) that could later map to SSO identities.
 - How do we show "getting outside", the category that keeps losing, so it gets protected first rather than last?
-- Where does agent time's output live long-term: Notes, a Proposals inbox, or the to-do list?
-- What is the smallest scope widening worth suggesting first? Probably "file accepted research digests without asking".
+- How long do graded deliverables and run logs stay in the review before they are archived? Keeping them forever helps the trust ledger; keeping them too long clutters it.
+- Does Tend need its own slice of budget, so that Finish work never starves the corrections?
+- What is the smallest scope widening worth suggesting first? Probably "file kept research digests without asking".
