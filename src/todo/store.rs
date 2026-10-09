@@ -860,7 +860,6 @@ fn delete_todo_conn(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     delete_by_id_conn(conn, "todos", id)
 }
 
-#[allow(dead_code)] // consumer is project management UI, not yet built
 pub fn delete_project(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todo_projects", id))
 }
@@ -1137,6 +1136,8 @@ mod tests {
                 deadline: None,
                 sort_order: 0.0,
                 path: None,
+                aliases: Vec::new(),
+                distinct_from: Vec::new(),
                 created_at: now,
                 updated_at: now,
             };

@@ -4940,6 +4940,14 @@ video {
   content: var(--tw-content);
 }
 
+.first\:border-t-0:first-child {
+  border-top-width: 0px;
+}
+
+.first\:pt-0:first-child {
+  padding-top: 0px;
+}
+
 .last\:border-0:last-child {
   border-width: 0px;
 }

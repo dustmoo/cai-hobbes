@@ -35,6 +35,7 @@ pub(crate) mod agent_review;
 pub(crate) mod agent_review_chat;
 pub(crate) mod agent_time;
 pub(crate) mod decisions;
+pub(crate) mod manage_projects;
 pub(crate) mod review;
 pub(crate) mod your_time;
 
@@ -53,6 +54,8 @@ pub(crate) enum PlannerSelection {
 pub(crate) enum PlannerPanel {
     AgentTime,
     WeeklyReview,
+    /// Rename, aliases, status, and merging possible duplicates.
+    ManageProjects,
 }
 
 impl PlannerPanel {
@@ -60,6 +63,7 @@ impl PlannerPanel {
         match self {
             PlannerPanel::AgentTime => "agent_time",
             PlannerPanel::WeeklyReview => "weekly_review",
+            PlannerPanel::ManageProjects => "manage_projects",
         }
     }
 }
@@ -533,6 +537,7 @@ pub fn PlannerView(
                 match panel {
                     Some(PlannerPanel::AgentTime) => rsx! { agent_time::AgentTimeView {} },
                     Some(PlannerPanel::WeeklyReview) => rsx! { review::WeeklyReview {} },
+                    Some(PlannerPanel::ManageProjects) => rsx! { manage_projects::ManageProjects {} },
                     None => rsx! { CentreColumn { selection } },
                 }
                 if show_today_rail {
@@ -703,7 +708,10 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
             )
         })
         .collect();
-    let has_tree = !top_level.is_empty() || !by_area.is_empty();
+    // The projects header (and its Manage link) shows whenever any project
+    // exists — closed ones are managed there too.
+    let has_projects = !state.projects.is_empty();
+    let duplicate_groups = crate::todo::project_identity::duplicate_groups(&state.projects).len();
 
     let sel = selection.read().clone();
     let is_view = |v: TodoView| sel == PlannerSelection::View(v);
@@ -820,13 +828,13 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                     selected: is_panel(PlannerPanel::WeeklyReview),
                     onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::WeeklyReview)),
                 }
-                if has_tree {
+                if has_projects {
                     div { class: "mx-3 my-1 border-t border-faint" }
                     RailIconButton {
                         icon: fi_icons::FiFolder,
                         label: "Projects".to_string(),
-                        badge: 0usize,
-                        selected: project_selected || *projects_open.read(),
+                        badge: duplicate_groups,
+                        selected: project_selected || *projects_open.read() || is_panel(PlannerPanel::ManageProjects),
                         onclick: move |_| {
                             let now = *projects_open.peek();
                             projects_open.set(!now);
@@ -840,6 +848,7 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                         open: projects_open,
                         top_level: project_rows,
                         by_area: area_rows,
+                        duplicate_groups,
                     }
                 }
             }
@@ -916,8 +925,32 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                 onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::WeeklyReview)),
             }
 
-            if has_tree {
+            if has_projects {
                 div { class: "my-2 border-t border-faint" }
+                div {
+                    class: "flex items-center gap-2 px-2 pb-1",
+                    p {
+                        class: "flex-1 text-xs font-medium uppercase tracking-wide text-fg-muted",
+                        "Projects"
+                    }
+                    button {
+                        class: if is_panel(PlannerPanel::ManageProjects) {
+                            "inline-flex items-center gap-1 text-[11px] text-fg"
+                        } else {
+                            "inline-flex items-center gap-1 text-[11px] text-fg-muted hover:text-fg"
+                        },
+                        title: if duplicate_groups > 0 {
+                            format!("Manage projects \u{b7} {} possible duplicate group(s)", duplicate_groups)
+                        } else {
+                            "Manage projects".to_string()
+                        },
+                        onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::ManageProjects)),
+                        "Manage"
+                        if duplicate_groups > 0 {
+                            span { class: "rounded-full bg-yellow-800 px-1.5 text-[10px] font-bold leading-4 text-yellow-300", "{duplicate_groups}" }
+                        }
+                    }
+                }
             }
 
             for project in top_level {
@@ -1010,7 +1043,13 @@ fn RailProjectsPopover(
     mut open: Signal<bool>,
     top_level: Vec<RailProjectRow>,
     by_area: Vec<RailAreaRows>,
+    duplicate_groups: usize,
 ) -> Element {
+    let manage_label = if duplicate_groups > 0 {
+        format!("Manage projects \u{b7} {duplicate_groups} to review")
+    } else {
+        "Manage projects".to_string()
+    };
     rsx! {
             div {
                 class: "fixed inset-0 z-40",
@@ -1020,6 +1059,17 @@ fn RailProjectsPopover(
                 class: "absolute left-full top-0 z-50 ml-1 max-h-[70vh] w-60 overflow-y-auto rounded-md border border-subtle bg-card p-2 shadow-lg",
                 role: "menu",
                 "aria-label": "Projects",
+                RailItem {
+                    icon: fi_icons::FiSliders,
+                    label: manage_label,
+                    count: 0usize,
+                    selected: *selection.read() == PlannerSelection::Panel(PlannerPanel::ManageProjects),
+                    onclick: move |_| {
+                        selection.set(PlannerSelection::Panel(PlannerPanel::ManageProjects));
+                        open.set(false);
+                    },
+                }
+                div { class: "my-1 border-t border-faint" }
                 for (id, title, n) in top_level {
                     RailItem {
                         key: "{id}",

@@ -100,7 +100,7 @@ fn parse_status(raw: &str) -> Result<TodoStatus, String> {
         "open" => Ok(TodoStatus::Open),
         "in_progress" | "in-progress" | "started" => Ok(TodoStatus::InProgress),
         "completed" => Ok(TodoStatus::Completed),
-        "cancelled" => Ok(TodoStatus::Cancelled),
+        "cancelled" | "archived" => Ok(TodoStatus::Cancelled),
         _ => Err(format!(
             "invalid status '{}' — expected open, in_progress, completed, or cancelled",
             raw
@@ -281,7 +281,7 @@ fn build_todo(
     }
     if let Some(project_id) = obj.get("project_id").and_then(|v| v.as_str()) {
         if !state.projects.iter().any(|p| p.id == project_id) {
-            return Err(format!("unknown project_id '{}'", project_id));
+            return Err(format!("unknown project_id '{}' — HOBBES_PROJECT_LIST shows the ids", project_id));
         }
         todo.project_id = Some(project_id.to_string());
     }
@@ -531,7 +531,7 @@ fn apply_todo_update(
     })?;
     if let Patch::Set(ref pid) = project_id {
         if !state.projects.iter().any(|p| p.id == *pid) {
-            return Err(format!("unknown project_id '{}'", pid));
+            return Err(format!("unknown project_id '{}' — HOBBES_PROJECT_LIST shows the ids", pid));
         }
     }
     // Pre-resolved to a session id by the dispatch layer (fleet lookup);
@@ -1846,10 +1846,10 @@ pub fn handle_project_upsert(
     }
     for (i, item) in projects.into_iter().flatten().enumerate() {
         match upsert_project(state, item, today, now) {
-            Ok(line) => {
+            Ok((line, id)) => {
                 applied.push(line);
                 if persist {
-                    if let Some(project) = last_touched_project(state, item) {
+                    if let Some(project) = state.projects.iter().find(|p| p.id == id) {
                         if let Err(e) = store::save_project(project) {
                             tracing::error!("Failed to persist project {}: {}", project.id, e);
                         }
@@ -1921,12 +1921,88 @@ fn upsert_area(state: &mut PlannerState, item: &Value, now: DateTime<Utc>) -> Re
     }
 }
 
+/// `[id] 'Title' (status)` — how refusals name candidate projects.
+fn project_ref(p: &Project) -> String {
+    if p.status.is_closed() {
+        format!("[{}] '{}' ({})", p.id, p.title, project_status_label(p.status))
+    } else {
+        format!("[{}] '{}'", p.id, p.title)
+    }
+}
+
+/// Project statuses in the words Manage projects uses: a cancelled project
+/// is "archived".
+pub fn project_status_label(s: TodoStatus) -> &'static str {
+    match s {
+        TodoStatus::Open => "open",
+        TodoStatus::InProgress => "in_progress",
+        TodoStatus::Completed => "completed",
+        TodoStatus::Cancelled => "archived",
+    }
+}
+
+/// `aliases` as given (trimmed, blanks and repeats of the title dropped).
+fn parse_aliases(obj: &serde_json::Map<String, Value>, title: &str) -> Result<Option<Vec<String>>, String> {
+    let Some(v) = obj.get("aliases") else { return Ok(None) };
+    let arr = v.as_array().ok_or("'aliases' must be an array of strings")?;
+    let mut out: Vec<String> = Vec::new();
+    for a in arr {
+        let a = a.as_str().ok_or("'aliases' must be an array of strings")?;
+        super::project_identity::add_alias(title, &mut out, a);
+    }
+    Ok(Some(out))
+}
+
+/// The optional fields every project upsert may carry.
+struct ProjectPatch {
+    deadline: Option<NaiveDate>,
+    status: Option<TodoStatus>,
+    area_id: Option<String>,
+}
+
+fn apply_project_patch(
+    project: &mut Project,
+    obj: &serde_json::Map<String, Value>,
+    patch: ProjectPatch,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    if let Some(notes) = obj.get("notes").and_then(|v| v.as_str()) {
+        project.notes = notes.to_string();
+    }
+    if let Some(aid) = patch.area_id {
+        project.area_id = Some(aid);
+    }
+    if let Some(d) = patch.deadline {
+        project.deadline = Some(d);
+    }
+    if let Some(s) = patch.status {
+        project.status = s;
+    }
+    if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
+        project.path = Some(p.trim().to_string()).filter(|p| !p.is_empty());
+    }
+    if let Some(aliases) = parse_aliases(obj, &project.title)? {
+        project.aliases = aliases;
+    }
+    project.updated_at = now;
+    Ok(())
+}
+
+/// Create or update one project. Returns the response line and the id of
+/// the project it touched (for the store write).
+///
+/// Without an `id`, the title is first looked up by name
+/// (`project_identity`): an exact match (title or alias, normalized)
+/// updates that project instead of creating a twin; only-similar matches
+/// are refused with the candidates unless `create_new: true`.
 fn upsert_project(
     state: &mut PlannerState,
     item: &Value,
     today: NaiveDate,
     now: DateTime<Utc>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
+    use super::project_identity::{self, ExactLookup};
+
     let obj = item.as_object().ok_or("expected an object")?;
     let title = obj.get("title").and_then(|v| v.as_str()).map(str::trim);
     let deadline = match obj.get("deadline").and_then(|v| v.as_str()) {
@@ -1943,70 +2019,109 @@ fn upsert_project(
             return Err(format!("unknown area_id '{}'", aid));
         }
     }
+    let patch = ProjectPatch { deadline, status, area_id };
 
-    match obj.get("id").and_then(|v| v.as_str()) {
-        Some(id) => {
+    if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+        let project = state
+            .projects
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| {
+                format!("unknown project id '{}' — HOBBES_PROJECT_LIST shows the ids", id)
+            })?;
+        if let Some(t) = title.filter(|t| !t.is_empty()) {
+            project.title = t.to_string();
+        }
+        apply_project_patch(project, obj, patch, now)?;
+        return Ok((format!("[{}] project: {}", project.id, project.title), project.id.clone()));
+    }
+
+    let title = title
+        .filter(|t| !t.is_empty())
+        .ok_or("missing required 'title' for a new project")?;
+    let create_new = obj.get("create_new").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match project_identity::lookup_exact(&state.projects, title) {
+        ExactLookup::One(id) => {
             let project = state
                 .projects
                 .iter_mut()
                 .find(|p| p.id == id)
-                .ok_or_else(|| format!("unknown project id '{}'", id))?;
-            if let Some(t) = title.filter(|t| !t.is_empty()) {
-                project.title = t.to_string();
-            }
-            if let Some(notes) = obj.get("notes").and_then(|v| v.as_str()) {
-                project.notes = notes.to_string();
-            }
-            if let Some(aid) = area_id {
-                project.area_id = Some(aid);
-            }
-            if let Some(d) = deadline {
-                project.deadline = Some(d);
-            }
-            if let Some(s) = status {
-                project.status = s;
-            }
-            if let Some(p) = obj.get("path").and_then(|v| v.as_str()) {
-                project.path = Some(p.trim().to_string()).filter(|p| !p.is_empty());
-            }
-            project.updated_at = now;
-            Ok(format!("[{}] project: {}", project.id, project.title))
-        }
-        None => {
-            let title = title
-                .filter(|t| !t.is_empty())
-                .ok_or("missing required 'title' for a new project")?;
-            let sort_order = state
-                .projects
-                .iter()
-                .map(|p| p.sort_order)
-                .fold(0.0f64, f64::max)
-                + SORT_STEP;
-            let project = Project {
-                id: uuid::Uuid::new_v4().to_string(),
-                title: title.to_string(),
-                notes: obj
-                    .get("notes")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                area_id,
-                status: status.unwrap_or_default(),
-                deadline,
-                sort_order,
-                path: obj
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .map(|p| p.trim().to_string())
-                    .filter(|p| !p.is_empty()),
-                created_at: now,
-                updated_at: now,
+                .expect("lookup returned a live id");
+            // The name it was asked for becomes an alias when it isn't
+            // already one of the project's names.
+            let mut aliases = project.aliases.clone();
+            project_identity::add_alias(&project.title, &mut aliases, title);
+            project.aliases = aliases;
+            apply_project_patch(project, obj, patch, now)?;
+            let note = if project.status.is_closed() {
+                format!(
+                    " It is {} — pass status 'open' with this id to reopen it.",
+                    project_status_label(project.status)
+                )
+            } else {
+                String::new()
             };
-            let line = format!("[{}] project: {}", project.id, project.title);
-            state.projects.push(project);
-            Ok(line)
+            return Ok((
+                format!(
+                    "matched existing project [{}] '{}' — updated it instead of creating a duplicate. Use this id from now on.{}",
+                    project.id, project.title, note
+                ),
+                project.id.clone(),
+            ));
+        }
+        ExactLookup::Many(ids) => {
+            let refs: Vec<String> = ids
+                .iter()
+                .filter_map(|id| state.projects.iter().find(|p| &p.id == id))
+                .map(project_ref)
+                .collect();
+            return Err(format!(
+                "not created: several existing projects are named '{}': {}. Pass the 'id' of the one to update (they look like duplicates — the user can merge them in Planner \u{25b8} Manage projects).",
+                title,
+                refs.join(", ")
+            ));
+        }
+        ExactLookup::None => {}
+    }
+
+    if !create_new {
+        let similar = project_identity::similar_projects(&state.projects, title);
+        if !similar.is_empty() {
+            let refs: Vec<String> = similar.iter().take(8).map(|p| project_ref(p)).collect();
+            return Err(format!(
+                "not created: '{}' looks like existing project(s) {}. Pass the 'id' to update one of them, or set create_new: true only if this really is a different project.",
+                title,
+                refs.join(", ")
+            ));
         }
     }
+
+    let sort_order = state
+        .projects
+        .iter()
+        .map(|p| p.sort_order)
+        .fold(0.0f64, f64::max)
+        + SORT_STEP;
+    let mut project = Project {
+        id: uuid::Uuid::new_v4().to_string(),
+        title: title.to_string(),
+        notes: String::new(),
+        area_id: None,
+        status: TodoStatus::default(),
+        deadline: None,
+        sort_order,
+        path: None,
+        aliases: Vec::new(),
+        distinct_from: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    };
+    apply_project_patch(&mut project, obj, patch, now)?;
+    let line = format!("[{}] project: {} (created)", project.id, project.title);
+    let id = project.id.clone();
+    state.projects.push(project);
+    Ok((line, id))
 }
 
 /// Re-fetch the record an upsert just touched so the store write sees the final
@@ -2019,11 +2134,105 @@ fn last_touched_area<'a>(state: &'a PlannerState, item: &Value) -> Option<&'a Ar
     }
 }
 
-fn last_touched_project<'a>(state: &'a PlannerState, item: &Value) -> Option<&'a Project> {
-    match item.get("id").and_then(|v| v.as_str()) {
-        Some(id) => state.projects.iter().find(|p| p.id == id),
-        None => state.projects.last(),
+// ── HOBBES_PROJECT_LIST ─────────────────────────────────────────────────────
+
+/// List projects with their ids, names, and activity — what the model looks
+/// at before creating or filing into a project. `query` filters by name
+/// (title or alias: exact, similar, or a normalized substring);
+/// `include_closed` adds completed/archived projects.
+pub fn handle_project_list(state: &PlannerState, args: &Value) -> (ToolCallStatus, String) {
+    use super::project_identity::{self, NameMatch};
+    use super::project_merge::project_stats;
+
+    let include_closed = args.get("include_closed").and_then(|v| v.as_bool()).unwrap_or(false);
+    let query = args
+        .get("query")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|q| !q.is_empty());
+
+    let mut rows: Vec<(&Project, NameMatch)> = state
+        .projects
+        .iter()
+        .filter(|p| include_closed || !p.status.is_closed())
+        .filter_map(|p| match query {
+            None => Some((p, NameMatch::Similar)),
+            Some(q) => project_identity::match_name(p, q).or_else(|| {
+                let nq = project_identity::normalize(q);
+                (!nq.is_empty()
+                    && project_identity::project_keys(p).iter().any(|k| k.contains(&nq)))
+                .then_some(NameMatch::Similar)
+            }).map(|m| (p, m)),
+        })
+        .collect();
+    rows.sort_by(|(a, ma), (b, mb)| {
+        mb.cmp(ma)
+            .then(a.status.is_closed().cmp(&b.status.is_closed()))
+            .then(a.sort_order.total_cmp(&b.sort_order))
+    });
+
+    if rows.is_empty() {
+        let msg = match query {
+            Some(q) => format!(
+                "No {}project matches '{}'. Create one with HOBBES_PROJECT_UPSERT{}.",
+                if include_closed { "" } else { "open " },
+                q,
+                if include_closed { "" } else { " (or retry with include_closed: true)" }
+            ),
+            None => "No projects yet. Create one with HOBBES_PROJECT_UPSERT.".to_string(),
+        };
+        return (ToolCallStatus::Completed, msg);
     }
+
+    let mut lines: Vec<String> = Vec::new();
+    for (p, _) in rows.iter().take(MAX_LIST_LINES) {
+        let stats = project_stats(state, p);
+        let mut line = format!("[{}] {}", p.id, p.title);
+        if !p.aliases.is_empty() {
+            line.push_str(&format!(" (aka {})", p.aliases.join(", ")));
+        }
+        if let Some(area) = p
+            .area_id
+            .as_ref()
+            .and_then(|aid| state.areas.iter().find(|a| &a.id == aid))
+        {
+            line.push_str(&format!(" · area: {}", area.title));
+        }
+        if let Some(path) = &p.path {
+            line.push_str(&format!(" · path: {}", path));
+        }
+        line.push_str(&format!(
+            " · {} · {} open to-do{} · last activity {}",
+            project_status_label(p.status),
+            stats.open_todos,
+            if stats.open_todos == 1 { "" } else { "s" },
+            stats.last_activity.with_timezone(&chrono::Local).date_naive()
+        ));
+        lines.push(line);
+    }
+    if rows.len() > MAX_LIST_LINES {
+        lines.push(format!("…and {} more (narrow with 'query')", rows.len() - MAX_LIST_LINES));
+    }
+
+    let mut out = format!("{} project(s):\n{}", rows.len(), lines.join("\n"));
+    if query.is_none() {
+        let groups = project_identity::duplicate_groups(&state.projects);
+        if !groups.is_empty() {
+            out.push_str(
+                "\nPossible duplicates (the user decides; they can merge them in Planner \u{25b8} Manage projects — don't create another):",
+            );
+            for g in groups {
+                let names: Vec<String> = g
+                    .ids
+                    .iter()
+                    .filter_map(|id| state.projects.iter().find(|p| &p.id == id))
+                    .map(project_ref)
+                    .collect();
+                out.push_str(&format!("\n- {}", names.join(" ~ ")));
+            }
+        }
+    }
+    (ToolCallStatus::Completed, out)
 }
 
 /// (session_id, todo title) pairs for every open todo linked to a fleet
@@ -2911,7 +3120,7 @@ pub fn planner_today_context_with_events(
         "blocks": blocks,
         "all_day": all_day,
         "overdue": overdue,
-        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days). When present, `fleet` lists today's external Claude Code coding-agent sessions (name — active time — latest summary); read-only observations, not managed by any tool.",
+        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Projects: look them up with HOBBES_PROJECT_LIST (ids, titles, aliases) and file to-dos into an existing one by id; create a project only when none fits. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days). When present, `fleet` lists today's external Claude Code coding-agent sessions (name — active time — latest summary); read-only observations, not managed by any tool.",
     });
     // Per-actor focus minutes for today, so the model can reason about person
     // vs agent load. Only when nonzero — an untouched day stays compact.
@@ -4284,6 +4493,144 @@ mod tests {
         let (status, resp) = upsert(&mut state, json!({"areas": [{}]}));
         assert_eq!(status, ToolCallStatus::Error);
         assert!(resp.contains("missing required 'title'"));
+    }
+
+    #[test]
+    fn project_upsert_without_id_matches_an_existing_name() {
+        let mut state = PlannerState::default();
+        upsert(&mut state, json!({"projects": [{"title": "Hobbes (cai-hobbes)"}]}));
+        let id = state.projects[0].id.clone();
+
+        // Same name, different spelling → updated, not duplicated.
+        let (status, resp) = upsert(
+            &mut state,
+            json!({"projects": [{"title": "cai_hobbes", "path": "~/Sites/cai-hobbes"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed, "{resp}");
+        assert!(resp.contains(&format!("matched existing project [{id}] 'Hobbes (cai-hobbes)'")), "{resp}");
+        assert_eq!(state.projects.len(), 1);
+        assert_eq!(state.projects[0].path.as_deref(), Some("~/Sites/cai-hobbes"));
+        // The requested spelling normalizes to an existing name: no alias.
+        assert!(state.projects[0].aliases.is_empty());
+
+        // A parenthetical's base already names it: matched, no alias.
+        upsert(&mut state, json!({"projects": [{"title": "Hobbes"}]}));
+        assert_eq!(state.projects.len(), 1);
+        assert!(state.projects[0].aliases.is_empty());
+        // A new spelling that only exactly matches compactly becomes an alias.
+        let (_, resp) = upsert(&mut state, json!({"projects": [{"title": "caihobbes"}]}));
+        assert!(resp.contains("matched existing project"), "{resp}");
+        assert_eq!(state.projects[0].aliases, vec!["caihobbes"]);
+
+        // create_new never overrides an exact match.
+        let (_, resp) = upsert(&mut state, json!({"projects": [{"title": "CAI-Hobbes", "create_new": true}]}));
+        assert!(resp.contains("matched existing project"), "{resp}");
+        assert_eq!(state.projects.len(), 1);
+    }
+
+    #[test]
+    fn project_upsert_refuses_similar_names_unless_create_new() {
+        let mut state = PlannerState::default();
+        upsert(&mut state, json!({"projects": [{"title": "Exceller8 AC-3 Chart Review"}]}));
+        let id = state.projects[0].id.clone();
+
+        let (status, resp) = upsert(&mut state, json!({"projects": [{"title": "cai-exceller8"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(resp.contains("not created"), "{resp}");
+        assert!(resp.contains(&format!("[{id}] 'Exceller8 AC-3 Chart Review'")), "{resp}");
+        assert!(resp.contains("create_new: true"), "{resp}");
+        assert_eq!(state.projects.len(), 1);
+
+        let (status, resp) = upsert(
+            &mut state,
+            json!({"projects": [{"title": "cai-exceller8", "create_new": true}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed, "{resp}");
+        assert!(resp.contains("(created)"), "{resp}");
+        assert_eq!(state.projects.len(), 2);
+
+        // Unrelated names create without ceremony.
+        let (status, _) = upsert(&mut state, json!({"projects": [{"title": "Garbage Vibe Kids"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(state.projects.len(), 3);
+    }
+
+    #[test]
+    fn project_upsert_names_existing_twins_instead_of_adding_a_third() {
+        let mut state = PlannerState::default();
+        upsert(&mut state, json!({"projects": [{"title": "Garbage Vibe Kids"}]}));
+        // An old twin from before dedupe existed.
+        let mut twin = state.projects[0].clone();
+        twin.id = "pr_twin".into();
+        state.projects.push(twin);
+
+        let (status, resp) = upsert(&mut state, json!({"projects": [{"title": "garbage vibe kids"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(resp.contains("several existing projects"), "{resp}");
+        assert!(resp.contains("[pr_twin]"), "{resp}");
+        assert!(resp.contains("Manage projects"), "{resp}");
+        assert_eq!(state.projects.len(), 2);
+    }
+
+    #[test]
+    fn project_upsert_sets_aliases_and_archives() {
+        let mut state = PlannerState::default();
+        upsert(
+            &mut state,
+            json!({"projects": [{"title": "Hobbes", "aliases": ["cai-hobbes", "hobbes", " "]}]}),
+        );
+        assert_eq!(state.projects[0].aliases, vec!["cai-hobbes"]);
+        let id = state.projects[0].id.clone();
+        let (status, _) = upsert(&mut state, json!({"projects": [{"id": id, "status": "archived"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert_eq!(state.projects[0].status, TodoStatus::Cancelled);
+        // Matched by alias even when archived — and told how to reopen.
+        let (_, resp) = upsert(&mut state, json!({"projects": [{"title": "CAI hobbes"}]}));
+        assert!(resp.contains("archived"), "{resp}");
+        assert!(resp.contains("status 'open'"), "{resp}");
+        assert_eq!(state.projects.len(), 1);
+    }
+
+    #[test]
+    fn project_list_shows_ids_filters_and_flags_duplicates() {
+        let mut state = PlannerState::default();
+        upsert(
+            &mut state,
+            json!({"projects": [
+                {"title": "Hobbes", "aliases": ["cai-hobbes"], "path": "~/Sites/cai-hobbes"},
+                {"title": "Garbage Vibe Kids"},
+                {"title": "Taxes 2026", "status": "completed"}
+            ]}),
+        );
+        let hobbes = state.projects[0].id.clone();
+        create(&mut state, json!({"todos": [{"title": "Ship RC", "project_id": hobbes}]}));
+        // A pre-existing twin.
+        let mut twin = state.projects[1].clone();
+        twin.id = "pr_twin".into();
+        state.projects.push(twin);
+
+        let (status, out) = handle_project_list(&state, &json!({}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(out.starts_with("3 project(s):"), "{out}");
+        assert!(out.contains(&format!("[{hobbes}] Hobbes (aka cai-hobbes) · path: ~/Sites/cai-hobbes · open · 1 open to-do · last activity")), "{out}");
+        assert!(!out.contains("Taxes 2026"), "closed hidden by default: {out}");
+        assert!(out.contains("Possible duplicates"), "{out}");
+        assert!(out.contains("[pr_twin] 'Garbage Vibe Kids'"), "{out}");
+
+        let (_, out) = handle_project_list(&state, &json!({"include_closed": true}));
+        assert!(out.contains("Taxes 2026") && out.contains("· completed ·"), "{out}");
+
+        // Query: by alias, by part of a name, and a miss.
+        let (_, out) = handle_project_list(&state, &json!({"query": "cai_hobbes"}));
+        assert!(out.starts_with("1 project(s):") && out.contains("Hobbes"), "{out}");
+        let (_, out) = handle_project_list(&state, &json!({"query": "vibe"}));
+        assert!(out.starts_with("2 project(s):"), "{out}");
+        let (_, out) = handle_project_list(&state, &json!({"query": "taxes"}));
+        assert!(out.contains("No open project matches 'taxes'"), "{out}");
+        assert!(out.contains("include_closed"), "{out}");
+
+        let (_, out) = handle_project_list(&PlannerState::default(), &json!({}));
+        assert!(out.starts_with("No projects yet"), "{out}");
     }
 
     // ── external meetings vs capacity ───────────────────────────────────────

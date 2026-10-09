@@ -216,7 +216,8 @@ than eight:
 | `HOBBES_TODO_LIST` | Query a view (`today`, `inbox`, `upcoming`, `anytime`, `someday`, `logbook`) or filter by project/tag/date range/text. |
 | `HOBBES_PLAN_DAY` | The Sunsama ritual: assign an ordered set of todos to a date with estimates, and return the capacity math (planned vs available, with an explicit overcommit warning). |
 | `HOBBES_TIME_BLOCK` | Create, move, or delete a block on the day timeline. |
-| `HOBBES_PROJECT_UPSERT` | Create or update projects and areas. |
+| `HOBBES_PROJECT_LIST` | List projects with ids, aliases, status, open to-do count and last activity; `query` filters by name. Read-only. |
+| `HOBBES_PROJECT_UPSERT` | Create or update projects and areas. A project without an `id` is matched by name (title or alias, normalized) and updated instead of duplicated; similar names are refused unless `create_new: true`. |
 
 `HOBBES_PLAN_DAY` is the tool that carries the product opinion. It shouldn't silently
 accept 11 hours of work into a 6-hour day — it returns the arithmetic and says so, and
