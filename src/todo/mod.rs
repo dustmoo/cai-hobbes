@@ -12,6 +12,7 @@
 //! See `PLANNER_DESIGN.md` for the full specification.
 //!
 pub mod agent_time;
+pub mod areas;
 pub mod calendar_sync;
 pub mod composio_calendar;
 pub mod dispatch;

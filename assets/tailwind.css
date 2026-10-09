@@ -2293,6 +2293,10 @@ video {
   max-width: 20rem;
 }
 
+.max-w-\[10rem\] {
+  max-width: 10rem;
+}
+
 .max-w-\[200px\] {
   max-width: 200px;
 }
@@ -3836,6 +3840,10 @@ video {
   padding-left: 0.375rem;
 }
 
+.pl-12 {
+  padding-left: 3rem;
+}
+
 .pl-2 {
   padding-left: 0.5rem;
 }
@@ -4320,6 +4328,10 @@ video {
 
 .text-yellow-200\/60 {
   color: rgb(254 240 138 / 0.6);
+}
+
+.text-yellow-200\/70 {
+  color: rgb(254 240 138 / 0.7);
 }
 
 .text-yellow-200\/80 {
@@ -5326,6 +5338,10 @@ video {
   transform: translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y));
 }
 
+.disabled\:cursor-default:disabled {
+  cursor: default;
+}
+
 .disabled\:cursor-not-allowed:disabled {
   cursor: not-allowed;
 }
@@ -5353,6 +5369,10 @@ video {
 
 .disabled\:opacity-50:disabled {
   opacity: 0.5;
+}
+
+.disabled\:hover\:bg-transparent:hover:disabled {
+  background-color: transparent;
 }
 
 .group:focus-within .group-focus-within\:opacity-100 {

@@ -173,31 +173,45 @@ pub fn maybe_auto_tag(
     crate::session::SessionState::save_signal(&session_state, None);
 }
 
-/// How many chat sessions are tagged to any of `project_ids`: hydrated ones
-/// from `SessionState` (authoritative over their rows), the rest through a
-/// `session_store` query — never by hydrating.
-pub fn count_sessions_tagged(state: &crate::session::SessionState, project_ids: &[String]) -> usize {
-    let tagged = |s: &crate::session::Session| {
-        s.project_id.as_ref().is_some_and(|p| project_ids.contains(p))
-    };
-    let hydrated = state.sessions.values().filter(|s| tagged(s)).count();
-    let stored = crate::session_store::session_ids_tagged(project_ids)
-        .into_iter()
-        .filter(|id| !state.sessions.contains_key(id))
+/// Hydrated sessions tagged to any of `project_ids`, and every hydrated id
+/// (the set the stored-row half must skip). In-memory; UI-thread safe.
+fn hydrated_tagged(
+    state: &crate::session::SessionState,
+    project_ids: &[String],
+) -> (usize, std::collections::HashSet<String>) {
+    let tagged = state
+        .sessions
+        .values()
+        .filter(|s| s.project_id.as_ref().is_some_and(|p| project_ids.contains(p)))
         .count();
-    hydrated + stored
+    (tagged, state.sessions.keys().cloned().collect())
 }
 
-/// Retag every chat session tagged to one of `from_ids` (merged projects)
-/// to `to_id`: hydrated sessions in `SessionState` (saved through P-009),
-/// the rest in place in `session_store`. Each retag is journaled as a
-/// `ProjectTagged` event carrying the session's existing `user_set`, so the
-/// journal projection agrees with the row. Returns how many were retagged.
-pub fn retag_merged_sessions(
+/// How many chat sessions are tagged to any of `project_ids`: hydrated ones
+/// from `SessionState` (authoritative over their rows), the rest through a
+/// `session_store` index lookup run on a blocking thread (P-017) — never by
+/// hydrating. Await it from a spawned task, not a handler body.
+pub async fn count_sessions_tagged(
+    session_state: dioxus::prelude::Signal<crate::session::SessionState>,
+    project_ids: Vec<String>,
+) -> usize {
+    use dioxus::prelude::Readable;
+    let (hydrated, hydrated_ids) = hydrated_tagged(&session_state.peek(), &project_ids);
+    let stored = tokio::task::spawn_blocking(move || crate::session_store::session_ids_tagged(&project_ids))
+        .await
+        .unwrap_or_default();
+    hydrated + stored.into_iter().filter(|id| !hydrated_ids.contains(id)).count()
+}
+
+/// The UI-thread half of retagging chats after a merge: every hydrated
+/// session tagged to one of `from_ids` moves to `to_id` in `SessionState`
+/// (saved through P-009). Returns `(session_id, project_tag_user_set)` per
+/// retag (for journaling) and the hydrated ids the stored-row half skips.
+pub fn retag_hydrated_sessions(
     mut session_state: dioxus::prelude::Signal<crate::session::SessionState>,
     from_ids: &[String],
     to_id: &str,
-) -> usize {
+) -> (Vec<(String, bool)>, std::collections::HashSet<String>) {
     use dioxus::prelude::{Readable, Writable};
     let hydrated: std::collections::HashSet<String> =
         session_state.peek().sessions.keys().cloned().collect();
@@ -211,24 +225,48 @@ pub fn retag_merged_sessions(
             }
         }
     }
-    let any_hydrated = !retagged.is_empty();
-    retagged.extend(crate::session_store::retag_sessions(from_ids, to_id, &hydrated));
-    for (id, user_set) in &retagged {
-        crate::session_events::log_event(
-            id,
-            crate::session_events::SessionEvent::ProjectTagged {
-                project_id: Some(to_id.to_string()),
-                user_set: *user_set,
-            },
-        );
-    }
-    if any_hydrated {
+    if !retagged.is_empty() {
         crate::session::SessionState::save_signal(&session_state, None);
     }
-    if !retagged.is_empty() {
-        tracing::info!(count = retagged.len(), to_id, "retagged sessions after a project merge");
+    (retagged, hydrated)
+}
+
+/// The blocking half (run it in `spawn_blocking`, P-017): retag every
+/// stored, non-hydrated session tagged to one of `from_ids` in place in
+/// `session_store` (an index lookup, then `data` for just those rows), and
+/// journal a `ProjectTagged` event for each — plus the hydrated retags in
+/// `hydrated_retagged` — carrying the session's existing `user_set`, so the
+/// journal projection agrees with the row. Returns how many stored rows
+/// moved.
+pub fn retag_stored_sessions_blocking(
+    from_ids: &[String],
+    to_id: &str,
+    skip_ids: &std::collections::HashSet<String>,
+    hydrated_retagged: &[(String, bool)],
+) -> usize {
+    let stored = crate::session_store::retag_sessions(from_ids, to_id, skip_ids);
+    if crate::session_store::is_available() {
+        let mut rows = Vec::new();
+        for (id, user_set) in hydrated_retagged.iter().chain(stored.iter()) {
+            rows.extend(crate::session_store::prepare_event_rows(
+                id,
+                &[crate::session_events::SessionEvent::ProjectTagged {
+                    project_id: Some(to_id.to_string()),
+                    user_set: *user_set,
+                }],
+            ));
+        }
+        if !rows.is_empty() {
+            if let Err(e) = crate::session_store::write_event_rows(&rows) {
+                tracing::error!("project merge: journaling retags failed: {e}");
+            }
+        }
     }
-    retagged.len()
+    let total = hydrated_retagged.len() + stored.len();
+    if total > 0 {
+        tracing::info!(count = total, to_id, "retagged sessions after a project merge");
+    }
+    stored.len()
 }
 
 /// Display title for a project id.

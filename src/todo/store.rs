@@ -860,8 +860,63 @@ fn delete_todo_conn(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     delete_by_id_conn(conn, "todos", id)
 }
 
+#[allow(dead_code)] // merges delete through `save_planner_rows`
 pub fn delete_project(id: &str) -> Result<(), String> {
     with_conn(|conn| delete_by_id_conn(conn, "todo_projects", id))
+}
+
+/// A batch of planner rows (a project merge, an area delete or reorder, a
+/// bulk move), snapshotted on the UI thread with their `seq`s already
+/// allocated there — so an edit the person makes while this is being
+/// written (a later seq) still wins over the snapshot.
+#[derive(Debug, Default)]
+pub struct PlannerRows {
+    pub todos: Vec<(Todo, i64)>,
+    pub projects: Vec<(Project, i64)>,
+    pub areas: Vec<(Area, i64)>,
+    pub grant: Option<(super::model::AgentTimeGrant, i64)>,
+    pub deleted_projects: Vec<String>,
+    pub deleted_areas: Vec<String>,
+}
+
+impl PlannerRows {
+    pub fn is_empty(&self) -> bool {
+        self.todos.is_empty()
+            && self.projects.is_empty()
+            && self.areas.is_empty()
+            && self.grant.is_none()
+            && self.deleted_projects.is_empty()
+            && self.deleted_areas.is_empty()
+    }
+}
+
+/// Write a batch of planner rows in one transaction. Blocking — call from
+/// `spawn_blocking`, never from a Dioxus handler (P-017).
+pub fn save_planner_rows(rows: &PlannerRows) -> Result<(), String> {
+    with_conn(|conn| save_planner_rows_conn(conn, rows))
+}
+
+pub fn save_planner_rows_conn(conn: &Connection, rows: &PlannerRows) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for (todo, seq) in &rows.todos {
+        upsert_todo_conn(&tx, todo, *seq)?;
+    }
+    for (project, seq) in &rows.projects {
+        upsert_project_conn(&tx, project, *seq)?;
+    }
+    for (area, seq) in &rows.areas {
+        upsert_area_conn(&tx, area, *seq)?;
+    }
+    if let Some((grant, seq)) = &rows.grant {
+        put_kv_conn(&tx, KV_AGENT_TIME_GRANT, grant, *seq)?;
+    }
+    for id in &rows.deleted_projects {
+        delete_by_id_conn(&tx, "todo_projects", id)?;
+    }
+    for id in &rows.deleted_areas {
+        delete_by_id_conn(&tx, "todo_areas", id)?;
+    }
+    tx.commit()
 }
 
 #[allow(dead_code)] // consumer is project management UI, not yet built
@@ -929,6 +984,41 @@ mod tests {
         t.tags = vec!["writing".into()];
         t.notes = "Outline first.".into();
         t
+    }
+
+    #[test]
+    fn planner_rows_batch_writes_deletes_and_respects_seq() {
+        with_db(|conn| {
+            let now = Utc::now();
+            let mut state = PlannerState::default();
+            let (keep_area, _) = state.create_area("Work", now).unwrap();
+            let (gone_area, _) = state.create_area("Old", now).unwrap();
+            for a in &state.areas {
+                upsert_area_conn(conn, a, 1).unwrap();
+            }
+            let mut todo = sample();
+            upsert_todo_conn(conn, &todo, 50).unwrap();
+
+            todo.title = "stale snapshot".into();
+            let rows = PlannerRows {
+                // seq 10 < 50: an edit saved after the snapshot wins.
+                todos: vec![(todo.clone(), 10)],
+                areas: state
+                    .areas
+                    .iter()
+                    .filter(|a| a.id == keep_area)
+                    .map(|a| (Area { title: "Office".into(), ..a.clone() }, 60))
+                    .collect(),
+                deleted_areas: vec![gone_area.clone()],
+                ..Default::default()
+            };
+            assert!(!rows.is_empty());
+            save_planner_rows_conn(conn, &rows).unwrap();
+            let loaded = load_all_conn(conn).unwrap();
+            assert_eq!(loaded.todos[0].title, "Draft the proposal");
+            assert_eq!(loaded.areas.len(), 1);
+            assert_eq!(loaded.areas[0].title, "Office");
+        });
     }
 
     #[test]

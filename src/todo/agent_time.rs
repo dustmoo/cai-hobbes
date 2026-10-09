@@ -2169,6 +2169,7 @@ pub fn agent_time_scope_allows(tool: &str, args: &serde_json::Value) -> ScopeVer
 ///      the skill's tools are gated one by one), `MCP_LOAD_SERVER_TOOLS` /
 ///      `MCP_UNLOAD_SERVER_TOOLS`, `HOBBES_DECISIONS action=list`,
 ///      `HOBBES_TIME_GOALS action=get`.
+///    - NeedsApproval: `HOBBES_PROJECT_MERGE` (it asks every time anyway).
 ///    - Deny: everything else of Hobbes' own — the person's to-dos, plan,
 ///      timeline, projects, goals (`HOBBES_TODO_CREATE/UPDATE`,
 ///      `HOBBES_PLAN_DAY`, `HOBBES_TIME_BLOCK`, `HOBBES_PROJECT_UPSERT`,
@@ -2192,6 +2193,9 @@ pub fn agent_time_scope(tool: &str, args: &serde_json::Value) -> (ScopeVerdict, 
         | "HOBBES_FLEET_STATUS" | "HOBBES_LIST_TIMERS" | "HOBBES_PAGE_RESULT"
         | "HOBBES_UPDATE_SCRATCHPAD" | "HOBBES_INVOKE_SKILL" | "HOBBES_UNLOAD_SKILL"
         | "MCP_LOAD_SERVER_TOOLS" | "MCP_UNLOAD_SERVER_TOOLS" => return (Allow, R::HobbesAllowed),
+        // A write to the person's projects that always asks anyway: held
+        // for their approval rather than refused outright.
+        "HOBBES_PROJECT_MERGE" => return (NeedsApproval, R::OutsideEffect),
         "HOBBES_DECISIONS" => {
             return if action_of(args) == "list" {
                 (Allow, R::HobbesAllowed)
@@ -2525,6 +2529,7 @@ mod tests {
         assert_eq!(agent_time_scope_allows("HOBBES_TODO_LIST", &none), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_CALENDAR_LIST", &none), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_PROJECT_LIST", &none), Allow);
+        assert_eq!(agent_time_scope_allows("HOBBES_PROJECT_MERGE", &none), NeedsApproval);
         assert_eq!(agent_time_scope_allows("HOBBES_UPDATE_SCRATCHPAD", &none), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_INVOKE_SKILL", &none), Allow);
         assert_eq!(agent_time_scope_allows("MCP_LOAD_SERVER_TOOLS", &none), Allow);

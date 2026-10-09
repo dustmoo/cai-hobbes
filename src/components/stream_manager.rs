@@ -703,7 +703,9 @@ impl StreamManagerContext {
                             // the message becomes a PermissionRequest (rendered as
                             // the skill approval bubble) and no result is sent.
                             // Approve flips it back to a Running ToolCall, which
-                            // the resume path in chat.rs dispatches.
+                            // the resume path in chat.rs dispatches. Built-ins
+                            // that always ask (HOBBES_PROJECT_MERGE) are held
+                            // the same way, every time (`builtin_needs_approval`).
                             //
                             // Agent time (SYMBIOTIC_PLANNER.md §3): every call
                             // from an agent-time chat passes the scope gate
@@ -724,7 +726,7 @@ impl StreamManagerContext {
                                 == crate::components::builtin_tools::AgentTimeGate::ForceApproval
                                 || (agent_time_gate
                                     == crate::components::builtin_tools::AgentTimeGate::Proceed
-                                    && crate::components::builtin_tools::skill_invoke_needs_approval(
+                                    && crate::components::builtin_tools::builtin_needs_approval(
                                         builtin_ctx,
                                         &tool_call,
                                         &args_json,

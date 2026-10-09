@@ -57,6 +57,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_TIME_BLOCK",
     "HOBBES_PROJECT_UPSERT",
     "HOBBES_PROJECT_LIST",
+    "HOBBES_PROJECT_MERGE",
     "HOBBES_CALENDAR_LIST",
     "HOBBES_DISPATCH",
     "HOBBES_DECISIONS",
@@ -118,7 +119,7 @@ pub fn is_planner_tool(name: &str) -> bool {
         || matches!(
             name,
             "HOBBES_PLAN_DAY" | "HOBBES_TIME_BLOCK" | "HOBBES_PROJECT_UPSERT"
-                | "HOBBES_PROJECT_LIST" | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH" | "HOBBES_DECISIONS"
+                | "HOBBES_PROJECT_LIST" | "HOBBES_PROJECT_MERGE" | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH" | "HOBBES_DECISIONS"
                 | "HOBBES_TIME_GOALS" | "HOBBES_AGENT_TIME"
         )
 }
@@ -317,6 +318,99 @@ pub fn skill_invoke_needs_approval(
         == PermissionStatus::RequiresPrompt
 }
 
+/// Built-ins that ask the person every single time, whatever their trust
+/// rules or always-allow lists say: irreversible changes to their own
+/// records. Trust rules never apply to built-ins (they are evaluated only in
+/// `McpManager::use_mcp_tool`), and there is no "always allow" for these —
+/// the approval prompt hides the trust-rule option for them.
+pub fn always_asks(tool_name: &str) -> bool {
+    tool_name == "HOBBES_PROJECT_MERGE"
+}
+
+/// Whether the streaming path must hold this built-in call as a
+/// `PermissionRequest` (the same hold-and-resume mechanism MCP calls use)
+/// instead of dispatching it: an [`always_asks`] tool (unless its feature
+/// is off, so dispatch refuses it straight away), or a model skill load
+/// that needs approval ([`skill_invoke_needs_approval`]). The approval-resume
+/// path in chat.rs dispatches with `user_approved = true`.
+pub fn builtin_needs_approval(
+    deps: BuiltinToolCtx,
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+) -> bool {
+    if always_asks(&tool_call.tool_name) {
+        return !is_planner_tool(&tool_call.tool_name) || deps.settings.peek().planner_enabled;
+    }
+    skill_invoke_needs_approval(deps, tool_call, args_json, session_id)
+}
+
+/// `HOBBES_PROJECT_MERGE`: fold `merge_ids` into `keep_id` through the same
+/// path Manage projects uses (`merge_projects_persisted` + `finish_merge`,
+/// whose disk half runs on a blocking thread). Refused unless the person
+/// approved this very call (`user_approved` — only the approval-resume path
+/// sets it; the streaming path always holds the call first).
+async fn project_merge_tool(
+    deps: BuiltinToolCtx,
+    args_json: &serde_json::Value,
+    user_approved: bool,
+) -> (ToolCallStatus, String) {
+    if !deps.settings.peek().planner_enabled {
+        return (ToolCallStatus::Error, "The planner is disabled in Settings.".to_string());
+    }
+    if !user_approved {
+        return (
+            ToolCallStatus::Error,
+            "HOBBES_PROJECT_MERGE needs the user's approval every time, and this call wasn't approved. Nothing was merged."
+                .to_string(),
+        );
+    }
+    let validated = crate::todo::handlers::validate_project_merge(&deps.planner.peek(), args_json);
+    let (keep_id, merge_ids) = match validated {
+        Ok(v) => v,
+        Err(e) => return (ToolCallStatus::Error, e),
+    };
+    let (keep_title, merged_titles) = {
+        let planner = deps.planner.peek();
+        let title = |id: &str| {
+            planner
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.title.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        (title(&keep_id), merge_ids.iter().map(|id| title(id)).collect::<Vec<_>>())
+    };
+    let manager = crate::settings::SettingsManager::new(crate::get_settings_path());
+    let merged = crate::components::planner_view::manage_projects::merge_projects_persisted(
+        deps.planner,
+        deps.session_state,
+        deps.settings,
+        &manager,
+        &keep_id,
+        &merge_ids,
+    );
+    match merged {
+        Ok((outcome, job)) => {
+            let chats =
+                crate::components::planner_view::manage_projects::finish_merge(job, deps.session_state).await;
+            (
+                ToolCallStatus::Completed,
+                format!(
+                    "Merged {} into '{}' [{}]: {} to-do(s) and {} chat(s) moved; the merged names are now its aliases.",
+                    merged_titles.iter().map(|t| format!("'{t}'")).collect::<Vec<_>>().join(", "),
+                    keep_title,
+                    keep_id,
+                    outcome.moved_todos.len(),
+                    chats
+                ),
+            )
+        }
+        Err(e) => (ToolCallStatus::Error, format!("Nothing was merged: {e}")),
+    }
+}
+
 /// Run `tool_call` if it is a built-in, otherwise return `None` so the caller
 /// falls through to normal MCP dispatch.
 ///
@@ -445,6 +539,15 @@ pub async fn dispatch_builtin_tool(
 
         "HOBBES_UNLOAD_SKILL" => {
             let (status, response) = unload_skill(deps, args_json, session_id);
+            Some(BuiltinOutcome {
+                status,
+                response,
+                persist: true,
+            })
+        }
+
+        "HOBBES_PROJECT_MERGE" => {
+            let (status, response) = project_merge_tool(deps, args_json, user_approved).await;
             Some(BuiltinOutcome {
                 status,
                 response,
@@ -1006,6 +1109,89 @@ mod tests {
         });
         assert!(agent_time_tool_visible(&planner, "chat"));
         assert!(!agent_time_tool_visible(&planner, "other"));
+    }
+
+    fn two_projects() -> crate::todo::PlannerState {
+        let mut planner = crate::todo::PlannerState::default();
+        for (id, title) in [("keep", "Hobbes"), ("dup", "cai-hobbes"), ("other", "Taxes")] {
+            planner.projects.push(crate::todo::model::Project {
+                id: id.into(),
+                title: title.into(),
+                notes: String::new(),
+                area_id: None,
+                status: crate::todo::model::TodoStatus::Open,
+                deadline: None,
+                sort_order: 0.0,
+                path: None,
+                aliases: Vec::new(),
+                distinct_from: Vec::new(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            });
+        }
+        let mut t = crate::todo::model::Todo::new("ship it", 0.0);
+        t.project_id = Some("dup".into());
+        planner.todos.push(t);
+        planner
+    }
+
+    /// HOBBES_PROJECT_MERGE is an always-ask built-in: the streaming path
+    /// holds it for approval every time (no trust rule or always-allow can
+    /// skip that), and dispatch refuses it without the approval.
+    #[test]
+    fn project_merge_always_asks_and_refuses_unapproved() {
+        assert!(always_asks("HOBBES_PROJECT_MERGE"));
+        assert!(is_builtin_tool("HOBBES_PROJECT_MERGE"));
+        assert!(is_planner_tool("HOBBES_PROJECT_MERGE"));
+        for t in ["HOBBES_PROJECT_LIST", "HOBBES_PROJECT_UPSERT", "HOBBES_TODO_CREATE"] {
+            assert!(!always_asks(t), "{t}");
+        }
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(two_projects(), Settings::default());
+            let args = serde_json::json!({ "keep_id": "keep", "merge_ids": ["dup"] });
+            let tc = ToolCall::new("hobbes-planner".into(), "HOBBES_PROJECT_MERGE".into(), args.clone(), None, None);
+            assert!(builtin_needs_approval(ctx, &tc, &args, "chat"), "always held for approval");
+            // A trust rule naming the tool changes nothing.
+            ctx.settings.clone().write().permission_settings.trust_rules.push(
+                crate::context::permissions::TrustRule {
+                    id: "r".into(),
+                    server: "hobbes-planner".into(),
+                    tool: Some("HOBBES_PROJECT_MERGE".into()),
+                    command_prefix: None,
+                    project_id: None,
+                    created_at: chrono::Utc::now(),
+                },
+            );
+            assert!(builtin_needs_approval(ctx, &tc, &args, "chat"));
+
+            let handle = tokio::runtime::Handle::current();
+            let (status, msg) = handle.block_on(project_merge_tool(ctx, &args, false));
+            assert_eq!(status, ToolCallStatus::Error);
+            assert!(msg.contains("approval"), "{msg}");
+            assert_eq!(ctx.planner.peek().projects.len(), 3, "nothing merged");
+
+            let (status, msg) = handle.block_on(project_merge_tool(ctx, &args, true));
+            assert_eq!(status, ToolCallStatus::Completed, "{msg}");
+            assert!(msg.contains("1 to-do(s)"), "{msg}");
+            let planner = ctx.planner.peek();
+            assert!(!planner.projects.iter().any(|p| p.id == "dup"));
+            assert_eq!(planner.todos[0].project_id.as_deref(), Some("keep"));
+            drop(planner);
+
+            // Planner off: not held (dispatch refuses it at once).
+            let off = crate::todo::dispatch::tests::test_ctx_with(
+                two_projects(),
+                Settings { planner_enabled: false, ..Default::default() },
+            );
+            assert!(!builtin_needs_approval(off, &tc, &args, "chat"));
+            let (status, _) = handle.block_on(project_merge_tool(off, &args, true));
+            assert_eq!(status, ToolCallStatus::Error);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[test]
