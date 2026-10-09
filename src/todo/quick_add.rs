@@ -714,6 +714,8 @@ mod tests {
             deadline: None,
             sort_order,
             path: None,
+            aliases: Vec::new(),
+            distinct_from: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

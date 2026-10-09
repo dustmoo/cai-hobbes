@@ -699,6 +699,89 @@ pub fn rename_session(id: &str, new_name: &str) {
     }
 }
 
+/// Rows whose top-level `project_id` is one of `project_ids`: `(id, data)`.
+/// `instr` narrows the scan to rows mentioning the id; parsing confirms it is
+/// the session's own tag (tool-call arguments inside messages carry
+/// `project_id` keys too).
+fn tagged_rows_conn(
+    conn: &Connection,
+    project_ids: &[String],
+) -> rusqlite::Result<Vec<(String, serde_json::Value, bool)>> {
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare("SELECT id, data FROM sessions WHERE instr(data, ?1) > 0")?;
+    for pid in project_ids {
+        let needle = format!("\"project_id\":{}", serde_json::Value::String(pid.clone()));
+        let rows = stmt.query_map(params![needle], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (id, data) = row?;
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+            if value.get("project_id").and_then(|v| v.as_str()) == Some(pid.as_str()) {
+                let user_set = value
+                    .get("project_tag_user_set")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                out.push((id, value, user_set));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Ids of stored sessions tagged to any of `project_ids` (hydrated or not —
+/// a hydrated session's row may lag its in-memory copy; callers that care
+/// overlay `SessionState`).
+pub fn session_ids_tagged(project_ids: &[String]) -> Vec<String> {
+    with_conn(|conn| tagged_rows_conn(conn, project_ids))
+        .map(|rows| rows.into_iter().map(|(id, _, _)| id).collect())
+        .unwrap_or_default()
+}
+
+/// Retag every stored session tagged to one of `from_ids` to `to_id`,
+/// skipping `skip_ids` (the hydrated sessions — the caller retags those in
+/// `SessionState`, whose next save writes their rows). Rewrites the `data`
+/// blob in place with a fresh `seq` (so an older in-flight write can't
+/// clobber it) and drops any stale fingerprint. Returns `(session_id,
+/// project_tag_user_set)` per retagged row, for journaling.
+pub fn retag_sessions(
+    from_ids: &[String],
+    to_id: &str,
+    skip_ids: &std::collections::HashSet<String>,
+) -> Vec<(String, bool)> {
+    match with_conn(|conn| retag_sessions_conn(conn, from_ids, to_id, skip_ids)) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("retag_sessions failed: {e}");
+            Vec::new()
+        }
+    }
+}
+
+fn retag_sessions_conn(
+    conn: &Connection,
+    from_ids: &[String],
+    to_id: &str,
+    skip_ids: &std::collections::HashSet<String>,
+) -> rusqlite::Result<Vec<(String, bool)>> {
+    let rows = tagged_rows_conn(conn, from_ids)?;
+    let tx = conn.unchecked_transaction()?;
+    let mut done = Vec::new();
+    for (id, mut value, user_set) in rows {
+        if skip_ids.contains(&id) {
+            continue;
+        }
+        value["project_id"] = serde_json::Value::String(to_id.to_string());
+        let Ok(new_data) = serde_json::to_string(&value) else { continue };
+        tx.execute(
+            "UPDATE sessions SET data = ?2, seq = ?3 WHERE id = ?1",
+            params![id, new_data, next_seq()],
+        )?;
+        forget_fingerprint(&id);
+        done.push((id, user_set));
+    }
+    tx.commit()?;
+    Ok(done)
+}
+
 /// Sum of cost/tokens across ALL stored sessions (live + never-opened).
 pub fn sum_cost_tokens() -> (f64, i64) {
     with_conn(|conn| {
@@ -1344,6 +1427,23 @@ pub mod test_support {
     pub fn journal_complete_for_test(conn: &Connection, session_id: &str) -> bool {
         journal_starts_with_creation_conn(conn, session_id).unwrap()
     }
+
+    pub fn session_ids_tagged_for_test(conn: &Connection, project_ids: &[String]) -> Vec<String> {
+        tagged_rows_conn(conn, project_ids)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+
+    pub fn retag_sessions_for_test(
+        conn: &Connection,
+        from_ids: &[String],
+        to_id: &str,
+        skip_ids: &std::collections::HashSet<String>,
+    ) -> Vec<(String, bool)> {
+        retag_sessions_conn(conn, from_ids, to_id, skip_ids).unwrap()
+    }
 }
 
 #[cfg(test)]
@@ -1360,6 +1460,56 @@ mod list_metadata_tests {
         s.tab_title = title.map(str::to_string);
         s.tab_emoji = emoji.map(str::to_string);
         s
+    }
+
+    #[test]
+    fn retag_rewrites_only_non_hydrated_rows_tagged_to_merged_projects() {
+        with_test_db(|conn| {
+            let mut a = session("A", false, None, None);
+            a.project_id = Some("old-1".into());
+            let mut b = session("B", false, None, None);
+            b.project_id = Some("old-2".into());
+            b.project_tag_user_set = true;
+            let mut hydrated = session("H", false, None, None);
+            hydrated.project_id = Some("old-1".into());
+            let mut other = session("O", false, None, None);
+            other.project_id = Some("keep-me".into());
+            for s in [&a, &b, &hydrated, &other] {
+                upsert(conn, s);
+            }
+            let from = vec!["old-1".to_string(), "old-2".to_string()];
+            let mut tagged = session_ids_tagged_for_test(conn, &from);
+            tagged.sort();
+            let mut want = vec![a.id.clone(), b.id.clone(), hydrated.id.clone()];
+            want.sort();
+            assert_eq!(tagged, want, "only the sessions' own tags count");
+
+            let seq_before: i64 = conn
+                .query_row("SELECT seq FROM sessions WHERE id = ?1", params![a.id], |r| r.get(0))
+                .unwrap();
+            let skip: std::collections::HashSet<String> = [hydrated.id.clone()].into();
+            let mut done = retag_sessions_for_test(conn, &from, "keep", &skip);
+            done.sort();
+            let mut want = vec![(a.id.clone(), false), (b.id.clone(), true)];
+            want.sort();
+            assert_eq!(done, want);
+
+            let tag_of = |id: &str| -> Option<String> {
+                let data = get_row_data(conn, id).unwrap();
+                serde_json::from_str::<Session>(&data).unwrap().project_id
+            };
+            assert_eq!(tag_of(&a.id).as_deref(), Some("keep"));
+            assert_eq!(tag_of(&b.id).as_deref(), Some("keep"));
+            assert_eq!(tag_of(&hydrated.id).as_deref(), Some("old-1"), "hydrated rows are the caller's");
+            assert_eq!(tag_of(&other.id).as_deref(), Some("keep-me"));
+            let seq_after: i64 = conn
+                .query_row("SELECT seq FROM sessions WHERE id = ?1", params![a.id], |r| r.get(0))
+                .unwrap();
+            assert!(seq_after > seq_before, "a fresh seq keeps older in-flight writes out");
+            // The user_set flag rides along unchanged.
+            let b_row: Session = serde_json::from_str(&get_row_data(conn, &b.id).unwrap()).unwrap();
+            assert!(b_row.project_tag_user_set);
+        });
     }
 
     #[test]

@@ -61,6 +61,8 @@ pub enum TidyTodoStatus {
 pub struct TidyProject {
     pub id: String,
     pub title: String,
+    /// Other names the project answers to — scored like the title.
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,10 +192,11 @@ fn suggest_project(
     let mut best: Option<(&TidyProject, usize)> = None;
     let mut tied = false;
     for p in projects {
-        let score = keywords(&p.title)
-            .iter()
-            .filter(|pw| words.contains(pw))
-            .count();
+        let score = std::iter::once(&p.title)
+            .chain(p.aliases.iter())
+            .map(|name| keywords(name).iter().filter(|pw| words.contains(pw)).count())
+            .max()
+            .unwrap_or(0);
         if score == 0 {
             continue;
         }
@@ -275,7 +278,7 @@ mod tests {
     }
 
     fn proj(id: &str, title: &str) -> TidyProject {
-        TidyProject { id: id.into(), title: title.into() }
+        TidyProject { id: id.into(), title: title.into(), aliases: Vec::new() }
     }
 
     fn ids<T>(v: &[T], f: impl Fn(&T) -> &str) -> Vec<String> {

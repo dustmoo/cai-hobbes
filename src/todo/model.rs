@@ -1767,6 +1767,17 @@ pub struct Project {
     /// to the project by cwd (longest-prefix match).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Other names this project answers to (merged-in titles, a repo name,
+    /// a nickname). Every name match — AI upsert dedupe, the session tagger,
+    /// quick-add `+project`, fleet cwd mapping — treats them like the title
+    /// (`todo::project_identity`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    /// Project ids the person said are NOT duplicates of this one ("Not
+    /// duplicates" in Manage projects) — keeps the pair out of "Possible
+    /// duplicates".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub distinct_from: Vec<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

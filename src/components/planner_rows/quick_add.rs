@@ -247,6 +247,23 @@ fn title_from_query(q: &str) -> String {
     }
 }
 
+/// The "Create project …" row a `+query` offers, or `None` when an open
+/// project already answers to that name (title or alias, normalized —
+/// `project_identity`): picking it is the way, never creating a twin.
+pub(crate) fn create_offer(state: &PlannerState, ix: &ProjectIndex, q: &str) -> Option<String> {
+    let title = title_from_query(q);
+    if title.is_empty() {
+        return None;
+    }
+    if ix.rank(q).iter().any(|r| r.tier == MatchTier::Exact) {
+        return None;
+    }
+    match crate::todo::project_identity::lookup_exact_open(&state.projects, &title) {
+        crate::todo::project_identity::ExactLookup::None => Some(title),
+        _ => None,
+    }
+}
+
 /// Splits `title` into runs marked by whether they match `query`'s
 /// characters in order (the list's highlight).
 fn highlight_runs(title: &str, query: &str) -> Vec<(String, bool)> {
@@ -297,6 +314,16 @@ pub(crate) fn apply_project_pick(
 }
 
 fn create_project(mut planner: Signal<PlannerState>, title: &str) -> String {
+    // A project that already answers to this name (created since the pick,
+    // or named by an alias) takes the to-do instead of a twin.
+    let existing = match crate::todo::project_identity::lookup_exact_open(&planner.peek().projects, title) {
+        crate::todo::project_identity::ExactLookup::One(id) => Some(id),
+        crate::todo::project_identity::ExactLookup::Many(ids) => ids.into_iter().next(),
+        crate::todo::project_identity::ExactLookup::None => None,
+    };
+    if let Some(id) = existing {
+        return id;
+    }
     let now = Utc::now();
     let sort_order = planner
         .peek()
@@ -314,6 +341,8 @@ fn create_project(mut planner: Signal<PlannerState>, title: &str) -> String {
         deadline: None,
         sort_order,
         path: None,
+        aliases: Vec::new(),
+        distinct_from: Vec::new(),
         created_at: now,
         updated_at: now,
     };
@@ -570,8 +599,7 @@ pub(crate) fn QuickAddField(
                     .take(8)
                     .map(ProjectRow::Project)
                     .collect();
-                let title = title_from_query(q);
-                if !title.is_empty() {
+                if let Some(title) = create_offer(&state, &ix, q) {
                     rows.push(ProjectRow::Create(title));
                 }
                 rows
@@ -1140,6 +1168,8 @@ mod tests {
             deadline: None,
             sort_order,
             path: None,
+            aliases: Vec::new(),
+            distinct_from: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -1229,6 +1259,26 @@ mod tests {
         assert_eq!(b.bucket, TodoBucket::Someday);
         let today = birth(&text("ship +rc"), &PlannerSelection::View(TodoView::Today));
         assert_eq!(today.scheduled_for, Some(d("2026-09-24")));
+    }
+
+    #[test]
+    fn create_is_offered_only_when_no_project_answers_to_the_name() {
+        let mut state = planner_with_projects();
+        state.projects[0].aliases.push("cai-hobbes".into());
+        let ix = ProjectIndex::from_state(&state);
+        // New name: offered.
+        assert_eq!(create_offer(&state, &ix, "garden-shed").as_deref(), Some("Garden shed"));
+        // An alias or the title, however it's spelled: never offered.
+        assert_eq!(create_offer(&state, &ix, "cai-hobbes"), None);
+        assert_eq!(create_offer(&state, &ix, "hobbes-rc"), None);
+        assert_eq!(create_offer(&state, &ix, "hobbesrc"), None);
+        // A prefix of an existing project still offers the new name.
+        assert_eq!(create_offer(&state, &ix, "hob").as_deref(), Some("Hob"));
+        // `+cai-hobbes` resolves to the aliased project directly.
+        let b = birth(&text("ship +cai-hobbes"), &PlannerSelection::View(TodoView::Inbox));
+        assert_eq!(b.project, BirthProject::None, "fixture without the alias");
+        let parsed = text("ship +cai-hobbes").parse(&state, d("2026-09-24"));
+        assert_eq!(parsed.project.map(|p| p.id).as_deref(), Some("rc"));
     }
 
     #[test]

@@ -128,27 +128,40 @@ impl ProjectIndex {
     }
 
     /// Open projects only — the same filter the row's project picker uses.
+    /// Every name a project answers to becomes an entry — its title, the
+    /// parts of a `"Base (inner)"` title, and its aliases
+    /// (`project_identity`) — so `+cai-hobbes` finds "Hobbes (cai-hobbes)"
+    /// or a project carrying that alias. `rank` folds them back to one row
+    /// per project.
     pub fn from_state(state: &PlannerState) -> Self {
-        let entries = state
-            .projects
-            .iter()
-            .filter(|p| !p.status.is_closed())
-            .map(|p| {
-                let s = slug(&p.title);
-                Entry {
+        let mut entries = Vec::new();
+        for p in state.projects.iter().filter(|p| !p.status.is_closed()) {
+            let area = p
+                .area_id
+                .as_ref()
+                .and_then(|aid| state.areas.iter().find(|a| &a.id == aid))
+                .map(|a| a.title.clone());
+            let mut slugs: Vec<String> = vec![slug(&p.title)];
+            let names = super::project_identity::name_keys(&p.title)
+                .into_iter()
+                .chain(p.aliases.iter().flat_map(|a| super::project_identity::name_keys(a)));
+            for k in names {
+                let s = slug(&k);
+                if !s.is_empty() && !slugs.contains(&s) {
+                    slugs.push(s);
+                }
+            }
+            for s in slugs {
+                entries.push(Entry {
                     id: p.id.clone(),
                     title: p.title.clone(),
                     initials: initials(&s),
                     slug: s,
-                    area: p
-                        .area_id
-                        .as_ref()
-                        .and_then(|aid| state.areas.iter().find(|a| &a.id == aid))
-                        .map(|a| a.title.clone()),
+                    area: area.clone(),
                     sort_order: p.sort_order,
-                }
-            })
-            .collect();
+                });
+            }
+        }
         Self { entries, pins: HashMap::new() }
     }
 
@@ -202,6 +215,16 @@ impl ProjectIndex {
             tb.cmp(ta)
                 .then(a.sort_order.total_cmp(&b.sort_order))
                 .then_with(|| a.title.cmp(&b.title))
+        });
+        // One row per project: its best-matching name (sorted first).
+        let mut seen: Vec<&str> = Vec::new();
+        out.retain(|(e, _)| {
+            if seen.contains(&e.id.as_str()) {
+                false
+            } else {
+                seen.push(e.id.as_str());
+                true
+            }
         });
         out.into_iter()
             .map(|(e, tier)| Ranked {
@@ -266,6 +289,8 @@ mod tests {
             deadline: None,
             sort_order,
             path: None,
+            aliases: Vec::new(),
+            distinct_from: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -366,6 +391,22 @@ mod tests {
         // Edited away from the inserted slug: nobody is created, and the
         // real project's prefix match takes it.
         assert_eq!(resolved_id(ix.resolve("gard")), Some("gs".into()));
+    }
+
+    #[test]
+    fn aliases_and_parentheticals_resolve_to_one_project() {
+        let mut h = project("h", "Hobbes (cai-hobbes)", 1.0);
+        h.aliases.push("The Assistant".into());
+        let ix = index(vec![h, project("x", "cai-exceller8", 2.0)]);
+        assert_eq!(resolved_id(ix.resolve("cai-hobbes")), Some("h".into()));
+        assert_eq!(resolved_id(ix.resolve("cai_hobbes")), Some("h".into()));
+        assert_eq!(resolved_id(ix.resolve("the-assistant")), Some("h".into()));
+        // The title's own slug still works, and a project appears once.
+        assert_eq!(resolved_id(ix.resolve("hobbes")), Some("h".into()));
+        let rows = ix.rank("hob");
+        assert_eq!(rows.iter().filter(|r| r.id == "h").count(), 1);
+        // "cai" prefixes both projects: ambiguous, never guessed.
+        assert!(matches!(ix.resolve("cai"), ProjectResolution::Ambiguous { .. }));
     }
 
     #[test]

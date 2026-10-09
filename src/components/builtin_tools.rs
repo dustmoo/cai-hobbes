@@ -56,6 +56,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_PLAN_DAY",
     "HOBBES_TIME_BLOCK",
     "HOBBES_PROJECT_UPSERT",
+    "HOBBES_PROJECT_LIST",
     "HOBBES_CALENDAR_LIST",
     "HOBBES_DISPATCH",
     "HOBBES_DECISIONS",
@@ -117,7 +118,7 @@ pub fn is_planner_tool(name: &str) -> bool {
         || matches!(
             name,
             "HOBBES_PLAN_DAY" | "HOBBES_TIME_BLOCK" | "HOBBES_PROJECT_UPSERT"
-                | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH" | "HOBBES_DECISIONS"
+                | "HOBBES_PROJECT_LIST" | "HOBBES_CALENDAR_LIST" | "HOBBES_DISPATCH" | "HOBBES_DECISIONS"
                 | "HOBBES_TIME_GOALS" | "HOBBES_AGENT_TIME"
         )
 }
@@ -555,6 +556,7 @@ fn run_planner_tool(
         "HOBBES_PROJECT_UPSERT" => {
             handlers::handle_project_upsert(&mut planner.write(), args_json, today, true)
         }
+        "HOBBES_PROJECT_LIST" => handlers::handle_project_list(&planner.read(), args_json),
         "HOBBES_TIME_GOALS" => {
             handlers::handle_time_goals(&mut planner.write(), args_json, today, true)
         }

@@ -2161,7 +2161,8 @@ pub fn agent_time_scope_allows(tool: &str, args: &serde_json::Value) -> ScopeVer
 ///
 /// 1. Hobbes built-ins are classified explicitly:
 ///    - Allow: `HOBBES_AGENT_TIME` (its own grant checks still apply),
-///      `HOBBES_TODO_LIST`, `HOBBES_CALENDAR_LIST`, `HOBBES_FLEET_STATUS`,
+///      `HOBBES_TODO_LIST`, `HOBBES_CALENDAR_LIST`, `HOBBES_PROJECT_LIST`,
+///      `HOBBES_FLEET_STATUS`,
 ///      `HOBBES_LIST_TIMERS`, `HOBBES_PAGE_RESULT`,
 ///      `HOBBES_UPDATE_SCRATCHPAD` (the session's own memory),
 ///      `HOBBES_INVOKE_SKILL` / `HOBBES_UNLOAD_SKILL` (capability loading;
@@ -2187,7 +2188,7 @@ pub fn agent_time_scope(tool: &str, args: &serde_json::Value) -> (ScopeVerdict, 
     use ScopeReason as R;
     use ScopeVerdict::*;
     match tool {
-        "HOBBES_AGENT_TIME" | "HOBBES_TODO_LIST" | "HOBBES_CALENDAR_LIST"
+        "HOBBES_AGENT_TIME" | "HOBBES_TODO_LIST" | "HOBBES_CALENDAR_LIST" | "HOBBES_PROJECT_LIST"
         | "HOBBES_FLEET_STATUS" | "HOBBES_LIST_TIMERS" | "HOBBES_PAGE_RESULT"
         | "HOBBES_UPDATE_SCRATCHPAD" | "HOBBES_INVOKE_SKILL" | "HOBBES_UNLOAD_SKILL"
         | "MCP_LOAD_SERVER_TOOLS" | "MCP_UNLOAD_SERVER_TOOLS" => return (Allow, R::HobbesAllowed),
@@ -2523,6 +2524,7 @@ mod tests {
         assert_eq!(agent_time_scope_allows("HOBBES_AGENT_TIME", &json!({"action": "propose"})), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_TODO_LIST", &none), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_CALENDAR_LIST", &none), Allow);
+        assert_eq!(agent_time_scope_allows("HOBBES_PROJECT_LIST", &none), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_UPDATE_SCRATCHPAD", &none), Allow);
         assert_eq!(agent_time_scope_allows("HOBBES_INVOKE_SKILL", &none), Allow);
         assert_eq!(agent_time_scope_allows("MCP_LOAD_SERVER_TOOLS", &none), Allow);

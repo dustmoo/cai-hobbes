@@ -98,7 +98,7 @@ impl PlannerClient {
                                         "deadline": { "type": "string", "description": "The day it is actually due (YYYY-MM-DD, 'today' or 'tomorrow')." },
                                         "estimate_minutes": { "type": "integer", "description": "Estimated focused minutes of work." },
                                         "priority": { "type": "string", "enum": ["urgent_important", "important", "urgent", "neither"], "description": "Eisenhower quadrant: urgent_important (Q1, do first), important (Q2, schedule), urgent (Q3, delegate), neither (Q4, drop). Leave unset unless the user states or clearly implies it." },
-                                        "project_id": { "type": "string", "description": "Id of an existing project to file it under." },
+                                        "project_id": { "type": "string", "description": "Id of an existing project to file it under (HOBBES_PROJECT_LIST shows them)." },
                                         "linked_session": { "type": "string", "description": "Fleet session carrying this todo: a session id from HOBBES_FLEET_STATUS, or a unique live session name." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Free-form tags." },
                                         "checklist": { "type": "array", "items": { "type": "string" }, "description": "Sub-step titles." },
@@ -151,7 +151,7 @@ impl PlannerClient {
                                         "deadline": { "type": ["string", "null"], "description": "YYYY-MM-DD, 'today' or 'tomorrow'; null clears it." },
                                         "estimate_minutes": { "type": ["integer", "null"], "description": "null clears it." },
                                         "priority": { "type": ["string", "null"], "enum": ["urgent_important", "important", "urgent", "neither", null], "description": "Eisenhower quadrant (Q1–Q4); null clears it." },
-                                        "project_id": { "type": ["string", "null"], "description": "null clears it." },
+                                        "project_id": { "type": ["string", "null"], "description": "Project id from HOBBES_PROJECT_LIST; null clears it." },
                                         "linked_session": { "type": ["string", "null"], "description": "Fleet session carrying this todo (id from HOBBES_FLEET_STATUS or unique live name); null clears the link. Setting status to in_progress auto-links the calling session when unlinked." },
                                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full tag list." },
                                         "checklist": { "type": "array", "items": { "type": "string" }, "description": "Replaces the full checklist." },
@@ -351,10 +351,44 @@ impl PlannerClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_PROJECT_LIST".into(),
+                description: Some(
+                    "List the user's projects with their ids: title, aliases (other names \
+                    the project answers to), area, path, status, open to-do count and last \
+                    activity. 'query' filters by name (title or alias, case/punctuation \
+                    insensitive, near-misses included). Open projects only unless \
+                    include_closed is true. Call this to find a project's id before filing \
+                    to-dos into it or updating it, and before creating a project. Possible \
+                    duplicates are flagged; only the user merges them (Planner \u{25b8} Manage \
+                    projects)."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "A project name or part of one, e.g. 'hobbes'." },
+                            "include_closed": { "type": "boolean", "description": "Also list completed and archived projects. Defaults to false." }
+                        }
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("List Projects".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_PROJECT_UPSERT".into(),
                 description: Some(format!(
-                    "Create or update projects and areas. Items without an 'id' are \
-                    created; items with an 'id' patch the existing record. {}",
+                    "Create or update projects and areas. Call HOBBES_PROJECT_LIST before \
+                    creating a project; prefer an existing one and pass its id. Items with an \
+                    'id' patch that record. A project item without an 'id' is matched by name \
+                    first: if an existing project already has that title or alias it is \
+                    updated instead (the response names its id); if only similar projects \
+                    exist the item is refused with the candidates — pass one's id, or \
+                    create_new: true when it truly is a different project. {}",
                     SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
@@ -366,12 +400,14 @@ impl PlannerClient {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "id": { "type": "string", "description": "Omit to create a new project." },
+                                        "id": { "type": "string", "description": "The project to update (from HOBBES_PROJECT_LIST). Omit only to create." },
                                         "title": { "type": "string", "description": "Required when creating." },
+                                        "aliases": { "type": "array", "items": { "type": "string" }, "description": "Other names the project answers to (repo name, nickname). Replaces the list." },
+                                        "create_new": { "type": "boolean", "description": "Create even though similarly named projects exist. Only after checking HOBBES_PROJECT_LIST; an exact name match is always updated, never duplicated." },
                                         "notes": { "type": "string" },
                                         "area_id": { "type": "string", "description": "Area to file the project under." },
                                         "deadline": { "type": "string", "description": "YYYY-MM-DD, 'today' or 'tomorrow'." },
-                                        "status": { "type": "string", "enum": ["open", "in_progress", "completed", "cancelled"] },
+                                        "status": { "type": "string", "enum": ["open", "in_progress", "completed", "archived"], "description": "completed / archived projects leave the Planner nav." },
                                         "path": { "type": "string", "description": "Repo/folder root for this project (e.g. ~/Sites/puget) — used to match coding-agent sessions to the project. Empty string clears it." }
                                     }
                                 }

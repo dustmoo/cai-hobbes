@@ -13,23 +13,19 @@ use crate::todo::model::Project;
 /// tag everything to an "AI Strategy" project.
 const MIN_CONTAINMENT_LEN: usize = 4;
 
-fn norm(s: &str) -> String {
-    s.trim().to_lowercase()
-}
-
-/// Does `candidate` name `project` (case-insensitive equality, or containment
-/// either way when both sides are long enough)?
-fn title_matches(title: &str, candidate: &str) -> bool {
-    let t = norm(title);
-    let c = norm(candidate);
-    if t.is_empty() || c.is_empty() {
+/// Does `candidate` name a project with these normalized names (title and
+/// aliases — `project_identity::project_keys`)? Equality, or containment
+/// either way when both sides are long enough.
+fn names_match(keys: &[String], candidate: &str) -> bool {
+    let c = crate::todo::project_identity::normalize(candidate);
+    if c.is_empty() {
         return false;
     }
-    if t == c {
-        return true;
-    }
-    (t.len() >= MIN_CONTAINMENT_LEN && c.len() >= MIN_CONTAINMENT_LEN)
-        && (t.contains(&c) || c.contains(&t))
+    keys.iter().any(|t| {
+        t == &c
+            || (t.len() >= MIN_CONTAINMENT_LEN && c.len() >= MIN_CONTAINMENT_LEN
+                && (t.contains(&c) || c.contains(t.as_str())))
+    })
 }
 
 /// The project this session's content points at — `Some(id)` only when
@@ -66,7 +62,8 @@ pub fn suggest_project(
         .filter(|p| p.status == crate::todo::model::TodoStatus::Open
             || p.status == crate::todo::model::TodoStatus::InProgress)
     {
-        if candidates.iter().any(|c| title_matches(&project.title, c)) {
+        let keys = crate::todo::project_identity::project_keys(project);
+        if candidates.iter().any(|c| names_match(&keys, c)) {
             match matched {
                 None => matched = Some(project),
                 // Two different projects match → ambiguous, tag nothing.
@@ -96,13 +93,16 @@ pub(crate) fn norm_path(p: &str) -> Option<String> {
 }
 
 /// The project whose `path` is the longest prefix of `cwd` (component-aligned
-/// — `/a/bc` is not under `/a/b`).
+/// — `/a/bc` is not under `/a/b`). With no path match, the deepest folder
+/// in `cwd` that exactly names one open project (title or alias, normalized,
+/// at least 4 characters) — so a repo folder maps to the project named
+/// after it, or to one carrying the repo name as an alias.
 pub fn project_for_cwd(projects: &[Project], cwd: &str) -> Option<String> {
     let cwd = cwd.trim_end_matches('/');
     if cwd.is_empty() {
         return None;
     }
-    projects
+    let by_path = projects
         .iter()
         .filter_map(|p| {
             let root = norm_path(p.path.as_deref()?)?;
@@ -111,7 +111,23 @@ pub fn project_for_cwd(projects: &[Project], cwd: &str) -> Option<String> {
             under.then_some((root.len(), p.id.clone()))
         })
         .max_by_key(|(len, _)| *len)
-        .map(|(_, id)| id)
+        .map(|(_, id)| id);
+    if by_path.is_some() {
+        return by_path;
+    }
+    let open: Vec<Project> = projects.iter().filter(|p| !p.status.is_closed()).cloned().collect();
+    for folder in cwd.rsplit('/') {
+        let key = crate::todo::project_identity::normalize(folder);
+        if key.chars().filter(|c| !c.is_whitespace()).count() < MIN_CONTAINMENT_LEN {
+            continue;
+        }
+        if let crate::todo::project_identity::ExactLookup::One(id) =
+            crate::todo::project_identity::lookup_exact(&open, folder)
+        {
+            return Some(id);
+        }
+    }
+    None
 }
 
 /// Auto-tag after a summary write (both summarizer paths call this).
@@ -157,6 +173,64 @@ pub fn maybe_auto_tag(
     crate::session::SessionState::save_signal(&session_state, None);
 }
 
+/// How many chat sessions are tagged to any of `project_ids`: hydrated ones
+/// from `SessionState` (authoritative over their rows), the rest through a
+/// `session_store` query — never by hydrating.
+pub fn count_sessions_tagged(state: &crate::session::SessionState, project_ids: &[String]) -> usize {
+    let tagged = |s: &crate::session::Session| {
+        s.project_id.as_ref().is_some_and(|p| project_ids.contains(p))
+    };
+    let hydrated = state.sessions.values().filter(|s| tagged(s)).count();
+    let stored = crate::session_store::session_ids_tagged(project_ids)
+        .into_iter()
+        .filter(|id| !state.sessions.contains_key(id))
+        .count();
+    hydrated + stored
+}
+
+/// Retag every chat session tagged to one of `from_ids` (merged projects)
+/// to `to_id`: hydrated sessions in `SessionState` (saved through P-009),
+/// the rest in place in `session_store`. Each retag is journaled as a
+/// `ProjectTagged` event carrying the session's existing `user_set`, so the
+/// journal projection agrees with the row. Returns how many were retagged.
+pub fn retag_merged_sessions(
+    mut session_state: dioxus::prelude::Signal<crate::session::SessionState>,
+    from_ids: &[String],
+    to_id: &str,
+) -> usize {
+    use dioxus::prelude::{Readable, Writable};
+    let hydrated: std::collections::HashSet<String> =
+        session_state.peek().sessions.keys().cloned().collect();
+    let mut retagged: Vec<(String, bool)> = Vec::new();
+    {
+        let mut state = session_state.write();
+        for (id, s) in state.sessions.iter_mut() {
+            if s.project_id.as_ref().is_some_and(|p| from_ids.contains(p)) {
+                s.project_id = Some(to_id.to_string());
+                retagged.push((id.clone(), s.project_tag_user_set));
+            }
+        }
+    }
+    let any_hydrated = !retagged.is_empty();
+    retagged.extend(crate::session_store::retag_sessions(from_ids, to_id, &hydrated));
+    for (id, user_set) in &retagged {
+        crate::session_events::log_event(
+            id,
+            crate::session_events::SessionEvent::ProjectTagged {
+                project_id: Some(to_id.to_string()),
+                user_set: *user_set,
+            },
+        );
+    }
+    if any_hydrated {
+        crate::session::SessionState::save_signal(&session_state, None);
+    }
+    if !retagged.is_empty() {
+        tracing::info!(count = retagged.len(), to_id, "retagged sessions after a project merge");
+    }
+    retagged.len()
+}
+
 /// Display title for a project id.
 pub fn project_title<'a>(projects: &'a [Project], id: &str) -> Option<&'a str> {
     projects
@@ -182,6 +256,8 @@ mod tests {
             deadline: None,
             sort_order: 0.0,
             path: path.map(str::to_string),
+            aliases: Vec::new(),
+            distinct_from: Vec::new(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -258,5 +334,34 @@ mod tests {
         // Component alignment: /Sites-x is not under /Sites.
         assert_eq!(project_for_cwd(&projects, "/Users/x/Sites-x"), None);
         assert_eq!(project_for_cwd(&[], "/anywhere"), None);
+    }
+
+    #[test]
+    fn cwd_falls_back_to_a_folder_naming_a_project_or_alias() {
+        let mut hobbes = project("h", "Hobbes", None);
+        hobbes.aliases.push("cai-hobbes".into());
+        let projects = vec![hobbes, project("x", "Exceller8", None)];
+        assert_eq!(
+            project_for_cwd(&projects, "/Users/x/Sites/cai-hobbes/src"),
+            Some("h".into())
+        );
+        assert_eq!(project_for_cwd(&projects, "/Users/x/Sites/exceller8"), Some("x".into()));
+        assert_eq!(project_for_cwd(&projects, "/Users/x/Sites/unrelated"), None);
+        // A path match still wins.
+        let with_path = vec![project("p", "Puget", Some("/Users/x/Sites/cai-hobbes"))];
+        assert_eq!(project_for_cwd(&with_path, "/Users/x/Sites/cai-hobbes"), Some("p".into()));
+    }
+
+    #[test]
+    fn aliases_tag_like_titles() {
+        let mut p = project("h", "Hobbes", None);
+        p.aliases.push("cai-hobbes".into());
+        let projects = vec![p, project("x", "Exceller8", None)];
+        let s = summary_with(Some("cai_hobbes"), &[]);
+        assert_eq!(suggest_project(&projects, "Oct 09", &s), Some("h".into()));
+        // Parenthetical title: its inner name tags too.
+        let projects = vec![project("hp", "Hobbes (cai-hobbes)", None)];
+        let s = summary_with(None, &["cai-hobbes release"]);
+        assert_eq!(suggest_project(&projects, "Oct 09", &s), Some("hp".into()));
     }
 }

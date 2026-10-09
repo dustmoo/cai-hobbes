@@ -782,6 +782,7 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
         "HOBBES_PLAN_DAY",
         "HOBBES_TIME_BLOCK",
         "HOBBES_PROJECT_UPSERT",
+        "HOBBES_PROJECT_LIST",
     ] {
         assert!(
             !prompt.prompt.tools.iter().any(|t| t.name == tool),

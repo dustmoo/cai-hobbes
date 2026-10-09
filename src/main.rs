@@ -272,7 +272,11 @@ fn tidy_inputs(
         .projects
         .iter()
         .filter(|p| !p.status.is_closed())
-        .map(|p| tab_tidy::TidyProject { id: p.id.clone(), title: p.title.clone() })
+        .map(|p| tab_tidy::TidyProject {
+            id: p.id.clone(),
+            title: p.title.clone(),
+            aliases: p.aliases.clone(),
+        })
         .collect();
     projects.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
     (tabs, todos, projects)

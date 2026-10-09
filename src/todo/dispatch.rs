@@ -544,6 +544,8 @@ pub(crate) mod tests {
                 deadline: None,
                 sort_order: 0.0,
                 path: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                aliases: Vec::new(),
+                distinct_from: Vec::new(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -600,6 +602,8 @@ pub(crate) mod tests {
                 deadline: None,
                 sort_order: 0.0,
                 path: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                aliases: Vec::new(),
+                distinct_from: Vec::new(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -706,6 +710,8 @@ pub(crate) mod tests {
                 deadline: None,
                 sort_order: 0.0,
                 path: Some(std::env::temp_dir().to_string_lossy().to_string()),
+                aliases: Vec::new(),
+                distinct_from: Vec::new(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -768,6 +774,8 @@ pub(crate) mod tests {
             deadline: None,
             sort_order: 0.0,
             path: None,
+            aliases: Vec::new(),
+            distinct_from: Vec::new(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

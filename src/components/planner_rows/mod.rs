@@ -34,19 +34,19 @@ pub(crate) use schedule::{set_schedule, ScheduleChoice};
 /// Mirrors `default_profile_color()` in `settings.rs` (private there).
 const DEFAULT_PROFILE_COLOR: &str = "bg-blue-600";
 
-const PILL: &str = "h-[22px] inline-flex items-center rounded-full border border-faint px-2 text-[11px] text-fg-muted gap-1.5 shrink-0";
-const META: &str = "font-mono text-[11px] tabular-nums text-fg-muted shrink-0";
-const BTN_PRIMARY: &str =
+pub(crate) const PILL: &str = "h-[22px] inline-flex items-center rounded-full border border-faint px-2 text-[11px] text-fg-muted gap-1.5 shrink-0";
+pub(crate) const META: &str = "font-mono text-[11px] tabular-nums text-fg-muted shrink-0";
+pub(crate) const BTN_PRIMARY: &str =
     "text-[11px] rounded px-2 py-0.5 bg-btn-primary text-fg hover:bg-btn-primary-hover shrink-0";
-const BTN_SECONDARY: &str =
+pub(crate) const BTN_SECONDARY: &str =
     "text-[11px] rounded px-2 py-0.5 border border-faint text-fg hover:bg-input shrink-0";
-const POPOVER: &str = "absolute right-0 top-full mt-1 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 py-1";
-const MENU_ITEM: &str =
+pub(crate) const POPOVER: &str = "absolute right-0 top-full mt-1 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 py-1";
+pub(crate) const MENU_ITEM: &str =
     "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg text-left hover:bg-input";
 pub(crate) const SECTION_HEADER: &str =
     "text-[11px] uppercase tracking-[0.08em] text-fg-muted px-2.5 pt-3.5 pb-1";
 
-const MENU_LABEL: &str = "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
-const MENU_RULE: &str = "h-px bg-[var(--color-border-muted)] my-1";
+pub(crate) const MENU_LABEL: &str = "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
+pub(crate) const MENU_RULE: &str = "h-px bg-[var(--color-border-muted)] my-1";
 /// The faint "this is what the list is sorted by" ring on a row's chip.
 const KEY_RING: &str = " ring-1 ring-primary-300/50";
