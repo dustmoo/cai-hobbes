@@ -1,8 +1,6 @@
 use super::super::SettingsCtx;
-use super::super::fleet::FleetSection;
 use super::super::shared::INPUT;
 use super::super::shared::Toggle;
-use super::super::terminal::TerminalSection;
 use dioxus::prelude::*;
 
 #[component]
@@ -843,14 +841,6 @@ pub(in super::super) fn BehaviorTab(
                         }
                     }
                 }
-
-                // Fleet observation (Pro): its own card so the hook
-                // registration flow doesn't hide inside the behavior wall.
-                // Commits immediately (not part of this tab's draft + Save).
-                FleetSection {}
-
-                // Native terminal: opt-in, commits immediately.
-                TerminalSection {}
 
     }
 }

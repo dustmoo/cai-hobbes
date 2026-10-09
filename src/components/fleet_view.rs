@@ -262,9 +262,9 @@ pub fn FleetView() -> Element {
                     class: "px-6 py-8 text-sm text-fg-muted space-y-2",
                     p { "No Claude Code sessions observed yet." }
                     if !enabled {
-                        p { "Turn on the fleet in Settings → Behavior → Fleet, then Connect Claude Code." }
+                        p { "Turn on the fleet in Settings → Fleet, then Connect Claude Code." }
                     } else if !connected {
-                        p { "Hooks aren't registered yet — open Settings → Behavior → Fleet and hit \"Connect Claude Code\"." }
+                        p { "Hooks aren't registered yet — open Settings → Fleet and hit \"Connect Claude Code\"." }
                     } else {
                         p { "Hooks are connected. Sessions appear here the moment one starts (or fires its next event)." }
                     }

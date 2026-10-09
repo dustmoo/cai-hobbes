@@ -2299,6 +2299,8 @@ pub enum SettingsTab {
     Skills,
     About,
     ImageGen,
+    Fleet,
+    Terminal,
 }
 
 impl Default for SettingsTab {

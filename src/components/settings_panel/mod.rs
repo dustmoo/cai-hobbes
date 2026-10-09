@@ -54,6 +54,8 @@ fn settings_tab_label(tab: crate::settings::SettingsTab) -> &'static str {
         T::Skills => "Skills",
         T::About => "About",
         T::ImageGen => "Image",
+        T::Fleet => "Fleet",
+        T::Terminal => "Terminal",
     }
 }
 
@@ -694,6 +696,8 @@ pub fn SettingsPanel(
                     SettingsNavItem { tab: crate::settings::SettingsTab::Mcp, icon: fi_icons::FiCpu, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Behavior, icon: fi_icons::FiSliders, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Planner, icon: fi_icons::FiCheckSquare, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Fleet, icon: fi_icons::FiRadio, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Terminal, icon: fi_icons::FiTerminal, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Data, icon: fi_icons::FiDatabase, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Permissions, icon: fi_icons::FiLock, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Hotkeys, icon: fi_icons::FiCommand, railed: nav_railed }
@@ -742,6 +746,10 @@ pub fn SettingsPanel(
                            McpTab { ctx, composio_url_warning, show_composio_advanced }
                        },
                        crate::settings::SettingsTab::Behavior => rsx! { BehaviorTab { ctx, app_behavior_collapsed } },
+                       // Fleet and Terminal commit immediately (not part of
+                       // the Behavior tab's draft + Save).
+                       crate::settings::SettingsTab::Fleet => rsx! { fleet::FleetSection {} },
+                       crate::settings::SettingsTab::Terminal => rsx! { terminal::TerminalSection {} },
                        crate::settings::SettingsTab::Data => rsx! {
                            DataTab { ctx, data_management_collapsed, show_conflict_modal, conflicting_sessions }
                        },

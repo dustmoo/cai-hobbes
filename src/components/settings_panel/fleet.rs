@@ -2,7 +2,7 @@ use super::shared::Toggle;
 use crate::settings::{Settings, SettingsManager};
 use dioxus::prelude::*;
 
-// ── Fleet (Behavior tab card, Pro) ──────────────────────────────────────────
+// ── Fleet (its own settings tab, Pro) ──────────────────────────────────────────
 
 /// The Fleet card: a single Connect/Disconnect action that commits
 /// atomically — hook registration in `~/.claude/settings.json` (timestamped
