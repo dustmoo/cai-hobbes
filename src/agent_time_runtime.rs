@@ -8,7 +8,9 @@
 //!
 //! Lifecycle:
 //!
-//! 1. **Start** (`ChatCommand::AgentTimeStart`, user-initiated only):
+//! 1. **Start** (`ChatCommand::AgentTimeStart`: the person's Start, or the
+//!    grant's scheduled window — [`scheduled_start_now`] fires the same
+//!    command once a day when `AgentTimeGrant::window_start` is reached):
 //!    [`start_now`] checks the grant and today's budget ([`start_check`]),
 //!    opens a dedicated chat ("Agent time · <date>") — or continues today's
 //!    one, whatever its last run's end reason ([`todays_chat`]: one chat a
@@ -186,9 +188,9 @@ pub fn gate_decision(i: &GateInput) -> GateDecision {
         ScopeVerdict::Deny => GateDecision::Refuse {
             message: format!(
                 "'{}' is out of scope for agent time and was refused. Agent time may read what \
-                 the user has shared and write only proposals (HOBBES_AGENT_TIME propose); the \
-                 user's to-dos, plan, timers, workers and anything destructive are off limits. \
-                 This attempt is logged.",
+                 the user has shared and write only to Hobbes-owned space (HOBBES_AGENT_TIME \
+                 deliver, propose, ask); the user's to-dos, plan, timers, workers and anything \
+                 destructive are off limits. This attempt is logged.",
                 i.tool
             ),
             record: Some(ScopeVerdict::Deny),
@@ -278,11 +280,11 @@ pub fn chat_title(date: NaiveDate) -> String {
     format!("Agent time · {}", date.format("%b %-d"))
 }
 
-/// The opening message of an agent-time chat. It states the grant, the rules
-/// and the controls, and deliberately suggests no task: the model picks —
-/// from the agent lane (`context`, built by
-/// `todo::agent_time::agent_time_context`) or Hobbes-owned space, never
-/// `owner`'s own tasks.
+/// The opening message of an agent-time chat. It states the grant, the four
+/// jobs in priority order (answers to saved questions → Prepare → Finish →
+/// Notice → Tend when idle), the rules and the controls. `context` (built by
+/// `todo::agent_time::agent_time_context`) carries the answers, the prep
+/// list, the agent lane, `owner`'s other tasks and their comments.
 pub fn seed_message(budget: &AgentTimeBudget, continued: bool, context: &str, owner: &str) -> String {
     let minutes = crate::todo::model::format_minutes(budget.minutes_left());
     let spend = budget.spend_left_usd();
@@ -292,44 +294,100 @@ pub fn seed_message(budget: &AgentTimeBudget, continued: bool, context: &str, ow
         return format!(
             "[New agent-time run: Hobbes started this on the user's behalf]\n\n\
              New agent-time run: {minutes}, ${spend:.2} left. Same rules; declare your intent \
-             with start (your earlier run in this chat is closed).\n\n\
+             with start (your earlier run in this chat is closed). Same order: answers first, \
+             then prepare, finish, notice, and tend when nothing else is queued. Deliver \
+             finished work with deliver; save questions with ask instead of stopping.\n\n\
              {context}"
         );
     }
     let opening = format!(
         "[Agent time: Hobbes opened this on the user's behalf]\n\n\
-         The user has granted you self-directed time: up to {minutes} today, with \
-         ${spend:.2} of spend. Nothing here is assigned. What you do with it is your choice."
+         The user has granted you agent time: up to {minutes} today, with ${spend:.2} of \
+         spend. Use it to do finished work {owner} reads later, in one review. You choose \
+         what to do within the order below."
     );
     format!(
         "{opening}\n\n\
+         Work in this order:\n\
+         1. Answers: if {owner} answered questions you saved earlier (listed below), act on \
+         them first.\n\
+         2. Prepare: briefs, drafts and background for the tasks {owner} flagged \"Prep \
+         this\" (the prep list below), and only those. Research their subject; don't act on \
+         them.\n\
+         3. Finish: work the agent-lane queue and deliver the finished work itself.\n\
+         4. Notice: propose changes worth making to {owner}'s stuff; {owner} accepts or \
+         dismisses each one.\n\
+         5. Tend, when nothing else is queued: Hobbes's own upkeep. Check loose ends in \
+         things you told {owner} and correct what was wrong; fix your own friction (failed \
+         calls, stalls); learn what connected tools can do; tidy memory. Tend is read-only \
+         outside Hobbes and writes only to Hobbes-owned space.\n\n\
          What is yours, and what is not:\n\
-         - Yours: the agent-lane to-dos listed below (queued or stuck, no worker running), \
-         and Hobbes-owned space: notes, research digests, draft skills, your own housekeeping.\n\
-         - Not yours: {owner}'s own tasks. Don't work on them or act on them; you may offer to \
-         take one (propose with kind \"offer\" and its todo_id), and only {owner}'s acceptance \
-         hands it over.\n\n\
+         - Yours: the prep list and the agent-lane to-dos below, and Hobbes-owned space.\n\
+         - Not yours: {owner}'s other tasks. Don't work on them or act on them; you may offer \
+         to take one (propose with kind \"offer\" and its todo_id), and only {owner}'s \
+         acceptance hands it over.\n\n\
          {context}\n\
          How it works:\n\
          1. First call HOBBES_AGENT_TIME with action \"start\" and an intent: one or two lines \
          on what you choose to do and why. Add todo_id when you take an agent-lane to-do. No \
          other tool runs until you do.\n\
          2. You may read what the user has shared with you.\n\
-         3. Your only output is proposals, filed with HOBBES_AGENT_TIME action \"propose\" \
-         (kind: note, todo, skill, research, other, or offer). The user will accept, edit or \
-         dismiss each one. You can't change their to-dos, plan or anything else directly.\n\
-         4. Reading {owner}'s tasks is fine for context; acting on them is not.\n\
-         5. Anything with an outside effect (sending, posting, buying, changing a repo, \
+         3. Deliver finished work with HOBBES_AGENT_TIME action \"deliver\" (job \"prepare\" \
+         with the flagged todo_id, \"finish\", or \"tend\"). {owner} keeps it, sends it back as \
+         needs work, or discards it.\n\
+         4. File changes to {owner}'s stuff with action \"propose\" (kind: note, todo, skill, \
+         research, other, or offer). You can't change their to-dos, plan or anything else \
+         directly.\n\
+         5. Don't stop to ask: save a question with action \"ask\" (a question and options) \
+         and carry on with what you can do without the answer. {owner} answers in the \
+         review; the answer reaches your next window.\n\
+         6. A correction (deliver job \"tend\" with correction: true) must say what was \
+         wrong and how you checked it.\n\
+         7. Reading {owner}'s tasks is fine for context; acting on them is not.\n\
+         8. Anything with an outside effect (sending, posting, buying, changing a repo, \
          running a command), and looking up a specific person's personal details, stops and \
          asks the user first.\n\
-         6. If a step needs the user's approval, end your turn after asking rather than \
-         leaving the run open: file your proposals first and make that call last. The run \
+         9. If a step needs the user's approval, end your turn after asking rather than \
+         leaving the run open: deliver your work first and make that call last. The run \
          waits for the user, and waiting still uses your minutes.\n\
-         7. When you're done, call HOBBES_AGENT_TIME with action \"end\" and a short summary.\n\n\
+         10. When you're done, call HOBBES_AGENT_TIME with action \"end\" and a short \
+         summary.\n\n\
          Every tool call you make is recorded on the log automatically; you don't need to log \
          calls yourself. The user can pause or stop you at any time. Deciding there is nothing \
          worth doing and ending straight away is also fine."
     )
+}
+
+/// The day [`scheduled_start_now`] last fired (runtime only): the scheduled
+/// window starts at most once a day per process.
+static AUTO_START_DAY: std::sync::Mutex<Option<NaiveDate>> = std::sync::Mutex::new(None);
+
+/// **Scheduled window.** Whether to start agent time now on the grant's
+/// schedule (`AgentTimeGrant::window_start`), per
+/// [`crate::todo::agent_time::scheduled_start_due`]. Counts as already
+/// attempted today when it fired before or a lease was taken today (a manual
+/// Start, even one whose model never called `start`). When it says yes it
+/// records today, so it fires once a day; the caller then issues
+/// `ChatCommand::AgentTimeStart`, the same path as the manual Start.
+pub fn scheduled_start_now(planner: &PlannerState, planner_enabled: bool) -> bool {
+    if !planner_enabled {
+        return false;
+    }
+    let local = chrono::Local::now();
+    let today = local.date_naive();
+    let fired = AUTO_START_DAY.lock().ok().is_some_and(|g| *g == Some(today));
+    let leased = LAST_LEASED
+        .lock()
+        .ok()
+        .is_some_and(|g| g.as_ref().is_some_and(|(d, _)| *d == today));
+    if !planner.scheduled_start_due(today, local.time(), Utc::now(), fired || leased) {
+        return false;
+    }
+    if let Ok(mut g) = AUTO_START_DAY.lock() {
+        *g = Some(today);
+    }
+    tracing::info!("Agent time: scheduled window reached; starting");
+    true
 }
 
 // ── Held for approval ───────────────────────────────────────────────────────
@@ -622,11 +680,12 @@ pub fn start_now(
         .clone()
         .filter(|n| !n.trim().is_empty())
         .unwrap_or_else(|| "the user".to_string());
-    let context = {
+    let (context, answered) = {
         let fleet = crate::fleet::shared().snapshot();
         let live = |sid: &str| crate::todo::handlers::fleet_worker_live(&fleet, sid);
         let lists = crate::todo::agent_time::agent_time_task_lists(&planner.peek(), today, &live);
-        crate::todo::agent_time::agent_time_context(&lists, &owner)
+        let answered: Vec<String> = lists.answers.iter().map(|(id, _, _)| id.clone()).collect();
+        (crate::todo::agent_time::agent_time_context(&lists, &owner), answered)
     };
     crate::components::chat_queue::queue_push(
         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
@@ -637,6 +696,15 @@ pub fn start_now(
         ),
     );
     crate::components::chat_queue::request_drain();
+    // The answers are in the opening message now: deliver them once.
+    if !answered.is_empty() {
+        let consumed = planner.write().consume_answers(&answered);
+        for q in &consumed {
+            if let Err(e) = crate::todo::store::save_agent_question(q) {
+                tracing::error!("Failed to persist question {}: {}", q.id, e);
+            }
+        }
+    }
     tracing::info!(chat_id = %chat_id, resumed = is_resume, "Agent time started");
     Ok(chat_id)
 }
@@ -830,12 +898,12 @@ pub fn grant_model_choice(
         .map_err(|e| format!("The agent-time model is no longer available ({e}). Pick another in the grant."))
 }
 
-/// **Accept & start, while agent time runs.** Hand to-do `todo_id` to the
+/// **Accept, while agent time runs.** Hand to-do `todo_id` to the
 /// running agent-time chat: queue the hand-off message through the chat
 /// queue (as the runtime's own messages go), set the run's `todo_id` when it
 /// has none, and log a runtime `Event`. The run continues. Returns the chat
-/// id, or `None` when no run holds the lease (the caller dispatches a new
-/// chat instead).
+/// id, or `None` when no run holds the lease (the to-do then stays queued
+/// for the next window).
 pub fn hand_to_run(
     mut planner: Signal<PlannerState>,
     settings: Signal<crate::settings::Settings>,
@@ -1330,15 +1398,27 @@ mod tests {
         let m = seed_message(&b, false, ctx, "Dustin");
         for needle in [
             "HOBBES_AGENT_TIME", "\"start\"", "\"propose\"", "\"end\"", "pause or stop", "asks the user", "$2.00",
+            // v2: finished work, saved questions, corrections.
+            "\"deliver\"", "\"ask\"", "Don't stop to ask",
+            "must say what was wrong and how you checked it",
+            // Tend stays inside Hobbes.
+            "read-only outside Hobbes and writes only to Hobbes-owned space",
             // Approval: end the turn rather than leave the run open.
             "end your turn after asking",
             // The boundary between agent work and the person's tasks.
-            "Not yours: Dustin's own tasks",
+            "Not yours: Dustin's other tasks",
+            "\"Prep this\"",
             "Reading Dustin's tasks is fine for context; acting on them is not.",
             "[t1] Digest notes",
         ] {
             assert!(m.contains(needle), "missing {needle}: {m}");
         }
+        // The four jobs in priority order: answers, prepare, finish, notice, tend.
+        let order = ["1. Answers", "2. Prepare", "3. Finish", "4. Notice", "5. Tend"];
+        let at: Vec<usize> = order.iter().map(|n| m.find(n).unwrap_or_else(|| panic!("missing {n}"))).collect();
+        assert!(at.windows(2).all(|w| w[0] < w[1]), "out of order: {at:?}");
+        // No more "proposals are your only output".
+        assert!(!m.contains("only output is proposals"));
         // Calls are recorded by the runtime; nothing asks the model to log them.
         assert!(m.contains("recorded on the log automatically"));
         assert!(!m.contains("action \"log\""), "no instruction to log before calls");
@@ -1347,6 +1427,7 @@ mod tests {
         let c = seed_message(&b, true, ctx, "Dustin");
         assert!(c.contains("New agent-time run: 45m, $2.00 left. Same rules; declare your intent with start"), "{c}");
         assert!(c.contains("[t1] Digest notes"));
+        assert!(c.contains("answers first") && c.contains("ask instead of stopping"), "{c}");
         assert!(c.len() < m.len());
     }
 

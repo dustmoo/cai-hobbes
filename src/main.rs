@@ -1969,11 +1969,14 @@ fn app() -> Element {
 
     // ── Agent-time budget tick ───────────────────────────────────────────────
     // While a lease is held, re-check today's minutes and spend every 30 s and
-    // stop the run when it is over (usage events re-check sooner). No
-    // auto-start: agent time only ever starts from ChatCommand::AgentTimeStart.
+    // stop the run when it is over (usage events re-check sooner). Agent time
+    // only ever starts through ChatCommand::AgentTimeStart: the person's
+    // Start, or the grant's scheduled window, which this tick fires at most
+    // once a day (agent_time_runtime::scheduled_start_now).
     {
         let planner_state = planner_state;
         let session_state = session_state;
+        let mut chat_command = chat_command;
         use_future(move || async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(
@@ -1982,6 +1985,11 @@ fn app() -> Element {
                 .await;
                 let streaming = STREAMING_SESSIONS.peek().clone();
                 agent_time_runtime::tick(planner_state, session_state, &streaming);
+                let planner_enabled = settings.peek().planner_enabled;
+                let due = agent_time_runtime::scheduled_start_now(&planner_state.peek(), planner_enabled);
+                if due {
+                    chat_command.set(Some(ChatCommand::AgentTimeStart));
+                }
             }
         });
     }
@@ -3201,7 +3209,7 @@ fn app() -> Element {
                     show_tidy.set(true);
                 }
                 // Agent-time runtime controls (agent_time_runtime.rs). Start
-                // is user-initiated only; the run gets its own background
+                // comes from the person or the scheduled window; the run gets its own background
                 // tab and never steals focus.
                 ChatCommand::AgentTimeStart => {
                     match agent_time_runtime::start_now(planner_state, session_state, settings) {

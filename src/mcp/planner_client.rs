@@ -487,31 +487,46 @@ impl PlannerClient {
         vec![Tool {
             name: "HOBBES_AGENT_TIME".into(),
             description: Some(
-                "Your granted agent time: a small budget in which you choose your own work, \
-                in the open. start(intent, todo_id?) first — declare what you will do and why, \
-                in one or two lines; pass todo_id only for a queued or stuck agent-lane to-do \
-                (the user's own, human-lane tasks are not yours: offer to take one with \
-                propose(kind: offer, todo_id, body) and only their acceptance hands it over). Every tool call you make is recorded on the log automatically, \
-                so don't log calls yourself. log(summary) is an optional note on why you're \
-                taking the next step (it attaches to that call). propose(kind, title, body) files \
-                an output (note, todo, skill, research, other; a todo with lane 'agent' is work you \
-                would do yourself) for the user to accept, edit or dismiss — proposals are your ONLY output; never change the user's to-dos, plan \
-                or anything outside Hobbes directly. end(summary) closes the session. Refused \
-                when the grant, day, minutes or spend cap don't allow it."
+                "Your granted agent time: a window in which you do finished work in the open, \
+                ending in one review the user reads later. start(intent, todo_id?) first — \
+                declare what you will do and why, in one or two lines; pass todo_id only for a \
+                queued or stuck agent-lane to-do. Four jobs: PREPARE briefs, drafts and \
+                background for the user's tasks they flagged \"Prep this\" (and only those); \
+                FINISH agent-lane work; NOTICE changes worth making to the user's stuff \
+                (proposals they accept or dismiss); TEND Hobbes's own upkeep when idle \
+                (corrections to things you told the user, your own failed calls and stalls, \
+                learning what connected tools can do, tidying memory — read-only outside \
+                Hobbes). deliver(job: prepare|finish|tend, title, body, kind?, todo_id?, \
+                correction?) files finished work for the user to keep, send back or discard; \
+                prepare needs the flagged to-do's todo_id; correction (tend only) must say what \
+                was wrong and how you checked. propose(kind, title, body) files a Notice \
+                proposal (note, todo, skill, research, other; a todo with lane 'agent' is work \
+                you would do yourself; kind offer + todo_id offers to take one of the user's \
+                own tasks, which only their acceptance hands over). ask(question, options) \
+                saves a question for the user's review instead of stopping — then carry on; \
+                the answer reaches your next window. Every tool call is recorded on the log \
+                automatically; log(summary) is an optional note on your next step. Never \
+                change the user's to-dos, plan or anything outside Hobbes directly. \
+                end(summary) closes the session. Refused when the grant, day, minutes or \
+                spend cap don't allow it."
                     .into(),
             ),
             input_schema: Arc::new(
                 serde_json::from_value(serde_json::json!({
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["start", "log", "propose", "end"] },
+                        "action": { "type": "string", "enum": ["start", "log", "deliver", "propose", "ask", "end"] },
                         "intent": { "type": "string", "description": "start: what you will do and why, one or two lines." },
                         "summary": { "type": "string", "description": "log (optional note, attached to your next call) / end: one line." },
-                        "kind": { "type": "string", "enum": ["note", "todo", "skill", "research", "other", "offer"], "description": "propose. offer = offer to take one of the user's tasks (needs todo_id)." },
-                        "todo_id": { "type": "string", "description": "start: the agent-lane to-do you work on (optional). propose(offer): the user's to-do you offer to take." },
+                        "job": { "type": "string", "enum": ["prepare", "finish", "tend"], "description": "deliver: which job the finished work is for." },
+                        "kind": { "type": "string", "enum": ["note", "todo", "skill", "research", "other", "offer"], "description": "propose (required) / deliver (optional). offer = propose to take one of the user's tasks (needs todo_id); never for deliver." },
+                        "todo_id": { "type": "string", "description": "start: the agent-lane to-do you work on (optional). deliver(prepare): the flagged to-do you prepared for (required). deliver(finish): the agent-lane to-do it finishes (optional). propose(offer): the user's to-do you offer to take." },
+                        "correction": { "type": "boolean", "description": "deliver(tend) only: this corrects something you told the user. Say what was wrong and how you checked." },
                         "lane": { "type": "string", "enum": ["agent", "human"], "description": "propose(todo): 'agent' when it is work you would do yourself (it lands in the agent lane, and accepting it can start it); 'human' (default) for a suggestion for the user." },
-                        "title": { "type": "string", "description": "propose: one line." },
-                        "body": { "type": "string", "description": "propose: the content (markdown)." }
+                        "title": { "type": "string", "description": "deliver / propose: one line." },
+                        "body": { "type": "string", "description": "deliver: the finished work itself (markdown). propose: the content (markdown)." },
+                        "question": { "type": "string", "description": "ask: one question for the user." },
+                        "options": { "type": "array", "items": { "type": "string" }, "description": "ask: suggested answers (up to 6)." }
                     },
                     "required": ["action"]
                 }))

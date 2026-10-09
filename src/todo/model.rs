@@ -3,7 +3,7 @@
 //! Pure data plus pure logic — no persistence, no Dioxus. Everything here is
 //! unit-testable without a database or a UI.
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 
 // ── Enums ───────────────────────────────────────────────────────────────────
@@ -974,6 +974,11 @@ pub struct AgentTimeGrant {
     /// (`Settings::allowed_models`). `None` = the connector's own model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// The scheduled window: on a granted day, once local time reaches this,
+    /// the runtime starts agent time by itself (once a day, never after the
+    /// person paused or stopped a run that day). `None` = manual Start only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_start: Option<NaiveTime>,
 }
 
 impl Default for AgentTimeGrant {
@@ -986,6 +991,7 @@ impl Default for AgentTimeGrant {
             scope: AgentTimeScope::default(),
             connector_id: None,
             model: None,
+            window_start: None,
         }
     }
 }
@@ -1105,6 +1111,10 @@ pub struct AgentTimeSession {
     /// `None` = work in Hobbes-owned space.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_id: Option<String>,
+    /// When the person read this run in the agent-time review
+    /// (`PlannerState::mark_reviewed`). `None` = not reviewed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewed_at: Option<DateTime<Utc>>,
 }
 
 impl AgentTimeSession {
@@ -1167,6 +1177,9 @@ pub enum ProposalStatus {
     /// Accepted after the person edited it.
     Edited,
     Dismissed,
+    /// A graded result (Prepare / Finish / Tend) the person sent back:
+    /// neither kept nor discarded. Never used for Notice proposals.
+    NeedsWork,
 }
 
 #[allow(dead_code)] // wave 2: Planner UI / weekly review
@@ -1177,7 +1190,127 @@ impl ProposalStatus {
             ProposalStatus::Accepted => "accepted",
             ProposalStatus::Edited => "edited",
             ProposalStatus::Dismissed => "dismissed",
+            ProposalStatus::NeedsWork => "needs_work",
         }
+    }
+
+    /// The verdict in words for a result of `job`: graded jobs read
+    /// kept / needs work / discarded, Notice proposals accepted / dismissed.
+    pub fn verdict_word(self, job: Job) -> &'static str {
+        match (job.is_graded(), self) {
+            (_, ProposalStatus::Open) => {
+                if job.is_graded() {
+                    "ungraded"
+                } else {
+                    "open"
+                }
+            }
+            (_, ProposalStatus::NeedsWork) => "needs work",
+            (true, ProposalStatus::Accepted | ProposalStatus::Edited) => "kept",
+            (true, ProposalStatus::Dismissed) => "discarded",
+            (false, ProposalStatus::Accepted | ProposalStatus::Edited) => "accepted",
+            (false, ProposalStatus::Dismissed) => "dismissed",
+        }
+    }
+}
+
+/// Which of agent time's four jobs a result belongs to.
+///
+/// - `Prepare`: briefs / drafts / background for a commitment the person
+///   flagged "Prep this" (`Todo::prep_requested`).
+/// - `Finish`: finished work on the agent-lane queue.
+/// - `Notice`: a proposal for a change to the person's stuff (accept /
+///   dismiss). Rows saved before jobs existed load as `Notice`.
+/// - `Tend`: Hobbes's own upkeep (corrections, its own friction, learning
+///   its tools, tidying memory). Read-only outside Hobbes.
+///
+/// Prepare / Finish / Tend results are *graded*: `Accepted` = Keep,
+/// `NeedsWork` = Needs work, `Dismissed` = Discard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Job {
+    Prepare,
+    Finish,
+    #[default]
+    Notice,
+    Tend,
+}
+
+#[allow(dead_code)] // label: consumer is the agent-time review UI
+impl Job {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Job::Prepare => "prepare",
+            Job::Finish => "finish",
+            Job::Notice => "notice",
+            Job::Tend => "tend",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Job::Prepare => "Prepare",
+            Job::Finish => "Finish",
+            Job::Notice => "Notice",
+            Job::Tend => "Tend",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "prepare" | "prep" => Some(Job::Prepare),
+            "finish" | "finished" => Some(Job::Finish),
+            "notice" => Some(Job::Notice),
+            "tend" | "upkeep" => Some(Job::Tend),
+            _ => None,
+        }
+    }
+
+    /// Whether results of this job are graded Keep / Needs work / Discard
+    /// (everything but Notice).
+    pub fn is_graded(self) -> bool {
+        self != Job::Notice
+    }
+
+    pub fn is_notice(&self) -> bool {
+        *self == Job::Notice
+    }
+}
+
+/// The person's comment on a result. Kept on the result and shown to the
+/// agent in the next window's opening context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResultNote {
+    pub at: DateTime<Utc>,
+    pub text: String,
+}
+
+/// A question agent time saved instead of stopping the run to ask
+/// (`HOBBES_AGENT_TIME ask`). The person answers it in the review; the
+/// answer reaches the next window's opening context once, then is
+/// `consumed`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentQuestion {
+    pub id: String,
+    /// The agent-time session that asked it.
+    pub session_id: String,
+    pub question: String,
+    /// Suggested answers (may be empty: a free answer).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+    pub asked_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answered_at: Option<DateTime<Utc>>,
+    /// The answer was delivered into a window's opening context.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consumed: bool,
+}
+
+impl AgentQuestion {
+    pub fn is_open(&self) -> bool {
+        self.answer.is_none()
     }
 }
 
@@ -1214,6 +1347,23 @@ pub struct Proposal {
     /// leaves the lists, but stays on disk with its revision record.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub removed: bool,
+    /// Which job produced it. Rows saved before jobs existed are `Notice`.
+    #[serde(default, skip_serializing_if = "Job::is_notice")]
+    pub job: Job,
+    /// A Tend result correcting something Hobbes told the person. Shown
+    /// first in the review.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub correction: bool,
+    /// The person's comments on it, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<ResultNote>,
+}
+
+impl Proposal {
+    /// A graded result (Prepare / Finish / Tend), not a Notice proposal.
+    pub fn is_result(&self) -> bool {
+        self.job.is_graded()
+    }
 }
 
 /// One after-the-fact change to a resolved proposal (Trust ledger → Review).
@@ -1252,6 +1402,18 @@ pub struct TrustLedger {
     /// Sessions that ended with zero out-of-scope attempts.
     #[serde(default)]
     pub clean_sessions: u32,
+    /// Graded results (Prepare / Finish / Tend) the person kept.
+    #[serde(default)]
+    pub results_kept: u32,
+    /// Graded results sent back as "needs work".
+    #[serde(default)]
+    pub results_needs_work: u32,
+    /// Graded results discarded.
+    #[serde(default)]
+    pub results_discarded: u32,
+    /// Corrections Hobbes delivered (Tend results flagged `correction`).
+    #[serde(default)]
+    pub corrections_delivered: u32,
 }
 
 #[allow(dead_code)] // wave 2: Planner UI / weekly review
@@ -1261,6 +1423,12 @@ impl TrustLedger {
         let ok = self.proposals_accepted + self.proposals_edited;
         let total = ok + self.proposals_dismissed;
         (total > 0).then(|| ok as f64 / total as f64)
+    }
+
+    /// Kept over every graded result; `None` before any.
+    pub fn keep_rate(&self) -> Option<f64> {
+        let total = self.results_kept + self.results_needs_work + self.results_discarded;
+        (total > 0).then(|| self.results_kept as f64 / total as f64)
     }
 
     pub fn in_scope_rate(&self) -> Option<f64> {
@@ -1363,6 +1531,11 @@ pub struct Todo {
     /// it. `None` when unknown (a Claude Code run on its default model).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_model: Option<String>,
+    /// "Prep this": the person asked agent time to prepare for this human
+    /// to-do (briefs, drafts, background). Only the person sets it — the
+    /// model's to-do tools refuse it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prep_requested: bool,
 
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -1400,6 +1573,8 @@ impl Todo {
             Lane::Agent => {
                 self.kind = None;
                 self.time_category = None;
+                // "Prep this" is for the person's own commitments.
+                self.prep_requested = false;
                 if self.agent_state.is_none() {
                     self.agent_state = Some(AgentState::Queued);
                 }
@@ -1444,6 +1619,7 @@ impl Todo {
             agent_state: None,
             decision: None,
             worker_model: None,
+            prep_requested: false,
             created_at: now,
             updated_at: now,
             completed_at: None,

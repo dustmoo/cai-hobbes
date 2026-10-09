@@ -251,8 +251,6 @@ pub(crate) fn AgentTimeView() -> Element {
     let settings = use_context::<Signal<Settings>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut todo_detail = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
-    // The dispatch path "Accept & start" shares with HOBBES_DISPATCH (P-015).
-    let dispatch_ctx = crate::components::builtin_tools::builtin_ctx_from_tree();
     // Proposals accepted in this sitting, shown as one line each.
     let mut accepted = use_signal(Vec::<AcceptedLine>::new);
     // Calls the run is waiting on the user for. A memo, so a chunk streaming
@@ -679,7 +677,7 @@ pub(crate) fn AgentTimeView() -> Element {
                                                             let pid = pid.clone();
                                                             move |_| {
                                                                 let edited = editing.peek().clone().map(|(_, t, b)| (t, b));
-                                                                if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, edited, false) {
+                                                                if let Some(line) = accept(planner, settings, &pid, edited, false) {
                                                                     accepted.write().push(line);
                                                                 }
                                                                 editing.set(None);
@@ -696,11 +694,11 @@ pub(crate) fn AgentTimeView() -> Element {
                                                     if starts {
                                                         button {
                                                             class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
-                                                            title: if running { "Accept and hand it to the running agent-time session" } else { "Accept and start it in a new chat (uses no agent time)" },
+                                                            title: if running { "Accept and hand it to the running agent-time session" } else { "Accept and queue it for the next agent time" },
                                                             onclick: {
                                                                 let pid = pid.clone();
                                                                 move |_| {
-                                                                    if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, None, true) {
+                                                                    if let Some(line) = accept(planner, settings, &pid, None, true) {
                                                                         if let Some(chat) = line.chat_id.clone().filter(|_| !line.error) {
                                                                             chat_command.set(Some(ChatCommand::OpenTabInBackground(chat)));
                                                                         }
@@ -716,7 +714,7 @@ pub(crate) fn AgentTimeView() -> Element {
                                                             onclick: {
                                                                 let pid = pid.clone();
                                                                 move |_| {
-                                                                    if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, None, false) {
+                                                                    if let Some(line) = accept(planner, settings, &pid, None, false) {
                                                                         accepted.write().push(line);
                                                                     }
                                                                 }
@@ -729,7 +727,7 @@ pub(crate) fn AgentTimeView() -> Element {
                                                             onclick: {
                                                                 let pid = pid.clone();
                                                                 move |_| {
-                                                                    if let Some(line) = accept(planner, settings, dispatch_ctx, &pid, None, false) {
+                                                                    if let Some(line) = accept(planner, settings, &pid, None, false) {
                                                                         accepted.write().push(line);
                                                                     }
                                                                 }
@@ -965,7 +963,8 @@ pub(crate) fn AgentTimeView() -> Element {
                                         "shrink-0 rounded-full border border-primary-400 px-2 text-[10.5px] text-fg"
                                     };
                                     let verdict = match row.status {
-                                        ProposalStatus::Edited => "accepted \u{b7} edited",
+                                        ProposalStatus::Edited if !row.is_result() => "accepted \u{b7} edited",
+                                        _ if row.is_result() || row.status == ProposalStatus::NeedsWork => row.status.verdict_word(row.job),
                                         ProposalStatus::Dismissed => "dismissed",
                                         _ => "accepted",
                                     };
@@ -1085,15 +1084,14 @@ fn dismiss(mut planner: Signal<PlannerState>, id: &str) {
 }
 
 /// Accept a proposal (`PlannerState::accept_proposal`: an offer moves the
-/// to-do to the agent lane, a suggested to-do is created) and persist it.
-/// With `start`, also start the work ("Accept & start"): hand it to the
-/// running agent-time session when one has budget left, else dispatch it
-/// to a new chat worker on the grant's model, which is user-initiated and
-/// uses no agent time. Returns the line shown in place of the card.
+/// to-do to the agent lane, a suggested to-do is created; a delivered
+/// result is kept) and persist it. Accepting never opens a chat tab: with
+/// `start`, a to-do it starts is handed to the running agent-time session
+/// when one has budget left; otherwise it stays `Queued` for the next
+/// agent-time window. Returns the line shown in place of the card.
 fn accept(
     mut planner: Signal<PlannerState>,
     settings: Signal<Settings>,
-    ctx: crate::components::builtin_tools::BuiltinToolCtx,
     id: &str,
     edited: Option<(String, String)>,
     start: bool,
@@ -1115,6 +1113,10 @@ fn accept(
         todo_id: todo_id.clone(),
         error: false,
     };
+    if p.is_result() {
+        line.text = "Kept".to_string();
+        return Some(line);
+    }
     if !proposal_starts_work(p) {
         line.text = match p.kind {
             ProposalKind::Todo => "Added to your Inbox".to_string(),
@@ -1132,7 +1134,8 @@ fn accept(
         return Some(line);
     }
     // Bind the route first: a `peek()` in the match scrutinee would hold the
-    // planner's read guard across both arms, and each arm writes the planner.
+    // planner's read guard across both arms, and hand_to_run writes the
+    // planner.
     let route = accept_start_route(&planner.peek(), today(), Utc::now());
     match route {
         AcceptStartRoute::HandToRun { .. } => {
@@ -1143,36 +1146,12 @@ fn accept(
                     line.chat_id = Some(chat);
                 }
                 None => {
-                    line.text = "Queued; agent time stopped before it could take it".to_string();
-                    line.error = true;
+                    line.text = "Queued for the next agent time; the run stopped before it could take it".to_string();
                 }
             }
         }
-        AcceptStartRoute::NewChat => {
-            let choice = crate::agent_time_runtime::grant_model_choice(
-                &planner.peek().agent_time_grant,
-                &settings.peek(),
-            );
-            let started = choice.and_then(|choice| {
-                crate::todo::dispatch::dispatch_to_chat(
-                    ctx,
-                    &todo_id,
-                    crate::todo::dispatch::ChatDispatchOpts { choice, focus: false, ..Default::default() },
-                )
-            });
-            match started {
-                Ok(d) => {
-                    line.text = format!(
-                        "Started in a new chat \u{b7} {} \u{b7} uses no agent time",
-                        short_model_label(&d.model)
-                    );
-                    line.chat_id = Some(d.session_id);
-                }
-                Err(e) => {
-                    line.text = format!("Queued; couldn't start: {e}");
-                    line.error = true;
-                }
-            }
+        AcceptStartRoute::NextWindow => {
+            line.text = "Queued for the next agent time".to_string();
         }
     }
     Some(line)
@@ -1182,39 +1161,70 @@ fn accept(
 mod tests {
     use super::*;
 
+    fn offer_state(lease: bool) -> (PlannerState, String) {
+        use crate::todo::model::{AgentTimeGrant, Proposal, ProposalKind, ProposalStatus, Todo};
+        let mut state = PlannerState::default();
+        state.agent_time_grant = AgentTimeGrant { enabled: true, daily_minutes: 45, spend_cap_usd: 2.0, ..Default::default() };
+        let todo = Todo::new("Compare Threadripper Halo vs DGX Station", 1.0);
+        let todo_id = todo.id.clone();
+        state.todos.push(todo);
+        state.proposals.push(Proposal {
+            id: "pr-offer".into(),
+            kind: ProposalKind::Offer,
+            title: "Hobbes offers to take it".into(),
+            body: String::new(),
+            status: ProposalStatus::Open,
+            created_at: Utc::now(),
+            resolved_at: None,
+            session_id: "ats-1".into(),
+            todo_id: Some(todo_id.clone()),
+            lane: None,
+            revisions: Vec::new(),
+            removed: false,
+            job: Default::default(),
+            correction: false,
+            notes: Vec::new(),
+        });
+        if lease {
+            state.open_agent_time_lease("chat-at", today(), Utc::now()).unwrap();
+        }
+        (state, todo_id)
+    }
+
     #[test]
-    fn accept_and_start_on_an_offer_dispatches_without_a_borrow_panic() {
+    fn accept_and_start_hands_to_the_running_run_without_a_borrow_panic() {
         // Regression: `match accept_start_route(&planner.peek(), ..)` held the
-        // planner's read guard across the arms, and dispatch_to_chat's
+        // planner's read guard across the arms, and the arm's
         // `planner.write()` panicked (crash on "Accept & start", 2026-10-07).
         let mut dom = dioxus::prelude::VirtualDom::new(|| {
-            use crate::todo::model::{AgentState, Lane, Proposal, ProposalKind, ProposalStatus, Todo};
-            let mut state = PlannerState::default();
-            let todo = Todo::new("Compare Threadripper Halo vs DGX Station", 1.0);
-            let todo_id = todo.id.clone();
-            state.todos.push(todo);
-            state.proposals.push(Proposal {
-                id: "pr-offer".into(),
-                kind: ProposalKind::Offer,
-                title: "Hobbes offers to take it".into(),
-                body: String::new(),
-                status: ProposalStatus::Open,
-                created_at: Utc::now(),
-                resolved_at: None,
-                session_id: "ats-1".into(),
-                todo_id: Some(todo_id.clone()),
-                lane: None,
-                revisions: Vec::new(),
-                removed: false,
-            });
+            use crate::todo::model::Lane;
+            let (state, todo_id) = offer_state(true);
             let ctx = crate::todo::dispatch::tests::test_ctx_with(state, Settings::default());
-            let line = accept(ctx.planner, ctx.settings, ctx, "pr-offer", None, true).expect("accepted");
+            let line = accept(ctx.planner, ctx.settings, "pr-offer", None, true).expect("accepted");
             assert!(!line.error, "{}", line.text);
-            let chat = line.chat_id.expect("a chat started");
+            assert_eq!(line.chat_id.as_deref(), Some("chat-at"), "the running run's chat, not a new one");
             let t = ctx.planner.peek().todo(&todo_id).cloned().unwrap();
             assert_eq!(t.lane, Lane::Agent);
-            assert_eq!(t.agent_state, Some(AgentState::Working));
-            assert_eq!(t.linked_fleet_session.as_deref(), Some(chat.as_str()));
+            assert!(ctx.session_state.peek().sessions.is_empty(), "no chat was created");
+
+            dioxus::prelude::rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
+    fn accept_and_start_without_a_run_queues_for_the_next_window() {
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            use crate::todo::model::{AgentState, Lane};
+            let (state, todo_id) = offer_state(false);
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(state, Settings::default());
+            let line = accept(ctx.planner, ctx.settings, "pr-offer", None, true).expect("accepted");
+            assert!(!line.error, "{}", line.text);
+            assert_eq!(line.text, "Queued for the next agent time");
+            assert_eq!(line.chat_id, None, "accepting never opens a tab");
+            let t = ctx.planner.peek().todo(&todo_id).cloned().unwrap();
+            assert_eq!((t.lane, t.agent_state), (Lane::Agent, Some(AgentState::Queued)));
+            assert!(ctx.session_state.peek().sessions.is_empty(), "no chat was created");
 
             dioxus::prelude::rsx! { div {} }
         });
@@ -1294,6 +1304,9 @@ mod tests {
             lane: None,
             revisions: Vec::new(),
             removed: false,
+            job: Default::default(),
+            correction: false,
+            notes: Vec::new(),
         };
         assert_eq!(proposal_headline(&p), "Hobbes offers to take: Draft the release notes");
         assert_eq!(kind_label(ProposalKind::Offer), "Offer to take");
@@ -1314,6 +1327,7 @@ mod tests {
             promises_kept: 9,
             promises_broken: 1,
             clean_sessions: 23,
+            ..Default::default()
         };
         let s = trust_stats(&l);
         assert_eq!(s[0], ("86%".to_string(), "accepted \u{b7} 38 of 44".to_string()));
@@ -1337,6 +1351,7 @@ mod tests {
             chat_session_id: None,
             out_of_scope_attempts: 0,
             todo_id: None,
+            reviewed_at: None,
         };
         assert_eq!(log_meta(&s, now), "18m \u{b7} $0.42 \u{b7} 0 tool calls");
         // Only real calls count: not the model's notes or the runtime's lines.

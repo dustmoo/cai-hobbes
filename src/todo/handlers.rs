@@ -245,6 +245,7 @@ fn build_todo(
     today: NaiveDate,
 ) -> Result<Todo, String> {
     let obj = item.as_object().ok_or("expected an object")?;
+    refuse_prep_flag(obj)?;
     let title = obj
         .get("title")
         .and_then(|v| v.as_str())
@@ -336,6 +337,16 @@ fn new_checklist_item(title: &str) -> ChecklistItem {
         title: title.to_string(),
         done: false,
     }
+}
+
+/// "Prep this" is the person's flag: the model's to-do tools refuse it.
+fn refuse_prep_flag(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
+    if obj.contains_key("prep_requested") || obj.contains_key("prep") {
+        return Err("'prep_requested' (\"Prep this\") is the user's own flag: only they set it, \
+                    in the Planner. Leave it out."
+            .into());
+    }
+    Ok(())
 }
 
 // ── HOBBES_TODO_UPDATE ──────────────────────────────────────────────────────
@@ -501,6 +512,7 @@ fn apply_todo_update(
         .and_then(|v| v.as_str())
         .ok_or("missing required 'id'")?;
 
+    refuse_prep_flag(obj)?;
     // Parse every patch before touching the todo so a bad field can't leave a
     // half-applied update behind.
     let scheduled = patch_from(obj, "scheduled_for", |v| {
@@ -2552,9 +2564,10 @@ pub fn handle_agent_time_for(
                     let lists = super::agent_time::agent_time_task_lists(state, today, &worker_live);
                     format!(
                         "Agent time started (session {}). Intent logged. {on} Budget left today: {} and \
-                         ${:.2}. Outputs are proposals only (propose); anything with an outside effect \
-                         goes through the normal approval gate. Every tool call is recorded for you. \
-                         Call end(summary) when done.\n\n{}",
+                         ${:.2}. Deliver finished work with deliver (job: prepare, finish or tend); file \
+                         changes to the user's stuff with propose; save questions with ask instead of \
+                         stopping. Anything with an outside effect goes through the normal approval \
+                         gate. Every tool call is recorded for you. Call end(summary) when done.\n\n{}",
                         s.id,
                         model::format_minutes(b.minutes_left()),
                         b.spend_left_usd(),
@@ -2599,6 +2612,86 @@ pub fn handle_agent_time_for(
                 })
             }
         },
+        "deliver" => match super::model::Job::parse(text("job")) {
+            None => Err(AgentTimeRefusal::Invalid(
+                "Provide 'job': prepare, finish, or tend. (Changes to the user's stuff are \
+                 proposals: use propose.)"
+                    .into(),
+            )),
+            Some(job) => {
+                let kind = match text("kind").trim() {
+                    "" => Ok(None),
+                    k => super::model::ProposalKind::parse(k).map(Some).ok_or_else(|| {
+                        AgentTimeRefusal::Invalid(
+                            "Unknown 'kind': use note, todo, skill, research, or other.".into(),
+                        )
+                    }),
+                };
+                kind.and_then(|kind| {
+                    let todo_id = Some(text("todo_id")).filter(|t| !t.trim().is_empty());
+                    let correction = args.get("correction").and_then(|v| v.as_bool()).unwrap_or(false);
+                    state.agent_time_deliver(
+                        session_id,
+                        super::agent_time::Delivery {
+                            job,
+                            kind,
+                            title: text("title"),
+                            body: text("body"),
+                            todo_id,
+                            correction,
+                        },
+                        today,
+                        now,
+                    )
+                })
+                .map(|d| {
+                    persist_session(&d.session);
+                    if persist {
+                        if let Err(e) = store::save_proposal(&d.result) {
+                            tracing::error!("Failed to persist result {}: {}", d.result.id, e);
+                        }
+                        if let Some(t) = &d.todo {
+                            persist_todo(t, true);
+                        }
+                        if d.result.correction {
+                            if let Err(e) = store::save_trust_ledger(&state.trust_ledger) {
+                                tracing::error!("Failed to persist trust ledger: {}", e);
+                            }
+                        }
+                    }
+                    let flag = if d.result.correction { " (correction)" } else { "" };
+                    format!(
+                        "Delivered {} ({}{flag}: {}). It waits in the user's review; they will keep \
+                         it, send it back as needs work, or discard it.",
+                        d.result.id,
+                        d.result.job.as_str(),
+                        d.result.title
+                    )
+                })
+            }
+        },
+        "ask" => {
+            let options: Vec<String> = args
+                .get("options")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|o| o.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            state
+                .agent_time_ask(session_id, text("question"), &options, today, now)
+                .map(|(q, s)| {
+                    persist_session(&s);
+                    if persist {
+                        if let Err(e) = store::save_agent_question(&q) {
+                            tracing::error!("Failed to persist question {}: {}", q.id, e);
+                        }
+                    }
+                    format!(
+                        "Question {} saved for the user's review. Don't wait for the answer: carry \
+                         on with what you can do without it. The answer reaches your next window.",
+                        q.id
+                    )
+                })
+        }
         "end" => state.agent_time_end(session_id, text("summary"), now).map(|s| {
             persist_session(&s);
             if persist {
@@ -2607,14 +2700,14 @@ pub fn handle_agent_time_for(
                 }
             }
             format!(
-                "Agent time ended after {} with {} proposal(s), {} tool call(s).",
+                "Agent time ended after {} with {} result(s) and proposal(s), {} tool call(s).",
                 model::format_minutes(s.minutes_used(now)),
                 s.outputs.len(),
                 s.call_count()
             )
         }),
         other => Err(AgentTimeRefusal::Invalid(format!(
-            "Unknown action '{}' — expected start, log, propose, or end.",
+            "Unknown action '{}' — expected start, log, deliver, propose, ask, or end.",
             other
         ))),
     };
@@ -4948,7 +5041,7 @@ mod tests {
         assert_eq!(status, ToolCallStatus::Error);
         let (status, out) = handle_agent_time(&mut state, &json!({"action": "end", "summary": "one digest"}), "agent-chat", today(), false);
         assert_eq!(status, ToolCallStatus::Completed, "{out}");
-        assert!(out.contains("1 proposal(s)"), "{out}");
+        assert!(out.contains("1 result(s) and proposal(s)"), "{out}");
         assert_eq!(state.open_proposals().len(), 1);
     }
 
@@ -5059,5 +5152,66 @@ mod tests {
         let t = state.todo(&id).unwrap();
         assert_eq!(t.agent_state, Some(model::AgentState::Stuck));
         assert!(t.decision.is_none(), "the gate's synthesized decision cleared");
+    }
+
+    #[test]
+    fn the_model_cannot_set_prep_this() {
+        let mut state = PlannerState::default();
+        let (status, out) = create(&mut state, json!({"todos": [{"title": "Investor call", "prep_requested": true}]}));
+        assert_eq!(status, ToolCallStatus::Error, "{out}");
+        assert!(out.contains("user's own flag"), "{out}");
+        assert!(state.todos.is_empty());
+        let (status, _) = create(&mut state, json!({"todos": [{"title": "Investor call"}]}));
+        assert_eq!(status, ToolCallStatus::Completed);
+        let id = state.todos[0].id.clone();
+        let (status, out) = update(&mut state, json!({"updates": [{"id": id, "prep_requested": true}]}));
+        assert_eq!(status, ToolCallStatus::Error, "{out}");
+        assert!(out.contains("only they set it"), "{out}");
+        let (status, _) = update(&mut state, json!({"updates": [{"id": id, "prep": false, "title": "Renamed"}]}));
+        assert_eq!(status, ToolCallStatus::Error);
+        let t = state.todo(&id).unwrap();
+        assert!(!t.prep_requested && t.title == "Investor call", "nothing applied");
+    }
+
+    #[test]
+    fn agent_time_deliver_and_ask_go_through_the_tool() {
+        let mut state = PlannerState {
+            agent_time_grant: model::AgentTimeGrant { enabled: true, daily_minutes: 45, spend_cap_usd: 2.0, ..Default::default() },
+            ..Default::default()
+        };
+        let mut call = model::Todo::new("Investor call", 1.0);
+        call.prep_requested = true;
+        let call_id = call.id.clone();
+        state.todos.push(call);
+        state.open_agent_time_lease("agent-chat", today(), Utc::now()).unwrap();
+        let at = |state: &mut PlannerState, args: Value| handle_agent_time(state, &args, "agent-chat", today(), false);
+
+        let (status, out) = at(&mut state, json!({"action": "start", "intent": "Prep the investor call"}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("Prepare: the user asked you to prep these") && out.contains("Investor call"), "{out}");
+        let (status, out) = at(&mut state, json!({"action": "deliver", "title": "x", "body": "y"}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("'job'"), "{out}");
+        let (status, out) = at(&mut state, json!({"action": "deliver", "job": "prepare", "kind": "poem", "title": "x", "body": "y", "todo_id": call_id}));
+        assert_eq!(status, ToolCallStatus::Error, "{out}");
+        let (status, out) = at(&mut state, json!({"action": "deliver", "job": "prepare", "kind": "research", "title": "Investor call brief", "body": "Who, what, asks.", "todo_id": call_id}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("Delivered") && out.contains("prepare"), "{out}");
+        let (status, out) = at(&mut state, json!({"action": "deliver", "job": "tend", "title": "Correction", "body": "Was 12th; checked the invite: 14th.", "correction": true}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("(correction)"), "{out}");
+        assert_eq!(state.trust_ledger.corrections_delivered, 1);
+        let (status, out) = at(&mut state, json!({"action": "ask", "question": "Formal or casual?", "options": ["Formal", "Casual"]}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("carry on"), "{out}");
+        assert_eq!(state.open_questions()[0].options, vec!["Formal".to_string(), "Casual".into()]);
+        let (status, out) = at(&mut state, json!({"action": "end", "summary": "brief and a correction"}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("2 result(s) and proposal(s)"), "{out}");
+        let results: Vec<model::Job> = state.proposals.iter().map(|p| p.job).collect();
+        assert_eq!(results, vec![model::Job::Prepare, model::Job::Tend]);
+        let (status, out) = at(&mut state, json!({"action": "dance"}));
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("deliver") && out.contains("ask"), "{out}");
     }
 }

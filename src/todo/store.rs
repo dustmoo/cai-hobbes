@@ -20,7 +20,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::session_store::{next_seq, with_conn};
 
 use super::model::{
-    AgentTimeSession, Area, CalendarEvent, DayPlan, FocusSession, Project, Proposal,
+    AgentQuestion, AgentTimeSession, Area, CalendarEvent, DayPlan, FocusSession, Project, Proposal,
     ResolvedDecision, TimeBlock, TimeGoal, Todo,
 };
 use super::PlannerState;
@@ -196,6 +196,20 @@ const MIGRATION_V5: &str = "
     );
 ";
 
+/// v6 (agent time v2): questions agent time saved for the person
+/// (`HOBBES_AGENT_TIME ask`). Results, grades and notes ride in the existing
+/// `todo_proposals.data` JSON and default on read, so proposals need no ALTER.
+const MIGRATION_V6: &str = "
+    CREATE TABLE IF NOT EXISTS todo_agent_questions (
+        id         TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        asked_at   TEXT NOT NULL,
+        seq        INTEGER NOT NULL,
+        data       TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_todo_agent_questions_asked ON todo_agent_questions(asked_at);
+";
+
 /// Ordered migrations. Append only — never edit a shipped entry, since
 /// databases in the wild have already recorded it as applied.
 const MIGRATIONS: &[(i32, &str)] = &[
@@ -204,6 +218,7 @@ const MIGRATIONS: &[(i32, &str)] = &[
     (3, MIGRATION_V3),
     (4, MIGRATION_V4),
     (5, MIGRATION_V5),
+    (6, MIGRATION_V6),
 ];
 
 /// `todo_kv` keys.
@@ -269,6 +284,7 @@ pub(crate) fn max_seq(conn: &Connection) -> i64 {
         "todo_proposals",
         "todo_decisions",
         "todo_kv",
+        "todo_agent_questions",
     ]
         .iter()
         .map(|table| {
@@ -589,6 +605,29 @@ pub fn upsert_proposal_conn(conn: &Connection, proposal: &Proposal, seq: i64) ->
     Ok(())
 }
 
+pub fn upsert_agent_question_conn(
+    conn: &Connection,
+    question: &AgentQuestion,
+    seq: i64,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO todo_agent_questions (id, session_id, asked_at, seq, data)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(id) DO UPDATE SET
+             session_id = excluded.session_id, asked_at = excluded.asked_at,
+             seq = excluded.seq, data = excluded.data
+         WHERE excluded.seq >= todo_agent_questions.seq",
+        params![
+            question.id,
+            question.session_id,
+            fmt_ts(&question.asked_at),
+            seq,
+            to_json(question)?
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn upsert_decision_conn(
     conn: &Connection,
     decision: &ResolvedDecision,
@@ -713,6 +752,11 @@ pub fn load_all_conn(conn: &Connection) -> rusqlite::Result<PlannerState> {
             v.sort_by_key(|d| d.resolved_at);
             v
         },
+        agent_questions: {
+            let mut v: Vec<AgentQuestion> = load_data_column(conn, "todo_agent_questions")?;
+            v.sort_by_key(|q| q.asked_at);
+            v
+        },
         agent_time_lease: None,
     })
 }
@@ -775,6 +819,11 @@ pub fn save_agent_time_session(session: &AgentTimeSession) -> Result<(), String>
 pub fn save_proposal(proposal: &Proposal) -> Result<(), String> {
     let seq = next_seq();
     with_conn(|conn| upsert_proposal_conn(conn, proposal, seq))
+}
+
+pub fn save_agent_question(question: &AgentQuestion) -> Result<(), String> {
+    let seq = next_seq();
+    with_conn(|conn| upsert_agent_question_conn(conn, question, seq))
 }
 
 pub fn save_resolved_decision(decision: &ResolvedDecision) -> Result<(), String> {
@@ -1613,7 +1662,7 @@ mod tests {
         let version: i32 = conn
             .query_row("SELECT version FROM schema_migrations WHERE domain = 'todo'", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
         let loaded = load_all_conn(&conn).unwrap();
         assert_eq!(loaded.todos.len(), 1);
         let t = &loaded.todos[0];
@@ -1663,6 +1712,7 @@ mod tests {
                 chat_session_id: Some("chat".into()),
                 out_of_scope_attempts: 0,
                 todo_id: None,
+                reviewed_at: Some(now),
             };
             upsert_agent_time_session_conn(conn, &session, 2).unwrap();
             let proposal = Proposal {
@@ -1678,6 +1728,9 @@ mod tests {
                 lane: None,
                 revisions: Vec::new(),
                 removed: false,
+                job: Job::Finish,
+                correction: false,
+                notes: vec![ResultNote { at: now, text: "Shorter next time".into() }],
             };
             upsert_proposal_conn(conn, &proposal, 3).unwrap();
             let decision = ResolvedDecision {
@@ -1716,8 +1769,20 @@ mod tests {
                 source: BlockSource::YourTime { category: "Outside".into() },
             };
             upsert_block_conn(conn, &block, 9).unwrap();
+            let question = AgentQuestion {
+                id: "aq_1".into(),
+                session_id: "at_1".into(),
+                question: "Formal or casual?".into(),
+                options: vec!["Formal".into(), "Casual".into()],
+                asked_at: now,
+                answer: Some("Casual".into()),
+                answered_at: Some(now),
+                consumed: false,
+            };
+            upsert_agent_question_conn(conn, &question, 10).unwrap();
 
             let loaded = load_all_conn(conn).unwrap();
+            assert_eq!(loaded.agent_questions, vec![question]);
             assert_eq!(loaded.time_goals, vec![goal]);
             assert_eq!(loaded.agent_time_sessions, vec![session]);
             assert_eq!(loaded.proposals, vec![proposal]);
@@ -1727,7 +1792,7 @@ mod tests {
             assert_eq!(loaded.review_signals, signals);
             assert_eq!(loaded.todos[0], todo);
             assert_eq!(loaded.blocks[0], block);
-            assert_eq!(max_seq(conn), 9, "max_seq spans the new tables");
+            assert_eq!(max_seq(conn), 10, "max_seq spans the new tables");
         });
     }
 }

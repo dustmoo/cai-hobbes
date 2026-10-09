@@ -67,6 +67,9 @@ pub struct PlannerState {
     pub review_signals: ReviewSignals,
     /// Answered agent decisions, oldest first.
     pub decision_log: Vec<ResolvedDecision>,
+    /// Questions agent time saved for the person (`HOBBES_AGENT_TIME ask`),
+    /// oldest first.
+    pub agent_questions: Vec<model::AgentQuestion>,
     /// Runtime only, never persisted: the chat session the agent-time
     /// runtime is currently running in. `HOBBES_AGENT_TIME` is refused from
     /// any other session (see `agent_time`).

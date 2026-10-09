@@ -240,27 +240,6 @@ pub struct BuiltinToolCtx {
     pub chat_command: Signal<Option<crate::components::chat_input::ChatCommand>>,
 }
 
-/// Assemble [`BuiltinToolCtx`] from the component tree, so UI surfaces can
-/// drive the same built-in code paths the model does (P-015: one dispatch
-/// path, never a second hand-rolled copy at a call site). Hook-shaped — call
-/// it unconditionally at the top of a component body.
-///
-/// Used by the Agent time panel's "Accept & start" (it dispatches through
-/// `todo::dispatch::dispatch_to_chat`). main.rs assembles its own
-/// `BuiltinToolCtx` from root-scope signals rather than `use_context`, since
-/// the root isn't a descendant of anything.
-pub(crate) fn builtin_ctx_from_tree() -> BuiltinToolCtx {
-    BuiltinToolCtx {
-        session_state: use_context(),
-        settings: use_context(),
-        skill_registry: use_context(),
-        permission_manager: use_context(),
-        mcp_context: use_context(),
-        planner: use_context(),
-        chat_command: use_context(),
-    }
-}
-
 /// Hand a planner todo to a headless Claude Code run — the exact code path
 /// `HOBBES_DISPATCH { target: "claude_code" }` takes, so the planner's
 /// "Dispatch to a background agent" and the model's tool call cannot drift.

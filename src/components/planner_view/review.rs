@@ -458,24 +458,40 @@ pub(crate) fn WeeklyReview() -> Element {
         (ProposalKind::Other, "Other"),
         (ProposalKind::Offer, "Offers to take a task"),
     ];
-    let prop_rows: Vec<(&str, u32, u32)> = kinds
+    // Notice proposals by kind (accepted vs dismissed), then delivered
+    // results by job (kept vs needs work or discarded).
+    let decided = |p: &&model::Proposal| in_week(p) && !p.removed;
+    let mut prop_rows: Vec<(&str, u32, u32)> = kinds
         .iter()
         .map(|(k, label)| {
-            let acc = state
-                .proposals
-                .iter()
-                .filter(|p| p.kind == *k && in_week(p) && !p.removed)
-                .filter(|p| matches!(p.status, ProposalStatus::Accepted | ProposalStatus::Edited))
-                .count() as u32;
-            let dis = state
-                .proposals
-                .iter()
-                .filter(|p| p.kind == *k && in_week(p) && !p.removed && p.status == ProposalStatus::Dismissed)
-                .count() as u32;
+            let notice = state.proposals.iter().filter(decided).filter(|p| p.job == model::Job::Notice && p.kind == *k);
+            let (acc, dis) = notice.fold((0u32, 0u32), |(a, d), p| match p.status {
+                ProposalStatus::Accepted | ProposalStatus::Edited => (a + 1, d),
+                ProposalStatus::Dismissed => (a, d + 1),
+                ProposalStatus::NeedsWork | ProposalStatus::Open => (a, d),
+            });
             (*label, acc, dis)
         })
         .filter(|(_, a, d)| a + d > 0)
         .collect();
+    let jobs = [
+        (model::Job::Prepare, "Prepared"),
+        (model::Job::Finish, "Finished work"),
+        (model::Job::Tend, "Upkeep"),
+    ];
+    prop_rows.extend(
+        jobs.iter()
+            .map(|(job, label)| {
+                let results = state.proposals.iter().filter(decided).filter(|p| p.job == *job);
+                let (kept, not_kept) = results.fold((0u32, 0u32), |(k, n), p| match p.status {
+                    ProposalStatus::Accepted | ProposalStatus::Edited => (k + 1, n),
+                    ProposalStatus::NeedsWork | ProposalStatus::Dismissed => (k, n + 1),
+                    ProposalStatus::Open => (k, n),
+                });
+                (*label, kept, not_kept)
+            })
+            .filter(|(_, a, d)| a + d > 0),
+    );
     drop(state);
 
     let has_goals = !goals.is_empty();
