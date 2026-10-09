@@ -124,6 +124,7 @@ mod tests {
                 connector_name: None,
                 model: None,
                 round_id: None,
+                cancelled: None,
             }),
             attachments: vec![],
             comments: vec![],

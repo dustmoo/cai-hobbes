@@ -6,7 +6,7 @@ use crate::components::shared::{StreamMessage, ToolCallStatus};
 
 use crate::services::tool_call_summarizer::ToolCallSummarizer;
 use crate::session::SessionState;
-use crate::session_events::{log_event, SessionEvent};
+use crate::session_events::{log_event, log_events, SessionEvent};
 use crate::settings::Settings;
 use dioxus::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -2141,7 +2141,7 @@ impl StreamManagerContext {
         //    The model may have already produced useful text/thinking content
         //    that the user wants to keep. Only remove orphaned Running tool
         //    call messages (they have no results and break the next prompt).
-        let (partial_message, removed_message_ids) = {
+        let (partial_message, removed_message_ids, stopped_calls) = {
             let mut state = self.session_state.write();
 
             // Check if the AI message has any content worth preserving.
@@ -2208,6 +2208,20 @@ impl StreamManagerContext {
                 }
             }
 
+            // Calls still running earlier in the turn (a parallel call that
+            // never returned) were cut off too: end them, marked as stopped,
+            // so the activity stream says "cancelled" for these and only these.
+            let stopped_calls = state
+                .sessions
+                .get_mut(session_id)
+                .map(|s| {
+                    s.cancel_running_calls(
+                        crate::components::shared::CANCELLED_BY_STOP,
+                        chrono::Utc::now(),
+                    )
+                })
+                .unwrap_or_default();
+
             // Clear stale tool_call_history from the cancelled turn so the
             // next prompt doesn't include CRITICAL RECOVERY INSTRUCTION or
             // stale tool context. Scoped to the cancelled stream's session so
@@ -2216,7 +2230,7 @@ impl StreamManagerContext {
                 session.tool_call_history.clear();
             }
 
-            (partial_message, removed_message_ids)
+            (partial_message, removed_message_ids, stopped_calls)
         };
 
         if partial_message.is_some() || !removed_message_ids.is_empty() {
@@ -2226,6 +2240,15 @@ impl StreamManagerContext {
                     partial_message,
                     removed_message_ids,
                 },
+            );
+        }
+        if !stopped_calls.is_empty() {
+            log_events(
+                session_id,
+                stopped_calls
+                    .into_iter()
+                    .map(|message| SessionEvent::ToolResult { message })
+                    .collect(),
             );
         }
 

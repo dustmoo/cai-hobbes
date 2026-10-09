@@ -170,7 +170,9 @@ pub fn live_placeholder_label(thought_summary: Option<&str>) -> String {
 
 /// Classify a tool call for its row icon and phrasing.
 pub fn step_kind(tc: &ToolCall) -> StepKind {
-    if tc.status == ToolCallStatus::Error {
+    // A cancelled call ended as an error result, but it didn't fail: it keeps
+    // its kind and the header counts it as cancelled instead.
+    if tc.status == ToolCallStatus::Error && tc.cancelled.is_none() {
         return StepKind::Error;
     }
     if tc.tool_name == TERMINAL_EXEC_TOOL {
@@ -812,14 +814,20 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
         })
         .max()
         .unwrap_or(turn_start);
-    let elapsed_secs = if props.is_live {
+    let elapsed_secs = if props.is_live || rows_running(&messages) {
         (now - turn_start).num_seconds()
     } else {
         (last_activity - turn_start).num_seconds()
     };
 
-    let cancelled = !props.is_live && rows.iter().any(|r| r.running);
-    let warn = failed > 0 || cancelled;
+    // "cancelled" only for calls something actually stopped (the user's
+    // Stop, Hobbes closing). A call still running after the stream ends is
+    // waiting on its result (a long terminal command, an approved call
+    // executing): the header keeps a working state until it lands.
+    let cancel_reason = cancelled_reason(&rows);
+    let waiting = !props.is_live && rows.iter().any(|r| r.running);
+    let working = props.is_live || waiting;
+    let warn = failed > 0 || cancel_reason.is_some();
 
     // A live block is always expanded; a finished one remembers the user's
     // choice across re-renders, defaulting to collapsed.
@@ -832,7 +840,7 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
 
     let border_class = if warn {
         "border-yellow-700/50"
-    } else if props.is_live {
+    } else if working {
         "border-subtle"
     } else {
         "border-faint"
@@ -901,7 +909,7 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                                 let current = expansion_state.read().get(&toggle_key).copied().unwrap_or(false);
                                 expansion_state.write().insert(toggle_key.clone(), !current);
                             },
-                            if props.is_live {
+                            if working {
                                 Icon {
                                     width: 14,
                                     height: 14,
@@ -923,13 +931,17 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                                         class: "font-mono text-fg-muted",
                                         "{live_usage_text}"
                                     }
-                                    button {
-                                        class: "px-2 py-0.5 rounded border border-faint text-fg-muted hover:text-fg hover:bg-card transition-colors",
-                                        onclick: move |evt: MouseEvent| {
-                                            evt.stop_propagation();
-                                            props.on_stop.call(());
-                                        },
-                                        "Stop"
+                                    // Stop cancels the stream; once it has
+                                    // ended there is nothing for it to stop.
+                                    if props.is_live {
+                                        button {
+                                            class: "px-2 py-0.5 rounded border border-faint text-fg-muted hover:text-fg hover:bg-card transition-colors",
+                                            onclick: move |evt: MouseEvent| {
+                                                evt.stop_propagation();
+                                                props.on_stop.call(());
+                                            },
+                                            "Stop"
+                                        }
                                     }
                                 }
                             } else {
@@ -957,8 +969,8 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                                 }
                                 if failed > 0 {
                                     span { class: "text-yellow-500 shrink-0", "{failed} failed" }
-                                } else if cancelled {
-                                    span { class: "text-yellow-500 shrink-0", "cancelled" }
+                                } else if let Some(reason) = cancel_reason.clone() {
+                                    span { class: "text-yellow-500 shrink-0", title: "{reason}", "cancelled" }
                                 }
                                 if let Some(usage_text) = &finished_usage_text {
                                     div {
@@ -1061,10 +1073,24 @@ pub fn ActivityStream(props: ActivityStreamProps) -> Element {
                 }
             }
         }
-        if props.is_live {
+        if working {
             Ticker { tick }
         }
     }
+}
+
+/// Why the run's calls were cut off, when any were (the first stopped
+/// call's reason); `None` when nothing was cancelled.
+fn cancelled_reason(rows: &[StepRow]) -> Option<String> {
+    rows.iter()
+        .find_map(|r| r.tool_call.as_ref().and_then(|tc| tc.cancelled.clone()))
+}
+
+/// Any call in the run still in flight.
+fn rows_running(messages: &[Message]) -> bool {
+    messages.iter().any(|m| {
+        matches!(&m.content, MessageContent::ToolCall(tc) if tc.status == ToolCallStatus::Running)
+    })
 }
 
 fn filter_class(selected: bool) -> &'static str {
@@ -1112,10 +1138,11 @@ struct ActivityRowProps {
 #[component]
 fn ActivityRow(props: ActivityRowProps) -> Element {
     let row = props.row.clone();
-    let duration_text = match row.duration_secs {
-        Some(s) => format_elapsed(s),
-        None if row.running => String::new(),
-        None => String::new(),
+    let cancelled = row.tool_call.as_ref().and_then(|tc| tc.cancelled.clone());
+    let duration_text = match (&cancelled, row.duration_secs) {
+        (Some(_), _) => "cancelled".to_string(),
+        (None, Some(s)) => format_elapsed(s),
+        (None, None) => String::new(),
     };
     let row_bg: &str = if row.running {
         "bg-card"
@@ -1148,7 +1175,11 @@ fn ActivityRow(props: ActivityRowProps) -> Element {
                     {step_icon(row.kind, row.running)}
                 }
                 span { class: "{label_class}", "{row.label}" }
-                span { class: "font-mono text-fg-muted text-[11px] text-right", "{duration_text}" }
+                span {
+                    class: if cancelled.is_some() { "text-yellow-500 text-[11px] text-right" } else { "font-mono text-fg-muted text-[11px] text-right" },
+                    title: "{cancelled.clone().unwrap_or_default()}",
+                    "{duration_text}"
+                }
             }
             if let Some(tail) = tail {
                 pre {
@@ -1625,6 +1656,7 @@ mod tests {
             connector_name: None,
             model: None,
             round_id: None,
+            cancelled: None,
         }
     }
 
@@ -2041,6 +2073,29 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].kind, StepKind::Thinking);
         assert_eq!(rows[0].label, "I should list the files.");
+    }
+
+    #[test]
+    fn a_cancelled_call_reads_as_cancelled_not_failed_and_a_running_one_as_neither() {
+        let start = Utc::now();
+        let mut stopped = tool("hobbes-terminal", "HOBBES_TERMINAL_EXEC", r#"{"command":"ls"}"#, ToolCallStatus::Running);
+        stopped.mark_cancelled(crate::components::shared::CANCELLED_BY_STOP, start);
+        assert_eq!(stopped.status, ToolCallStatus::Error, "never Running again: no approval re-runs it");
+        assert_eq!(step_kind(&stopped), StepKind::Command, "keeps its kind");
+
+        let failed = tool("gmail", "SEND", "{}", ToolCallStatus::Error);
+        let rows = build_rows(&[tool_msg(stopped), tool_msg(failed)], start, None);
+        assert_eq!(row_counts(&rows), (2, 1, 0, 1), "only the real error counts as failed");
+        assert_eq!(cancelled_reason(&rows).as_deref(), Some("Stopped by you"));
+
+        // Still in flight after the stream ended (waiting on a terminal):
+        // running, and nothing says cancelled.
+        let waiting = tool("hobbes-terminal", "HOBBES_TERMINAL_EXEC", r#"{"command":"make"}"#, ToolCallStatus::Running);
+        let msgs = [tool_msg(waiting)];
+        let rows = build_rows(&msgs, start, None);
+        assert!(rows[0].running);
+        assert_eq!(cancelled_reason(&rows), None);
+        assert!(rows_running(&msgs));
     }
 
     #[test]

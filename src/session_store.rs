@@ -570,6 +570,7 @@ fn parse_session(id: &str, data: &str) -> Option<Session> {
 /// save doesn't rewrite unchanged rows.
 pub fn load_sessions(ids: &[String]) -> HashMap<String, Session> {
     let mut out = HashMap::new();
+    let mut cancelled: Vec<(String, Vec<crate::components::chat::Message>)> = Vec::new();
     let result = with_conn(|conn| {
         let mut stmt = conn.prepare("SELECT data FROM sessions WHERE id = ?1")?;
         for id in ids {
@@ -577,8 +578,19 @@ pub fn load_sessions(ids: &[String]) -> HashMap<String, Session> {
             let data: Option<String> =
                 stmt.query_row(params![id], |r| r.get(0)).optional()?;
             if let Some(data) = data {
-                if let Some(session) = parse_session(id, &data) {
+                if let Some(mut session) = parse_session(id, &data) {
                     mark_row_loaded(id, &data);
+                    // Nothing runs a call across a restart: one still
+                    // `Running` on disk was cut off when Hobbes closed. End it
+                    // so the activity stream says why, and so the next
+                    // approval in this tab doesn't silently re-run it.
+                    let ended = session.cancel_running_calls(
+                        crate::components::shared::CANCELLED_BY_RESTART,
+                        chrono::Utc::now(),
+                    );
+                    if !ended.is_empty() {
+                        cancelled.push((id.clone(), ended));
+                    }
                     out.insert(id.clone(), session);
                 }
             }
@@ -587,6 +599,17 @@ pub fn load_sessions(ids: &[String]) -> HashMap<String, Session> {
     });
     if let Err(e) = result {
         tracing::error!("load_sessions failed: {e}");
+    }
+    // Journal outside `with_conn`: appending takes the same connection lock.
+    for (id, messages) in cancelled {
+        tracing::info!(session_id = %id, calls = messages.len(), "Ended tool calls cut off by a restart");
+        crate::session_events::log_events(
+            &id,
+            messages
+                .into_iter()
+                .map(|message| crate::session_events::SessionEvent::ToolResult { message })
+                .collect(),
+        );
     }
     out
 }

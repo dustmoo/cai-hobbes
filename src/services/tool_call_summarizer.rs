@@ -96,6 +96,7 @@ mod tests {
                     connector_name: None,
                     model: None,
                     round_id: None,
+                    cancelled: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -177,6 +178,7 @@ mod tests {
                 connector_name: None,
                 model: None,
                 round_id: None,
+                cancelled: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,

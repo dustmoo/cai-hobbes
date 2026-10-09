@@ -610,6 +610,25 @@ impl Session {
         count
     }
 
+    /// End every tool call still `Running` in this session with `reason`
+    /// ([`ToolCall::mark_cancelled`](crate::components::shared::ToolCall::mark_cancelled)).
+    /// Calls held for approval are `PermissionRequest`s and stay held.
+    /// Returns the changed messages, for the caller to journal as
+    /// `ToolResult`s.
+    pub fn cancel_running_calls(&mut self, reason: &str, now: DateTime<Utc>) -> Vec<crate::components::chat::Message> {
+        use crate::components::shared::{MessageContent, ToolCallStatus};
+        let mut changed = Vec::new();
+        for m in &mut self.messages {
+            if let MessageContent::ToolCall(tc) = &mut m.content {
+                if tc.status == ToolCallStatus::Running {
+                    tc.mark_cancelled(reason, now);
+                    changed.push(m.clone());
+                }
+            }
+        }
+        changed
+    }
+
     /// Drop ledger entries whose anchor message is gone (rewind, cancel,
     /// message removal), and trim snapshots whose window anchor is gone.
     pub fn prune_orphaned_ledger(&mut self) {
@@ -2010,6 +2029,44 @@ impl Default for SessionState {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cancel_running_calls_ends_only_calls_in_flight() {
+        use crate::components::chat::Message;
+        use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+        let mut state = SessionState { save_disabled: true, ..Default::default() };
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        let call = |status| {
+            let mut tc = ToolCall::new("hobbes-terminal".into(), "HOBBES_TERMINAL_EXEC".into(), serde_json::json!({}), None, None);
+            tc.status = status;
+            Message {
+                id: uuid::Uuid::new_v4(),
+                author: "Hobbes".into(),
+                content: MessageContent::ToolCall(tc),
+                attachments: Vec::new(),
+                comments: Vec::new(),
+                created_at: Utc::now(),
+                usage: None,
+            }
+        };
+        s.messages.push(call(ToolCallStatus::Completed));
+        s.messages.push(call(ToolCallStatus::Running));
+        let now = Utc::now();
+        let changed = s.cancel_running_calls(crate::components::shared::CANCELLED_BY_RESTART, now);
+        assert_eq!(changed.len(), 1);
+        let statuses: Vec<_> = s
+            .messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::ToolCall(tc) => Some((tc.status, tc.cancelled.clone(), tc.completed_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses[0], (ToolCallStatus::Completed, None, None), "finished calls untouched");
+        assert_eq!(statuses[1], (ToolCallStatus::Error, Some("Hobbes closed while it ran".to_string()), Some(now)));
+        assert!(s.cancel_running_calls("again", now).is_empty(), "nothing left running");
+    }
+
     mod tab_identity {
         use super::*;
 
@@ -3052,6 +3109,7 @@ mod tests {
                         connector_name: None,
                         model: None,
                         round_id: None,
+                        cancelled: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -3078,6 +3136,7 @@ mod tests {
                         connector_name: None,
                         model: None,
                         round_id: None,
+                        cancelled: None,
                     }),
                     attachments: vec![],
                     comments: vec![],

@@ -170,7 +170,19 @@ pub struct ToolCall {
     /// otherwise adjacent `ToolCall` messages. `None` on legacy rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub round_id: Option<String>,
+    /// Why this call never finished, when something stopped it: the user's
+    /// Stop, or Hobbes closing while it ran. A cancelled call is no longer
+    /// `Running` (see [`ToolCall::mark_cancelled`]); the activity stream says
+    /// "cancelled" only for these, never for a call still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<String>,
 }
+
+/// Stop reason for a call cut off by the user's Stop.
+pub const CANCELLED_BY_STOP: &str = "Stopped by you";
+/// Stop reason for a call still in flight when Hobbes closed.
+pub const CANCELLED_BY_RESTART: &str = "Hobbes closed while it ran";
+
 
 pub enum StreamMessage {
     Text {
@@ -207,6 +219,16 @@ pub struct UsageData {
 }
 
 impl ToolCall {
+    /// End a call that will never finish: an error result naming `reason`
+    /// (the model sees it, and nothing re-runs it — the approval-resume path
+    /// collects only `Running` calls), stamped `cancelled` for the UI.
+    pub fn mark_cancelled(&mut self, reason: &str, now: chrono::DateTime<chrono::Utc>) {
+        self.status = ToolCallStatus::Error;
+        self.response = format!("Cancelled: {reason}. The call did not finish; its result is unknown.");
+        self.completed_at = Some(now);
+        self.cancelled = Some(reason.to_string());
+    }
+
     pub fn new(
         server_name: String,
         tool_name: String,
@@ -231,6 +253,7 @@ impl ToolCall {
             connector_name: None,
             model: None,
             round_id: None,
+            cancelled: None,
         }
     }
 
