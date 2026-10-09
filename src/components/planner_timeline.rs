@@ -20,20 +20,47 @@ use crate::todo::PlannerState;
 
 use super::planner_view::{mutate_todo, persist_block, persist_todo, today, SelectedBlockContext};
 
-/// Vertical scale of the day timeline.
-const PX_PER_HOUR: f64 = 48.0;
+use super::planner_range::{self as range_math, OutOfRange, ViewRange};
+
+/// Shortest a block is ever drawn: keeps a one-line title readable.
+const MIN_BLOCK_PX: f64 = 22.0;
+/// Below this height a block renders ONE line (title + start time); at or
+/// above it, a title line plus the full time range.
+const TWO_LINE_BLOCK_PX: f64 = 38.0;
+
+/// Bridge for the rail body (`#planner-rail-body`): height reports and wheel
+/// gestures, as JSON arrays `["h", px]` / `["w", dy, zoom, y]`.
+const RAIL_BODY_JS: &str = r#"
+let tries = 0;
+const attach = () => {
+    const el = document.getElementById('planner-rail-body');
+    if (!el) { if (tries++ < 50) setTimeout(attach, 100); return; }
+    dioxus.send(['h', el.clientHeight]);
+    const ro = new ResizeObserver(() => {
+        if (!el.isConnected) { ro.disconnect(); return; }
+        dioxus.send(['h', el.clientHeight]);
+    });
+    ro.observe(el);
+    el.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+        dioxus.send(['w', dy, e.ctrlKey || e.metaKey, e.clientY - el.getBoundingClientRect().top]);
+    }, { passive: false });
+};
+attach();
+"#;
 
 /// Current-time indicator color: warm orange, complementary to the cool
 /// blue/green block palette and distinct from the subscription palette's red.
 const NOW_LINE_COLOR: &str = "#fb923c";
 
 /// Pixel offset of the current-time line inside the ruler, or `None` when
-/// "now" falls outside the rendered workday window.
-fn now_line_offset(now_min: i64, day_start: u32, day_end: u32) -> Option<f64> {
-    if now_min < day_start as i64 || now_min > day_end as i64 {
+/// "now" falls outside the visible range.
+fn now_line_offset(now_min: i64, view: ViewRange, pph: f64) -> Option<f64> {
+    if now_min < view.start as i64 || now_min > view.end as i64 {
         return None;
     }
-    Some((now_min - day_start as i64) as f64 / 60.0 * PX_PER_HOUR)
+    Some(range_math::minute_to_y(now_min as f64, view, pph))
 }
 
 /// What a timeline drag is doing to a block.
@@ -66,58 +93,31 @@ fn workday_bounds(start: &str, end: &str) -> (u32, u32) {
 }
 
 /// Pixel geometry for a block on the ruler: `(top, height)` clamped into the
-/// workday window. `None` when the block lies entirely outside it.
-fn block_geometry(
-    start_min: i64,
-    end_min: i64,
-    day_start: u32,
-    day_end: u32,
-) -> Option<(f64, f64)> {
-    let start = start_min.max(day_start as i64);
-    let end = end_min.min(day_end as i64);
+/// visible range at `pph` pixels per hour. `None` when the block lies entirely
+/// outside it.
+fn block_geometry(start_min: i64, end_min: i64, view: ViewRange, pph: f64) -> Option<(f64, f64)> {
+    let start = start_min.max(view.start as i64);
+    let end = end_min.min(view.end as i64);
     if end <= start {
         return None;
     }
-    let top = (start - day_start as i64) as f64 / 60.0 * PX_PER_HOUR;
-    // The floor keeps a one-line title readable: a 15-minute block is only
-    // 12px at 48px/h, which clips its own label.
-    let height = ((end - start) as f64 / 60.0 * PX_PER_HOUR).max(20.0);
+    let top = range_math::minute_to_y(start as f64, view, pph);
+    // The floor keeps a one-line title readable: a 15-minute block is only a
+    // few pixels tall in a long range.
+    let height = ((end - start) as f64 / 60.0 * pph).max(MIN_BLOCK_PX);
     Some((top, height))
 }
 
-/// Which side of the workday window a fully-off-window block sits on.
-///
-/// The exact complement of [`block_geometry`]'s culling rule: every block on
-/// the day is either drawn on the ruler or classified here for the off-window
-/// strip — the store must never hold a block the Today rail doesn't show.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum OffWindow {
-    /// Ends at or before the workday starts.
-    Early,
-    /// Starts at or after the workday ends.
-    After,
-}
-
-fn off_window(start_min: i64, end_min: i64, day_start: u32, day_end: u32) -> Option<OffWindow> {
-    if end_min <= day_start as i64 {
-        Some(OffWindow::Early)
-    } else if start_min >= day_end as i64 {
-        Some(OffWindow::After)
-    } else {
-        None
-    }
-}
-
 /// [`block_geometry`] plus honesty about the clamp: external (calendar) blocks
-/// that spill past a workday edge render clamped with a dashed cue on the
+/// that spill past a range edge render clamped with a dashed cue on the
 /// clamped side instead of silently looking shorter than the meeting is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct ClampedGeometry {
     top: f64,
     height: f64,
-    /// The block starts before the workday window opens.
+    /// The block starts before the visible range opens.
     clamped_top: bool,
-    /// The block ends after the workday window closes.
+    /// The block ends after the visible range closes.
     clamped_bottom: bool,
 }
 
@@ -128,30 +128,19 @@ struct ClampedGeometry {
 fn clamped_block_geometry(
     start_min: i64,
     end_min: i64,
-    day_start: u32,
-    day_end: u32,
+    view: ViewRange,
+    pph: f64,
 ) -> Option<ClampedGeometry> {
     if end_min <= start_min {
         return None; // zero-length guard, mirrors block_geometry
     }
-    let (top, height) = block_geometry(start_min, end_min, day_start, day_end)?;
+    let (top, height) = block_geometry(start_min, end_min, view, pph)?;
     Some(ClampedGeometry {
         top,
         height,
-        clamped_top: start_min < day_start as i64,
-        clamped_bottom: end_min > day_end as i64,
+        clamped_top: start_min < view.start as i64,
+        clamped_bottom: end_min > view.end as i64,
     })
-}
-
-/// Label for external events the ruler can't show at all: `"2 earlier · 1
-/// later"`. `None` when there is nothing outside the window.
-fn fmt_outside_counts(earlier: usize, later: usize) -> Option<String> {
-    match (earlier, later) {
-        (0, 0) => None,
-        (e, 0) => Some(format!("{} earlier", e)),
-        (0, l) => Some(format!("{} later", l)),
-        (e, l) => Some(format!("{} earlier · {} later", e, l)),
-    }
 }
 
 /// Resolve a subscription id to its display color. `None` when the block has
@@ -867,6 +856,115 @@ pub(crate) fn TodayRail(
     let mut selected_block = use_context::<SelectedBlockContext>().0;
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let mut ui_state = use_context::<Signal<crate::settings::UiState>>();
+    let ui_state_manager = use_context::<Signal<crate::settings::UiStateManager>>();
+
+    // Visible time range. The remembered view (preset or custom range) lives
+    // in this signal for instant feedback and is written through to UiState
+    // after a short debounce, so a wheel flick never rewrites ui_state.json
+    // per event. The rail body's measured height turns the range into a scale.
+    let mut rail_view = use_signal(|| {
+        ui_state
+            .peek()
+            .planner_rail_view
+            .unwrap_or(range_math::RailView::Workday)
+    });
+    let mut body_h = use_signal(|| 0.0f64);
+    let mut wheel_acc = use_signal(|| 0.0f64);
+    let mut zoom_acc = use_signal(|| 0.0f64);
+    let mut persist_gen = use_signal(|| 0u64);
+
+    let current_workday = move || {
+        let st = settings.peek();
+        workday_bounds(&st.planner_workday_start, &st.planner_workday_end)
+    };
+    let local_now_min = || minutes_in_local_day(&Utc::now()).max(0) as u32;
+    let current_range = move || {
+        let v = *rail_view.peek();
+        range_math::resolve_view(v, current_workday(), local_now_min())
+    };
+    let mut persist_view = move || {
+        let g = *persist_gen.peek() + 1;
+        persist_gen.set(g);
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let latest = *persist_gen.peek();
+            if latest != g {
+                return;
+            }
+            let v = *rail_view.peek();
+            let mut ui = ui_state.write();
+            if ui.planner_rail_view != Some(v) {
+                ui.planner_rail_view = Some(v);
+                ui_state_manager.read().save_async(ui.clone(), None);
+            }
+        });
+    };
+    let mut set_range = move |r: ViewRange| {
+        let v = range_math::view_from_range(r, current_workday());
+        if *rail_view.peek() != v {
+            rail_view.set(v);
+        }
+        persist_view();
+    };
+    let mut set_preset = move |p: range_math::Preset| {
+        rail_view.set(match p {
+            range_math::Preset::Workday => range_math::RailView::Workday,
+            range_math::Preset::Now => range_math::RailView::Now,
+            range_math::Preset::FullDay => range_math::RailView::FullDay,
+        });
+        persist_view();
+    };
+
+    // One JS bridge for the rail body: a ResizeObserver reports its height
+    // (window resizes, sibling sections appearing) and a non-passive wheel
+    // listener (the webview would otherwise scroll the rail) reports pan /
+    // zoom gestures.
+    use_future(move || async move {
+        let mut ev = document::eval(RAIL_BODY_JS);
+        while let Ok(msg) = ev.recv::<serde_json::Value>().await {
+            match msg.get(0).and_then(|v| v.as_str()) {
+                Some("h") => {
+                    let h = msg.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let known = *body_h.peek();
+                    if (h - known).abs() >= 1.0 {
+                        body_h.set(h);
+                    }
+                }
+                Some("w") => {
+                    let dy = msg.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let zoom = msg.get(2).and_then(|v| v.as_bool()).unwrap_or(false);
+                    let y = msg.get(3).and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let rng = current_range();
+                    let pph = range_math::px_per_hour(*body_h.peek(), rng);
+                    if zoom {
+                        let (steps, acc) = range_math::zoom_wheel_steps(*zoom_acc.peek(), dy);
+                        zoom_acc.set(acc);
+                        if steps != 0 {
+                            let pivot = range_math::y_to_minute(y, rng, pph);
+                            let factor = range_math::ZOOM_WHEEL_FACTOR.powi(-steps);
+                            let next = range_math::zoom_around(rng, factor, pivot);
+                            if next != rng {
+                                set_range(next);
+                            }
+                        }
+                    } else {
+                        let (delta, acc) = range_math::wheel_steps(*wheel_acc.peek(), dy, pph);
+                        wheel_acc.set(acc);
+                        if delta != 0 {
+                            let next = range_math::pan_by(rng, delta);
+                            if next != rng {
+                                set_range(next);
+                            } else {
+                                wheel_acc.set(0.0);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
 
     // The End-the-day card takes over the foot of the rail when open.
     let mut end_day_open = use_signal(|| false);
@@ -1035,51 +1133,41 @@ pub(crate) fn TodayRail(
         ..eod_core
     };
 
-    // Blocks the ruler culls (fully outside the workday window) still exist
-    // and still count — first-fit overflow is deliberately honest — so they
-    // get a strip of their own instead of rendering nowhere. External blocks
-    // are excluded: the strip carries select/delete affordances that must not
-    // exist for read-only mirrored events, so they get a compact count
-    // indicator on the ruler instead.
-    let off_window_blocks: Vec<(TimeBlock, OffWindow)> = blocks
+    // Every block on the day is drawn when it falls in the visible range;
+    // the rest are tallied here so the Earlier / Later chips can pan to them.
+    let block_spans: Vec<(i64, i64)> = blocks
         .iter()
-        .filter(|b| !matches!(b.source, BlockSource::External { .. }))
-        .filter_map(|b| {
-            off_window(
-                minutes_in_local_day(&b.start),
-                minutes_in_local_day(&b.end),
-                day_start,
-                day_end,
-            )
-            .map(|side| (b.clone(), side))
+        .map(|b| (minutes_in_local_day(&b.start), minutes_in_local_day(&b.end)))
+        .collect();
+
+    let now_local = local_now_min();
+    let view = range_math::resolve_view(*rail_view.read(), (day_start, day_end), now_local);
+    let pph = range_math::px_per_hour(*body_h.read(), view);
+    let timeline_height = view.hours() * pph;
+    let now_line_top = is_today
+        .then(|| now_line_offset(minutes_in_local_day(&Utc::now()), view, pph))
+        .flatten();
+    let hours: Vec<u32> = range_math::hour_marks(view, pph);
+    let shade: Vec<range_math::ShadeBand> = range_math::shade_bands(view, (day_start, day_end));
+    let (earlier_n, later_n) = range_math::out_of_range_counts(&block_spans, view);
+    let strip_ticks: Vec<range_math::StripTick> = blocks
+        .iter()
+        .zip(block_spans.iter())
+        .map(|(b, (s, e))| {
+            let color = match &b.source {
+                BlockSource::External { subscription_id, .. } => {
+                    subscription_color(&calendar_subs, subscription_id.as_deref())
+                        .unwrap_or_else(|| "#94a3b8".to_string())
+                }
+                _ => match b.your_time_category() {
+                    Some(c) => super::planner_view::your_time::category_colour(&goals, c),
+                    None => range_math::BRACKET_COLOR.to_string(),
+                },
+            };
+            range_math::StripTick { start: *s, end: *e, color }
         })
         .collect();
-
-    // External events entirely outside the workday window: counted, not drawn.
-    let (external_earlier, external_later) = blocks
-        .iter()
-        .filter(|b| matches!(b.source, BlockSource::External { .. }))
-        .fold((0usize, 0usize), |(e, l), b| {
-            match off_window(
-                minutes_in_local_day(&b.start),
-                minutes_in_local_day(&b.end),
-                day_start,
-                day_end,
-            ) {
-                Some(OffWindow::Early) => (e + 1, l),
-                Some(OffWindow::After) => (e, l + 1),
-                None => (e, l),
-            }
-        });
-    let outside_label = fmt_outside_counts(external_earlier, external_later);
-
-    let timeline_height = (day_end - day_start) as f64 / 60.0 * PX_PER_HOUR;
-    let now_line_top = is_today
-        .then(|| now_line_offset(minutes_in_local_day(&Utc::now()), day_start, day_end))
-        .flatten();
-    let hours: Vec<u32> = (day_start / 60..=day_end / 60)
-        .filter(|h| h * 60 >= day_start && h * 60 <= day_end)
-        .collect();
+    let strip_now = is_today.then_some(now_local);
 
     // A block dropped on the calendar IS planned work: it creates a todo
     // scheduled for the day (estimate = block length) plus the linked block.
@@ -1087,7 +1175,7 @@ pub(crate) fn TodayRail(
     // capacity math — the timeline and the list must stay one model.
     let block_minutes = settings.peek().planner_default_block_minutes.max(15);
     let mut create_block_at = move |minutes: u32| {
-        let start_min = snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)));
+        let start_min = snap_to_quarter(minutes.min(range_math::DAY_MINUTES - 15));
 
         let mut todo = Todo::new("Focus", planner.peek().next_sort_order());
         // Anytime, not Inbox: this todo is born triaged — clearing its date
@@ -1120,13 +1208,13 @@ pub(crate) fn TodayRail(
     // A protected your-time block: no to-do behind it (your time isn't a
     // task), counted toward the category's weekly goal.
     let mut create_your_time_at = move |minutes: u32, category: String| {
-        let start_min = snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)));
+        let start_min = snap_to_quarter(minutes.min(range_math::DAY_MINUTES - 15));
         let block = TimeBlock {
             id: uuid::Uuid::new_v4().to_string(),
             todo_id: None,
             title: category.clone(),
             start: local_minutes_to_utc(day, start_min),
-            end: local_minutes_to_utc(day, (start_min + 60).min(day_end.max(start_min + 15))),
+            end: local_minutes_to_utc(day, (start_min + 60).min(range_math::DAY_MINUTES)),
             source: BlockSource::YourTime { category },
         };
         persist_block(&block);
@@ -1397,6 +1485,24 @@ pub(crate) fn TodayRail(
                     "Plan my day"
                 }
             }
+            range_math::DayStrip {
+                range: view,
+                workday: (day_start, day_end),
+                ticks: strip_ticks,
+                now_min: strip_now,
+                now_color: NOW_LINE_COLOR.to_string(),
+                on_change: move |r: ViewRange| set_range(r),
+            }
+            range_math::RangeControls {
+                range: view,
+                workday: (day_start, day_end),
+                now_min: now_local,
+                on_preset: move |p: range_math::Preset| set_preset(p),
+                on_zoom: move |zoom_in: bool| {
+                    let cur = current_range();
+                    set_range(range_math::zoom_step(cur, zoom_in));
+                },
+            }
             CapacityBar {
                 planned: capacity.planned_minutes,
                 done: capacity.done_minutes,
@@ -1473,24 +1579,80 @@ pub(crate) fn TodayRail(
             // below. Holding the height makes the rail scroll instead, which
             // is what its `overflow-y-auto` is for.
             div {
-                class: "relative shrink-0 rounded border border-faint bg-app",
-                style: "height: {timeline_height}px;",
+                id: "planner-rail-body",
+                class: "relative rounded border border-faint bg-app",
+                style: "flex: 1 1 0%; min-height: 260px;",
                 onclick: move |evt| {
                     let y = evt.data.element_coordinates().y;
-                    let minutes = day_start + (y / PX_PER_HOUR * 60.0).max(0.0) as u32;
-                    slot_menu.set(Some(snap_to_quarter(minutes.clamp(day_start, day_end.saturating_sub(15)))));
+                    let minutes = range_math::y_to_minute(y, view, pph).max(0.0) as u32;
+                    slot_menu.set(Some(snap_to_quarter(minutes.min(range_math::DAY_MINUTES - 15))));
                 },
-                // External events the window can't show at all, as an honest
-                // count. Non-interactive so it never eats a create-block click.
-                if let Some(label) = outside_label {
-                    span {
-                        class: "pointer-events-none absolute right-1 top-0.5 z-10 rounded-full bg-input px-2 py-0.5 text-[10px] text-fg-muted",
-                        "{label}"
+                // Hours outside the workday: a darker band, never culled.
+                for band in shade {
+                    {
+                        let top = range_math::minute_to_y(band.start as f64, view, pph);
+                        let height = (band.end - band.start) as f64 / 60.0 * pph;
+                        let label = if band.before { "before your workday" } else { "after your workday" };
+                        rsx! {
+                            div {
+                                key: "shade-{band.start}",
+                                class: "pointer-events-none absolute left-0 right-0 overflow-hidden",
+                                style: "top: {top}px; height: {height}px; background: rgba(0, 0, 0, 0.22);",
+                                if height >= 18.0 {
+                                    span {
+                                        class: "absolute top-0.5 text-[10px] italic leading-none text-fg-muted",
+                                        style: "left: 44px;",
+                                        "{label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Blocks the range can't show, one click away: pan to reveal.
+                if earlier_n > 0 {
+                    {
+                        let spans = block_spans.clone();
+                        rsx! {
+                    button {
+                        class: "absolute right-1 top-1 z-30 rounded-full border border-faint bg-input px-2 py-0.5 text-[10px] text-fg-muted hover:text-fg",
+                        title: "Pan up to the nearest earlier block",
+                        onmousedown: move |evt| evt.stop_propagation(),
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            let cur = current_range();
+                            if let Some(next) = range_math::reveal_target(&spans, cur, OutOfRange::Earlier) {
+                                set_range(next);
+                            }
+                        },
+                        "Earlier \u{b7} {earlier_n} \u{2191}"
+                    }
+                        }
+                    }
+                }
+                if later_n > 0 {
+                    {
+                        let spans = block_spans.clone();
+                        rsx! {
+                    button {
+                        class: "absolute bottom-1 right-1 z-30 rounded-full border border-faint bg-input px-2 py-0.5 text-[10px] text-fg-muted hover:text-fg",
+                        title: "Pan down to the nearest later block",
+                        onmousedown: move |evt| evt.stop_propagation(),
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            let cur = current_range();
+                            if let Some(next) = range_math::reveal_target(&spans, cur, OutOfRange::Later) {
+                                set_range(next);
+                            }
+                        },
+                        "Later \u{b7} {later_n} \u{2193}"
+                    }
+                        }
                     }
                 }
                 for hour in hours {
                     {
-                        let top = (hour * 60 - day_start) as f64 / 60.0 * PX_PER_HOUR;
+                        let top = range_math::minute_to_y((hour * 60) as f64, view, pph);
                         rsx! {
                             div {
                                 key: "hr-{hour}",
@@ -1516,7 +1678,7 @@ pub(crate) fn TodayRail(
                     }
                     div {
                         class: "absolute left-10 z-40 w-56 rounded-lg border border-subtle bg-card py-1 shadow-xl",
-                        style: "top: {((m.saturating_sub(day_start)) as f64 / 60.0 * PX_PER_HOUR).min((timeline_height - 220.0).max(0.0))}px;",
+                        style: "top: {range_math::minute_to_y(m as f64, view, pph).clamp(0.0, (timeline_height - 220.0).max(0.0))}px;",
                         role: "menu",
                         onclick: move |evt| evt.stop_propagation(),
                         onmousedown: move |evt| evt.stop_propagation(),
@@ -1580,7 +1742,7 @@ pub(crate) fn TodayRail(
                 // than left blank. Clicking one creates a block at its start,
                 // exactly as clicking bare ruler does.
                 for (gs, ge) in gaps.iter().copied() {
-                    if let Some((top, height)) = block_geometry(gs as i64, ge as i64, day_start, day_end) {
+                    if let Some((top, height)) = block_geometry(gs as i64, ge as i64, view, pph) {
                         {
                             let mut style = format!("top: {top}px; height: {height}px;");
                             style.push_str(&overlap_column_style_scaled(0, 1, lane_avail));
@@ -1609,8 +1771,8 @@ pub(crate) fn TodayRail(
                     if let Some((top, height)) = block_geometry(
                         minutes_in_local_day(&item.start),
                         minutes_in_local_day(&item.end),
-                        day_start,
-                        day_end,
+                        view,
+                        pph,
                     ) {
                         {
                             let style =
@@ -1640,9 +1802,9 @@ pub(crate) fn TodayRail(
                         _ => (minutes_in_local_day(&b.start), minutes_in_local_day(&b.end)),
                     };
                     let geo = if matches!(b.source, BlockSource::External { .. }) {
-                        clamped_block_geometry(s_min, e_min, day_start, day_end)
+                        clamped_block_geometry(s_min, e_min, view, pph)
                     } else {
-                        block_geometry(s_min, e_min, day_start, day_end).map(|(top, height)| {
+                        block_geometry(s_min, e_min, view, pph).map(|(top, height)| {
                             ClampedGeometry { top, height, clamped_top: false, clamped_bottom: false }
                         })
                     };
@@ -1739,6 +1901,17 @@ pub(crate) fn TodayRail(
                         } else {
                             "absolute overflow-hidden rounded border border-subtle bg-btn-primary px-1.5 py-0.5 text-fg cursor-grab"
                         };
+                        let tooltip = {
+                            let base = format!("{display_title} \u{b7} {start_label}\u{2013}{end_label}");
+                            if your_time.is_some() {
+                                format!("protected \u{b7} {base}")
+                            } else if is_external && ext_tentative {
+                                format!("(tentative) {base}")
+                            } else {
+                                base
+                            }
+                        };
+                        let short = height < TWO_LINE_BLOCK_PX;
                         rsx! {
                                 div {
                                     key: "{block.id}",
@@ -1746,10 +1919,10 @@ pub(crate) fn TodayRail(
                                     class: if is_dragging_this { "z-10 ring-1 ring-primary-400" },
                                     class: if is_focus_block { "ring-1 ring-primary-300" },
                                     class: if is_external && has_url { "cursor-pointer" },
-                                    // Tentative invitations announce themselves in
-                                    // the hover tooltip; the dashed left bar is the
-                                    // at-a-glance cue.
-                                    title: if is_external && ext_tentative { "(tentative) {display_title}" },
+                                    // Full title and times always ride in the tooltip
+                                    // (short blocks clip them); tentative invitations
+                                    // announce themselves here too.
+                                    title: "{tooltip}",
                                     style: "{block_style}",
                                     // Selection also runs through the drag: a
                                     // press that never leaves its quarter-hour
@@ -1798,6 +1971,9 @@ pub(crate) fn TodayRail(
                                             } else {
                                                 span { class: "min-w-0 truncate", "{display_title}" }
                                             }
+                                            if short {
+                                                span { class: "shrink-0 font-mono text-[10px] font-normal opacity-80", "{start_label}" }
+                                            }
                                         }
                                         if is_external && has_url {
                                             span {
@@ -1826,7 +2002,8 @@ pub(crate) fn TodayRail(
                                             }
                                         }
                                     }
-                                    if let Some(items) = &chore_items {
+                                    if short {
+                                    } else if let Some(items) = &chore_items {
                                         div {
                                             class: "grid grid-cols-2 gap-x-3 text-[10.5px] leading-[13px]",
                                             for (i, (title, est, closed)) in items.iter().cloned().enumerate() {
@@ -1842,10 +2019,8 @@ pub(crate) fn TodayRail(
                                             }
                                         }
                                     } else if let Some(meta) = yt_meta.clone() {
-                                        if height >= 24.0 {
-                                            p { class: "truncate font-mono text-[10px] opacity-80", "{meta}" }
-                                        }
-                                    } else if height >= 30.0 {
+                                        p { class: "truncate font-mono text-[10px] opacity-80", "{meta}" }
+                                    } else {
                                         p { class: "text-[10px] opacity-80", "{start_label}–{end_label}" }
                                     }
                                     if !is_external {
@@ -1864,82 +2039,6 @@ pub(crate) fn TodayRail(
                                         }
                                     }
                                 }
-                        }
-                    }
-                }
-            }
-
-            // Off-window strip: the visible home for blocks the ruler culls.
-            // Same select/delete affordances as ruler blocks, minus dragging.
-            if !off_window_blocks.is_empty() {
-                div {
-                    class: "flex flex-col gap-1",
-                    for (block, side) in off_window_blocks {
-                        {
-                            let is_selected =
-                                selected_block.read().as_deref() == Some(block.id.as_str());
-                            let display_title = linked_info
-                                .get(&block.id)
-                                .map(|(t, _, _)| t.clone())
-                                .unwrap_or_else(|| block.title.clone());
-                            let start_label =
-                                fmt_hhmm(minutes_in_local_day(&block.start).max(0) as u32);
-                            let end_label =
-                                fmt_hhmm(minutes_in_local_day(&block.end).max(0) as u32);
-                            let side_label = match side {
-                                OffWindow::Early => "Early",
-                                OffWindow::After => "After hours",
-                            };
-                            let select_id = block.id.clone();
-                            let delete_id = block.id.clone();
-                            rsx! {
-                                div {
-                                    key: "{block.id}",
-                                    class: if is_selected {
-                                        "flex items-center gap-2 rounded bg-card px-2 py-1.5 ring-1 ring-primary-400 cursor-pointer"
-                                    } else {
-                                        "flex items-center gap-2 rounded bg-card px-2 py-1.5 cursor-pointer"
-                                    },
-                                    onclick: move |evt| {
-                                        evt.stop_propagation();
-                                        let current = selected_block.peek().clone();
-                                        selected_block.set(
-                                            if current.as_deref() == Some(select_id.as_str()) {
-                                                None
-                                            } else {
-                                                Some(select_id.clone())
-                                            },
-                                        );
-                                    },
-                                    span {
-                                        class: "shrink-0 rounded-full bg-input px-2 py-0.5 text-[10px] text-fg-muted",
-                                        "{side_label}"
-                                    }
-                                    span {
-                                        class: "shrink-0 text-[10px] text-fg-muted",
-                                        "{start_label}–{end_label}"
-                                    }
-                                    span { class: "flex-1 min-w-0 truncate text-xs text-fg", "{display_title}" }
-                                    if is_selected {
-                                        button {
-                                            class: "shrink-0 text-red-400 hover:text-red-300",
-                                            title: "Delete block",
-                                            onclick: move |evt| {
-                                                evt.stop_propagation();
-                                                if let Err(e) = store::delete_block(&delete_id) {
-                                                    tracing::error!(
-                                                        "planner: failed to delete block {}: {}",
-                                                        delete_id, e
-                                                    );
-                                                }
-                                                planner.write().blocks.retain(|b| b.id != delete_id);
-                                                selected_block.set(None);
-                                            },
-                                            Icon { width: 12, height: 12, icon: fi_icons::FiTrash2 }
-                                        }
-                                    }
-                                }
-                            }
                         }
                     }
                 }
@@ -1968,13 +2067,15 @@ pub(crate) fn TodayRail(
                             return;
                         };
                         let dy = evt.data.screen_coordinates().y - anchor_y;
-                        let delta_min = (dy / PX_PER_HOUR * 60.0).round() as i64;
+                        let delta_min = range_math::px_to_minutes(dy, pph).round() as i64;
+                        // Drags are bounded by the whole day, not the visible
+                        // range: a block half off-screen must not jump.
                         let next = match mode {
                             BlockDragMode::Move => {
-                                dragged_move(orig_s, orig_e, delta_min, day_start, day_end)
+                                dragged_move(orig_s, orig_e, delta_min, 0, range_math::DAY_MINUTES)
                             }
                             BlockDragMode::ResizeEnd => {
-                                dragged_resize(orig_s, orig_e, delta_min, day_end)
+                                dragged_resize(orig_s, orig_e, delta_min, range_math::DAY_MINUTES)
                             }
                         };
                         // Don't promote an unmoved press into a drag: the
@@ -2084,7 +2185,6 @@ pub(crate) fn TodayRail(
             }
 
             // ── End the day ────────────────────────────────────────────
-            div { class: "flex-1" }
             if let Some((at, said)) = day_closed.clone() {
                 div {
                     class: "flex h-8 shrink-0 items-center rounded border border-faint px-2",
@@ -2300,6 +2400,10 @@ mod tests {
     use chrono::{DateTime, Duration};
     use std::collections::HashSet;
 
+    /// The classic 09:00-17:00 window at the old 48px/hour scale.
+    const WD: ViewRange = ViewRange { start: 540, end: 1020 };
+    const PPH: f64 = 48.0;
+
     fn sub(id: &str, color: &str) -> CalendarSubscription {
         CalendarSubscription {
             id: id.into(),
@@ -2338,49 +2442,58 @@ mod tests {
     #[test]
     fn clamped_geometry_matches_block_geometry_when_fully_inside() {
         // 09:30–10:15 in a 09:00–17:00 window: same pixels, no clamp flags.
-        let geo = clamped_block_geometry(570, 615, 540, 1020).unwrap();
-        assert_eq!((geo.top, geo.height), block_geometry(570, 615, 540, 1020).unwrap());
+        let geo = clamped_block_geometry(570, 615, WD, PPH).unwrap();
+        assert_eq!((geo.top, geo.height), block_geometry(570, 615, WD, PPH).unwrap());
         assert!(!geo.clamped_top && !geo.clamped_bottom);
     }
 
     #[test]
     fn clamped_geometry_flags_the_clamped_side() {
         // 08:00–10:00 against a 09:00 open: clamped at the top only.
-        let geo = clamped_block_geometry(480, 600, 540, 1020).unwrap();
-        assert_eq!((geo.top, geo.height), block_geometry(480, 600, 540, 1020).unwrap());
+        let geo = clamped_block_geometry(480, 600, WD, PPH).unwrap();
+        assert_eq!((geo.top, geo.height), block_geometry(480, 600, WD, PPH).unwrap());
         assert!(geo.clamped_top && !geo.clamped_bottom);
         assert_eq!(geo.top, 0.0);
 
         // 16:30–18:00 against a 17:00 close: clamped at the bottom only.
-        let geo = clamped_block_geometry(990, 1080, 540, 1020).unwrap();
+        let geo = clamped_block_geometry(990, 1080, WD, PPH).unwrap();
         assert!(!geo.clamped_top && geo.clamped_bottom);
 
         // 08:00–18:00 spans the whole window: clamped on both sides.
-        let geo = clamped_block_geometry(480, 1080, 540, 1020).unwrap();
+        let geo = clamped_block_geometry(480, 1080, WD, PPH).unwrap();
         assert!(geo.clamped_top && geo.clamped_bottom);
         assert_eq!(geo.top, 0.0);
-        assert_eq!(geo.height, 8.0 * PX_PER_HOUR);
+        assert_eq!(geo.height, 8.0 * PPH);
     }
 
     #[test]
     fn clamped_geometry_excludes_fully_outside_and_zero_length() {
         // Entirely before the window / entirely after: not drawn (counted
-        // instead, via off_window).
-        assert_eq!(clamped_block_geometry(420, 540, 540, 1020), None);
-        assert_eq!(clamped_block_geometry(1020, 1080, 540, 1020), None);
-        assert_eq!(off_window(420, 540, 540, 1020), Some(OffWindow::Early));
-        assert_eq!(off_window(1020, 1080, 540, 1020), Some(OffWindow::After));
+        // instead, via out_of_range).
+        assert_eq!(clamped_block_geometry(420, 540, WD, PPH), None);
+        assert_eq!(clamped_block_geometry(1020, 1080, WD, PPH), None);
+        assert_eq!(range_math::out_of_range(420, 540, WD), Some(OutOfRange::Earlier));
+        assert_eq!(range_math::out_of_range(1020, 1080, WD), Some(OutOfRange::Later));
         // Zero- and negative-length guard.
-        assert_eq!(clamped_block_geometry(600, 600, 540, 1020), None);
-        assert_eq!(clamped_block_geometry(600, 570, 540, 1020), None);
+        assert_eq!(clamped_block_geometry(600, 600, WD, PPH), None);
+        assert_eq!(clamped_block_geometry(600, 570, WD, PPH), None);
     }
 
     #[test]
-    fn fmt_outside_counts_reads_naturally() {
-        assert_eq!(fmt_outside_counts(0, 0), None);
-        assert_eq!(fmt_outside_counts(2, 0), Some("2 earlier".into()));
-        assert_eq!(fmt_outside_counts(0, 1), Some("1 later".into()));
-        assert_eq!(fmt_outside_counts(2, 1), Some("2 earlier · 1 later".into()));
+    fn clamped_geometry_follows_the_scale_and_range() {
+        // Same 09:30-10:15 block at 90px/h: 45 min = 67.5px, 30 min in = 45px.
+        let geo = clamped_block_geometry(570, 615, WD, 90.0).unwrap();
+        assert_eq!((geo.top, geo.height), (45.0, 67.5));
+        // A shifted range moves the same block: window 08:00-12:00 at 60px/h.
+        let narrow = ViewRange { start: 480, end: 720 };
+        let geo = clamped_block_geometry(570, 615, narrow, 120.0).unwrap();
+        assert_eq!((geo.top, geo.height), (180.0, 90.0));
+        // A block before 09:00 is NOT culled once the range includes it.
+        assert!(clamped_block_geometry(420, 480, narrow, 120.0).is_none());
+        let wide = ViewRange { start: 0, end: 1440 };
+        let geo = clamped_block_geometry(420, 540, wide, 30.0).unwrap();
+        assert_eq!((geo.top, geo.height), (210.0, 60.0));
+        assert!(!geo.clamped_top && !geo.clamped_bottom);
     }
 
     #[test]
@@ -2477,13 +2590,16 @@ mod tests {
     }
 
     #[test]
-    fn now_line_appears_only_inside_the_workday_window() {
+    fn now_line_appears_only_inside_the_visible_range() {
         // 09:00–17:00 window: before, at start, mid-day, at end, after.
-        assert_eq!(now_line_offset(8 * 60, 540, 1020), None);
-        assert_eq!(now_line_offset(540, 540, 1020), Some(0.0));
-        assert_eq!(now_line_offset(12 * 60 + 30, 540, 1020), Some(3.5 * PX_PER_HOUR));
-        assert_eq!(now_line_offset(1020, 540, 1020), Some(8.0 * PX_PER_HOUR));
-        assert_eq!(now_line_offset(1021, 540, 1020), None);
+        assert_eq!(now_line_offset(8 * 60, WD, PPH), None);
+        assert_eq!(now_line_offset(540, WD, PPH), Some(0.0));
+        assert_eq!(now_line_offset(12 * 60 + 30, WD, PPH), Some(3.5 * PPH));
+        assert_eq!(now_line_offset(1020, WD, PPH), Some(8.0 * PPH));
+        assert_eq!(now_line_offset(1021, WD, PPH), None);
+        // Scale and range both matter: 08:00 is visible in a 07:00 range.
+        let early = ViewRange { start: 420, end: 780 };
+        assert_eq!(now_line_offset(8 * 60, early, 100.0), Some(100.0));
     }
 
     #[test]
@@ -2498,42 +2614,73 @@ mod tests {
     #[test]
     fn block_geometry_positions_and_clamps() {
         // 09:30–10:15 in a 09:00–17:00 window at 48px/h.
-        assert_eq!(block_geometry(570, 615, 540, 1020), Some((24.0, 36.0)));
+        assert_eq!(block_geometry(570, 615, WD, PPH), Some((24.0, 36.0)));
         // Starting before the window clamps to its top.
-        assert_eq!(block_geometry(480, 600, 540, 1020), Some((0.0, 48.0)));
-        // Fully outside the window renders nothing.
-        assert_eq!(block_geometry(300, 480, 540, 1020), None);
-        assert_eq!(block_geometry(1080, 1140, 540, 1020), None);
+        assert_eq!(block_geometry(480, 600, WD, PPH), Some((0.0, 48.0)));
+        // Fully outside the range renders nothing.
+        assert_eq!(block_geometry(300, 480, WD, PPH), None);
+        assert_eq!(block_geometry(1080, 1140, WD, PPH), None);
         // Very short blocks keep a height that fits a one-line title.
-        let (_, h) = block_geometry(540, 545, 540, 1020).unwrap();
-        assert_eq!(h, 20.0);
+        let (_, h) = block_geometry(540, 545, WD, PPH).unwrap();
+        assert_eq!(h, MIN_BLOCK_PX);
+        // 15 minutes at 90px/h is 22.5px: real height wins over the floor.
+        assert_eq!(block_geometry(540, 555, WD, 90.0), Some((0.0, 22.5)));
     }
 
     #[test]
-    fn off_window_classifies_exactly_what_the_ruler_culls() {
-        let (ds, de) = (540, 1020); // 09:00–17:00
-
-        // Fully before / fully after the window, edges touching included.
-        assert_eq!(off_window(300, 480, ds, de), Some(OffWindow::Early));
-        assert_eq!(off_window(480, 540, ds, de), Some(OffWindow::Early));
-        assert_eq!(off_window(1020, 1080, ds, de), Some(OffWindow::After));
-        assert_eq!(off_window(1080, 1140, ds, de), Some(OffWindow::After));
-
-        // Anything the ruler draws (even partially) is not off-window.
-        assert_eq!(off_window(570, 615, ds, de), None);
-        assert_eq!(off_window(480, 600, ds, de), None);
-        assert_eq!(off_window(1000, 1080, ds, de), None);
-
-        // The complement of block_geometry: every block is drawn or stripped.
-        for (s, e) in [(300, 480), (480, 600), (570, 615), (1000, 1080), (1020, 1080)] {
-            assert_eq!(
-                block_geometry(s, e, ds, de).is_none(),
-                off_window(s, e, ds, de).is_some(),
-                "({}, {}) must render in exactly one place",
-                s,
-                e
-            );
+    fn out_of_range_is_the_complement_of_geometry() {
+        for rng in [WD, ViewRange { start: 0, end: 1440 }, ViewRange { start: 600, end: 840 }] {
+            for (s, e) in [(300, 480), (480, 600), (570, 615), (1000, 1080), (1020, 1080)] {
+                assert_eq!(
+                    block_geometry(s, e, rng, PPH).is_none(),
+                    range_math::out_of_range(s, e, rng).is_some(),
+                    "({s}, {e}) in {rng:?} must be drawn or counted, exactly once"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn short_blocks_switch_to_one_line() {
+        // 15 min at 48px/h is the 22px floor; 30 min at 48 is 24px; an hour
+        // at 48 is 48px (two lines); 30 min at 90px/h is 45px (two lines).
+        let h = |mins: i64, pph: f64| block_geometry(600, 600 + mins, WD, pph).unwrap().1;
+        assert!(h(15, 48.0) < TWO_LINE_BLOCK_PX);
+        assert!(h(30, 48.0) < TWO_LINE_BLOCK_PX);
+        assert!(h(60, 48.0) >= TWO_LINE_BLOCK_PX);
+        assert!(h(30, 90.0) >= TWO_LINE_BLOCK_PX);
+        assert!(h(15, 90.0) < TWO_LINE_BLOCK_PX);
+    }
+
+    #[test]
+    fn drag_math_is_correct_at_every_scale() {
+        // dy pixels -> minutes with the live scale, then snapped by the
+        // dragged_* helpers. 09:30-10:15, 45px of travel:
+        for (pph, expect_delta) in [(90.0, 30), (48.0, 56), (30.0, 90), (20.0, 135)] {
+            let delta = range_math::px_to_minutes(45.0, pph).round() as i64;
+            assert_eq!(delta, expect_delta, "pph {pph}");
+            let (s, e) = dragged_move(570, 615, delta, 0, 1440);
+            assert_eq!(s % 15, 0);
+            assert_eq!(e - s, 45);
+            assert_eq!(s, snap_to_quarter(570 + delta as u32));
+        }
+        // Resize at 90px/h: 30px down = 20 min -> 10:15 -> 10:30 end snapped down.
+        let delta = range_math::px_to_minutes(30.0, 90.0).round() as i64;
+        assert_eq!(dragged_resize(570, 615, delta, 1440), (570, 630));
+        // Whole-day bounds: dragging past midnight pins the end at 24:00.
+        assert_eq!(dragged_resize(1380, 1400, 600, 1440), (1380, 1440));
+        assert_eq!(dragged_move(1380, 1440, 600, 0, 1440), (1380, 1440));
+    }
+
+    #[test]
+    fn click_to_add_converts_pixels_at_any_scale() {
+        // A click 135px down the body at 90px/h in a 09:00 range is 10:30.
+        let m = range_math::y_to_minute(135.0, WD, 90.0).max(0.0) as u32;
+        assert_eq!(snap_to_quarter(m), 630);
+        // Same click in a full-day range at 30px/h is 04:30.
+        let full = ViewRange { start: 0, end: 1440 };
+        let m = range_math::y_to_minute(135.0, full, 30.0) as u32;
+        assert_eq!(snap_to_quarter(m), 270);
     }
 
     #[test]

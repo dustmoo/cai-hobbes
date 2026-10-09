@@ -2320,6 +2320,9 @@ pub struct UiState {
     /// Missing = Manual. A view preference, never written to the todos.
     #[serde(default)]
     pub planner_list_orders: std::collections::HashMap<String, crate::todo::views::ListOrder>,
+    /// The Today rail's visible time range (preset or custom). Missing = Workday.
+    #[serde(default)]
+    pub planner_rail_view: Option<crate::components::planner_range::RailView>,
     /// Default state for tool call Arguments section (expanded or collapsed)
     #[serde(default = "default_true", alias = "show_tool_arguments")]
     pub default_tool_arguments_open: bool,
@@ -2466,6 +2469,7 @@ impl Default for UiState {
             planner_left_width: default_planner_left_width(),
             planner_today_width: default_planner_today_width(),
             planner_list_orders: std::collections::HashMap::new(),
+            planner_rail_view: None,
             default_tool_arguments_open: true,
             default_tool_response_open: false,
             default_tool_thought_open: false,
