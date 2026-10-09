@@ -196,14 +196,24 @@ pub(crate) fn ChatRail(chat_ref: Signal<Option<ChatRef>>) -> Element {
             } else {
                 div { class: "flex max-h-[420px] flex-col gap-1.5 overflow-y-auto",
                     for (i, b) in bubbles_now.iter().enumerate() {
-                        div {
-                            key: "{i}",
-                            class: if b.from_user {
-                                "ml-auto max-w-[88%] whitespace-pre-line rounded-lg bg-btn-primary px-2.5 py-1.5 text-xs leading-4 text-fg"
-                            } else {
-                                "mr-auto max-w-[88%] whitespace-pre-line rounded-lg border border-faint bg-card px-2.5 py-1.5 text-xs leading-4 text-fg"
-                            },
-                            "{b.text}"
+                        if b.from_user {
+                            div {
+                                key: "{i}",
+                                class: "ml-auto max-w-[88%] whitespace-pre-line rounded-lg bg-btn-primary px-2.5 py-1.5 text-xs leading-4 text-fg",
+                                "{b.text}"
+                            }
+                        } else {
+                            // Hobbes replies are markdown (headings, lists,
+                            // bold, code): render them like the chat does.
+                            div {
+                                key: "{i}",
+                                class: "mr-auto max-w-[88%] min-w-0 overflow-x-auto rounded-lg border border-faint bg-card px-2.5 py-1.5 text-xs text-fg",
+                                crate::components::markdown_renderer::MarkdownRenderer {
+                                    content: b.text.clone(),
+                                    comments: None,
+                                    pending_highlight: None,
+                                }
+                            }
                         }
                     }
                 }
