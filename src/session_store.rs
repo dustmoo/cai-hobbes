@@ -45,6 +45,8 @@ pub const META_TOOL_CALL_HISTORY: &str = "tool_call_history";
 const META_JSON_MIGRATED: &str = "migrated_from_json";
 /// Set once `search_text` carries each row's AI topic title (`tab_title`).
 const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
+/// Set once the `project_id` column carries each row's `data.project_id`.
+const META_PROJECT_ID_COLUMN: &str = "project_id_column_backfilled";
 
 fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
     FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -130,7 +132,8 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
              summary       TEXT NOT NULL,
              search_text   TEXT NOT NULL,
              seq           INTEGER NOT NULL,
-             data          TEXT NOT NULL
+             data          TEXT NOT NULL,
+             project_id    TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_last_updated ON sessions(last_updated DESC);
          CREATE TABLE IF NOT EXISTS meta (
@@ -147,6 +150,7 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
              PRIMARY KEY (session_id, seq)
          );",
     )?;
+    ensure_project_id_column(conn)?;
 
     // The planner and the fleet share this database and connection. Creating
     // their schemas here means test databases get their tables too.
@@ -195,6 +199,10 @@ pub fn init() -> Result<(), String> {
         tracing::warn!("search_text tab_title backfill failed (will retry next launch): {e}");
     }
 
+    if let Err(e) = backfill_project_id_column(&conn) {
+        tracing::warn!("project_id column backfill failed (will retry next launch): {e}");
+    }
+
     seed_seq_from_db(&conn);
 
     let _ = CONN.set(Mutex::new(conn));
@@ -231,6 +239,49 @@ fn backfill_search_tab_titles(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
     meta_set_conn(conn, META_SEARCH_TAB_TITLE, "1", 0)
+}
+
+/// The indexed `project_id` column (a copy of `data.project_id`, written by
+/// `upsert_row`). Databases created before it existed get it added here —
+/// `ADD COLUMN` is a schema-only change in SQLite, instant at any size —
+/// and `backfill_project_id_column` fills it once.
+fn ensure_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'project_id'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute("ALTER TABLE sessions ADD COLUMN project_id TEXT", [])?;
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON sessions(project_id)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// One-time: copy each row's `data.project_id` into the `project_id` column,
+/// so project lookups (Manage projects' merge, `HOBBES_PROJECT_MERGE`) hit
+/// the index instead of scanning every row's JSON. Reads every row once
+/// (in `init`, before the connection is shared); writes only the tagged
+/// rows. Leaves `data`, `seq` and fingerprints untouched.
+fn backfill_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
+    if meta_get_conn(conn, META_PROJECT_ID_COLUMN)?.is_some() {
+        return Ok(());
+    }
+    let started = std::time::Instant::now();
+    let updated = conn.execute(
+        "UPDATE sessions
+         SET project_id = json_extract(data, '$.project_id')
+         WHERE project_id IS NOT json_extract(data, '$.project_id')",
+        [],
+    )?;
+    meta_set_conn(conn, META_PROJECT_ID_COLUMN, "1", 0)?;
+    tracing::info!(
+        updated,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "backfilled the sessions.project_id column"
+    );
+    Ok(())
 }
 
 fn migrate_from_json_files(conn: &Connection) -> Result<(), String> {
@@ -358,6 +409,8 @@ pub struct SessionRow {
     pub has_timers: bool,
     pub summary: String,
     pub search_text: String,
+    /// `session.project_id`, mirrored into an indexed column.
+    pub project_id: Option<String>,
     pub seq: i64,
     pub data: String,
     pub data_hash: u64,
@@ -402,6 +455,7 @@ pub fn build_row(session: &Session, seq: i64) -> Result<SessionRow, serde_json::
         has_timers: !session.scheduled_timers.is_empty(),
         summary,
         search_text,
+        project_id: session.project_id.clone(),
         seq,
         data,
         data_hash,
@@ -412,8 +466,8 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO sessions
             (id, name, last_updated, message_count, total_cost, total_tokens,
-             has_timers, summary, search_text, seq, data)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             has_timers, summary, search_text, seq, data, project_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              last_updated = excluded.last_updated,
@@ -424,7 +478,8 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
              summary = excluded.summary,
              search_text = excluded.search_text,
              seq = excluded.seq,
-             data = excluded.data
+             data = excluded.data,
+             project_id = excluded.project_id
          WHERE excluded.seq >= sessions.seq",
         params![
             row.id,
@@ -438,6 +493,7 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
             row.search_text,
             row.seq,
             row.data,
+            row.project_id,
         ],
     )?;
     Ok(())
@@ -699,41 +755,58 @@ pub fn rename_session(id: &str, new_name: &str) {
     }
 }
 
-/// Rows whose top-level `project_id` is one of `project_ids`: `(id, data)`.
-/// `instr` narrows the scan to rows mentioning the id; parsing confirms it is
-/// the session's own tag (tool-call arguments inside messages carry
-/// `project_id` keys too).
-fn tagged_rows_conn(
-    conn: &Connection,
-    project_ids: &[String],
-) -> rusqlite::Result<Vec<(String, serde_json::Value, bool)>> {
+/// Ids of rows tagged to any of `project_ids` — an index lookup on the
+/// `project_id` column (the session's own tag; tool-call arguments inside
+/// `data` that happen to carry `project_id` keys never match).
+fn tagged_ids_conn(conn: &Connection, project_ids: &[String]) -> rusqlite::Result<Vec<String>> {
     let mut out = Vec::new();
-    let mut stmt = conn.prepare("SELECT id, data FROM sessions WHERE instr(data, ?1) > 0")?;
+    let mut stmt = conn.prepare_cached("SELECT id FROM sessions WHERE project_id = ?1")?;
     for pid in project_ids {
-        let needle = format!("\"project_id\":{}", serde_json::Value::String(pid.clone()));
-        let rows = stmt.query_map(params![needle], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-        for row in rows {
-            let (id, data) = row?;
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
-            if value.get("project_id").and_then(|v| v.as_str()) == Some(pid.as_str()) {
-                let user_set = value
-                    .get("project_tag_user_set")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                out.push((id, value, user_set));
+        let rows = stmt.query_map(params![pid], |r| r.get::<_, String>(0))?;
+        for id in rows {
+            let id = id?;
+            if !out.contains(&id) {
+                out.push(id);
             }
         }
     }
     Ok(out)
 }
 
+/// Rows tagged to any of `project_ids`, except `skip_ids`: `(id, data as
+/// JSON, project_tag_user_set)`. Selected by the indexed column; `data` is
+/// read only for those rows.
+fn tagged_rows_conn(
+    conn: &Connection,
+    project_ids: &[String],
+    skip_ids: &std::collections::HashSet<String>,
+) -> rusqlite::Result<Vec<(String, serde_json::Value, bool)>> {
+    let mut out = Vec::new();
+    let mut stmt = conn.prepare_cached("SELECT data FROM sessions WHERE id = ?1")?;
+    for id in tagged_ids_conn(conn, project_ids)? {
+        if skip_ids.contains(&id) {
+            continue;
+        }
+        let data: String = match stmt.query_row(params![id], |r| r.get(0)) {
+            Ok(d) => d,
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => return Err(e),
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&data) else { continue };
+        let user_set = value
+            .get("project_tag_user_set")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        out.push((id, value, user_set));
+    }
+    Ok(out)
+}
+
 /// Ids of stored sessions tagged to any of `project_ids` (hydrated or not —
 /// a hydrated session's row may lag its in-memory copy; callers that care
-/// overlay `SessionState`).
+/// overlay `SessionState`). An index lookup, cheap at any database size.
 pub fn session_ids_tagged(project_ids: &[String]) -> Vec<String> {
-    with_conn(|conn| tagged_rows_conn(conn, project_ids))
-        .map(|rows| rows.into_iter().map(|(id, _, _)| id).collect())
-        .unwrap_or_default()
+    with_conn(|conn| tagged_ids_conn(conn, project_ids)).unwrap_or_default()
 }
 
 /// Retag every stored session tagged to one of `from_ids` to `to_id`,
@@ -762,18 +835,16 @@ fn retag_sessions_conn(
     to_id: &str,
     skip_ids: &std::collections::HashSet<String>,
 ) -> rusqlite::Result<Vec<(String, bool)>> {
-    let rows = tagged_rows_conn(conn, from_ids)?;
+    let rows = tagged_rows_conn(conn, from_ids, skip_ids)?;
     let tx = conn.unchecked_transaction()?;
     let mut done = Vec::new();
     for (id, mut value, user_set) in rows {
-        if skip_ids.contains(&id) {
-            continue;
-        }
         value["project_id"] = serde_json::Value::String(to_id.to_string());
         let Ok(new_data) = serde_json::to_string(&value) else { continue };
+        // The column moves with `data` so later lookups stay exact.
         tx.execute(
-            "UPDATE sessions SET data = ?2, seq = ?3 WHERE id = ?1",
-            params![id, new_data, next_seq()],
+            "UPDATE sessions SET data = ?2, project_id = ?3, seq = ?4 WHERE id = ?1",
+            params![id, new_data, to_id, next_seq()],
         )?;
         forget_fingerprint(&id);
         done.push((id, user_set));
@@ -1429,11 +1500,20 @@ pub mod test_support {
     }
 
     pub fn session_ids_tagged_for_test(conn: &Connection, project_ids: &[String]) -> Vec<String> {
-        tagged_rows_conn(conn, project_ids)
+        tagged_ids_conn(conn, project_ids).unwrap()
+    }
+
+    pub fn project_id_column(conn: &Connection, id: &str) -> Option<String> {
+        conn.query_row("SELECT project_id FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
             .unwrap()
-            .into_iter()
-            .map(|(id, _, _)| id)
-            .collect()
+    }
+
+    pub fn backfill_project_ids_for_test(conn: &Connection) {
+        backfill_project_id_column(conn).unwrap();
+    }
+
+    pub fn ensure_project_id_column_for_test(conn: &Connection) {
+        ensure_project_id_column(conn).unwrap();
     }
 
     pub fn retag_sessions_for_test(
@@ -1509,7 +1589,122 @@ mod list_metadata_tests {
             // The user_set flag rides along unchanged.
             let b_row: Session = serde_json::from_str(&get_row_data(conn, &b.id).unwrap()).unwrap();
             assert!(b_row.project_tag_user_set);
+            // The indexed column moved with `data`.
+            assert_eq!(project_id_column(conn, &a.id).as_deref(), Some("keep"));
+            assert_eq!(project_id_column(conn, &hydrated.id).as_deref(), Some("old-1"));
+            let mut now_keep = session_ids_tagged_for_test(conn, &["keep".to_string()]);
+            now_keep.sort();
+            let mut want = vec![a.id.clone(), b.id.clone()];
+            want.sort();
+            assert_eq!(now_keep, want);
+            assert!(session_ids_tagged_for_test(conn, &["old-2".to_string()]).is_empty());
         });
+    }
+
+    #[test]
+    fn upsert_writes_the_project_id_column_and_tool_args_never_match() {
+        with_test_db(|conn| {
+            let mut a = session("A", false, None, None);
+            a.project_id = Some("p1".into());
+            // A chat that only *mentions* p1 in a tool call's arguments.
+            let mut mention = session("M", false, None, None);
+            let tc = crate::components::shared::ToolCall::new(
+                "hobbes-planner".into(),
+                "HOBBES_TODO_CREATE".into(),
+                serde_json::json!({ "todos": [{ "title": "x", "project_id": "p1" }] }),
+                None,
+                None,
+            );
+            mention.messages.push(crate::components::chat::Message {
+                id: uuid::Uuid::new_v4(),
+                author: "Hobbes".into(),
+                content: crate::components::shared::MessageContent::ToolCall(tc),
+                attachments: Vec::new(),
+                comments: Vec::new(),
+                created_at: chrono::Utc::now(),
+                usage: None,
+            });
+            upsert(conn, &a);
+            upsert(conn, &mention);
+            assert_eq!(project_id_column(conn, &a.id).as_deref(), Some("p1"));
+            assert_eq!(project_id_column(conn, &mention.id), None);
+            assert_eq!(session_ids_tagged_for_test(conn, &["p1".to_string()]), vec![a.id.clone()]);
+
+            // A later save that clears the tag clears the column.
+            a.project_id = None;
+            upsert(conn, &a);
+            assert_eq!(project_id_column(conn, &a.id), None);
+            assert!(session_ids_tagged_for_test(conn, &["p1".to_string()]).is_empty());
+
+            // An older in-flight write (lower seq) can't put the column back.
+            let mut stale = a.clone();
+            stale.project_id = Some("p1".into());
+            upsert_with_seq(conn, &stale, 0);
+            assert_eq!(project_id_column(conn, &a.id), None);
+        });
+    }
+
+    #[test]
+    fn project_id_column_migration_adds_backfills_once_and_indexes() {
+        let conn = Connection::open_in_memory().unwrap();
+        // A pre-column database: the old sessions table, rows carrying the
+        // tag only inside `data`.
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL, last_updated TEXT NOT NULL,
+                 message_count INTEGER NOT NULL, total_cost REAL NOT NULL,
+                 total_tokens INTEGER NOT NULL, has_timers INTEGER NOT NULL,
+                 summary TEXT NOT NULL, search_text TEXT NOT NULL, seq INTEGER NOT NULL,
+                 data TEXT NOT NULL);
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL, seq INTEGER NOT NULL);",
+        )
+        .unwrap();
+        let mut tagged = session("T", false, None, None);
+        tagged.project_id = Some("p1".into());
+        let untagged = session("U", false, None, None);
+        for s in [&tagged, &untagged] {
+            let row = build_row(s, 5).unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, name, last_updated, message_count, total_cost,
+                     total_tokens, has_timers, summary, search_text, seq, data)
+                 VALUES (?1, ?2, ?3, 0, 0, 0, 0, '', '', ?4, ?5)",
+                params![row.id, row.name, row.last_updated, row.seq, row.data],
+            )
+            .unwrap();
+        }
+
+        ensure_project_id_column_for_test(&conn);
+        // Idempotent: a second schema pass doesn't try to add it again.
+        ensure_project_id_column_for_test(&conn);
+        assert_eq!(project_id_column(&conn, &tagged.id), None, "not backfilled yet");
+
+        backfill_project_ids_for_test(&conn);
+        assert_eq!(project_id_column(&conn, &tagged.id).as_deref(), Some("p1"));
+        assert_eq!(project_id_column(&conn, &untagged.id), None);
+        assert_eq!(meta(&conn, META_PROJECT_ID_COLUMN).as_deref(), Some("1"));
+        // `data` and `seq` are untouched (fingerprints stay valid).
+        let (seq, data): (i64, String) = conn
+            .query_row("SELECT seq, data FROM sessions WHERE id = ?1", params![tagged.id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(seq, 5);
+        assert_eq!(data, build_row(&tagged, 5).unwrap().data);
+
+        // Guarded by the meta key: a second run is a no-op.
+        conn.execute("UPDATE sessions SET project_id = NULL", []).unwrap();
+        backfill_project_ids_for_test(&conn);
+        assert_eq!(project_id_column(&conn, &tagged.id), None);
+
+        // The lookup uses the index, not a scan.
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM sessions WHERE project_id = 'p1'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("idx_sessions_project_id"), "{plan}");
     }
 
     #[test]

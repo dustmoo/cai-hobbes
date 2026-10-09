@@ -167,6 +167,7 @@ mod secret_manager_generic; // keyring crate
 | AP-008 | `use_memo` Over a Prop | Streaming code/markdown freezes at first chunk | Compute inline; reserve `use_memo` for Signals (P-012) |
 | AP-009 | Built-in Tool Intercepted at One Call Site | Tool works normally, fails only after a permission approval | Add it to `dispatch_builtin_tool`, never to a call site (P-015) |
 | AP-010 | Stream Mirror Skips Once Generating Ends | Finished reply cut off mid-sentence until a tab switch; DB has the full text | Reconcile from `session_state` at turn end; only a channel owner may skip (P-016) |
+| AP-011 | Store Scan in a Click Handler | Beach ball on a click; opening a chat stalls meanwhile | Indexed query, run in `spawn_blocking` from a spawned task, in-progress state in the UI (P-017) |
 
 ---
 
@@ -557,3 +558,55 @@ tab switch (remount re-seeds `content` from the prop) fixes it.
 
 **If broken**: the end of long replies silently goes missing on screen while
 persistence, cost and history all look correct.
+
+---
+
+### 17. No Store or File I/O on the UI Thread
+
+> **Pattern ID**: P-017
+> **Anti-Pattern**: Running a row-scanning `session_store` query from a Dioxus handler (AP-011)
+
+Dioxus event handlers, render, and tasks started with `spawn` all run on the
+main thread. Any `session_store` query that can scan rows, or any disk I/O
+beyond a single-row upsert, goes through `tokio::task::spawn_blocking` from a
+spawned task, with an in-progress state in the UI. The store also sits behind
+one global `with_conn` mutex, so a slow query on the UI thread blocks every
+other store user too (opening a chat from History, saves, the journal).
+
+**The bug that set this rule**: Manage projects' "Merge into…" counted the
+chats tagged to the merging projects in the click handler, and the confirm
+retagged them there too. Both ran `SELECT id, data FROM sessions WHERE
+instr(data, ?)` and parsed the JSON of each hit — on a 1.18 GB `sessions.db`
+a multi-second full scan, twice, on the main thread, holding the connection.
+The app beach-balled.
+
+**Rules**:
+- Make the query cheap first: anything selected by a session field gets a
+  derived, indexed column written by `build_row`/`upsert_row` (like
+  `project_id`, `has_timers`, `search_text`), backfilled once behind a
+  `meta` key in `init()`. Never `instr`/`LIKE` over `data` to find rows.
+- Then move it off the main thread anyway: open the UI at once with an
+  in-progress state ("Counting chats…", "retagging N chats…"), run the store
+  work in `spawn_blocking` inside `spawn(async move { … })`, and write the
+  result back to signals on the UI side when it lands.
+- Never move a `Signal` write into `spawn_blocking`: compute there, write
+  back after the `.await`. Snapshot what the blocking side needs (rows,
+  ids, seqs) on the UI thread first, P-009 style.
+- Multi-row planner writes go through `todo::store::PlannerRows` with seqs
+  allocated at snapshot time, so an edit made while the batch is in flight
+  still wins.
+- A single-row upsert from a handler (renaming one project) is fine.
+
+**Location**: `src/session_store.rs` (`project_id` column,
+`backfill_project_id_column`, `tagged_ids_conn`),
+`src/services/project_tagger.rs` (`count_sessions_tagged`,
+`retag_stored_sessions_blocking`),
+`src/components/planner_view/manage_projects.rs` (`finish_merge`,
+`write_rows_async`).
+
+**Tests**: `project_id_column_migration_adds_backfills_once_and_indexes`
+(asserts the lookup's query plan uses the index),
+`upsert_writes_the_project_id_column_and_tool_args_never_match`.
+
+**If broken**: the app freezes on a click whose cost grows with the size of
+the chat history — invisible on a test database, minutes on a real one.

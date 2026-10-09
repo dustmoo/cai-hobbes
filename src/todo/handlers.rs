@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::components::shared::ToolCallStatus;
 
 use super::model::{
-    self, Area, BlockSource, CalendarEvent, ChecklistItem, DayPlan, HumanKind, Lane,
+    self, BlockSource, CalendarEvent, ChecklistItem, DayPlan, HumanKind, Lane,
     Priority, Project, TimeBlock, TimeOfDay, Todo, TodoBucket, TodoOrigin, TodoStatus, SORT_STEP,
 };
 use super::views::{self, TodoView};
@@ -1831,10 +1831,10 @@ pub fn handle_project_upsert(
     // existing area by id.
     for (i, item) in areas.into_iter().flatten().enumerate() {
         match upsert_area(state, item, now) {
-            Ok(line) => {
+            Ok((line, id)) => {
                 applied.push(line);
                 if persist {
-                    if let Some(area) = last_touched_area(state, item) {
+                    if let Some(area) = state.areas.iter().find(|a| a.id == id) {
                         if let Err(e) = store::save_area(area) {
                             tracing::error!("Failed to persist area {}: {}", area.id, e);
                         }
@@ -1880,43 +1880,47 @@ pub fn handle_project_upsert(
     }
 }
 
-fn upsert_area(state: &mut PlannerState, item: &Value, now: DateTime<Utc>) -> Result<String, String> {
+/// Create or update one area. `Ok((line, id))`. An item without an id that
+/// names an existing area (same normalized name, as for projects) updates
+/// that area instead of creating a duplicate. Areas are never deleted here.
+fn upsert_area(
+    state: &mut PlannerState,
+    item: &Value,
+    now: DateTime<Utc>,
+) -> Result<(String, String), String> {
     let obj = item.as_object().ok_or("expected an object")?;
     let title = obj.get("title").and_then(|v| v.as_str()).map(str::trim);
 
     match obj.get("id").and_then(|v| v.as_str()) {
         Some(id) => {
-            let area = state
-                .areas
-                .iter_mut()
-                .find(|a| a.id == id)
-                .ok_or_else(|| format!("unknown area id '{}'", id))?;
-            if let Some(t) = title.filter(|t| !t.is_empty()) {
-                area.title = t.to_string();
+            if !state.areas.iter().any(|a| a.id == id) {
+                return Err(format!("unknown area id '{}'", id));
             }
+            if let Some(t) = title.filter(|t| !t.is_empty()) {
+                state.rename_area(id, t, now)?;
+            }
+            let area = state.areas.iter_mut().find(|a| a.id == id).ok_or("area vanished")?;
             area.updated_at = now;
-            Ok(format!("[{}] area: {}", area.id, area.title))
+            Ok((format!("[{}] area: {}", area.id, area.title), area.id.clone()))
         }
         None => {
             let title = title
                 .filter(|t| !t.is_empty())
                 .ok_or("missing required 'title' for a new area")?;
-            let sort_order = state
-                .areas
-                .iter()
-                .map(|a| a.sort_order)
-                .fold(0.0f64, f64::max)
-                + SORT_STEP;
-            let area = Area {
-                id: uuid::Uuid::new_v4().to_string(),
-                title: title.to_string(),
-                sort_order,
-                created_at: now,
-                updated_at: now,
-            };
-            let line = format!("[{}] area: {}", area.id, area.title);
-            state.areas.push(area);
-            Ok(line)
+            let (id, created) = state.create_area(title, now)?;
+            let area = state.areas.iter_mut().find(|a| a.id == id).ok_or("area vanished")?;
+            if created {
+                Ok((format!("[{}] area: {}", area.id, area.title), id))
+            } else {
+                area.updated_at = now;
+                Ok((
+                    format!(
+                        "[{}] area: {} (matched existing area [{}]; no duplicate created)",
+                        area.id, area.title, area.id
+                    ),
+                    id,
+                ))
+            }
         }
     }
 }
@@ -2124,16 +2128,6 @@ fn upsert_project(
     Ok((line, id))
 }
 
-/// Re-fetch the record an upsert just touched so the store write sees the final
-/// state. Keyed by the item's id when updating; falls back to the newest record
-/// (just pushed) when creating.
-fn last_touched_area<'a>(state: &'a PlannerState, item: &Value) -> Option<&'a Area> {
-    match item.get("id").and_then(|v| v.as_str()) {
-        Some(id) => state.areas.iter().find(|a| a.id == id),
-        None => state.areas.last(),
-    }
-}
-
 // ── HOBBES_PROJECT_LIST ─────────────────────────────────────────────────────
 
 /// List projects with their ids, names, and activity — what the model looks
@@ -2214,12 +2208,20 @@ pub fn handle_project_list(state: &PlannerState, args: &Value) -> (ToolCallStatu
         lines.push(format!("…and {} more (narrow with 'query')", rows.len() - MAX_LIST_LINES));
     }
 
-    let mut out = format!("{} project(s):\n{}", rows.len(), lines.join("\n"));
+    // Areas first (with ids), so the model can file a project under one.
+    let areas = state.areas_sorted();
+    let mut out = if areas.is_empty() {
+        String::new()
+    } else {
+        let names: Vec<String> = areas.iter().map(|a| format!("[{}] {}", a.id, a.title)).collect();
+        format!("Areas (set a project's area_id): {}\n", names.join(", "))
+    };
+    out.push_str(&format!("{} project(s):\n{}", rows.len(), lines.join("\n")));
     if query.is_none() {
         let groups = project_identity::duplicate_groups(&state.projects);
         if !groups.is_empty() {
             out.push_str(
-                "\nPossible duplicates (the user decides; they can merge them in Planner \u{25b8} Manage projects — don't create another):",
+                "\nPossible duplicates (don't create another; the user decides — suggest merging with HOBBES_PROJECT_MERGE, which asks them to approve, or they can merge in Planner \u{25b8} Manage projects):",
             );
             for g in groups {
                 let names: Vec<String> = g
@@ -2233,6 +2235,70 @@ pub fn handle_project_list(state: &PlannerState, args: &Value) -> (ToolCallStatu
         }
     }
     (ToolCallStatus::Completed, out)
+}
+
+// ── HOBBES_PROJECT_MERGE ────────────────────────────────────────────────────
+
+/// Validate `HOBBES_PROJECT_MERGE` arguments against the current projects:
+/// `keep_id` must exist; `merge_ids` must be a non-empty array of other
+/// existing project ids (duplicates collapse). `Ok((keep_id, merge_ids))`.
+pub fn validate_project_merge(state: &PlannerState, args: &Value) -> Result<(String, Vec<String>), String> {
+    let known = |id: &str| state.projects.iter().any(|p| p.id == id);
+    let keep_id = args
+        .get("keep_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("missing 'keep_id': the id of the project to keep (HOBBES_PROJECT_LIST shows ids)")?;
+    if !known(keep_id) {
+        return Err(format!("unknown project id '{}' — HOBBES_PROJECT_LIST shows the ids", keep_id));
+    }
+    let raw = args
+        .get("merge_ids")
+        .and_then(|v| v.as_array())
+        .ok_or("missing 'merge_ids': an array of the project ids to fold into keep_id")?;
+    let mut merge_ids: Vec<String> = Vec::new();
+    for v in raw {
+        let id = v.as_str().map(str::trim).ok_or("merge_ids must be strings (project ids)")?;
+        if id == keep_id {
+            return Err("keep_id can't also be in merge_ids".to_string());
+        }
+        if !known(id) {
+            return Err(format!("unknown project id '{}' — HOBBES_PROJECT_LIST shows the ids", id));
+        }
+        if !merge_ids.iter().any(|m| m == id) {
+            merge_ids.push(id.to_string());
+        }
+    }
+    if merge_ids.is_empty() {
+        return Err("merge_ids is empty: name at least one project to fold into keep_id".to_string());
+    }
+    Ok((keep_id.to_string(), merge_ids))
+}
+
+/// What a merge will move, for the approval prompt: the titles, how many
+/// to-dos, and how many chats (`None` while still counting).
+pub fn project_merge_preview(
+    state: &PlannerState,
+    keep_id: &str,
+    merge_ids: &[String],
+    chats: Option<usize>,
+) -> String {
+    let title = |id: &str| {
+        state
+            .projects
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.title.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let merged: Vec<String> = merge_ids.iter().map(|id| title(id)).collect();
+    let todos = state
+        .todos
+        .iter()
+        .filter(|t| t.project_id.as_ref().is_some_and(|p| merge_ids.contains(p)))
+        .count();
+    crate::components::planner_view::manage_projects::merge_message(&title(keep_id), &merged, todos, chats)
 }
 
 /// (session_id, todo title) pairs for every open todo linked to a fleet
@@ -4589,6 +4655,57 @@ mod tests {
         assert!(resp.contains("archived"), "{resp}");
         assert!(resp.contains("status 'open'"), "{resp}");
         assert_eq!(state.projects.len(), 1);
+    }
+
+    #[test]
+    fn area_upsert_without_id_matches_an_existing_area() {
+        let mut state = PlannerState::default();
+        upsert(&mut state, json!({"areas": [{"title": "Deep Work"}]}));
+        let id = state.areas[0].id.clone();
+        let (status, resp) = upsert(&mut state, json!({"areas": [{"title": "deep-work"}]}));
+        assert_eq!(status, ToolCallStatus::Completed, "{resp}");
+        assert_eq!(state.areas.len(), 1, "no duplicate area: {resp}");
+        assert!(resp.contains(&format!("matched existing area [{id}]")), "{resp}");
+        // Renaming by id onto another area's name is refused.
+        upsert(&mut state, json!({"areas": [{"title": "Home"}]}));
+        let (status, resp) = upsert(&mut state, json!({"areas": [{"id": id, "title": "home"}]}));
+        assert_eq!(status, ToolCallStatus::Error, "{resp}");
+        assert_eq!(state.areas.len(), 2);
+    }
+
+    #[test]
+    fn project_list_lists_areas_with_ids_first() {
+        let mut state = PlannerState::default();
+        upsert(&mut state, json!({"areas": [{"title": "Work"}], "projects": [{"title": "Hobbes"}]}));
+        let area = state.areas[0].id.clone();
+        let (_, out) = handle_project_list(&state, &json!({}));
+        assert!(out.starts_with(&format!("Areas (set a project's area_id): [{area}] Work\n1 project(s):")), "{out}");
+    }
+
+    #[test]
+    fn project_merge_validation_names_the_fix() {
+        let mut state = PlannerState::default();
+        upsert(&mut state, json!({"projects": [{"title": "Hobbes"}, {"title": "Taxes"}, {"title": "Exceller"}]}));
+        let ids: Vec<String> = state.projects.iter().map(|p| p.id.clone()).collect();
+        let ok = validate_project_merge(&state, &json!({"keep_id": ids[0], "merge_ids": [ids[1], ids[2], ids[1]]}));
+        assert_eq!(ok, Ok((ids[0].clone(), vec![ids[1].clone(), ids[2].clone()])), "duplicates collapse");
+        let err = |args: Value| validate_project_merge(&state, &args).unwrap_err();
+        assert!(err(json!({"merge_ids": [ids[1]]})).contains("keep_id"));
+        assert!(err(json!({"keep_id": "nope", "merge_ids": [ids[1]]})).contains("unknown project id 'nope'"));
+        assert!(err(json!({"keep_id": ids[0]})).contains("merge_ids"));
+        assert!(err(json!({"keep_id": ids[0], "merge_ids": []})).contains("empty"));
+        assert!(err(json!({"keep_id": ids[0], "merge_ids": [ids[0]]})).contains("can't also be"));
+        assert!(err(json!({"keep_id": ids[0], "merge_ids": ["ghost"]})).contains("unknown project id 'ghost'"));
+        assert!(err(json!({"keep_id": ids[0], "merge_ids": [3]})).contains("strings"));
+
+        // The approval prompt's statement.
+        let mut t = Todo::new("x", 0.0);
+        t.project_id = Some(ids[1].clone());
+        state.todos.push(t);
+        let preview = project_merge_preview(&state, &ids[0], &[ids[1].clone()], Some(2));
+        assert!(preview.contains("Merge \u{201c}Taxes\u{201d} into \u{201c}Hobbes\u{201d}"), "{preview}");
+        assert!(preview.contains("1 to-do and 2 chats"), "{preview}");
+        assert!(preview.contains("can't be undone"), "{preview}");
     }
 
     #[test]

@@ -358,9 +358,11 @@ impl PlannerClient {
                     activity. 'query' filters by name (title or alias, case/punctuation \
                     insensitive, near-misses included). Open projects only unless \
                     include_closed is true. Call this to find a project's id before filing \
-                    to-dos into it or updating it, and before creating a project. Possible \
-                    duplicates are flagged; only the user merges them (Planner \u{25b8} Manage \
-                    projects)."
+                    to-dos into it or updating it, and before creating a project. Areas are \
+                    listed first with their ids (set a project's area_id to file it). Possible \
+                    duplicates are flagged: suggest merging them with HOBBES_PROJECT_MERGE (the \
+                    user approves every merge), or the user can merge them in Planner \u{25b8} \
+                    Manage projects."
                         .into(),
                 ),
                 input_schema: Arc::new(
@@ -380,6 +382,34 @@ impl PlannerClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_PROJECT_MERGE".into(),
+                description: Some(
+                    "Merge duplicate projects: fold the projects in merge_ids into keep_id. Their \
+                    to-dos and tagged chats move to keep_id, their names become its aliases, and \
+                    they are removed. It can't be undone, so the user is asked to approve every \
+                    merge (the prompt states what moves). Look the ids up with \
+                    HOBBES_PROJECT_LIST first, and talk it through with the user before calling: \
+                    suggest which to merge and which to keep separate."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "keep_id": { "type": "string", "description": "The project to keep (from HOBBES_PROJECT_LIST)." },
+                            "merge_ids": { "type": "array", "items": { "type": "string" }, "description": "Projects to fold into keep_id. At least one; not keep_id itself." }
+                        },
+                        "required": ["keep_id", "merge_ids"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Merge Projects".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_PROJECT_UPSERT".into(),
                 description: Some(format!(
                     "Create or update projects and areas. Call HOBBES_PROJECT_LIST before \
@@ -388,7 +418,10 @@ impl PlannerClient {
                     first: if an existing project already has that title or alias it is \
                     updated instead (the response names its id); if only similar projects \
                     exist the item is refused with the candidates — pass one's id, or \
-                    create_new: true when it truly is a different project. {}",
+                    create_new: true when it truly is a different project. To combine \
+                    duplicates use HOBBES_PROJECT_MERGE, not an upsert. An area item without an \
+                    'id' that names an existing area (same name, ignoring case and punctuation) \
+                    updates that area; areas are never deleted here. {}",
                     SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(

@@ -769,6 +769,17 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
             .any(|t| t.name == "HOBBES_TODO_CREATE"),
         "enabled: planner tools advertised"
     );
+    let merge = prompt
+        .prompt
+        .tools
+        .iter()
+        .find(|t| t.name == "HOBBES_PROJECT_MERGE")
+        .expect("enabled: HOBBES_PROJECT_MERGE advertised");
+    assert!(merge.description.contains("approve"), "{}", merge.description);
+    for t in ["HOBBES_PROJECT_LIST", "HOBBES_PROJECT_UPSERT"] {
+        let def = prompt.prompt.tools.iter().find(|d| d.name == t).unwrap();
+        assert!(def.description.contains("HOBBES_PROJECT_MERGE"), "{t} should point at the merge tool");
+    }
 
     let disabled = Settings {
         planner_enabled: false,
@@ -783,6 +794,7 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
         "HOBBES_TIME_BLOCK",
         "HOBBES_PROJECT_UPSERT",
         "HOBBES_PROJECT_LIST",
+        "HOBBES_PROJECT_MERGE",
     ] {
         assert!(
             !prompt.prompt.tools.iter().any(|t| t.name == tool),

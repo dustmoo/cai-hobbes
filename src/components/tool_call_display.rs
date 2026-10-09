@@ -386,6 +386,51 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let mut make_rule = use_signal(|| false);
     let mut scope_to_project = use_signal(|| false);
 
+    // Built-ins that always ask can't be pre-approved: no trust-rule option.
+    let always_asks = crate::components::builtin_tools::always_asks(&tool_call.tool_name);
+    // HOBBES_PROJECT_MERGE states what moves. Titles and to-dos are in
+    // memory; the chat count is an index lookup run off the UI thread
+    // (P-017), filled in when it lands.
+    let mut merge_chats = use_signal(|| None::<usize>);
+    let merge_args: Option<(String, Vec<String>)> = (tool_call.tool_name == "HOBBES_PROJECT_MERGE")
+        .then(|| {
+            parsed_args.as_ref().and_then(|a| {
+                crate::todo::handlers::validate_project_merge(&planner.read(), a).ok()
+            })
+        })
+        .flatten();
+    use_hook({
+        let ids = merge_args.as_ref().map(|(_, m)| m.clone());
+        move || {
+            if let Some(ids) = ids {
+                spawn(async move {
+                    let n = crate::services::project_tagger::count_sessions_tagged(session_state, ids).await;
+                    merge_chats.set(Some(n));
+                });
+            }
+        }
+    });
+    let merge_description: Option<String> = if tool_call.tool_name == "HOBBES_PROJECT_MERGE" {
+        Some(match &merge_args {
+            Some((keep, merge)) => crate::todo::handlers::project_merge_preview(
+                &planner.read(),
+                keep,
+                merge,
+                *merge_chats.read(),
+            ),
+            None => {
+                let why = parsed_args
+                    .as_ref()
+                    .map(|a| crate::todo::handlers::validate_project_merge(&planner.read(), a))
+                    .and_then(|r| r.err())
+                    .unwrap_or_else(|| "its arguments couldn't be read".to_string());
+                format!("This merge can't run as asked: {why}. Approving it changes nothing.")
+            }
+        })
+    } else {
+        None
+    };
+
     // Shared decision logger with this prompt's identity.
     let decision_base = {
         let tc = tool_call.clone();
@@ -471,9 +516,16 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                         }
                     }
                 }
+                if let Some(desc) = merge_description {
+                    p { class: "font-semibold text-yellow-100", "{desc}" }
+                }
                 p { "Do you want to allow this?" }
+                if always_asks {
+                    p { class: "text-xs text-yellow-200/70", "Hobbes asks every time for this one; it can't be set to always allow." }
+                }
                 // Trust-rule authoring at the moment of decision (the skill
                 // prompt's remember-choice idiom).
+                if !always_asks {
                 div {
                     class: "flex flex-col gap-1 pt-1",
                     div {
@@ -515,6 +567,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                             }
                         }
                     }
+                }
                 }
             }
             div {
