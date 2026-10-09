@@ -515,6 +515,15 @@ pub(super) fn TodoRow(
                     }
                 }
 
+                if todo.prep_requested {
+                    span {
+                        class: "shrink-0 text-fg-muted",
+                        title: "Hobbes will prep this",
+                        "aria-label": "Hobbes will prep this",
+                        Icon { width: 12, height: 12, icon: fi_icons::FiFileText }
+                    }
+                }
+
                 // Project pill — the door to this todo's tags and its project.
                 // A todo with neither wears it only on hover, so untagged rows
                 // stay quiet but never lose the affordance.

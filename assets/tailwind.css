@@ -1983,6 +1983,10 @@ video {
   max-height: 320px;
 }
 
+.max-h-\[420px\] {
+  max-height: 420px;
+}
+
 .max-h-\[70vh\] {
   max-height: 70vh;
 }
@@ -2143,8 +2147,8 @@ video {
   width: 34px;
 }
 
-.w-\[390px\] {
-  width: 390px;
+.w-\[360px\] {
+  width: 360px;
 }
 
 .w-\[3px\] {
@@ -2228,6 +2232,10 @@ video {
   min-width: 300px;
 }
 
+.min-w-\[320px\] {
+  min-width: 320px;
+}
+
 .min-w-\[520px\] {
   min-width: 520px;
 }
@@ -2301,6 +2309,10 @@ video {
   max-width: 45%;
 }
 
+.max-w-\[460px\] {
+  max-width: 460px;
+}
+
 .max-w-\[60\%\] {
   max-width: 60%;
 }
@@ -2311,6 +2323,10 @@ video {
 
 .max-w-\[70\%\] {
   max-width: 70%;
+}
+
+.max-w-\[88\%\] {
+  max-width: 88%;
 }
 
 .max-w-\[92vw\] {
@@ -2561,6 +2577,10 @@ video {
 
 .grid-cols-\[minmax\(0\2c 1fr\)_auto\] {
   grid-template-columns: minmax(0,1fr) auto;
+}
+
+.grid-cols-\[repeat\(auto-fit\2c minmax\(300px\2c 1fr\)\)\] {
+  grid-template-columns: repeat(auto-fit,minmax(300px,1fr));
 }
 
 .flex-row {
@@ -5077,6 +5097,10 @@ video {
 
 .hover\:bg-yellow-500\/10:hover {
   background-color: rgb(234 179 8 / 0.1);
+}
+
+.hover\:bg-yellow-900\/70:hover {
+  background-color: rgb(113 63 18 / 0.7);
 }
 
 .hover\:text-fg:hover {

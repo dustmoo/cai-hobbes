@@ -120,6 +120,7 @@ fn DetailCardInner(todo_id: String) -> Element {
         return rsx! {};
     };
     let id = todo_id.clone();
+    let prep_on = todo.prep_requested;
 
     let commit_title = {
         let id = id.clone();
@@ -396,6 +397,26 @@ fn DetailCardInner(todo_id: String) -> Element {
                             if !c.is_empty() {
                                 span { "· {c}" }
                             }
+                        }
+                    }
+                }
+
+                // Prep this: the person's own open to-dos only.
+                if todo.lane == crate::todo::model::Lane::Human && !todo.status.is_closed() {
+                    label {
+                        class: "flex cursor-pointer items-start gap-2",
+                        input {
+                            class: "mt-0.5 shrink-0 accent-current",
+                            r#type: "checkbox",
+                            checked: todo.prep_requested,
+                            onchange: {
+                                let id = id.clone();
+                                move |_| set_prep(planner, &id, !prep_on)
+                            },
+                        }
+                        span { class: "flex flex-col",
+                            span { class: "text-sm text-fg", "Prep this" }
+                            span { class: "text-xs text-fg-muted", "Hobbes prepares a brief or draft for it in agent time" }
                         }
                     }
                 }
@@ -833,6 +854,20 @@ fn DetailCardInner(todo_id: String) -> Element {
                 }
             }
         }
+    }
+}
+
+/// Flag or unflag a to-do "Prep this" (`PlannerState::set_prep_requested`)
+/// and persist it. The write guard is dropped before the save.
+fn set_prep(mut planner: Signal<PlannerState>, id: &str, on: bool) {
+    let res = planner.write().set_prep_requested(id, on, chrono::Utc::now());
+    match res {
+        Ok(t) => {
+            if let Err(e) = crate::todo::store::save_todo(&t) {
+                tracing::error!("planner: failed to save to-do {}: {}", t.id, e);
+            }
+        }
+        Err(e) => tracing::warn!("planner: couldn't set prep on {}: {}", id, e),
     }
 }
 

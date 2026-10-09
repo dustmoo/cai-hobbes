@@ -31,6 +31,8 @@ use super::planner_timeline::TodayRail;
 // readouts, the decision queue, your-time goals, the weekly review and the
 // agent-time panel.
 pub(crate) mod agent_lane;
+pub(crate) mod agent_review;
+pub(crate) mod agent_review_chat;
 pub(crate) mod agent_time;
 pub(crate) mod decisions;
 pub(crate) mod review;

@@ -18,7 +18,7 @@ use crate::components::chat_input::ChatCommand;
 use crate::session::SessionState;
 use crate::settings::{short_model_label, AllowedModel, Settings};
 use crate::todo::agent_time::{
-    accept_start_route, proposal_starts_work, AcceptStartRoute, AgentTimeBudget,
+    accept_start_route, proposal_starts_work, review_for, AcceptStartRoute, AgentTimeBudget,
 };
 use crate::todo::measures;
 use crate::todo::model::{
@@ -27,6 +27,7 @@ use crate::todo::model::{
 use crate::todo::store;
 use crate::todo::PlannerState;
 
+use super::agent_review::{mark_reviewed, result_stats, review_meta, ReviewBody};
 use super::today;
 
 // ── Pure helpers ────────────────────────────────────────────────────────────
@@ -251,13 +252,14 @@ pub(crate) fn AgentTimeView() -> Element {
     let settings = use_context::<Signal<Settings>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut todo_detail = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
-    // Proposals accepted in this sitting, shown as one line each.
-    let mut accepted = use_signal(Vec::<AcceptedLine>::new);
+    // The full run log and the grant: the person's choice, else a default
+    // that follows whether a review is showing.
+    let mut log_open = use_signal(|| Option::<bool>::None);
+    let mut grant_open = use_signal(|| Option::<bool>::None);
     // Calls the run is waiting on the user for. A memo, so a chunk streaming
     // into any chat re-runs only this scan, not the panel.
     let held = use_memo(move || held_approvals(&planner.read(), &session_state.read()));
     let mut widening_dismissed = use_signal(|| false);
-    let mut editing = use_signal(|| Option::<(String, String, String)>::None);
     // Trust ledger → Review: the list is open; the change being made
     // (proposal id, new verdict or None = remove, the note).
     let mut ledger_open = use_signal(|| false);
@@ -290,7 +292,7 @@ pub(crate) fn AgentTimeView() -> Element {
             let title = state.todo(&id).map(|t| t.title.clone()).unwrap_or_else(|| "a deleted to-do".to_string());
             (id, title)
         });
-    let proposals: Vec<Proposal> = state.open_proposals().into_iter().cloned().collect();
+    let review = review_for(&state, None, now);
     let ledger = state.trust_ledger;
     let resolved = ledger_review_rows(&state.proposals);
     let projects: Vec<String> = grant
@@ -340,7 +342,12 @@ pub(crate) fn AgentTimeView() -> Element {
             .unwrap_or_else(|| "connector default".to_string());
         format!("{label} (no longer available)")
     });
-    let accepted_lines = accepted.read().clone();
+    let log_shown = log_open.read().unwrap_or(review.is_empty());
+    let grant_shown = grant_open.read().unwrap_or(review.is_empty());
+    let show_review = grant.enabled || !review.is_empty();
+    let review_meta_line = (!review.is_empty()).then(|| review_meta(&review, grant.daily_minutes, grant.spend_cap_usd));
+    let result_stats = result_stats(&ledger);
+    let window_start_value = grant.window_start.map(|t| t.format("%H:%M").to_string()).unwrap_or_default();
     let reads_label = if projects.is_empty() {
         "notes, the planner, and what you've shared".to_string()
     } else {
@@ -355,7 +362,10 @@ pub(crate) fn AgentTimeView() -> Element {
                 // ── Header: status + the controls ─────────────────────────
                 div {
                     class: "flex flex-wrap items-center gap-3",
-                    h1 { class: "text-xl font-semibold", "Agent time" }
+                    h1 {
+                        class: "text-xl font-semibold",
+                        if review.is_empty() { "Agent time" } else { "While you were away" }
+                    }
                     span {
                         class: "{pill_class}",
                         if waiting {
@@ -369,6 +379,25 @@ pub(crate) fn AgentTimeView() -> Element {
                         span { class: "font-mono text-[11px] text-fg-muted", "{s}" }
                     }
                     div { class: "flex-1" }
+                    button {
+                        class: "inline-flex h-8 items-center rounded-md border border-faint px-3 text-[13px] text-fg hover:bg-input",
+                        "aria-pressed": if log_shown { "true" } else { "false" },
+                        title: "Every tool call, intent and cost of the latest run",
+                        onclick: move |_| log_open.set(Some(!log_shown)),
+                        "Full run log"
+                    }
+                    if !review.session_ids.is_empty() {
+                        button {
+                            class: "inline-flex h-8 items-center gap-1.5 rounded-md bg-btn-primary px-3.5 text-[13px] font-medium text-fg hover:bg-btn-primary-hover",
+                            title: "Mark these runs as read",
+                            onclick: {
+                                let ids = review.session_ids.clone();
+                                move |_| mark_reviewed(planner, &ids)
+                            },
+                            Icon { width: 13, height: 13, icon: fi_icons::FiCheck }
+                            "Mark reviewed"
+                        }
+                    }
                     if grant.enabled {
                         if running {
                             button {
@@ -405,6 +434,9 @@ pub(crate) fn AgentTimeView() -> Element {
                             "Grant agent time"
                         }
                     }
+                }
+                if let Some(meta) = review_meta_line {
+                    p { class: "font-mono text-[11px] text-fg-muted", "{meta}" }
                 }
                 // ── Waiting for your approval ────────────────────────────
                 for h in held.iter().cloned() {
@@ -469,299 +501,13 @@ pub(crate) fn AgentTimeView() -> Element {
                 } else if let Some(r) = refusal.clone().filter(|_| !running) {
                     p { class: "text-xs text-fg-muted", "{r}" }
                 }
-                div {
-                    class: "flex flex-wrap gap-3",
-                    // ── Left: the grant + proposals ───────────────────────
+                if show_review {
+                    ReviewBody { review: review.clone() }
+                }
+                // ── The full run log: intent + tool calls ────────────────
+                if log_shown {
                     div {
-                        class: "flex w-[390px] max-w-full shrink-0 flex-col gap-3",
-                        div {
-                            class: "{PANEL}",
-                            div { class: "flex items-center gap-2",
-                                span { class: "{EYEBROW}", "The grant" }
-                                div { class: "flex-1" }
-                                if grant.enabled {
-                                    button {
-                                        class: "font-mono text-[10.5px] text-fg-muted hover:text-red-300",
-                                        title: "Turn agent time off",
-                                        onclick: move |_| {
-                                            planner.write().agent_time_grant.enabled = false;
-                                            persist_grant(&planner);
-                                            if running {
-                                                chat_command.set(Some(ChatCommand::AgentTimeStop));
-                                            }
-                                        },
-                                        "turn off"
-                                    }
-                                } else {
-                                    span { class: "font-mono text-[10.5px] text-fg-muted", "off by default" }
-                                }
-                            }
-                            div {
-                                class: "grid grid-cols-[96px_minmax(0,1fr)] items-center gap-x-3 gap-y-2.5 text-xs",
-                                span { class: "text-fg-muted", "Minutes a day" }
-                                div { class: "flex items-center gap-2.5",
-                                    input {
-                                        r#type: "range",
-                                        class: "min-w-0 flex-1 accent-primary-500",
-                                        min: "0",
-                                        max: "120",
-                                        step: "5",
-                                        value: "{grant.daily_minutes}",
-                                        "aria-label": "Minutes a day",
-                                        style: "--pct: {min_pct}%;",
-                                        oninput: move |e| {
-                                            if let Ok(m) = e.value().parse::<u32>() {
-                                                planner.write().agent_time_grant.daily_minutes = m;
-                                            }
-                                        },
-                                        onchange: move |_| persist_grant(&planner),
-                                    }
-                                    span { class: "w-14 text-right font-mono text-[13px] text-fg", "{grant.daily_minutes} min" }
-                                }
-                                span { class: "text-fg-muted", "Spend cap" }
-                                div { class: "flex items-center gap-1.5",
-                                    span { class: "font-mono text-fg-muted", "$" }
-                                    input {
-                                        class: "h-6 w-20 rounded border border-faint bg-input px-2 text-right font-mono text-xs text-fg outline-none",
-                                        value: "{cap_text}",
-                                        "aria-label": "Spend cap in dollars a day",
-                                        oninput: move |e| cap_text.set(e.value()),
-                                        onchange: move |e| {
-                                            if let Ok(v) = e.value().trim().trim_start_matches('$').parse::<f64>() {
-                                                if v >= 0.0 {
-                                                    planner.write().agent_time_grant.spend_cap_usd = v;
-                                                    persist_grant(&planner);
-                                                    cap_text.set(format!("{v:.2}"));
-                                                }
-                                            }
-                                        },
-                                    }
-                                    span { class: "text-fg-muted", "a day" }
-                                }
-                                span { class: "text-fg-muted", "Days" }
-                                div { class: "flex gap-1",
-                                    for (i, (l, name)) in DAY_NAMES.iter().enumerate() {
-                                        button {
-                                            key: "{i}",
-                                            class: if grant.days[i] {
-                                                "h-6 w-6 rounded bg-btn-primary text-[11px] font-medium text-fg"
-                                            } else {
-                                                "h-6 w-6 rounded border border-faint text-[11px] text-fg-muted hover:text-fg"
-                                            },
-                                            "aria-label": "{name}",
-                                            "aria-pressed": if grant.days[i] { "true" } else { "false" },
-                                            onclick: move |_| {
-                                                let cur = planner.peek().agent_time_grant.days[i];
-                                                planner.write().agent_time_grant.days[i] = !cur;
-                                                persist_grant(&planner);
-                                            },
-                                            "{l}"
-                                        }
-                                    }
-                                }
-                                span { class: "text-fg-muted", "Model" }
-                                select {
-                                    class: "h-6 min-w-0 rounded border border-faint bg-input px-1.5 text-xs text-fg outline-none",
-                                    "aria-label": "Model agent time runs on",
-                                    title: "Agent time runs on this model; its spend follows the model's pricing.",
-                                    onchange: move |e| {
-                                        let (c, m) = parse_grant_select(&e.value());
-                                        {
-                                            let mut state = planner.write();
-                                            state.agent_time_grant.connector_id = c;
-                                            state.agent_time_grant.model = m;
-                                        }
-                                        persist_grant(&planner);
-                                    },
-                                    option { value: "", selected: grant_value.is_empty(), "Same as your chats" }
-                                    if let Some(label) = stale_choice.clone() {
-                                        option { value: "{grant_value}", selected: true, "{label}" }
-                                    }
-                                    for (name, opts) in groups.iter().cloned() {
-                                        optgroup { key: "{name}", label: "{name}",
-                                            for (v, label) in opts {
-                                                option { key: "{v}", value: "{v}", selected: v == grant_value, "{label}" }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            div { class: "h-px bg-[var(--color-border-muted)]" }
-                            p { class: "text-xs text-fg", span { class: "font-semibold", "Reads " } span { class: "text-fg-muted", "{reads_label}" } }
-                            p { class: "text-xs text-fg", span { class: "font-semibold", "Writes " } span { class: "text-fg-muted", "only to Hobbes-owned space: {kinds_label}" } }
-                            p { class: "text-xs text-fg", span { class: "font-semibold", "Outside effects " } span { class: "text-fg-muted", "always ask, through the normal approval gates" } }
-                            if !grant.scope.note.trim().is_empty() {
-                                p { class: "whitespace-pre-line text-[11px] text-fg-muted", "{grant.scope.note}" }
-                            }
-                        }
-                        div {
-                            class: "{PANEL}",
-                            div { class: "flex items-center gap-2",
-                                span { class: "{EYEBROW}", "Proposals" }
-                                span { class: "font-mono text-[11px] text-fg-muted",
-                                    if proposals.is_empty() { "none open" } else { "{proposals.len()} open" }
-                                }
-                            }
-                            for line in accepted_lines.iter().cloned() {
-                                div {
-                                    key: "acc-{line.proposal_id}",
-                                    class: "flex min-w-0 items-center gap-2 rounded-md border border-faint px-2.5 py-1.5 text-[11.5px]",
-                                    if line.error {
-                                        span { class: "shrink-0 text-yellow-300", Icon { width: 12, height: 12, icon: fi_icons::FiAlertTriangle } }
-                                    } else {
-                                        span { class: "shrink-0 text-primary-300", Icon { width: 12, height: 12, icon: fi_icons::FiCheck } }
-                                    }
-                                    span { class: "min-w-0 truncate text-fg", title: "{line.title}", "{line.title}" }
-                                    span { class: "min-w-0 shrink truncate text-fg-muted", title: "{line.text}", "\u{b7} {line.text}" }
-                                    div { class: "flex-1" }
-                                    if let Some(chat) = line.chat_id.clone() {
-                                        button {
-                                            class: "shrink-0 text-primary-300 hover:text-fg",
-                                            title: "Open the chat doing the work",
-                                            onclick: move |_| chat_command.set(Some(ChatCommand::SwitchToSession(chat.clone()))),
-                                            "Open chat"
-                                        }
-                                    } else if let Some(tid) = line.todo_id.clone() {
-                                        button {
-                                            class: "shrink-0 text-primary-300 hover:text-fg",
-                                            title: "Open the to-do",
-                                            onclick: move |_| todo_detail.set(Some(tid.clone())),
-                                            "Open to-do"
-                                        }
-                                    }
-                                }
-                            }
-                            if proposals.is_empty() && accepted_lines.is_empty() {
-                                p { class: "{EMPTY}", "No proposals. Whatever agent time makes lands here as a suggestion you accept, edit or dismiss." }
-                            }
-                            for p in proposals {
-                                {
-                                    let is_editing = editing.read().as_ref().is_some_and(|(id, _, _)| *id == p.id);
-                                    let pid = p.id.clone();
-                                    let starts = proposal_starts_work(&p);
-                                    rsx! {
-                                        div {
-                                            key: "{p.id}",
-                                            class: "flex flex-col gap-1.5 rounded-md border border-faint bg-card px-2.5 py-2",
-                                            div { class: "flex items-center gap-2",
-                                                if p.kind == ProposalKind::Offer {
-                                                    span { class: "rounded-full border border-primary-400 px-1.5 text-[10px] uppercase leading-4 tracking-[0.08em] text-primary-300", "{kind_label(p.kind)}" }
-                                                } else {
-                                                    span { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "{kind_label(p.kind)}" }
-                                                }
-                                                div { class: "flex-1" }
-                                                span { class: "font-mono text-[10.5px] text-fg-muted", "{hhmm(p.created_at)}" }
-                                            }
-                                            if is_editing {
-                                                input {
-                                                    class: "h-7 rounded border border-faint bg-input px-2 text-xs text-fg outline-none",
-                                                    value: "{editing.read().as_ref().map(|e| e.1.clone()).unwrap_or_default()}",
-                                                    oninput: move |e| if let Some(ed) = editing.write().as_mut() { ed.1 = e.value() },
-                                                }
-                                                textarea {
-                                                    class: "min-h-[64px] rounded border border-faint bg-input px-2 py-1 text-xs text-fg outline-none",
-                                                    value: "{editing.read().as_ref().map(|e| e.2.clone()).unwrap_or_default()}",
-                                                    oninput: move |e| if let Some(ed) = editing.write().as_mut() { ed.2 = e.value() },
-                                                }
-                                            } else {
-                                                div { class: "text-[13px] leading-[18px] text-fg", "{proposal_headline(&p)}" }
-                                                if !p.body.trim().is_empty() {
-                                                    div { class: "line-clamp-3 whitespace-pre-line text-[11.5px] leading-4 text-fg-muted", "{p.body}" }
-                                                }
-                                            }
-                                            div { class: "flex gap-1.5",
-                                                if is_editing {
-                                                    button {
-                                                        class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
-                                                        onclick: {
-                                                            let pid = pid.clone();
-                                                            move |_| {
-                                                                let edited = editing.peek().clone().map(|(_, t, b)| (t, b));
-                                                                if let Some(line) = accept(planner, settings, &pid, edited, false) {
-                                                                    accepted.write().push(line);
-                                                                }
-                                                                editing.set(None);
-                                                            }
-                                                        },
-                                                        "Save & accept"
-                                                    }
-                                                    button {
-                                                        class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
-                                                        onclick: move |_| editing.set(None),
-                                                        "Cancel"
-                                                    }
-                                                } else {
-                                                    if starts {
-                                                        button {
-                                                            class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
-                                                            title: if running { "Accept and hand it to the running agent-time session" } else { "Accept and queue it for the next agent time" },
-                                                            onclick: {
-                                                                let pid = pid.clone();
-                                                                move |_| {
-                                                                    if let Some(line) = accept(planner, settings, &pid, None, true) {
-                                                                        if let Some(chat) = line.chat_id.clone().filter(|_| !line.error) {
-                                                                            chat_command.set(Some(ChatCommand::OpenTabInBackground(chat)));
-                                                                        }
-                                                                        accepted.write().push(line);
-                                                                    }
-                                                                }
-                                                            },
-                                                            "Accept & start"
-                                                        }
-                                                        button {
-                                                            class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
-                                                            title: "Accept and leave it queued in the agent lane",
-                                                            onclick: {
-                                                                let pid = pid.clone();
-                                                                move |_| {
-                                                                    if let Some(line) = accept(planner, settings, &pid, None, false) {
-                                                                        accepted.write().push(line);
-                                                                    }
-                                                                }
-                                                            },
-                                                            "Accept only"
-                                                        }
-                                                    } else {
-                                                        button {
-                                                            class: "rounded bg-btn-primary px-2.5 py-0.5 text-[11px] text-fg hover:bg-btn-primary-hover",
-                                                            onclick: {
-                                                                let pid = pid.clone();
-                                                                move |_| {
-                                                                    if let Some(line) = accept(planner, settings, &pid, None, false) {
-                                                                        accepted.write().push(line);
-                                                                    }
-                                                                }
-                                                            },
-                                                            "Accept"
-                                                        }
-                                                    }
-                                                    if p.kind != ProposalKind::Offer {
-                                                        button {
-                                                            class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
-                                                            onclick: {
-                                                                let seed = (p.id.clone(), p.title.clone(), p.body.clone());
-                                                                move |_| editing.set(Some(seed.clone()))
-                                                            },
-                                                            "Edit"
-                                                        }
-                                                    }
-                                                    button {
-                                                        class: "rounded border border-faint px-2.5 py-0.5 text-[11px] text-fg hover:bg-input",
-                                                        onclick: {
-                                                            let pid = pid.clone();
-                                                            move |_| dismiss(planner, &pid)
-                                                        },
-                                                        "Dismiss"
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // ── Right: intent + live log ─────────────────────────
+                        class: "flex flex-wrap gap-3",
                     div {
                         class: "flex min-w-[300px] flex-1 flex-col gap-3",
                         // The intent stays in view above the log while it scrolls.
@@ -880,6 +626,7 @@ pub(crate) fn AgentTimeView() -> Element {
                             }
                         }
                     }
+                    }
                 }
                 // ── Trust ledger ─────────────────────────────────────────
                 div {
@@ -890,6 +637,12 @@ pub(crate) fn AgentTimeView() -> Element {
                     }
                     for (i, (v, cap)) in stats.iter().cloned().enumerate() {
                         div { key: "{i}", class: "flex w-[120px] flex-col gap-0.5",
+                            span { class: "text-lg font-semibold tabular-nums text-fg", "{v}" }
+                            span { class: "text-[11px] text-fg-muted", "{cap}" }
+                        }
+                    }
+                    for (i, (v, cap)) in result_stats.iter().cloned().enumerate() {
+                        div { key: "r{i}", class: "flex w-[120px] flex-col gap-0.5",
                             span { class: "text-lg font-semibold tabular-nums text-fg", "{v}" }
                             span { class: "text-[11px] text-fg-muted", "{cap}" }
                         }
@@ -1036,6 +789,163 @@ pub(crate) fn AgentTimeView() -> Element {
                         }
                     }
                 }
+                // ── The grant ────────────────────────────────────────────
+                div {
+                    class: "flex max-w-[460px] flex-col gap-2",
+                    button {
+                        class: "flex items-center gap-2 text-left",
+                        "aria-expanded": if grant_shown { "true" } else { "false" },
+                        onclick: move |_| grant_open.set(Some(!grant_shown)),
+                        span { class: "text-fg-muted",
+                            if grant_shown {
+                                Icon { width: 13, height: 13, icon: fi_icons::FiChevronDown }
+                            } else {
+                                Icon { width: 13, height: 13, icon: fi_icons::FiChevronRight }
+                            }
+                        }
+                        span { class: "{EYEBROW}", "Grant" }
+                        span { class: "font-mono text-[11px] text-fg-muted",
+                            if grant.enabled { "{grant.daily_minutes} min a day \u{b7} ${grant.spend_cap_usd:.2} cap" } else { "off" }
+                        }
+                    }
+                    if grant_shown {
+                        div {
+                            class: "{PANEL}",
+                            div { class: "flex items-center gap-2",
+                                span { class: "{EYEBROW}", "The grant" }
+                                div { class: "flex-1" }
+                                if grant.enabled {
+                                    button {
+                                        class: "font-mono text-[10.5px] text-fg-muted hover:text-red-300",
+                                        title: "Turn agent time off",
+                                        onclick: move |_| {
+                                            planner.write().agent_time_grant.enabled = false;
+                                            persist_grant(&planner);
+                                            if running {
+                                                chat_command.set(Some(ChatCommand::AgentTimeStop));
+                                            }
+                                        },
+                                        "turn off"
+                                    }
+                                } else {
+                                    span { class: "font-mono text-[10.5px] text-fg-muted", "off by default" }
+                                }
+                            }
+                            div {
+                                class: "grid grid-cols-[96px_minmax(0,1fr)] items-center gap-x-3 gap-y-2.5 text-xs",
+                                span { class: "text-fg-muted", "Minutes a day" }
+                                div { class: "flex items-center gap-2.5",
+                                    input {
+                                        r#type: "range",
+                                        class: "min-w-0 flex-1 accent-primary-500",
+                                        min: "0",
+                                        max: "120",
+                                        step: "5",
+                                        value: "{grant.daily_minutes}",
+                                        "aria-label": "Minutes a day",
+                                        style: "--pct: {min_pct}%;",
+                                        oninput: move |e| {
+                                            if let Ok(m) = e.value().parse::<u32>() {
+                                                planner.write().agent_time_grant.daily_minutes = m;
+                                            }
+                                        },
+                                        onchange: move |_| persist_grant(&planner),
+                                    }
+                                    span { class: "w-14 text-right font-mono text-[13px] text-fg", "{grant.daily_minutes} min" }
+                                }
+                                span { class: "text-fg-muted", "Spend cap" }
+                                div { class: "flex items-center gap-1.5",
+                                    span { class: "font-mono text-fg-muted", "$" }
+                                    input {
+                                        class: "h-6 w-20 rounded border border-faint bg-input px-2 text-right font-mono text-xs text-fg outline-none",
+                                        value: "{cap_text}",
+                                        "aria-label": "Spend cap in dollars a day",
+                                        oninput: move |e| cap_text.set(e.value()),
+                                        onchange: move |e| {
+                                            if let Ok(v) = e.value().trim().trim_start_matches('$').parse::<f64>() {
+                                                if v >= 0.0 {
+                                                    planner.write().agent_time_grant.spend_cap_usd = v;
+                                                    persist_grant(&planner);
+                                                    cap_text.set(format!("{v:.2}"));
+                                                }
+                                            }
+                                        },
+                                    }
+                                    span { class: "text-fg-muted", "a day" }
+                                }
+                                span { class: "text-fg-muted", "Days" }
+                                div { class: "flex gap-1",
+                                    for (i, (l, name)) in DAY_NAMES.iter().enumerate() {
+                                        button {
+                                            key: "{i}",
+                                            class: if grant.days[i] {
+                                                "h-6 w-6 rounded bg-btn-primary text-[11px] font-medium text-fg"
+                                            } else {
+                                                "h-6 w-6 rounded border border-faint text-[11px] text-fg-muted hover:text-fg"
+                                            },
+                                            "aria-label": "{name}",
+                                            "aria-pressed": if grant.days[i] { "true" } else { "false" },
+                                            onclick: move |_| {
+                                                let cur = planner.peek().agent_time_grant.days[i];
+                                                planner.write().agent_time_grant.days[i] = !cur;
+                                                persist_grant(&planner);
+                                            },
+                                            "{l}"
+                                        }
+                                    }
+                                }
+                                span { class: "text-fg-muted", "Start at" }
+                                input {
+                                    r#type: "time",
+                                    class: "h-6 w-28 rounded border border-faint bg-input px-1.5 font-mono text-xs text-fg outline-none",
+                                    "aria-label": "Time agent time starts by itself",
+                                    value: "{window_start_value}",
+                                    onchange: move |e| {
+                                        planner.write().agent_time_grant.window_start =
+                                            chrono::NaiveTime::parse_from_str(e.value().trim(), "%H:%M").ok();
+                                        persist_grant(&planner);
+                                    },
+                                }
+                                span { class: "text-fg-muted", "Model" }
+                                select {
+                                    class: "h-6 min-w-0 rounded border border-faint bg-input px-1.5 text-xs text-fg outline-none",
+                                    "aria-label": "Model agent time runs on",
+                                    title: "Agent time runs on this model; its spend follows the model's pricing.",
+                                    onchange: move |e| {
+                                        let (c, m) = parse_grant_select(&e.value());
+                                        {
+                                            let mut state = planner.write();
+                                            state.agent_time_grant.connector_id = c;
+                                            state.agent_time_grant.model = m;
+                                        }
+                                        persist_grant(&planner);
+                                    },
+                                    option { value: "", selected: grant_value.is_empty(), "Same as your chats" }
+                                    if let Some(label) = stale_choice.clone() {
+                                        option { value: "{grant_value}", selected: true, "{label}" }
+                                    }
+                                    for (name, opts) in groups.iter().cloned() {
+                                        optgroup { key: "{name}", label: "{name}",
+                                            for (v, label) in opts {
+                                                option { key: "{v}", value: "{v}", selected: v == grant_value, "{label}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            p { class: "text-[11px] leading-4 text-fg-muted",
+                                "Agent time starts by itself at this time on granted days. Leave empty to start it yourself."
+                            }
+                            div { class: "h-px bg-[var(--color-border-muted)]" }
+                            p { class: "text-xs text-fg", span { class: "font-semibold", "Reads " } span { class: "text-fg-muted", "{reads_label}" } }
+                            p { class: "text-xs text-fg", span { class: "font-semibold", "Writes " } span { class: "text-fg-muted", "only to Hobbes-owned space: {kinds_label}" } }
+                            p { class: "text-xs text-fg", span { class: "font-semibold", "Outside effects " } span { class: "text-fg-muted", "always ask, through the normal approval gates" } }
+                            if !grant.scope.note.trim().is_empty() {
+                                p { class: "whitespace-pre-line text-[11px] text-fg-muted", "{grant.scope.note}" }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1066,7 +976,7 @@ fn revise(mut planner: Signal<PlannerState>, id: &str, to: Option<ProposalStatus
     }
 }
 
-fn persist_resolved(planner: &Signal<PlannerState>, p: &Proposal) {
+pub(super) fn persist_resolved(planner: &Signal<PlannerState>, p: &Proposal) {
     if let Err(e) = store::save_proposal(p) {
         tracing::error!("planner: failed to save proposal {}: {}", p.id, e);
     }
@@ -1076,7 +986,7 @@ fn persist_resolved(planner: &Signal<PlannerState>, p: &Proposal) {
 }
 
 /// Dismiss a proposal; persist it and the ledger.
-fn dismiss(mut planner: Signal<PlannerState>, id: &str) {
+pub(super) fn dismiss(mut planner: Signal<PlannerState>, id: &str) {
     let resolved = planner.write().resolve_proposal(id, ProposalStatus::Dismissed, None, Utc::now());
     if let Some(p) = resolved {
         persist_resolved(&planner, &p);
@@ -1089,7 +999,7 @@ fn dismiss(mut planner: Signal<PlannerState>, id: &str) {
 /// `start`, a to-do it starts is handed to the running agent-time session
 /// when one has budget left; otherwise it stays `Queued` for the next
 /// agent-time window. Returns the line shown in place of the card.
-fn accept(
+pub(super) fn accept(
     mut planner: Signal<PlannerState>,
     settings: Signal<Settings>,
     id: &str,
