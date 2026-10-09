@@ -166,6 +166,34 @@ fn worker_for(
     resolve_worker(linked.is_some(), &facts)
 }
 
+/// Where clicking an agent card goes. Navigation only: opening a worker
+/// approves, denies or sends nothing — it takes the person to where the
+/// question or permission prompt is.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum CardOpen {
+    /// A Hobbes chat that is in memory or a Hobbes-origin fleet row: open
+    /// its tab (`SwitchToSession` hydrates a closed one from History).
+    Chat(String),
+    /// A Claude Code run: open the Fleet.
+    Fleet,
+    /// Linked, but neither in memory nor in the fleet mirror: decided on
+    /// click (a stored chat opens as a tab, anything else opens the Fleet).
+    Unresolved(String),
+    /// No worker yet: the to-do's details.
+    Details,
+}
+
+/// **Pure.** `in_memory` = the linked id is a hydrated chat; `fleet_origin`
+/// = the linked id's fleet row, `Some(true)` when Hobbes started it.
+pub(crate) fn card_open(linked: Option<&str>, in_memory: bool, fleet_origin: Option<bool>) -> CardOpen {
+    match (linked, in_memory, fleet_origin) {
+        (None, _, _) => CardOpen::Details,
+        (Some(id), true, _) | (Some(id), _, Some(true)) => CardOpen::Chat(id.to_string()),
+        (Some(_), false, Some(false)) => CardOpen::Fleet,
+        (Some(id), false, None) => CardOpen::Unresolved(id.to_string()),
+    }
+}
+
 // ── Header readout ──────────────────────────────────────────────────────────
 
 /// The "Agents" header readout: working · needs you · done today, and the
@@ -255,8 +283,15 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let label = |t: &Todo| worker_for(t, &fleet, &sessions, day, now);
     let card = |t: &Todo| -> CardData {
         let w = label(t);
+        let linked = t.linked_fleet_session.as_deref();
+        let open = card_open(
+            linked,
+            linked.is_some_and(|sid| sessions.sessions.contains_key(sid)),
+            linked.and_then(|sid| fleet.sessions.get(sid)).map(|r| r.origin == FleetOrigin::Hobbes),
+        );
         CardData {
             id: t.id.clone(),
+            open,
             outcome: t.outcome.clone().filter(|o| !o.trim().is_empty()).unwrap_or_else(|| t.title.clone()),
             question: t.decision.as_ref().filter(|d| d.is_open()).map(|d| d.question.clone()),
             gate: t
@@ -308,6 +343,19 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     drop(fleet);
     drop(state);
 
+    // Card click: open the worker so the person can unblock it there.
+    let open_card = move |(id, open): (String, CardOpen)| match open {
+        CardOpen::Chat(sid) => chat_command.set(Some(ChatCommand::SwitchToSession(sid))),
+        CardOpen::Fleet => chat_command.set(Some(ChatCommand::ToggleFleet)),
+        CardOpen::Unresolved(sid) => {
+            if crate::session_store::contains(&sid) {
+                chat_command.set(Some(ChatCommand::SwitchToSession(sid)));
+            } else {
+                chat_command.set(Some(ChatCommand::ToggleFleet));
+            }
+        }
+        CardOpen::Details => detail.set(Some(id)),
+    };
     let is_collapsed = collapsed.read().unwrap_or(embedded && n_needs == 0);
     let root_class = if embedded {
         "flex shrink-0 flex-col rounded border border-faint bg-app pb-2"
@@ -361,7 +409,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         }
                     }
                     for c in needs {
-                        LaneCard { key: "{c.id}", data: c.clone(), need: true, on_open: move |id: String| detail.set(Some(id)) }
+                        LaneCard { key: "{c.id}", data: c.clone(), need: true, on_open: open_card, on_details: move |id: String| detail.set(Some(id)) }
                     }
                 }
                 if !working.is_empty() {
@@ -372,7 +420,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         span { "\u{b7} {working.len()}" }
                     }
                     for c in working {
-                        LaneCard { key: "{c.id}", data: c.clone(), need: false, on_open: move |id: String| detail.set(Some(id)) }
+                        LaneCard { key: "{c.id}", data: c.clone(), need: false, on_open: open_card, on_details: move |id: String| detail.set(Some(id)) }
                     }
                 }
                 if !stuck.is_empty() {
@@ -383,7 +431,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         span { "\u{b7} {stuck.len()}" }
                     }
                     for c in stuck {
-                        LaneCard { key: "{c.id}", data: c.clone(), need: false, on_open: move |id: String| detail.set(Some(id)) }
+                        LaneCard { key: "{c.id}", data: c.clone(), need: false, on_open: open_card, on_details: move |id: String| detail.set(Some(id)) }
                     }
                 }
                 if !queued.is_empty() {
@@ -450,6 +498,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
 #[derive(Clone, PartialEq)]
 struct CardData {
     id: String,
+    open: CardOpen,
     outcome: String,
     question: Option<String>,
     gate: bool,
@@ -463,13 +512,40 @@ struct CardData {
 }
 
 #[component]
-fn LaneCard(data: CardData, need: bool, on_open: EventHandler<String>) -> Element {
+fn LaneCard(
+    data: CardData,
+    need: bool,
+    on_open: EventHandler<(String, CardOpen)>,
+    on_details: EventHandler<String>,
+) -> Element {
     let id = data.id.clone();
+    let details_id = data.id.clone();
+    let open = data.open.clone();
+    let hint = match &data.open {
+        CardOpen::Chat(_) => "Open its chat",
+        CardOpen::Fleet => "Open it in the Fleet",
+        CardOpen::Unresolved(_) => "Open its worker",
+        CardOpen::Details => "Show details",
+    };
     rsx! {
         div {
             class: if need { "{CARD} border-subtle" } else { "{CARD}" },
-            onclick: move |_| on_open.call(id.clone()),
-            div { class: "text-[12.5px] font-medium leading-[17px] text-fg", "{data.outcome}" }
+            title: "{hint}",
+            onclick: move |_| on_open.call((id.clone(), open.clone())),
+            div { class: "flex items-start gap-2",
+                div { class: "min-w-0 flex-1 text-[12.5px] font-medium leading-[17px] text-fg", "{data.outcome}" }
+                if data.open != CardOpen::Details {
+                    button {
+                        class: "shrink-0 text-[10.5px] text-fg-muted hover:text-fg",
+                        title: "The to-do's details",
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            on_details.call(details_id.clone());
+                        },
+                        "Details"
+                    }
+                }
+            }
             if need {
                 if let Some(q) = data.question.clone() {
                     div { class: "text-xs leading-4 text-fg", "\u{201c}{q}\u{201d}" }
@@ -596,6 +672,15 @@ pub(crate) fn AgentStateSync() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_opens_its_worker_or_falls_back_to_details() {
+        assert_eq!(card_open(None, false, None), CardOpen::Details, "no worker yet");
+        assert_eq!(card_open(Some("c1"), true, None), CardOpen::Chat("c1".into()), "an open chat tab");
+        assert_eq!(card_open(Some("c1"), false, Some(true)), CardOpen::Chat("c1".into()), "a Hobbes chat whose tab is closed");
+        assert_eq!(card_open(Some("cc"), false, Some(false)), CardOpen::Fleet, "a Claude Code run");
+        assert_eq!(card_open(Some("x"), false, None), CardOpen::Unresolved("x".into()), "decided on click");
+    }
 
     fn facts<'a>() -> WorkerFacts<'a> {
         WorkerFacts::default()
