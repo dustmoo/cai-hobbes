@@ -50,7 +50,9 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
     let mut deselected = use_signal(HashSet::<String>::new);
     // `Some(None)` = the user chose "keep unsorted" for that tab.
     let mut overrides = use_signal(HashMap::<String, Option<String>>::new);
-    let mut unsorted_off = use_signal(HashSet::<String>::new);
+    // Unsorted tabs the person ticked to close (opt-in: nothing suggests
+    // closing them). Filing is the project chip, independent of closing.
+    let mut unsorted_close = use_signal(HashSet::<String>::new);
     let mut menu_for = use_signal(|| None::<String>);
     // Where the open project menu sits: the click point, in viewport px.
     // The menu is `position: fixed` so the scrolling list can't clip it.
@@ -78,47 +80,41 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
             None => u.suggested_project.clone(),
         }
     };
-    let unsorted_checked = |u: &UnsortedTab| {
-        effective_project(u).is_some() && !unsorted_off.read().contains(&u.session_id)
-    };
+    let closes_unsorted = |u: &UnsortedTab| unsorted_close.read().contains(&u.session_id);
 
     let finished_ids: Vec<String> = sug.finished.iter().map(|f| f.session_id.clone()).collect();
     let idle_ids: Vec<String> = sug.idle.iter().map(|i| i.session_id.clone()).collect();
     let all_finished_on = finished_ids.iter().all(|id| !deselected.read().contains(id));
     let all_idle_on = idle_ids.iter().all(|id| !deselected.read().contains(id));
-    let fileable: Vec<&UnsortedTab> = sug
-        .unsorted
-        .iter()
-        .filter(|u| effective_project(u).is_some())
-        .collect();
-    let all_unsorted_on = fileable.iter().all(|u| unsorted_checked(u));
+    let unsorted_ids: Vec<String> = sug.unsorted.iter().map(|u| u.session_id.clone()).collect();
+    let all_unsorted_closing = !unsorted_ids.is_empty() && sug.unsorted.iter().all(&closes_unsorted);
 
-    let close_count = finished_ids
-        .iter()
-        .chain(idle_ids.iter())
-        .filter(|id| !deselected.read().contains(*id))
-        .count();
+    // Filed: every unsorted tab whose chip names a project (a suggestion,
+    // or the person's pick). A tab both filed and closed is filed first, so
+    // it lands in History under that project.
     let tag: Vec<(String, String)> = sug
         .unsorted
         .iter()
-        .filter(|u| unsorted_checked(u))
         .filter_map(|u| effective_project(u).map(|p| (u.session_id.clone(), p)))
         .collect();
     let group_count = tag.len();
+    let close: Vec<String> = finished_ids
+        .iter()
+        .chain(idle_ids.iter())
+        .filter(|id| !deselected.read().contains(*id))
+        .cloned()
+        .chain(sug.unsorted.iter().filter(|u| closes_unsorted(u)).map(|u| u.session_id.clone()))
+        .collect();
+    let close_count = close.len();
     let suggestion_count = sug.finished.len() + sug.idle.len() + sug.unsorted.len();
 
     let apply = {
-        let close: Vec<String> = finished_ids
-            .iter()
-            .chain(idle_ids.iter())
-            .filter(|id| !deselected.read().contains(*id))
-            .cloned()
-            .collect();
+        let close = close.clone();
         let tag = tag.clone();
         let on_apply = props.on_apply;
         move |_| on_apply.call(TidyApply { close: close.clone(), tag: tag.clone() })
     };
-    let primary_label = format!("Close {close_count} · group {group_count}");
+    let primary_label = format!("Close {close_count} · file {group_count}");
 
     let mut toggle_close = move |ids: Vec<String>, on: bool| {
         let mut d = deselected.write();
@@ -279,25 +275,24 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                             input {
                                 r#type: "checkbox",
                                 class: "{CB}",
-                                "aria-label": "Group unsorted tabs",
-                                disabled: fileable.is_empty(),
-                                checked: !fileable.is_empty() && all_unsorted_on,
+                                "aria-label": "Close all unsorted tabs",
+                                checked: all_unsorted_closing,
                                 onchange: {
-                                    let ids: Vec<String> = fileable.iter().map(|u| u.session_id.clone()).collect();
+                                    let ids = unsorted_ids.clone();
                                     move |evt: FormEvent| {
-                                        let mut off = unsorted_off.write();
+                                        let mut c = unsorted_close.write();
                                         for id in ids.iter() {
                                             if evt.checked() {
-                                                off.remove(id);
+                                                c.insert(id.clone());
                                             } else {
-                                                off.insert(id.clone());
+                                                c.remove(id);
                                             }
                                         }
                                     }
                                 },
                             }
-                            span { "Group unsorted" }
-                            span { class: "{WHY}", "suggested project" }
+                            span { "Unsorted tabs" }
+                            span { class: "{WHY}", "tick to close · the chip files it into a project" }
                         }
                         div {
                             class: "flex flex-col",
@@ -305,7 +300,7 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                                 {
                                     let id = u.session_id.clone();
                                     let eff = effective_project(u);
-                                    let checked = unsorted_checked(u);
+                                    let checked = closes_unsorted(u);
                                     let label = label_of(&id);
                                     let emoji = emoji_of(&id);
                                     let chip = match &eff {
@@ -320,16 +315,16 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                                             input {
                                                 r#type: "checkbox",
                                                 class: "{CB}",
-                                                disabled: eff.is_none(),
+                                                "aria-label": "Close {label}",
                                                 checked,
                                                 onchange: {
                                                     let id = id.clone();
                                                     move |evt: FormEvent| {
-                                                        let mut off = unsorted_off.write();
+                                                        let mut c = unsorted_close.write();
                                                         if evt.checked() {
-                                                            off.remove(&id);
+                                                            c.insert(id.clone());
                                                         } else {
-                                                            off.insert(id.clone());
+                                                            c.remove(&id);
                                                         }
                                                     }
                                                 },
@@ -381,7 +376,6 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                                                                     class: "w-full text-left px-3 py-1.5 text-xs text-fg-muted hover:bg-primary-900/50 hover:text-fg truncate",
                                                                     onclick: move |_| {
                                                                         overrides.write().insert(id.clone(), Some(pick.clone()));
-                                                                        unsorted_off.write().remove(&id);
                                                                         menu_for.set(None);
                                                                     },
                                                                     "{title}"
