@@ -52,6 +52,9 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
     let mut overrides = use_signal(HashMap::<String, Option<String>>::new);
     let mut unsorted_off = use_signal(HashSet::<String>::new);
     let mut menu_for = use_signal(|| None::<String>);
+    // Where the open project menu sits: the click point, in viewport px.
+    // The menu is `position: fixed` so the scrolling list can't clip it.
+    let mut menu_at = use_signal(|| (0.0f64, 0.0f64));
 
     let sug: TidySuggestions = suggest(&props.tabs, &props.todos, &props.projects, Utc::now());
     let tab_of = |id: &str| props.tabs.iter().find(|t| t.session_id == id);
@@ -164,6 +167,12 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
 
                 div {
                     class: "flex-1 min-h-0 overflow-y-auto flex flex-col gap-3 pr-1",
+                    // A fixed menu would float away from its row: close it.
+                    onscroll: move |_| {
+                        if menu_for.peek().is_some() {
+                            menu_for.set(None);
+                        }
+                    },
                     if suggestion_count == 0 {
                         p { class: "text-sm text-fg-muted py-6 text-center", "Nothing to tidy. Every open tab is in use or already filed." }
                     }
@@ -336,6 +345,8 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                                                     move |evt: MouseEvent| {
                                                         evt.stop_propagation();
                                                         let open_now = menu_for.peek().as_deref() == Some(id.as_str());
+                                                        let p = evt.client_coordinates();
+                                                        menu_at.set((p.x, p.y));
                                                         menu_for.set(if open_now { None } else { Some(id.clone()) });
                                                     }
                                                 },
@@ -344,7 +355,8 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                                             }
                                             if menu_open {
                                                 div {
-                                                    class: "absolute right-0 top-full mt-1 w-56 max-h-48 overflow-y-auto bg-card border border-subtle rounded-lg shadow-xl z-50 py-1",
+                                                    class: "fixed w-56 max-h-48 overflow-y-auto bg-card border border-subtle rounded-lg shadow-xl z-50 py-1",
+                                                    style: "{menu_style(*menu_at.read())}",
                                                     onclick: |evt| evt.stop_propagation(),
                                                     button {
                                                         class: "w-full text-left px-3 py-1.5 text-xs text-fg-muted hover:bg-primary-900/50 hover:text-fg",
@@ -405,4 +417,15 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
             }
         }
     }
+}
+
+/// Inline geometry for the fixed project menu: just below the click,
+/// right-aligned to it, clamped inside the viewport (the 192px list cap and
+/// 224px width) so a row near the bottom opens its menu upward.
+fn menu_style((x, y): (f64, f64)) -> String {
+    format!(
+        "left: clamp(8px, {:.0}px, calc(100vw - 232px)); top: min({:.0}px, calc(100vh - 200px));",
+        x - 200.0,
+        y + 10.0
+    )
 }
