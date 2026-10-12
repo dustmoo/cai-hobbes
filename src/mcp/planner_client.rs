@@ -262,8 +262,10 @@ impl PlannerClient {
             Tool {
                 name: "HOBBES_TIME_BLOCK".into(),
                 description: Some(format!(
-                    "Create, move, or delete a block on the day timeline. Times are local \
-                    'HH:MM'; the response warns (without failing) when the block overlaps \
+                    "List, create, move, or delete blocks on the day timeline. To change an \
+                    existing block (reschedule, shorten, push to tomorrow) MOVE it by id — list \
+                    first if you don't have the id; never create a replacement and leave the \
+                    old one behind. Times are local 'HH:MM'; the response warns (without failing) when the block overlaps \
                     an existing one. Link 'todo_id' when the block is time for a to-do — \
                     a block without todo_id is a calendar-only event (e.g. a meeting) that \
                     does NOT appear in the to-do lists or count toward the day's capacity. \
@@ -277,11 +279,12 @@ impl PlannerClient {
                     serde_json::from_value(serde_json::json!({
                         "type": "object",
                         "properties": {
-                            "action": { "type": "string", "enum": ["create", "move", "delete"] },
+                            "action": { "type": "string", "enum": ["list", "create", "move", "delete"], "description": "list: the blocks (with ids) for 'date' (default today) and 'days' (default 1, max 14). move: change an existing block's date, start, end, or title; unspecified parts are kept." },
                             "id": { "type": "string", "description": "Block id — required for move and delete." },
+                            "days": { "type": "integer", "description": "List only: how many days from 'date'. Default 1, max 14." },
                             "todo_id": { "type": "string", "description": "Optional todo this block is working on." },
                             "title": { "type": "string", "description": "Block title. For create, defaults to the linked todo's title." },
-                            "date": { "type": "string", "description": "Day of the block (YYYY-MM-DD, 'today' or 'tomorrow'). Required for create." },
+                            "date": { "type": "string", "description": "Day of the block (YYYY-MM-DD, 'today' or 'tomorrow'). Required for create; for move, the new day; for list, the first day." },
                             "start": { "type": "string", "description": "Local start time 'HH:MM'. Required for create." },
                             "end": { "type": "string", "description": "Local end time 'HH:MM', after start. Required for create." },
                             "kind": { "type": "string", "enum": ["work", "your_time", "chores"], "description": "Create only. work (default): a to-do timebox or event; your_time: protected time for the user (needs category, no todo_id); chores: a batched chores slot." },

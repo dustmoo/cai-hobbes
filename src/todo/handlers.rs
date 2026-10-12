@@ -1257,11 +1257,92 @@ pub fn handle_time_block(
         Some("create") => time_block_create(state, args, today, persist),
         Some("move") => time_block_move(state, args, today, persist),
         Some("delete") => time_block_delete(state, args, persist),
+        Some("list") => time_block_list(state, args, today),
         _ => (
             ToolCallStatus::Error,
-            "Provide 'action': one of create, move, delete.".to_string(),
+            "Provide 'action': one of list, create, move, delete.".to_string(),
         ),
     }
+}
+
+/// Longest range `action: list` covers; larger requests clamp.
+const TIME_BLOCK_LIST_MAX_DAYS: i64 = 14;
+
+/// `HOBBES_TIME_BLOCK action=list` — the timeline's blocks with their ids, so
+/// the model can move or delete an existing block instead of creating a
+/// duplicate. Read-only; takes `&PlannerState` so dispatch can use a read
+/// guard. Mirrored meetings are listed too (marked read-only) because they
+/// matter when picking a slot.
+pub fn time_block_list(
+    state: &PlannerState,
+    args: &Value,
+    today: NaiveDate,
+) -> (ToolCallStatus, String) {
+    let start = match args.get("date").and_then(|v| v.as_str()) {
+        Some(raw) => match parse_date(raw, today) {
+            Ok(d) => d,
+            Err(e) => return (ToolCallStatus::Error, format!("date: {}", e)),
+        },
+        None => today,
+    };
+    let days = match args.get("days").filter(|v| !v.is_null()) {
+        Some(v) => match v.as_i64() {
+            Some(n) => n.clamp(1, TIME_BLOCK_LIST_MAX_DAYS),
+            None => {
+                return (
+                    ToolCallStatus::Error,
+                    "invalid 'days' — expected an integer".to_string(),
+                )
+            }
+        },
+        None => 1,
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for offset in 0..days {
+        let day = start + chrono::Duration::days(offset);
+        for b in state.blocks_on(day) {
+            let tag = match &b.source {
+                BlockSource::External { .. } => " — calendar meeting, read-only".to_string(),
+                BlockSource::YourTime { category } => {
+                    format!(" — protected your-time ({}), move only with user_confirmed", category)
+                }
+                BlockSource::Chores { .. } => " — chores".to_string(),
+                _ => match &b.todo_id {
+                    Some(tid) => format!(" — todo {}", tid),
+                    None => String::new(),
+                },
+            };
+            lines.push(format!("{}{}", block_line(state, b), tag));
+        }
+    }
+    let range = if days == 1 {
+        views::friendly_date(start, today)
+    } else {
+        format!(
+            "{} to {}",
+            views::friendly_date(start, today),
+            views::friendly_date(start + chrono::Duration::days(days - 1), today)
+        )
+    };
+    if lines.is_empty() {
+        return (
+            ToolCallStatus::Completed,
+            format!("No blocks on the timeline {}.", range),
+        );
+    }
+    let total = lines.len();
+    let mut out = format!(
+        "Timeline {} — {} block(s). Move or delete by id; don't create a duplicate:",
+        range, total
+    );
+    for line in lines.iter().take(MAX_LIST_LINES) {
+        out.push_str("\n  ");
+        out.push_str(line);
+    }
+    if total > MAX_LIST_LINES {
+        out.push_str(&format!("\n…and {} more", total - MAX_LIST_LINES));
+    }
+    (ToolCallStatus::Completed, out)
 }
 
 fn parse_block_times(
@@ -3118,10 +3199,12 @@ pub fn planner_today_context_with_events(
             suffix
         )
     };
+    // Own blocks carry their id so "move my 2pm" is a HOBBES_TIME_BLOCK move,
+    // not a duplicate create.
     let mut blocks: Vec<String> = own
         .into_iter()
         .take(CTX_MAX_OWN_BLOCKS)
-        .map(|b| block_line(b, ""))
+        .map(|b| block_line(b, &format!(" [{}]", b.id)))
         .collect();
     blocks.extend(meetings.into_iter().take(CTX_MAX_MEETINGS).map(|b| {
         // Free/focus-time mirrors are labeled so the model knows it may plan
@@ -4348,6 +4431,23 @@ mod tests {
         let (status, resp) = block(&mut state, json!({"action": "delete", "id": id}));
         assert_eq!(status, ToolCallStatus::Completed, "{resp}");
         assert!(state.blocks.is_empty());
+    }
+
+    #[test]
+    fn time_block_list_gives_ids_to_move_by() {
+        let mut state = PlannerState::default();
+        block(
+            &mut state,
+            json!({"action": "create", "title": "Focus", "date": TODAY, "start": "09:30", "end": "10:15"}),
+        );
+        let id = state.blocks[0].id.clone();
+        let (status, resp) = block(&mut state, json!({"action": "list", "date": TODAY}));
+        assert_eq!(status, ToolCallStatus::Completed, "{resp}");
+        assert!(resp.contains(&format!("[{id}] 09:30–10:15 Focus")), "{resp}");
+        assert_eq!(state.blocks.len(), 1, "list must not change the timeline");
+
+        let (_, resp) = block(&mut state, json!({"action": "list", "date": "tomorrow"}));
+        assert!(resp.starts_with("No blocks"), "{resp}");
     }
 
     #[test]

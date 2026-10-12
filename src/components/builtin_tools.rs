@@ -654,7 +654,12 @@ fn run_planner_tool(
             )
         }
         "HOBBES_TIME_BLOCK" => {
-            handlers::handle_time_block(&mut planner.write(), args_json, today, true)
+            if args_json.get("action").and_then(|v| v.as_str()) == Some("list") {
+                // Read-only: a read guard, so listing doesn't re-render the planner.
+                handlers::time_block_list(&planner.read(), args_json, today)
+            } else {
+                handlers::handle_time_block(&mut planner.write(), args_json, today, true)
+            }
         }
         "HOBBES_PROJECT_UPSERT" => {
             handlers::handle_project_upsert(&mut planner.write(), args_json, today, true)
