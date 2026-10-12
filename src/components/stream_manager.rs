@@ -952,7 +952,7 @@ impl StreamManagerContext {
                                             } else {
                                                 // ── Image-aware content extraction ───────────────────────────
                                                 // Scan aggregated_content for image blobs. Save them to disk
-                                                // (max 768px tall) and build a text-only response string.
+                                                // (max 1568px long edge) and build a text-only response string.
                                                 // The file path is stored in tc.cached_image_path so
                                                 // prompt_builder can inject it as ContentBlock::Image on the
                                                 // next continuation turn.
@@ -2730,8 +2730,8 @@ mod tests {
 // Image caching helper
 // ============================================================================
 
-/// Decode a base64 image blob from an MCP tool result, resize it to at most
-/// 768 px tall (preserving aspect ratio), re-encode as JPEG, persist to the
+/// Decode a base64 image blob from an MCP tool result, fit it to
+/// `chat_input::MAX_ATTACHMENT_EDGE` on the long edge (preserving aspect ratio), re-encode as JPEG, persist to the
 /// same `generated_images/` directory used by `image_client.rs`, and return
 /// the saved path.
 ///
@@ -2745,17 +2745,13 @@ async fn save_tool_image(data_b64: &str, _mime_type: &str) -> Option<std::path::
 
     // Resize on a blocking thread so we don't stall the async executor.
     let resized_bytes = tokio::task::spawn_blocking(move || {
-        use image::imageops::FilterType;
         use image::ImageFormat;
 
         let img = image::load_from_memory(&bytes).ok()?;
 
-        // Cap at 768 px tall; scale width proportionally.
-        let resized = if img.height() > 768 {
-            img.resize(u32::MAX, 768, FilterType::Lanczos3)
-        } else {
-            img
-        };
+        // Same long-edge cap as attachments: a 768px-tall cap made wide
+        // desktop screenshots too blurry for the model to read.
+        let resized = crate::components::chat_input::fit_attachment(img);
 
         let mut buf = std::io::Cursor::new(Vec::new());
         resized.write_to(&mut buf, ImageFormat::Jpeg).ok()?;

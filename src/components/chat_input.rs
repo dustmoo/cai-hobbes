@@ -2085,11 +2085,11 @@ pub fn ChatInput(
 /// phone screenshots unreadable and models hallucinated their contents.
 /// 1568 is Claude's no-downscale limit and keeps text sharp for Gemini and
 /// local vision models (Qwen) without blowing up the context.
-const MAX_ATTACHMENT_EDGE: u32 = 1568;
+pub(crate) const MAX_ATTACHMENT_EDGE: u32 = 1568;
 
 /// Shrink `img` so its longest edge is at most `MAX_ATTACHMENT_EDGE`,
 /// preserving aspect ratio. Images already within the limit are untouched.
-fn fit_attachment(img: DynamicImage) -> DynamicImage {
+pub(crate) fn fit_attachment(img: DynamicImage) -> DynamicImage {
     if img.width().max(img.height()) > MAX_ATTACHMENT_EDGE {
         img.resize(
             MAX_ATTACHMENT_EDGE,

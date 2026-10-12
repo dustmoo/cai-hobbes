@@ -635,7 +635,7 @@ impl<'a> PromptBuilder<'a> {
                         // ── Vision injection ─────────────────────────────────────────────
                         // If this tool call produced a screenshot, inject it as a vision
                         // message so the model can see the image on the next turn.
-                        // The image was already resized to max 768px and saved as JPEG by
+                        // The image was already fitted to 1568px on the long edge and saved as JPEG by
                         // stream_manager::save_tool_image — we just need to load and re-encode.
                         if let Some(ref img_path) = tc.cached_image_path {
                             let fs_path = img_path.strip_prefix("file://").unwrap_or(img_path);
