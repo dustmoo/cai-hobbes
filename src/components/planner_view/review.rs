@@ -19,7 +19,7 @@ use crate::todo::PlannerState;
 
 use super::persist_block;
 use super::today;
-use super::your_time::{category_colour, TimeGoalsEditor};
+use super::your_time::{apply_recategorise, category_colour, promote_to_goal, CategoryMenuItems, TimeGoalsEditor};
 use crate::components::planner_timeline::{fmt_hhmm, local_minutes_to_utc};
 
 // ── Pure: formatting ────────────────────────────────────────────────────────
@@ -390,6 +390,8 @@ pub(crate) fn WeeklyReview() -> Element {
     // Weeks whose nudge was acted on / dismissed in this view (and what happened).
     let mut nudge_done = use_signal(std::collections::HashMap::<NaiveDate, String>::new);
     let mut style_offer_dismissed = use_signal(|| false);
+    // The category whose "Merge into…" menu is open.
+    let mut merge_open = use_signal(|| Option::<String>::None);
 
     // Fleet figures cost a store query per day: computed when the week
     // changes, not on every fleet poke.
@@ -433,6 +435,14 @@ pub(crate) fn WeeklyReview() -> Element {
                 t.hour() * 60 + t.minute()
             })
     };
+    let blocks_in = |cat: &str| {
+        state
+            .blocks
+            .iter()
+            .filter(|b| b.your_time_category().is_some_and(|c| c.trim().eq_ignore_ascii_case(cat.trim())))
+            .count()
+    };
+    let merge_count = merge_open.read().as_deref().map(blocks_in).unwrap_or(0);
     let nudge = pick_nudge(&review.your_time, habitual);
     let copy = review_copy(style, &review.your_time, |c| category_colour(&goals, &c.category), nudge.as_ref());
     let (scale, step) = bar_scale(&copy.rows);
@@ -652,6 +662,75 @@ pub(crate) fn WeeklyReview() -> Element {
                                             }
                                         }
                                         span { class: "text-right font-mono text-[11px] tabular-nums text-fg-muted", "{r.label}" }
+                                    }
+                                    // A category with time but no goal (often one
+                                    // Hobbes filed): promote it, or re-file it.
+                                    if r.goal.is_none() {
+                                        div {
+                                            key: "{r.category}-actions",
+                                            class: "grid grid-cols-[120px_minmax(0,1fr)_100px] gap-x-3 -mt-2.5",
+                                            span {}
+                                            div {
+                                                class: "relative flex flex-wrap items-center gap-2 text-[11px]",
+                                                span { class: "text-fg-muted", "no goal" }
+                                                button {
+                                                    class: "text-primary-300 hover:text-fg",
+                                                    title: "Make {r.category} a goal (3h a week to start)",
+                                                    onclick: {
+                                                        let cat = r.category.clone();
+                                                        move |_| {
+                                                            promote_to_goal(&mut planner, &cat);
+                                                            editing_goals.set(true);
+                                                        }
+                                                    },
+                                                    "Set goal"
+                                                }
+                                                span { class: "text-fg-muted", "\u{b7}" }
+                                                button {
+                                                    class: "text-primary-300 hover:text-fg",
+                                                    title: "Re-file every {r.category} block under another category, or rename it",
+                                                    onclick: {
+                                                        let cat = r.category.clone();
+                                                        move |_| merge_open.set(Some(cat.clone()))
+                                                    },
+                                                    "Merge into\u{2026}"
+                                                }
+                                                if merge_open.read().as_deref() == Some(r.category.as_str()) {
+                                                    div {
+                                                        class: "fixed inset-0 z-30",
+                                                        onclick: move |_| merge_open.set(None),
+                                                    }
+                                                    div {
+                                                        class: "absolute left-0 top-full z-40 mt-1 w-56 rounded-lg border border-subtle bg-card py-1 shadow-xl",
+                                                        role: "menu",
+                                                        div {
+                                                            class: "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted truncate",
+                                                            "Merge {r.category} into"
+                                                        }
+                                                        CategoryMenuItems {
+                                                            exclude: Some(r.category.clone()),
+                                                            placeholder: "Or rename to\u{2026}".to_string(),
+                                                            on_pick: {
+                                                                let from = r.category.clone();
+                                                                move |to: String| {
+                                                                    merge_open.set(None);
+                                                                    apply_recategorise(&mut planner, &from, &to);
+                                                                }
+                                                            },
+                                                        }
+                                                        p {
+                                                            class: "px-2.5 pb-1.5 text-[10.5px] text-fg-muted",
+                                                            if merge_count == 1 {
+                                                                "Moves its 1 block."
+                                                            } else {
+                                                                "Moves all {merge_count} of its blocks, every week."
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            span {}
+                                        }
                                     }
                                 }
                                 div {

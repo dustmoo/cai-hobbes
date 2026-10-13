@@ -978,6 +978,8 @@ pub(crate) fn TodayRail(
     let mut rollup_error = use_signal(|| Option::<String>::None);
     // The empty-slot menu: the clicked slot's start (local minutes).
     let mut slot_menu = use_signal(|| Option::<u32>::None);
+    // A selected your-time block's category picker: the block's id.
+    let mut category_menu = use_signal(|| Option::<String>::None);
 
     // Current-time indicator: a once-a-minute tick is enough for a line that
     // moves ~0.8 px/min; subscribing to it re-renders the rail so the line
@@ -1221,19 +1223,31 @@ pub(crate) fn TodayRail(
         selected_block.set(Some(block.id.clone()));
         planner.write().blocks.push(block);
     };
-    let slot_categories: Vec<(String, String)> = if goals.is_empty() {
-        super::planner_view::your_time::DEFAULT_PALETTE
-            .iter()
-            .map(|(n, c)| (n.to_string(), c.to_string()))
-            .collect()
-    } else {
-        let mut g = goals.clone();
-        g.sort_by(|a, b| a.sort_order.partial_cmp(&b.sort_order).unwrap_or(std::cmp::Ordering::Equal));
-        g.iter()
-            .map(|g| (g.category.clone(), super::planner_view::your_time::category_colour(&goals, &g.category)))
-            .collect()
-    };
+    // One category list everywhere (goals, then in use, then suggestions):
+    // the menus render it via CategoryMenuItems; the count only sizes them.
+    let category_count = super::planner_view::your_time::category_list(&planner.read()).len();
+    let menu_h = 120.0 + 28.0 * category_count as f64;
     let menu_at = *slot_menu.read();
+    // The category picker sits under its block's top edge.
+    let category_menu_at: Option<(String, Option<String>, f64)> = category_menu.read().as_ref().and_then(|id| {
+        blocks.iter().find(|b| &b.id == id).map(|b| {
+            let s_min = minutes_in_local_day(&b.start).max(0) as f64;
+            (id.clone(), b.your_time_category().map(str::to_string), range_math::minute_to_y(s_min, view, pph) + 22.0)
+        })
+    });
+    let mut recategorise_block = move |id: String, category: String| {
+        let saved = {
+            let mut state = planner.write();
+            state
+                .blocks
+                .iter_mut()
+                .find(|b| b.id == id)
+                .and_then(|b| crate::todo::categories::set_block_category(b, &category).then(|| b.clone()))
+        };
+        if let Some(b) = saved {
+            persist_block(&b);
+        }
+    };
 
     // Auto-placement's busy set. Non-busy external blocks (free / focus-time
     // mirrors) are NOT busy — tasks may be placed over them.
@@ -1678,7 +1692,7 @@ pub(crate) fn TodayRail(
                     }
                     div {
                         class: "absolute left-10 z-40 w-56 rounded-lg border border-subtle bg-card py-1 shadow-xl",
-                        style: "top: {range_math::minute_to_y(m as f64, view, pph).clamp(0.0, (timeline_height - 220.0).max(0.0))}px;",
+                        style: "top: {range_math::minute_to_y(m as f64, view, pph).clamp(0.0, (timeline_height - menu_h).max(0.0))}px;",
                         role: "menu",
                         onclick: move |evt| evt.stop_propagation(),
                         onmousedown: move |evt| evt.stop_propagation(),
@@ -1702,23 +1716,37 @@ pub(crate) fn TodayRail(
                                 span { class: "normal-case tracking-normal", "\u{b7} no goals yet" }
                             }
                         }
-                        for (cat, colour) in slot_categories.iter().cloned() {
-                            button {
-                                key: "yt-{cat}",
-                                class: "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg text-left hover:bg-input",
-                                title: "Protect 1h for {cat}",
-                                onclick: {
-                                    let cat = cat.clone();
-                                    move |evt: MouseEvent| {
-                                        evt.stop_propagation();
-                                        slot_menu.set(None);
-                                        create_your_time_at(m, cat.clone());
-                                    }
-                                },
-                                span { class: "h-2 w-2 shrink-0 rounded-full", style: "background: {colour};" }
-                                span { class: "flex-1 truncate", "{cat}" }
-                                Icon { width: 10, height: 10, icon: fi_icons::FiLock }
-                            }
+                        super::planner_view::your_time::CategoryMenuItems {
+                            on_pick: move |cat: String| {
+                                slot_menu.set(None);
+                                create_your_time_at(m, cat);
+                            },
+                        }
+                    }
+                }
+                // A selected your-time block's category picker: the same
+                // list; picking re-files (and, by default, re-titles) it.
+                if let Some((cid, current, top)) = category_menu_at.clone() {
+                    div {
+                        class: "fixed inset-0 z-30",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            category_menu.set(None);
+                        },
+                    }
+                    div {
+                        class: "absolute right-2 z-40 w-56 rounded-lg border border-subtle bg-card py-1 shadow-xl",
+                        style: "top: {top.clamp(0.0, (timeline_height - menu_h).max(0.0))}px;",
+                        role: "menu",
+                        onclick: move |evt| evt.stop_propagation(),
+                        onmousedown: move |evt| evt.stop_propagation(),
+                        div { class: "px-2.5 pt-1.5 pb-1 text-[11px] uppercase tracking-[0.08em] text-fg-muted", "Change category" }
+                        super::planner_view::your_time::CategoryMenuItems {
+                            current: current.clone(),
+                            on_pick: move |cat: String| {
+                                category_menu.set(None);
+                                recategorise_block(cid.clone(), cat);
+                            },
                         }
                     }
                 }
@@ -1819,10 +1847,17 @@ pub(crate) fn TodayRail(
                             .as_ref()
                             .map(|c| super::planner_view::your_time::category_colour(&goals, c));
                         let chore_items = chore_lists.get(&block.id).cloned();
-                        let yt_meta = your_time.as_ref().map(|_| {
+                        let yt_meta = your_time.as_ref().map(|cat| {
                             let mins = (block.end - block.start).num_minutes().max(0) as u32;
                             let done = if block.end <= Utc::now() { " \u{b7} done \u{2713}" } else { "" };
-                            format!("protected{done} \u{b7} {} \u{b7} {}", fmt_hhmm(s_min.max(0) as u32), model::format_minutes(mins))
+                            // A title of its own ("Walk with Sam") keeps the
+                            // category visible in the meta line.
+                            let label = if block.title.trim().eq_ignore_ascii_case(cat.trim()) {
+                                String::new()
+                            } else {
+                                format!("{} \u{b7} ", cat.trim())
+                            };
+                            format!("{label}protected{done} \u{b7} {} \u{b7} {}", fmt_hhmm(s_min.max(0) as u32), model::format_minutes(mins))
                         });
                         // Subscription tint + deep link for mirrored calendar
                         // events. A block whose subscription is unknown (legacy
@@ -1864,6 +1899,7 @@ pub(crate) fn TodayRail(
                             .map(|(t, c, f)| (t.clone(), *c, *f))
                             .unwrap_or_else(|| (block.title.clone(), false, false));
                         let delete_id = block.id.clone();
+                        let category_id = block.id.clone();
                         let drag_id = block.id.clone();
                         let resize_id = block.id.clone();
                         // Original minutes anchor the drag math; labels follow
@@ -1980,6 +2016,25 @@ pub(crate) fn TodayRail(
                                                 class: "shrink-0 opacity-70",
                                                 title: "Open in calendar",
                                                 Icon { width: 10, height: 10, icon: fi_icons::FiExternalLink }
+                                            }
+                                        }
+                                        if is_selected {
+                                            if let Some(cat) = your_time.clone() {
+                                                button {
+                                                    class: "shrink-0 inline-flex max-w-[110px] items-center gap-1 rounded-full border border-black/30 px-1.5 text-[10px] leading-[14px] font-normal hover:bg-black/10",
+                                                    title: "Change category",
+                                                    onmousedown: move |evt| evt.stop_propagation(),
+                                                    onclick: {
+                                                        let id = category_id.clone();
+                                                        move |evt: MouseEvent| {
+                                                            evt.stop_propagation();
+                                                            category_menu.set(Some(id.clone()));
+                                                        }
+                                                    },
+                                                    Icon { width: 9, height: 9, icon: fi_icons::FiTag }
+                                                    span { class: "truncate", "{cat}" }
+                                                    Icon { width: 9, height: 9, icon: fi_icons::FiChevronDown }
+                                                }
                                             }
                                         }
                                         if is_selected && !is_external {

@@ -13,6 +13,7 @@
 //!
 pub mod agent_time;
 pub mod areas;
+pub mod categories;
 pub mod calendar_sync;
 pub mod composio_calendar;
 pub mod dispatch;
