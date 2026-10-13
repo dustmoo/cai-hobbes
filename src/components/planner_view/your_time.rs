@@ -8,6 +8,7 @@ use chrono::{DateTime, NaiveDate, Utc};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+use crate::todo::categories;
 use crate::todo::measures;
 use crate::todo::model::{self, TimeBlock, TimeGoal};
 use crate::todo::store;
@@ -88,6 +89,206 @@ pub(crate) fn next_palette_colour(goals: &[TimeGoal]) -> &'static str {
 pub(crate) fn daily_share(goals: &[TimeGoal]) -> u32 {
     let week: u32 = goals.iter().map(|g| g.weekly_target_minutes).sum();
     (week + 3) / 7
+}
+
+/// The palette's category names, for [`categories::category_options`].
+pub(crate) fn palette_names() -> [&'static str; 5] {
+    DEFAULT_PALETTE.map(|(n, _)| n)
+}
+
+/// The one your-time category list (goals, then in use, then suggestions)
+/// from the planner's in-memory state.
+pub(crate) fn category_list(state: &PlannerState) -> Vec<categories::CategoryOption> {
+    categories::category_options(
+        &state.time_goals,
+        &state.blocks,
+        &palette_names(),
+        categories::in_use_since(Utc::now()),
+    )
+}
+
+/// Re-file every block and your-time to-do in `from` under `to`, then write
+/// the touched rows through off the UI thread (P-017). Returns how many
+/// blocks moved.
+pub(crate) fn apply_recategorise(planner: &mut Signal<PlannerState>, from: &str, to: &str) -> usize {
+    let (blocks, todos) = {
+        let mut state = planner.write();
+        let st = &mut *state;
+        let r = categories::recategorise(&mut st.blocks, &mut st.todos, from, to, Utc::now());
+        let blocks: Vec<TimeBlock> = st.blocks.iter().filter(|b| r.blocks.contains(&b.id)).cloned().collect();
+        let todos: Vec<model::Todo> = st.todos.iter().filter(|t| r.todos.contains(&t.id)).cloned().collect();
+        (blocks, todos)
+    };
+    let moved = blocks.len();
+    if !blocks.is_empty() || !todos.is_empty() {
+        tokio::task::spawn_blocking(move || {
+            for b in &blocks {
+                if let Err(e) = store::save_block(b) {
+                    tracing::error!("planner: failed to save block {}: {}", b.id, e);
+                }
+            }
+            for t in &todos {
+                if let Err(e) = store::save_todo(t) {
+                    tracing::error!("planner: failed to save todo {}: {}", t.id, e);
+                }
+            }
+        });
+    }
+    moved
+}
+
+/// The weekly target a category gets when promoted to a goal from the
+/// review (the goals editor's own default).
+pub(crate) const PROMOTED_GOAL_MINUTES: u32 = 3 * 60;
+
+/// Make an in-use category a goal: [`PROMOTED_GOAL_MINUTES`] a week, its
+/// palette colour when that's free, else the next unused one. No-op when it
+/// already is one.
+pub(crate) fn promote_to_goal(planner: &mut Signal<PlannerState>, category: &str) {
+    let goal = {
+        let state = planner.peek();
+        if state.time_goals.iter().any(|g| g.matches(category)) {
+            return;
+        }
+        let palette = DEFAULT_PALETTE
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(category.trim()))
+            .map(|(_, c)| *c)
+            .filter(|c| {
+                !state
+                    .time_goals
+                    .iter()
+                    .any(|g| g.colour.as_deref().is_some_and(|gc| gc.eq_ignore_ascii_case(c)))
+            });
+        TimeGoal {
+            colour: Some(palette.unwrap_or_else(|| next_palette_colour(&state.time_goals)).to_string()),
+            sort_order: state.time_goals.iter().map(|g| g.sort_order).fold(0.0f64, f64::max) + 1.0,
+            ..TimeGoal::new(category.trim(), PROMOTED_GOAL_MINUTES)
+        }
+    };
+    persist_goal(&goal);
+    planner.write().time_goals.push(goal);
+}
+
+/// Menu rows for the your-time category list: goals, then categories in use
+/// without a goal, then suggestions, then a field to type a new one. Used by
+/// the timeline's empty-slot menu, a selected block's category picker and
+/// the review's "Merge into…".
+#[component]
+pub(crate) fn CategoryMenuItems(
+    on_pick: EventHandler<String>,
+    /// Ticked in the list (a block's current category).
+    #[props(default)]
+    current: Option<String>,
+    /// Left out of the list (the category being merged away).
+    #[props(default)]
+    exclude: Option<String>,
+    #[props(default = "New category\u{2026}".to_string())]
+    placeholder: String,
+) -> Element {
+    let planner = use_context::<Signal<PlannerState>>();
+    let mut typed = use_signal(String::new);
+    let (options, goals) = {
+        let state = planner.read();
+        (category_list(&state), state.time_goals.clone())
+    };
+    let same = |a: &str, b: &Option<String>| b.as_deref().is_some_and(|b| a.eq_ignore_ascii_case(b.trim()));
+    let options: Vec<categories::CategoryOption> = options.into_iter().filter(|o| !same(&o.name, &exclude)).collect();
+    let (main, suggestions): (Vec<_>, Vec<_>) = options
+        .into_iter()
+        .partition(|o| o.source != categories::CategorySource::Suggestion);
+    let mut submit = move || {
+        let raw = typed.peek().trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let name = {
+            let state = planner.peek();
+            categories::canonical(&state.time_goals, &state.blocks, &raw)
+        };
+        typed.set(String::new());
+        on_pick.call(name);
+    };
+    rsx! {
+        for o in main {
+            CategoryMenuRow {
+                key: "yt-{o.name}",
+                colour: category_colour(&goals, &o.name),
+                ticked: same(&o.name, &current),
+                option: o.clone(),
+                on_pick: on_pick,
+            }
+        }
+        if !suggestions.is_empty() {
+            div {
+                class: "px-2.5 pt-1.5 pb-0.5 text-[10px] uppercase tracking-[0.08em] text-fg-muted",
+                "Suggestions"
+            }
+        }
+        for o in suggestions {
+            CategoryMenuRow {
+                key: "yt-{o.name}",
+                colour: category_colour(&goals, &o.name),
+                ticked: same(&o.name, &current),
+                option: o.clone(),
+                on_pick: on_pick,
+            }
+        }
+        div {
+            class: "px-2 pt-1 pb-1",
+            input {
+                class: "h-6 w-full rounded border border-faint bg-input px-2 text-[11px] text-fg outline-none",
+                placeholder: "{placeholder}",
+                value: "{typed}",
+                onmousedown: move |evt| evt.stop_propagation(),
+                onclick: move |evt| evt.stop_propagation(),
+                oninput: move |e| typed.set(e.value()),
+                onkeydown: move |e| {
+                    // Keys typed here are text, not the rail's `[` / `]`.
+                    e.stop_propagation();
+                    if e.key() == Key::Enter {
+                        submit();
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[component]
+fn CategoryMenuRow(
+    option: categories::CategoryOption,
+    colour: String,
+    ticked: bool,
+    on_pick: EventHandler<String>,
+) -> Element {
+    let o = option;
+    let suggestion = o.source == categories::CategorySource::Suggestion;
+    rsx! {
+        button {
+            class: if suggestion {
+                "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg-muted text-left hover:bg-input hover:text-fg"
+            } else {
+                "w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] text-fg text-left hover:bg-input"
+            },
+            onclick: {
+                let name = o.name.clone();
+                move |evt: MouseEvent| {
+                    evt.stop_propagation();
+                    on_pick.call(name.clone());
+                }
+            },
+            span { class: "h-2 w-2 shrink-0 rounded-full", style: "background: {colour};" }
+            span { class: "flex-1 truncate", "{o.name}" }
+            if ticked {
+                Icon { width: 10, height: 10, icon: fi_icons::FiCheck }
+            } else if let Some(m) = o.goal_minutes {
+                span { class: "font-mono text-[10px] text-fg-muted", "{model::format_minutes(m)}/wk" }
+            } else if o.source == categories::CategorySource::InUse {
+                span { class: "font-mono text-[10px] text-fg-muted", "no goal" }
+            }
+        }
+    }
 }
 
 /// One category chip in the readout.
@@ -286,14 +487,24 @@ pub(crate) fn TimeGoalsEditor(on_close: EventHandler<()>) -> Element {
     goals.sort_by(|a, b| a.sort_order.partial_cmp(&b.sort_order).unwrap_or(std::cmp::Ordering::Equal));
     let suggested = next_palette_colour(&goals).to_string();
     let chosen = new_colour.read().clone().unwrap_or_else(|| suggested.clone());
+    // Categories already on blocks without a goal (Break, say) come first:
+    // anything Hobbes filed time under can be promoted to a goal here.
+    let in_use_names: Vec<String> = {
+        let state = planner.read();
+        categories::in_use_without_goal(&state.time_goals, &state.blocks, categories::in_use_since(chrono::Utc::now()))
+    };
     let unused_names: Vec<&str> = DEFAULT_PALETTE
         .iter()
         .map(|(n, _)| *n)
         .filter(|n| !goals.iter().any(|g| g.matches(n)))
+        .filter(|n| !in_use_names.iter().any(|u| u.eq_ignore_ascii_case(n)))
         .collect();
 
     let mut add = move || {
-        let name = new_name.peek().trim().to_string();
+        let name = {
+            let state = planner.peek();
+            categories::canonical(&state.time_goals, &state.blocks, &new_name.peek())
+        };
         if name.is_empty() {
             return;
         }
@@ -379,10 +590,38 @@ pub(crate) fn TimeGoalsEditor(on_close: EventHandler<()>) -> Element {
                     "Add"
                 }
             }
-            if !unused_names.is_empty() {
+            if !in_use_names.is_empty() || !unused_names.is_empty() {
                 div {
                     class: "flex flex-wrap items-center gap-1",
-                    span { class: "text-[10.5px] text-fg-muted", "Suggestions:" }
+                    if !in_use_names.is_empty() {
+                        span { class: "text-[10.5px] text-fg-muted", title: "On your blocks, without a goal yet", "In use:" }
+                    }
+                    for n in in_use_names.iter().cloned() {
+                        button {
+                            key: "in-use-{n}",
+                            class: "inline-flex h-[18px] items-center gap-1 rounded-full border border-faint px-1.5 text-[10.5px] text-fg hover:text-fg",
+                            title: "Make {n} a goal",
+                            onclick: {
+                                let name = n.clone();
+                                move |_| {
+                                    let colour = DEFAULT_PALETTE
+                                        .iter()
+                                        .find(|(p, _)| p.eq_ignore_ascii_case(&name))
+                                        .map(|(_, c)| c.to_string());
+                                    new_name.set(name.clone());
+                                    new_colour.set(colour);
+                                }
+                            },
+                            span {
+                                class: "h-[7px] w-[7px] rounded-full",
+                                style: "background: {category_colour(&[], &n)};",
+                            }
+                            "{n}"
+                        }
+                    }
+                    if !unused_names.is_empty() {
+                        span { class: "text-[10.5px] text-fg-muted", "Suggestions:" }
+                    }
                     for n in unused_names {
                         button {
                             key: "{n}",
@@ -412,6 +651,7 @@ pub(crate) fn TimeGoalsEditor(on_close: EventHandler<()>) -> Element {
 fn GoalRow(goal: TimeGoal) -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let mut hours = use_signal(|| hours_field(goal.weekly_target_minutes));
+    let mut name = use_signal(|| goal.category.clone());
     let mut colour_open = use_signal(|| false);
     let colour = category_colour(&[goal.clone()], &goal.category);
     let id = goal.id.clone();
@@ -438,7 +678,43 @@ fn GoalRow(goal: TimeGoal) -> Element {
                 title: "Change colour",
                 onclick: move |_| colour_open.toggle(),
             }
-            span { class: "min-w-0 flex-1 truncate text-xs text-fg", "{goal.category}" }
+            input {
+                class: "h-6 min-w-0 flex-1 rounded border border-faint bg-input px-2 text-xs text-fg outline-none",
+                title: "Rename \u{2014} its blocks move with it",
+                value: "{name}",
+                oninput: move |e| name.set(e.value()),
+                onchange: {
+                    let id = id.clone();
+                    move |e: FormEvent| {
+                        let to = e.value().trim().to_string();
+                        let renamed = {
+                            let mut state = planner.write();
+                            let Some(from) = state.time_goals.iter().find(|g| g.id == id).map(|g| g.category.clone()) else {
+                                return;
+                            };
+                            if from == to {
+                                return;
+                            }
+                            categories::rename_goal(&mut state.time_goals, &from, &to).map(|g| (from, g))
+                        };
+                        match renamed {
+                            Ok((from, Some(g))) => {
+                                persist_goal(&g);
+                                apply_recategorise(&mut planner, &from, &g.category);
+                                name.set(g.category.clone());
+                            }
+                            Ok((_, None)) => {}
+                            Err(_) => {
+                                // Empty, or another goal's name: put the old one back.
+                                let old = planner.peek().time_goals.iter().find(|g| g.id == id).map(|g| g.category.clone());
+                                if let Some(old) = old {
+                                    name.set(old);
+                                }
+                            }
+                        }
+                    }
+                },
+            }
             input {
                 class: "h-6 w-14 rounded border border-faint bg-input px-2 text-right font-mono text-xs text-fg outline-none",
                 title: "Hours a week",

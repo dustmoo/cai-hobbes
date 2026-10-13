@@ -272,7 +272,10 @@ impl PlannerClient {
                     Resizing a linked block re-estimates its to-do. kind 'your_time' creates a \
                     PROTECTED block for the user's own time (needs a category); work cannot be \
                     placed over protected time, and protected blocks are never moved or deleted \
-                    unless the user explicitly agreed (then pass user_confirmed: true). {}",
+                    unless the user explicitly agreed (then pass user_confirmed: true). For the \
+                    category, use one of the user's your-time goals (HOBBES_TIME_GOALS get, or \
+                    planner_today.your_time.week) unless the user named another; any other name is \
+                    tracked with no target and the response says so. {}",
                     SHARED_NOTE
                 ).into()),
                 input_schema: Arc::new(
@@ -288,7 +291,7 @@ impl PlannerClient {
                             "start": { "type": "string", "description": "Local start time 'HH:MM'. Required for create." },
                             "end": { "type": "string", "description": "Local end time 'HH:MM', after start. Required for create." },
                             "kind": { "type": "string", "enum": ["work", "your_time", "chores"], "description": "Create only. work (default): a to-do timebox or event; your_time: protected time for the user (needs category, no todo_id); chores: a batched chores slot." },
-                            "category": { "type": "string", "description": "Your-time category for kind your_time (e.g. 'Outside')." },
+                            "category": { "type": "string", "description": "Your-time category for kind your_time: prefer one of the user's goal categories (e.g. 'Outside'). On move, re-files a your_time block (needs user_confirmed)." },
                             "override_protected": { "type": "boolean", "description": "Create only: place work over protected your-time. ONLY when the user explicitly asked to use that time." },
                             "user_confirmed": { "type": "boolean", "description": "Move/delete of a protected your-time block: true ONLY after the user explicitly agreed in this conversation." }
                         },
@@ -512,8 +515,11 @@ impl PlannerClient {
                     "The user's your-time goals: weekly targets for what their time is FOR \
                     (reading, gaming, getting outside…), and this week's progress against \
                     them (protected your-time blocks plus time logged on your-time to-dos). \
-                    'get' (default) reads; 'set' upserts goals by category and removes \
-                    categories listed in 'remove'. Only set goals the user stated."
+                    'get' (default) reads, and also lists categories in use on blocks that have \
+                    no goal; 'set' upserts goals by category, renames categories in 'rename' \
+                    (blocks and to-dos move along; renaming into an existing goal merges into it), \
+                    and removes goals listed in 'remove' (their blocks stay). Only set goals the \
+                    user stated."
                         .into(),
                 ),
                 input_schema: Arc::new(
@@ -534,7 +540,16 @@ impl PlannerClient {
                                     "required": ["category"]
                                 }
                             },
-                            "remove": { "type": "array", "items": { "type": "string" }, "description": "set: categories to delete." }
+                            "rename": {
+                                "type": "array",
+                                "description": "set: rename a category (its goal, blocks and your-time to-dos), e.g. [{\"from\": \"Break\", \"to\": \"Outside\"}].",
+                                "items": {
+                                    "type": "object",
+                                    "properties": { "from": { "type": "string" }, "to": { "type": "string" } },
+                                    "required": ["from", "to"]
+                                }
+                            },
+                            "remove": { "type": "array", "items": { "type": "string" }, "description": "set: goals to delete (their blocks stay, tracked without a target)." }
                         }
                     }))
                     .unwrap_or_default(),

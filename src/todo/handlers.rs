@@ -1420,6 +1420,37 @@ fn protected_guard(block: &TimeBlock, args: &Value, verb: &str) -> Option<String
     ))
 }
 
+/// Tell the model when it filed time under a category that isn't one of the
+/// user's goals: it still counts (tracked, no target), but the goals are
+/// what the user asked for.
+fn non_goal_note(state: &PlannerState, category: &str) -> Option<String> {
+    if state.time_goals.iter().any(|g| g.matches(category)) {
+        return None;
+    }
+    if state.time_goals.is_empty() {
+        return Some(format!(
+            "Note: the user has no your-time goals yet, so '{}' is tracked without a target.",
+            category
+        ));
+    }
+    let goals: Vec<&str> = super::categories::ordered_goals(&state.time_goals)
+        .into_iter()
+        .map(|g| g.category.as_str())
+        .collect();
+    Some(format!(
+        "Note: '{}' isn't one of the user's goals \u{2014} it's tracked but has no target. Goals: {}. \
+         Prefer one of these unless the user asked for '{}'.",
+        category,
+        goals.join(", "),
+        category
+    ))
+}
+
+/// The cut-off for "in use" categories, from the local day.
+fn in_use_since_day(today: NaiveDate) -> DateTime<Utc> {
+    super::categories::in_use_since(today.and_hms_opt(0, 0, 0).expect("midnight").and_utc())
+}
+
 fn time_block_create(
     state: &mut PlannerState,
     args: &Value,
@@ -1482,8 +1513,9 @@ fn time_block_create(
                     "A your_time block needs a 'category' (e.g. one of the user's time goals).".to_string(),
                 );
             };
+            // "outside" files under the existing "Outside".
             BlockSource::YourTime {
-                category: category.to_string(),
+                category: super::categories::canonical(&state.time_goals, &state.blocks, category),
             }
         }
         Some(k) if k == "chores" => BlockSource::Chores {
@@ -1544,8 +1576,13 @@ fn time_block_create(
         }
     }
     let warning = overlap_warning(state, &block);
+    let category_note = block.your_time_category().and_then(|c| non_goal_note(state, c));
     persist_block(&block, persist);
     let mut out = format!("Created {}", block_line(state, &block));
+    if let Some(n) = category_note {
+        out.push('\n');
+        out.push_str(&n);
+    }
     let linked = block.todo_id.clone();
     state.blocks.push(block);
     // Timeboxing work on a day IS scheduling it there.
@@ -1632,6 +1669,20 @@ fn time_block_move(
     let mut updated = existing;
     updated.start = start;
     updated.end = end;
+    // Re-file a your-time block (the protected guard above already asked
+    // for user_confirmed). An explicit title below still wins.
+    let mut category_note = None;
+    if let Some(raw) = args.get("category").and_then(|v| v.as_str()).map(str::trim).filter(|c| !c.is_empty()) {
+        if !updated.is_protected() {
+            return (
+                ToolCallStatus::Error,
+                "'category' only applies to your_time blocks.".to_string(),
+            );
+        }
+        let category = super::categories::canonical(&state.time_goals, &state.blocks, raw);
+        super::categories::set_block_category(&mut updated, &category);
+        category_note = non_goal_note(state, &category);
+    }
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         updated.title = title.to_string();
     }
@@ -1639,6 +1690,10 @@ fn time_block_move(
     let warning = overlap_warning(state, &updated);
     persist_block(&updated, persist);
     let mut out = format!("Moved {}", block_line(state, &updated));
+    if let Some(n) = category_note {
+        out.push('\n');
+        out.push_str(&n);
+    }
     let new_duration = updated.duration_minutes();
     let linked = updated.todo_id.clone();
     if let Some(slot) = state.blocks.iter_mut().find(|b| b.id == id) {
@@ -2759,6 +2814,62 @@ pub fn handle_time_goals(
                     }
                 }
             }
+            // Rename a category: its goal (if any), every your-time block
+            // and your-time to-do move to the new name.
+            if let Some(renames) = args.get("rename").and_then(|v| v.as_array()) {
+                for (i, r) in renames.iter().enumerate() {
+                    let field = |k: &str| r.get(k).and_then(|v| v.as_str()).map(str::trim).filter(|c| !c.is_empty());
+                    let (Some(from), Some(to)) = (field("from"), field("to")) else {
+                        errors.push(format!("rename[{}]: needs 'from' and 'to'", i));
+                        continue;
+                    };
+                    let to = match state.time_goals.iter().find(|g| g.matches(to)) {
+                        Some(g) if !g.matches(from) => g.category.clone(),
+                        _ => to.to_string(),
+                    };
+                    let goal = match super::categories::rename_goal(&mut state.time_goals, from, &to) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            errors.push(format!(
+                                "rename[{}]: {} \u{2014} to merge two goals, remove '{}' and rename its category into '{}'",
+                                i, e, from, to
+                            ));
+                            continue;
+                        }
+                    };
+                    let st = &mut *state;
+                    let moved = super::categories::recategorise(&mut st.blocks, &mut st.todos, from, &to, Utc::now());
+                    if goal.is_none() && moved.is_empty() {
+                        errors.push(format!("rename[{}]: no goal, block or to-do in '{}'", i, from));
+                        continue;
+                    }
+                    if persist {
+                        if let Some(g) = &goal {
+                            if let Err(e) = store::save_time_goal(g) {
+                                tracing::error!("Failed to persist time goal {}: {}", g.id, e);
+                            }
+                        }
+                        for b in st.blocks.iter().filter(|b| moved.blocks.contains(&b.id)) {
+                            if let Err(e) = store::save_block(b) {
+                                tracing::error!("Failed to persist time block {}: {}", b.id, e);
+                            }
+                        }
+                        for t in st.todos.iter().filter(|t| moved.todos.contains(&t.id)) {
+                            if let Err(e) = store::save_todo(t) {
+                                tracing::error!("Failed to persist todo {}: {}", t.id, e);
+                            }
+                        }
+                    }
+                    notes.push(format!(
+                        "Renamed '{}' to '{}'{}: {} block(s), {} to-do(s) moved.",
+                        from,
+                        to,
+                        if goal.is_some() { " (goal kept)" } else { "" },
+                        moved.blocks.len(),
+                        moved.todos.len()
+                    ));
+                }
+            }
             if let Some(remove) = args.get("remove").and_then(|v| v.as_array()) {
                 for c in remove.iter().filter_map(|v| v.as_str()) {
                     match state.time_goals.iter().position(|g| g.matches(c)) {
@@ -2828,6 +2939,15 @@ pub fn handle_time_goals(
     let (protected_today, _) = super::measures::protected_on(&state.blocks, today);
     if protected_today > 0 {
         out.push_str(&format!("\nProtected today: {}.", model::format_minutes(protected_today)));
+    }
+    let untracked =
+        super::categories::in_use_without_goal(&state.time_goals, &state.blocks, in_use_since_day(today));
+    if !untracked.is_empty() {
+        out.push_str(&format!(
+            "\nIn use without a goal (last {} weeks): {}. Tracked, no target; the user can make one a goal.",
+            super::categories::IN_USE_LOOKBACK_DAYS / 7,
+            untracked.join(", ")
+        ));
     }
     for n in notes {
         out.push('\n');
@@ -5442,6 +5562,58 @@ mod tests {
         assert_eq!(state.time_goals.len(), 1, "valid removal still applied");
         let (status, _) = handle_time_goals(&mut state, &json!({"action": "set", "goals": [{"category": "X", "weekly_target_minutes": 60, "colour": "green"}]}), today(), false);
         assert_eq!(status, ToolCallStatus::Error);
+    }
+
+    #[test]
+    fn your_time_blocks_snap_to_goal_spelling_and_flag_non_goals() {
+        let mut state = PlannerState::default();
+        let (_, out) = block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Break", "date": "today", "start": "15:00", "end": "15:15"}));
+        assert!(out.contains("no your-time goals yet"), "{out}");
+        goals(&mut state);
+        let (_, out) = block(&mut state, json!({"action": "create", "kind": "your_time", "category": "outside", "date": "today", "start": "12:00", "end": "13:00"}));
+        assert!(!out.contains("Note:"), "a goal needs no note: {out}");
+        assert_eq!(state.blocks.last().unwrap().your_time_category(), Some("Outside"));
+        let (_, out) = block(&mut state, json!({"action": "create", "kind": "your_time", "category": "break", "date": "today", "start": "16:00", "end": "16:15"}));
+        assert!(out.contains("'Break' isn't one of the user's goals") && out.contains("Goals: Outside, Reading"), "{out}");
+        assert_eq!(state.blocks.last().unwrap().your_time_category(), Some("Break"), "snaps to the in-use spelling");
+
+        let (_, out) = handle_time_goals(&mut state, &json!({}), today(), false);
+        assert!(out.contains("In use without a goal (last 8 weeks): Break."), "{out}");
+
+        // Re-file one block on move (protected: needs the user's say-so).
+        let id = state.blocks.last().unwrap().id.clone();
+        let (status, _) = block(&mut state, json!({"action": "move", "id": id, "category": "Reading"}));
+        assert_eq!(status, ToolCallStatus::Error, "protected guard");
+        let (status, out) = block(&mut state, json!({"action": "move", "id": id, "category": "reading", "user_confirmed": true}));
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        let b = state.blocks.iter().find(|b| b.id == id).unwrap();
+        assert_eq!((b.your_time_category(), b.title.as_str()), (Some("Reading"), "Reading"));
+    }
+
+    #[test]
+    fn time_goals_rename_carries_blocks_and_merges_into_goals() {
+        let mut state = PlannerState::default();
+        goals(&mut state);
+        block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Break", "date": "today", "start": "15:00", "end": "15:15"}));
+        block(&mut state, json!({"action": "create", "kind": "your_time", "category": "Outside", "date": "today", "start": "12:00", "end": "13:00"}));
+
+        // A goal rename keeps the goal and moves its blocks.
+        let (status, out) = handle_time_goals(&mut state, &json!({"action": "set", "rename": [{"from": "outside", "to": "Getting outside"}]}), today(), false);
+        assert_eq!(status, ToolCallStatus::Completed, "{out}");
+        assert!(out.contains("Renamed 'outside' to 'Getting outside' (goal kept): 1 block(s)"), "{out}");
+        assert!(state.time_goals.iter().any(|g| g.category == "Getting outside"));
+        assert!(state.blocks.iter().any(|b| b.your_time_category() == Some("Getting outside")));
+
+        // A non-goal category merges into a goal, in the goal's spelling.
+        let (_, out) = handle_time_goals(&mut state, &json!({"action": "set", "rename": [{"from": "Break", "to": "getting OUTSIDE"}]}), today(), false);
+        assert!(!out.contains("In use without a goal"), "{out}");
+        assert!(state.blocks.iter().all(|b| b.your_time_category() == Some("Getting outside")));
+
+        // Two goals don't silently merge; unknown categories are refused.
+        let (status, out) = handle_time_goals(&mut state, &json!({"action": "set", "rename": [{"from": "Reading", "to": "Getting outside"}, {"from": "Nope", "to": "X"}]}), today(), false);
+        assert_eq!(status, ToolCallStatus::Error);
+        assert!(out.contains("already a goal") && out.contains("no goal, block or to-do in 'Nope'"), "{out}");
+        assert_eq!(state.time_goals.len(), 2);
     }
 
     #[test]
