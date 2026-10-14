@@ -63,6 +63,8 @@ jobs:
 
     - name: Build Pro Version
       run: ./scripts/build_pro.sh
+      env:
+        HOBBES_DX: /usr/local/bin/dx
 
     - name: Package to DMG
       run: |

@@ -643,11 +643,15 @@ fn diagnose_stuck(session: &PtySession, acc: &[u8]) -> String {
             }
         }
     }
+    // Foreground process group and tty name are Unix-only PTY concepts.
+    #[cfg(unix)]
     let fg = session
         ._master
         .lock()
         .ok()
         .and_then(|m| m.process_group_leader());
+    #[cfg(not(unix))]
+    let fg: Option<i32> = None;
     if let (Some(fg), Some(sh)) = (fg, session.shell_pid) {
         if fg as u32 != sh {
             findings.push(format!(
@@ -780,7 +784,10 @@ fn spawn_shell(cwd: &str, init_sentinel: &str) -> Result<PtySession, String> {
         }
     });
 
+    #[cfg(unix)]
     let tty_path = pair.master.tty_name();
+    #[cfg(not(unix))]
+    let tty_path: Option<std::path::PathBuf> = None;
     let shell_pid = child.process_id();
     let session = PtySession {
         writer: std::sync::Mutex::new(writer),

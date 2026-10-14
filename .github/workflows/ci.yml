@@ -126,6 +126,8 @@ jobs:
 
     - name: Build Release (CI Mode)
       run: ./scripts/build_release.sh
+      env:
+        HOBBES_DX: /usr/local/bin/dx
 
   # ── ENABLED: Azure certificate validation completed ──
   build-windows-release:

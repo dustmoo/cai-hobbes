@@ -13,6 +13,7 @@ name = "hobbes"
 path = "../../src/main.rs"
 
 [dependencies]
+unicode-segmentation = "1.13"
 # Workspace dependencies
 dioxus = { workspace = true, features = ["desktop"] }
 dioxus-desktop = { workspace = true }
