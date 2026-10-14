@@ -1,3 +1,53 @@
+# Hobbes v0.12.2 — The Planner, the Fleet, and Side Tabs
+
+## ✨ New Features
+
+### The Planner
+- **A built-in planner, shared with the AI.** Open it from the chat bar or its own tab. Inbox, Today, Upcoming, Anytime, Someday and Logbook lists, with quick-add tokens (`~30m`, `@2pm`, `+project`, `!chore`, priorities) and a live preview chip. Press ⌘K anywhere for quick capture.
+- **Today, with a timeline.** Drag to-dos onto the day, then drag blocks to move or resize them. A capacity bar shows planned against done. Unfinished work rolls over to the next day, and you can end the day when you're done. The timeline fits your workday and zooms to any visible range.
+- **Your calendars on the timeline.** Mirror Google Calendar (through Composio) or any ICS/webcal feed as read-only blocks. Firm meetings count against the day's capacity, and the AI plans around them.
+- **Your time & goals.** Protect blocks for what your time is *for* (reading, getting outside, gaming) and set weekly targets. The AI plans work around protected time and never over it.
+- **Projects & areas.** File to-dos into projects grouped by area. Hobbes matches names and aliases, so the AI reuses an existing project instead of creating a duplicate. **Manage projects** handles renames, aliases, status and merging duplicates.
+- **Focus mode.** Start a to-do to track time against its estimate, with a menu-bar timer. Activating a to-do can also open a fresh chat seeded with it.
+- **Two lanes.** Hand a to-do to an agent and it moves into the agent lane beside your own work, so you can see what's working, what's stuck and what needs you.
+- **Weekly review (experimental).** A look back at your week: your-time goals, agent leverage, outcomes reached and chore minutes, with feedback in a style you choose. It's marked Experimental while it takes shape.
+- **The AI uses the planner too.** New `HOBBES_TODO_*`, `HOBBES_PLAN_DAY`, `HOBBES_TIME_BLOCK`, `HOBBES_PROJECT_*`, `HOBBES_TIME_GOALS` and `HOBBES_CALENDAR_LIST` tools. Today's plan is included in every chat, so the AI knows your day without asking. Turn the planner off in Settings → Planner.
+
+### Fleet & delegation (Pro)
+- **Watch your coding agents.** The Fleet tab lists every Claude Code session on your machine: what it's doing, transcript briefs, a day rollup, and the "exocortex" measure of how much agent work runs while you're engaged.
+- **Dispatch work.** `HOBBES_DISPATCH` hands a to-do to a new Hobbes chat or to a headless Claude Code run in the project's folder, on a model you allow. When a background agent finishes, the chat that sent it picks up the result and carries on.
+- **Trust rules.** Approve a tool call once and choose to always allow that command or tool in a project. Every approval decision is logged.
+- **Built-in terminal (opt-in).** A persistent per-chat shell the AI can use, always behind tool approval. Off by default; turn it on in Settings → Terminal.
+
+### Tabs & layout
+- **Side tabs are the new default.** Open tabs now sit in a resizable left sidebar that can collapse to an emoji rail. It's sortable, can be grouped by project, and has keys for jumping between groups. You can switch back to the top strip in Settings → Behavior.
+- **Tidy tabs.** Hobbes suggests which tabs to close or file into projects, with an optional nudge once too many are open.
+- **Tabs that say what they're about.** Each tab shows an emoji, a date and a topic, and the title settles after a few messages. Narrow layouts give way gracefully, with hairline dividers between columns you can resize.
+- **One drawer layout for Settings, History and MCP.** Fleet and Terminal get their own Settings tabs.
+
+### Chat
+- **Prompt caching for Claude.** A stable system prefix, per-turn context sent once, and optional keep-alive pings for idle tabs. Long chats get much cheaper and faster. You can tune it under the prompt-caching toggle.
+- **Activity stream.** Each turn shows its tool calls and thinking as one readable activity row, with real step timing.
+- **Mermaid diagrams and LaTeX** render in replies. Messages show timestamps and day dividers.
+- **Skills:** three-state permissions (Auto / Ask / Off), a configurable idle unload, and `HOBBES_UNLOAD_SKILL`.
+- **Models:** Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5, plus current lineups and pricing for Claude, Gemini and OpenAI.
+- **A new tiger mascot** in the chat bar, the menu bar and the empty chat.
+
+## 🐛 Fixes
+- **Image attachments stay legible.** Attachments and tool screenshots are capped at 1568px on the long edge instead of being shrunk further.
+- **Mid-chat model switches work.** Switching providers no longer fails on another model's thought signatures.
+- **Prompt construction:** history trims in whole chunks, the user turn is never sent twice, a request never ends on an assistant turn, and tool results that already fit aren't cut.
+- **Terminal:** clean output, no more hangs on stuck prompts, and timed-out output no longer leaks into later commands.
+- **Tabs:** titles and emoji are set reliably, crowded tab strips don't bleed into each other, and approvals resume in the tab that asked for them.
+- **Composio:** no more duplicate tool declarations in dispatched tabs, and background refreshes stay within one profile.
+
+## 🛡️ Reliability & Security
+- **Logs without secrets.** Logging no longer records secrets or message content at the default level. The Pro build writes daily log files you can share when reporting a bug.
+- **Planner data is local**, in its own SQLite store next to your sessions, and it survives restarts.
+- **Dependency audit findings resolved.**
+
+---
+
 # Hobbes v0.11.4 — On-Demand MCP Loading Fix
 
 ## 🐛 Fixes
