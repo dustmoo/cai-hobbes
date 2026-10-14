@@ -520,11 +520,12 @@ impl Session {
     /// is stamped as `"%b %d - %I:%M %p"` at creation (`create_session_raw`)
     /// and is never touched again except by a user rename. Once renamed,
     /// that original stamp is gone, so this falls back to `last_updated`
-    /// (the closest thing to a creation date this struct still carries).
+    /// (the closest thing to a creation date this struct still carries),
+    /// shown in local time like the stamp.
     pub fn short_date(&self) -> String {
         match self.name.split_once(" - ") {
             Some((date_part, _)) => date_part.to_string(),
-            None => self.last_updated.format("%b %d").to_string(),
+            None => self.last_updated.with_timezone(&chrono::Local).format("%b %d").to_string(),
         }
     }
 
@@ -2250,9 +2251,10 @@ mod tests {
         fn short_date_falls_back_to_last_updated_once_renamed() {
             let mut s = session_with("My Renamed Chat", true, None);
             s.last_updated =
-                chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                chrono::DateTime::parse_from_rfc3339("2026-03-01T12:00:00Z")
                     .unwrap()
                     .with_timezone(&Utc);
+            // Noon UTC is Mar 01 in every timezone from UTC-11 to UTC+11.
             assert_eq!(s.short_date(), "Mar 01");
         }
 
