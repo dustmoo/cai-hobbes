@@ -111,6 +111,34 @@ impl CoreClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_UNLOAD_SKILL".into(),
+                description: Some(
+                    "Unload a skill you loaded earlier (listed under 'loaded_skills' in your \
+                    system context), dropping its instruction manual from your context. Use this \
+                    when you are done with a skill and it no longer applies to the conversation. \
+                    You can load it again later with HOBBES_INVOKE_SKILL."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Exact name of the loaded skill to unload."
+                            }
+                        },
+                        "required": ["name"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Unload Skill".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_SET_TIMER".into(),
                 description: Some(
                     "Schedule a timer/reminder. When it fires, Hobbes brings its window to the \
@@ -152,6 +180,35 @@ impl CoreClient {
                     .unwrap_or_default(),
                 ),
                 title: Some("List Timers".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
+                name: "HOBBES_FLEET_STATUS".into(),
+                description: Some(
+                    "Live status of the user's coding-agent fleet: every Claude Code \
+                    terminal session and Hobbes chat tab observed today — status \
+                    (working / needs_attention / idle / ended), minutes of agent time, \
+                    re-entry brief (what it did, what it's blocked on), and any pending \
+                    permission approval. Read-only. Optionally filter by a name or \
+                    path substring."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "session": {
+                                "type": "string",
+                                "description": "Optional case-insensitive substring to match against session names or paths (e.g. 'puget')."
+                            }
+                        }
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Fleet Status".to_string()),
                 output_schema: None,
                 annotations: None,
                 icons: None,

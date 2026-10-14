@@ -15,12 +15,15 @@ use dioxus::prelude::*;
 use dotenvy::dotenv;
 use futures_util::StreamExt;
 
+mod agent_time_runtime;
 mod async_persist;
 #[cfg(target_os = "macos")]
 mod biometric_auth;
 mod components;
 mod constants;
 mod context;
+mod entitlement;
+mod fleet;
 mod formatters;
 mod gemini;
 mod hotkey;
@@ -29,6 +32,8 @@ mod keychain_ffi;
 #[cfg(all(test, target_os = "macos"))]
 mod keychain_tests;
 mod llm;
+mod layout_budget;
+mod log_utils;
 mod mcp;
 mod menu;
 mod permissions;
@@ -45,14 +50,21 @@ use secret_manager_generic as secret_manager;
 pub use secret_types::SecretManagerTrait;
 mod services;
 mod session;
+mod session_events;
 mod session_store;
 mod str_utils;
+mod tab_list;
+mod tab_tidy;
+#[cfg(test)]
+mod test_support;
 mod timers;
+mod todo;
 mod usage_log;
 mod settings;
 mod skills;
 mod theme;
 mod tray;
+mod focus_tray;
 
 use tray::{APP_QUIT, WINDOW_VISIBLE};
 use tray_icon::TrayIcon;
@@ -60,6 +72,267 @@ use tray_icon::TrayIcon;
 /// Transient reminder text shown as a top-of-window toast when a timer fires.
 /// Set by the timer scheduler; auto-dismisses, and can be dismissed manually.
 static TIMER_TOAST: GlobalSignal<Option<String>> = Signal::global(|| None);
+
+/// Mirror of `StreamManagerContext.streaming_sessions`, kept in sync by
+/// `StreamBridge`. `app()`'s own root-scope closures (tab close/delete, the
+/// `ChatCommand` handler) cannot `consume_context::<StreamManagerContext>()`
+/// themselves — that context is provided by the `StreamManager` component,
+/// a *descendant* of the root scope, and Dioxus context only flows downward
+/// — so they consult this GlobalSignal instead, which is reachable from any
+/// scope.
+static STREAMING_SESSIONS: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Session ids `delete_session_fn` wants `StreamBridge` to cancel the active
+/// stream for. Set from the root scope (which cannot reach
+/// `StreamManagerContext` directly — see `STREAMING_SESSIONS`), drained by
+/// `StreamBridge`, which *can*. A set rather than a single id so two deletes
+/// landing between two effect runs don't drop one of the cancels.
+static CANCEL_STREAM_REQUEST: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Ask `StreamBridge` to cancel `session_id`'s active stream, from code
+/// that cannot reach `StreamManagerContext` (the agent-time runtime's
+/// Pause / Stop / budget stop). No-op when nothing is streaming there.
+pub(crate) fn request_stream_cancel(session_id: &str) {
+    CANCEL_STREAM_REQUEST.write().insert(session_id.to_string());
+}
+
+/// Drain `CANCEL_STREAM_REQUEST`, subscribing the caller to it.
+///
+/// Must be called from inside a `use_effect`: only `.read()` registers the
+/// effect's reactive context (`.write()` notifies subscribers but subscribes
+/// nothing), so the read below is what makes a later insert re-run the
+/// effect. The read guard ends with its statement so it is never held across
+/// the drain's write, and the early return keeps an idle run from writing at
+/// all — an unconditional write after the read would re-dirty the effect
+/// forever.
+fn drain_cancel_stream_requests() -> Vec<String> {
+    if CANCEL_STREAM_REQUEST.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *CANCEL_STREAM_REQUEST.write())
+        .into_iter()
+        .collect()
+}
+
+/// Parent session ids a landed dispatch continuation wants reopened in the
+/// tab strip. Written by the fleet drain loop's continuation block (a plain
+/// `spawn`ed task, which runs *before* `open_tabs` is declared later in
+/// `app()` and so cannot reference it directly — same reach problem as
+/// `STREAMING_SESSIONS`/`CANCEL_STREAM_REQUEST` above, same fix: a
+/// root-reachable `GlobalSignal`). Drained by the `ChatCommand` handler,
+/// which does have `open_tabs` in scope.
+static PENDING_TAB_REOPEN: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Drain `PENDING_TAB_REOPEN`, subscribing the caller to it. Same idiom as
+/// `drain_cancel_stream_requests`: the read (not the write) is what makes a
+/// later insert re-run the subscribed effect.
+fn drain_pending_tab_reopens() -> Vec<String> {
+    if PENDING_TAB_REOPEN.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *PENDING_TAB_REOPEN.write())
+        .into_iter()
+        .collect()
+}
+
+/// One entry in the visible tab strip, in `tab_bar.rs`'s left-to-right render
+/// order: open chat tabs (by index into `open_tabs`), then Planner, then
+/// Fleet — the latter two only present when their `_tab_open` flag is set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripItem {
+    Chat(usize),
+    Planner,
+    Fleet,
+}
+
+/// Builds the ordered strip for `NextTab`/`PrevTab` cycling. Pure so it's
+/// testable without Dioxus context; mirrors `TabBar`'s render order (chat
+/// tabs loop, then the `planner_tab_open` block, then `fleet_tab_open`).
+fn build_tab_strip(open_tabs_len: usize, planner_tab_open: bool, fleet_tab_open: bool) -> Vec<StripItem> {
+    let mut strip: Vec<StripItem> = (0..open_tabs_len).map(StripItem::Chat).collect();
+    if planner_tab_open {
+        strip.push(StripItem::Planner);
+    }
+    if fleet_tab_open {
+        strip.push(StripItem::Fleet);
+    }
+    strip
+}
+
+/// Next/previous index into a slice of length `len`, wrapping at both ends.
+/// Callers must guard `len == 0` themselves (undefined here).
+fn cycle_index(current: usize, len: usize, forward: bool) -> usize {
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+/// The sidebar's visible navigation order, built from live state the same
+/// way `TabSidebar` builds its rows (same facts, same sanitised lens), so the
+/// shortcuts walk what is on screen. Returns the stops and whether the list
+/// is grouped (grouping other than None).
+fn sidebar_nav_stops(
+    open_tabs: &[String],
+    state: &session::SessionState,
+    planner: &todo::PlannerState,
+    settings: &settings::Settings,
+    stored_order: tab_list::TabListOrder,
+    planner_tab_open: bool,
+    fleet_tab_open: bool,
+) -> (Vec<tab_list::NavStop>, bool) {
+    let order = stored_order.sanitized(
+        &tab_list::TabSortKey::ALL,
+        &tab_list::tab_group_options(settings.planner_enabled, settings.composio_profiles.len()),
+    );
+    let facts: Vec<tab_list::TabFacts> = open_tabs
+        .iter()
+        .enumerate()
+        .map(|(idx, id)| {
+            let s = state.sessions.get(id);
+            let last_updated = s.map(|s| s.last_updated).unwrap_or_else(chrono::Utc::now);
+            tab_list::TabFacts {
+                idx,
+                title: s.map(|s| s.display_title()).unwrap_or_default(),
+                last_updated,
+                started: s
+                    .and_then(|s| s.messages.first())
+                    .map(|m| m.created_at)
+                    .unwrap_or(last_updated),
+                project: s.and_then(|s| s.project_id.as_ref()).and_then(|pid| {
+                    planner
+                        .projects
+                        .iter()
+                        .find(|p| &p.id == pid)
+                        .map(|p| (p.sort_order, p.id.clone(), p.title.clone()))
+                }),
+                profile: s.and_then(|s| {
+                    settings.resolve_session_profile_display_name(s.composio_profile.as_deref())
+                }),
+            }
+        })
+        .collect();
+    let groups = tab_list::arrange_tabs(&facts, order);
+    (
+        tab_list::nav_order(&groups, planner_tab_open, fleet_tab_open),
+        order.group != tab_list::TabGroupBy::None,
+    )
+}
+
+/// Snapshot for the Tidy tabs sheet: the open chats, the planner's to-dos
+/// reduced to what tidying reads, and the projects a tab can be filed into
+/// (open ones, A-Z, as the chat-bar chip lists them).
+fn tidy_inputs(
+    open_tabs: &[String],
+    state: &session::SessionState,
+    planner: &todo::PlannerState,
+    streaming: &std::collections::HashSet<String>,
+) -> (Vec<tab_tidy::TidyTab>, Vec<tab_tidy::TidyTodo>, Vec<tab_tidy::TidyProject>) {
+    use tab_tidy::TidyTodoStatus;
+    let tabs = open_tabs
+        .iter()
+        .filter_map(|id| {
+            let s = state.sessions.get(id)?;
+            Some(tab_tidy::TidyTab {
+                session_id: id.clone(),
+                title: s.display_title(),
+                topic: s.tab_topic(),
+                emoji: s.tab_emoji.clone(),
+                last_updated: s.last_updated,
+                project_id: s.project_id.clone(),
+                is_active: state.active_session_id == *id,
+                is_streaming: streaming.contains(id),
+                has_pending_timer: s
+                    .scheduled_timers
+                    .iter()
+                    .any(|t| t.status == timers::TimerStatus::Pending),
+                pinned: false,
+            })
+        })
+        .collect();
+    let todos = planner
+        .todos
+        .iter()
+        .map(|t| tab_tidy::TidyTodo {
+            linked_session: t.linked_fleet_session.clone(),
+            status: match t.status {
+                todo::model::TodoStatus::Completed => TidyTodoStatus::Done,
+                todo::model::TodoStatus::Cancelled => TidyTodoStatus::Cancelled,
+                _ => TidyTodoStatus::Open,
+            },
+            done_at: t.completed_at.unwrap_or(t.updated_at),
+            project_id: t.project_id.clone(),
+        })
+        .collect();
+    let mut projects: Vec<tab_tidy::TidyProject> = planner
+        .projects
+        .iter()
+        .filter(|p| !p.status.is_closed())
+        .map(|p| tab_tidy::TidyProject {
+            id: p.id.clone(),
+            title: p.title.clone(),
+            aliases: p.aliases.clone(),
+        })
+        .collect();
+    projects.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+    (tabs, todos, projects)
+}
+
+#[cfg(test)]
+mod tab_cycle_tests {
+    use super::*;
+
+    #[test]
+    fn cycle_index_wraps_forward() {
+        assert_eq!(cycle_index(0, 3, true), 1);
+        assert_eq!(cycle_index(2, 3, true), 0);
+    }
+
+    #[test]
+    fn cycle_index_wraps_backward() {
+        assert_eq!(cycle_index(0, 3, false), 2);
+        assert_eq!(cycle_index(1, 3, false), 0);
+    }
+
+    #[test]
+    fn cycle_index_single_item_is_noop_position() {
+        // Callers guard len<=1 before calling, but the arithmetic itself
+        // still holds for len==1 (stays at 0).
+        assert_eq!(cycle_index(0, 1, true), 0);
+        assert_eq!(cycle_index(0, 1, false), 0);
+    }
+
+    #[test]
+    fn build_tab_strip_orders_chat_then_planner_then_fleet() {
+        let strip = build_tab_strip(2, true, true);
+        assert_eq!(
+            strip,
+            vec![
+                StripItem::Chat(0),
+                StripItem::Chat(1),
+                StripItem::Planner,
+                StripItem::Fleet,
+            ]
+        );
+    }
+
+    #[test]
+    fn build_tab_strip_omits_closed_tabs() {
+        assert_eq!(build_tab_strip(1, false, false), vec![StripItem::Chat(0)]);
+        assert_eq!(build_tab_strip(0, true, false), vec![StripItem::Planner]);
+        assert_eq!(build_tab_strip(0, false, true), vec![StripItem::Fleet]);
+    }
+
+    #[test]
+    fn build_tab_strip_len_le_1_is_the_noop_case() {
+        assert!(build_tab_strip(1, false, false).len() <= 1);
+        assert!(build_tab_strip(0, false, false).len() <= 1);
+    }
+}
 
 /// Show a timer toast and auto-clear it after a few seconds (unless a newer
 /// toast replaced it in the meantime). Avoids the reminder lingering forever.
@@ -73,57 +346,162 @@ fn flash_timer_toast(msg: String) {
     });
 }
 
-/// Debug builds (cargo run): DEBUG+ to log file, INFO+ to stderr.
-/// File goes to ~/Library/Application Support/com.hobbes.app/hobbes.log (daily rotation).
-#[cfg(debug_assertions)]
-fn init_logger() {
+/// Keeps the non-blocking file writer alive. Dropped by `flush_logs()` on the
+/// quit path so the last buffered lines reach disk.
+static LOG_FILE_GUARD: std::sync::OnceLock<std::sync::Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>> =
+    std::sync::OnceLock::new();
+
+/// Flush and close the log file writer. Called on quit; later log lines are
+/// dropped by the (now closed) channel, which is fine at that point.
+fn flush_logs() {
+    if let Some(slot) = LOG_FILE_GUARD.get() {
+        if let Ok(mut guard) = slot.lock() {
+            drop(guard.take());
+        }
+    }
+}
+
+/// Log directory: `<config dir>/com.hobbes.app/logs/` on macOS/Linux
+/// (`~/Library/Application Support/com.hobbes.app/logs`), and
+/// `%LOCALAPPDATA%\com.hobbes.app\logs` on Windows.
+fn log_dir() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    let base = dirs::data_local_dir();
+    #[cfg(not(target_os = "windows"))]
+    let base = dirs::config_dir();
+    base.map(|b| b.join("com.hobbes.app").join("logs"))
+}
+
+/// Daily-rotated `hobbes.<date>.log`, 7 files kept, written on a lossy
+/// background thread. Returns `None` (no file layer) if the directory can't
+/// be created or opened — logging must never take the app down.
+fn build_file_writer() -> Option<(tracing_appender::non_blocking::NonBlocking, std::path::PathBuf)> {
+    use tracing_appender::rolling::{Builder, Rotation};
+    let dir = log_dir()?;
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
+    let appender = Builder::new()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("hobbes")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(&dir)
+        .ok()?;
+    let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
+        .lossy(true)
+        .buffered_lines_limit(8_192)
+        .thread_name("hobbes-log")
+        .finish(appender);
+    let _ = LOG_FILE_GUARD.set(std::sync::Mutex::new(Some(guard)));
+    Some((writer, dir))
+}
+
+/// Route panics through tracing so they land in the log file, then run the
+/// previous (default) hook so stderr output is unchanged.
+fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        tracing::error!(
+            "PANIC on thread '{}' at {}: {}",
+            std::thread::current().name().unwrap_or("<unnamed>"),
+            location,
+            msg
+        );
+        previous(info);
+    }));
+}
+
+/// Shared setup for both build types. `default_filter` applies to the file
+/// (and to stderr in release); `HOBBES_LOG` overrides it.
+fn init_logger_with(default_filter: &str, build_type: &str, stderr: Option<tracing_subscriber::filter::LevelFilter>) {
+    use std::io::IsTerminal;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
     use tracing_subscriber::Layer;
 
-    let log_dir = dirs::config_dir()
-        .unwrap_or_default()
-        .join("com.hobbes.app");
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "hobbes.log");
-    let (non_blocking_file, file_guard) = tracing_appender::non_blocking(file_appender);
-    // SAFETY: Leak the guard to keep the non-blocking writer alive for the process lifetime.
-    // Box::leak is preferred over mem::forget — it communicates "intentional static lifetime"
-    // rather than "we forgot to drop this" and avoids the clippy mem_forget lint.
-    Box::leak(Box::new(file_guard));
+    let (filter_str, filter_warning) =
+        log_utils::choose_log_filter(std::env::var("HOBBES_LOG").ok().as_deref(), default_filter);
+    let make_filter = || {
+        tracing_subscriber::EnvFilter::builder()
+            .parse(&filter_str)
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter))
+    };
 
-    let (non_blocking_stderr, stderr_guard) = tracing_appender::non_blocking(std::io::stderr());
-    Box::leak(Box::new(stderr_guard));
+    let file = build_file_writer();
+    let file_dir = file.as_ref().map(|(_, d)| d.display().to_string());
+    let file_layer = file.map(|(writer, _)| {
+        tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_filter(make_filter())
+    });
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,hobbes=debug"));
+    // Release: stderr only when explicitly asked for or attached to a
+    // terminal (a Finder-launched app's stderr goes nowhere useful).
+    // Debug: always, at the given level.
+    let want_stderr = match stderr {
+        Some(_) => true,
+        None => {
+            std::env::var("HOBBES_LOG_STDERR").map(|v| v == "1").unwrap_or(false)
+                || std::io::stderr().is_terminal()
+        }
+    };
+    let stderr_layer = want_stderr.then(|| {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal());
+        match stderr {
+            Some(level) => layer.with_filter(level).boxed(),
+            None => layer.with_filter(make_filter()).boxed(),
+        }
+    });
 
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking_file)
-        .with_ansi(false)
-        .with_filter(env_filter);
-
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(non_blocking_stderr)
-        .with_ansi(true)
-        .with_filter(tracing_subscriber::filter::LevelFilter::INFO);
-
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(file_layer)
         .with(stderr_layer)
-        .init();
+        .try_init();
+
+    install_panic_hook();
+
+    if let Some(w) = filter_warning {
+        tracing::warn!("{}", w);
+    }
+    tracing::info!(
+        "Hobbes {} ({} build) logging started; filter = \"{}\"; log dir = {}",
+        env!("CARGO_PKG_VERSION"),
+        build_type,
+        filter_str,
+        file_dir.as_deref().unwrap_or("<none: file logging unavailable>")
+    );
 }
 
-/// Release builds: INFO+ to stderr only, no log file created.
+/// Debug builds (cargo run / dx serve): DEBUG+ for this crate to the log
+/// file, INFO+ to stderr.
+#[cfg(debug_assertions)]
+fn init_logger() {
+    init_logger_with(
+        &log_utils::default_debug_filter(),
+        "debug",
+        Some(tracing_subscriber::filter::LevelFilter::INFO),
+    );
+}
+
+/// Release (Pro) builds: INFO+ for this crate, WARN+ for dependencies, to the
+/// rolling log file; stderr only with `HOBBES_LOG_STDERR=1` or a terminal.
 #[cfg(not(debug_assertions))]
 fn init_logger() {
-    let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
-    // SAFETY: Leak the guard to keep the non-blocking writer alive for the process lifetime.
-    Box::leak(Box::new(guard));
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer(non_blocking)
-        .with_ansi(true)
-        .init();
+    init_logger_with(&log_utils::default_release_filter(), "release", None);
 }
 
 fn main() {
@@ -131,8 +509,10 @@ fn main() {
     dotenv().ok();
     tracing::debug!("Attempted to load .env file from the environment.");
     // Logger setup — cargo run (debug) vs built app (release):
-    // Debug: DEBUG+ to log file, INFO+ to stderr (avoids iTerm beach-ball)
-    // Release: INFO+ to stderr only, no file created
+    // Debug: DEBUG+ (this crate) to log file, INFO+ to stderr
+    // Release: INFO+ (this crate) / WARN+ (deps) to a rolling file in
+    // <config>/com.hobbes.app/logs; stderr only if HOBBES_LOG_STDERR=1 or a tty.
+    // HOBBES_LOG overrides the filter in both.
     init_logger();
 
     // Initialize the SQLite session store. On first launch after the JSON→
@@ -181,6 +561,12 @@ fn main() {
                     + r#"<style>html, body { height: 100%; margin: 0; padding: 0; font-family: 'Inter', system-ui, sans-serif; }</style>"#
                     + r#"<style>"# + include_str!("../assets/tailwind.css") + r#"</style>"#
                     + r#"<style>"# + include_str!("../assets/main.css") + r#"</style>"#
+                    // Mermaid diagrams: the 5MB+ bundle is NOT parsed here.
+                    // It's loaded on demand from Rust (see
+                    // `components::mermaid::ensure_mermaid_loaded`) the first
+                    // time a chat actually contains a diagram, so it costs
+                    // nothing at startup for the (common) case where it
+                    // never renders.
                     // Windows/Linux WebView renders classic, always-visible
                     // scrollbars (with arrow buttons) where macOS uses hidden
                     // overlay scrollbars. Style them down to a thin, button-less
@@ -212,7 +598,7 @@ use crate::{
     components::{
         confirm_delete_modal::ConfirmDeleteModal,
         shared::{SessionIdContext, SessionToDeleteContext},
-        stream_manager::StreamManager,
+        stream_manager::{StreamManager, StreamManagerContext},
     },
     llm::{GeminiConnector, LlmConnector},
     mcp::manager::McpManager,
@@ -299,6 +685,9 @@ pub enum MenuAction {
     Settings,
     History,
     Mcp,
+    Planner,
+    Fleet,
+    QuickCapture,
     Profile,
     Attachments,
 }
@@ -373,10 +762,358 @@ fn app() -> Element {
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
     // Usage log for cost tracking that survives session deletion
-    use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
+    let mut usage_log_sig = use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
+    // Cache keep-alive pings run on background tasks; their usage entries
+    // come back over a channel because a Signal can't be written from there.
+    use_hook(move || {
+        use llm::claude::keepalive;
+        keepalive::seed_spend(
+            usage_log_sig
+                .read()
+                .keepalive_spend_on_day(chrono::Local::now()),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        keepalive::install_sink(tx);
+        spawn(async move {
+            while let Some(entry) = rx.recv().await {
+                usage_log_sig.write().record(entry);
+            }
+        });
+    });
 
     let skill_registry = use_context_provider(|| Signal::new(skills::SkillRegistry::new()));
     let mut skills_loaded = use_signal(|| false);
+
+    // The planner is hydrated in full at startup — its rows are small and
+    // bounded by human effort, so there is no lazy-loading path to justify.
+    // Safe here: session_store::init() ran in main() before the app launched.
+    let mut planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
+    // Which list the Planner is showing, for surfaces mounted outside it
+    // (the ⌘K palette pre-seeds its project from this).
+    use_context_provider(|| {
+        components::planner_view::PlannerFocusHint(Signal::new(None))
+    });
+
+    // Fleet (Pro): the hook listener runs on plain tokio tasks with its
+    // canonical state in `fleet::shared()` — this signal is a UI mirror fed
+    // by the drain loop below. Signals are never touched from server tasks.
+    let mut fleet_state = use_context_provider(|| Signal::new(fleet::FleetState::default()));
+    let mut fleet_runtime_started = use_signal(|| false);
+    use_effect(move || {
+        if *fleet_runtime_started.peek() {
+            return;
+        }
+        fleet_runtime_started.set(true);
+
+        // Drain loop: mirror state snapshots into the signal and surface
+        // newly needs-attention sessions through the existing toast strip
+        // (no new notification machinery).
+        spawn(async move {
+            let shared = fleet::shared().clone();
+            let mut rx = shared.subscribe();
+            loop {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+                let snapshot = shared.snapshot();
+                {
+                    let prev = fleet_state.peek().clone();
+                    for (id, s) in &snapshot.sessions {
+                        let was = prev
+                            .sessions
+                            .get(id)
+                            .map(|p| p.status.needs_attention())
+                            .unwrap_or(false);
+                        if s.status.needs_attention() && !was {
+                            flash_timer_toast(format!("🛰 {} needs your attention", s.name));
+                        }
+                    }
+                }
+                fleet_state.set(snapshot);
+
+                // Dispatched runs that finished hand their result back to the
+                // chat that launched them. The fleet sweep (a plain tokio
+                // task) can't touch Signals, so it parks the continuations on
+                // FleetShared and pokes us; this is the only side that writes
+                // the chat queue.
+                for c in shared.take_continuations() {
+                    let todo_title = c
+                        .todo_id
+                        .as_deref()
+                        .and_then(|id| planner_state.peek().todo(id).map(|t| t.title.clone()))
+                        .unwrap_or_else(|| c.session_name.clone());
+                    let fallback = c.todo_id.as_deref().and_then(|id| {
+                        planner_state.peek().todo(id).and_then(|t| t.latest_progress.clone())
+                    });
+                    let text = fleet::continuation_text(
+                        &todo_title,
+                        &c.session_name,
+                        c.progress.as_deref().or(fallback.as_deref()),
+                    );
+                    // The drain refuses to pop for a session that isn't in
+                    // state (it would eat the message), so a parent whose tab
+                    // was closed is hydrated back into memory first. Focus is
+                    // never stolen — the turn runs in the background and the
+                    // toast is the only interruption.
+                    if !session_state.peek().sessions.contains_key(&c.parent_session_id) {
+                        match crate::session_store::load_session(&c.parent_session_id) {
+                            Some(session) => {
+                                session_state
+                                    .write()
+                                    .sessions
+                                    .insert(c.parent_session_id.clone(), session);
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "dispatch continuation: parent session {} is gone; dropping",
+                                    c.parent_session_id
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    crate::components::chat_queue::queue_push(
+                        &mut crate::components::chat_queue::CHAT_QUEUE.write(),
+                        &c.parent_session_id,
+                        crate::components::chat_queue::QueuedMessage::new(text, Vec::new()),
+                    );
+                    crate::components::chat_queue::request_drain();
+                    // The parent's tab may have been closed while the run was
+                    // in flight (or was never opened for a `claude_code`
+                    // dispatch from a planner row) — the resumed turn needs a
+                    // visible tab to show its activity in. `open_tabs` isn't
+                    // reachable from this task (see `PENDING_TAB_REOPEN`), so
+                    // park the id for the ChatCommand handler to reopen.
+                    PENDING_TAB_REOPEN
+                        .write()
+                        .insert(c.parent_session_id.clone());
+                    let parent_tab_name = session_state
+                        .peek()
+                        .sessions
+                        .get(&c.parent_session_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| c.session_name.clone());
+                    flash_timer_toast(format!(
+                        "🛰 {todo_title} finished — continuing the chat in \"{parent_tab_name}\""
+                    ));
+                }
+            }
+        });
+
+        // Supervisor: keep the listener's lifecycle in sync with the Pro
+        // entitlement (hydrated asynchronously with the secrets) and the
+        // fleet_enabled setting. Polling sidesteps needing reactive plumbing
+        // into the entitlement statics; a few seconds of start/stop latency
+        // is fine for an observation feature.
+        spawn(async move {
+            let shared = fleet::shared().clone();
+            let mut server: Option<fleet::server::FleetServer> = None;
+            let mut hydrated = false;
+            loop {
+                let want = settings.peek().fleet_enabled && crate::entitlement::pro_active();
+                // Hobbes tabs report through the bridge under the same
+                // condition as the listener (which also keeps the staleness
+                // sweep running whenever Hobbes rows are live).
+                fleet::bridge::set_enabled(want);
+                fleet::set_retire_minutes(settings.peek().fleet_retire_minutes);
+                fleet::set_dispatch_auto_continue(settings.peek().dispatch_auto_continue);
+                if want && server.is_none() {
+                    if !hydrated {
+                        // Sessions left live by a previous process re-enter
+                        // the map; the sweep and span caps keep them honest,
+                        // and reconciliation corrects anything that changed
+                        // on disk while Hobbes wasn't listening.
+                        shared.hydrate_from_store();
+                        let shared_for_reconcile = shared.clone();
+                        tokio::task::spawn_blocking(move || {
+                            fleet::reconcile::reconcile_all(&shared_for_reconcile);
+                        });
+                        hydrated = true;
+                    }
+                    match fleet::server::start_from_meta(shared.clone()).await {
+                        Ok(s) => {
+                            fleet::set_running_port(Some(s.port));
+                            // Self-heal hook registration: the user already
+                            // consented to Connect; when a new build changes
+                            // the Hobbes-owned entry set, refresh our entries
+                            // in place rather than serving a stale set from
+                            // behind a green "Connected".
+                            if let Some(path) = fleet::hooks_config::claude_settings_path() {
+                                if fleet::hooks_config::connected_port_file(&path).is_some() {
+                                    let (port, token) = fleet::server::ensure_identity();
+                                    if !fleet::hooks_config::file_hooks_current(&path, port, &token)
+                                    {
+                                        match fleet::hooks_config::connect_file(&path, port, &token)
+                                        {
+                                            Ok(()) => tracing::info!(
+                                                "fleet: refreshed outdated hook registration"
+                                            ),
+                                            Err(e) => tracing::warn!(
+                                                "fleet: hook self-heal failed: {e}"
+                                            ),
+                                        }
+                                    }
+                                }
+                            }
+                            server = Some(s);
+                        }
+                        Err(e) => tracing::error!("fleet: listener failed to start: {e}"),
+                    }
+                } else if !want {
+                    if let Some(s) = server.take() {
+                        s.shutdown();
+                        fleet::set_running_port(None);
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        });
+
+        // Brief supervisor: turns dirty fleet sessions into LLM re-entry
+        // briefs. Lives on the Dioxus side because only this half of the
+        // process holds hydrated API keys (fleet tokio tasks never see
+        // Settings). One task per 15s tick — with the 45s quiet period this
+        // is the debounce — keeps cost and concurrency trivially bounded.
+        spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let s = settings.peek().clone();
+                if !(s.fleet_enabled
+                    && s.fleet_briefs_enabled
+                    && crate::entitlement::pro_active())
+                {
+                    continue;
+                }
+                let Some(instance) = s
+                    .active_connector()
+                    .filter(|i| s.is_connector_configured(i))
+                    .or_else(|| {
+                        s.llm_connectors
+                            .iter()
+                            .find(|i| s.is_connector_configured(i))
+                    })
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                let today = chrono::Local::now().date_naive();
+                let live = fleet::shared().snapshot();
+                let ended = fleet::store::sessions_active_on(today);
+                let links = crate::todo::handlers::linked_session_pairs(&planner_state.peek());
+                let due = fleet::briefs::collect_due(&live, &ended, &links, chrono::Utc::now());
+                let Some(task) = due.into_iter().next() else {
+                    continue;
+                };
+
+                let started_at = chrono::Utc::now();
+                let clear_dirty = |task: &fleet::briefs::BriefTask| {
+                    if !fleet::shared().clear_brief_dirty(&task.session_id, started_at) {
+                        fleet::store::merge_session(&task.session_id, |row| {
+                            if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
+                                row.brief_dirty_at = None;
+                            }
+                        });
+                    }
+                };
+
+                let tail = match fleet::transcript::read_tail(
+                    &task.transcript_path,
+                    fleet::transcript::TAIL_MAX_BYTES,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(
+                            "fleet briefs: unreadable transcript for {}: {e}",
+                            task.session_id
+                        );
+                        clear_dirty(&task);
+                        continue;
+                    }
+                };
+                let digest = fleet::transcript::digest_transcript(
+                    &tail,
+                    fleet::transcript::DIGEST_MAX_TURNS,
+                    fleet::transcript::DIGEST_MAX_CHARS,
+                );
+                if digest.text.trim().is_empty() {
+                    clear_dirty(&task);
+                    continue;
+                }
+
+                let session_title = digest.title.clone();
+                let (prev, framed) = fleet::briefs::brief_framing(&task, &digest);
+                let connector = llm::build_connector_for_instance(&instance, None);
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(90),
+                    connector.generate_fleet_brief(prev, framed),
+                )
+                .await
+                {
+                    Ok(Ok(value)) => {
+                        let Some(brief) = fleet::briefs::brief_from_summary_value(
+                            &value,
+                            chrono::Utc::now(),
+                            task.is_final,
+                        ) else {
+                            clear_dirty(&task);
+                            continue;
+                        };
+                        let shared = fleet::shared();
+                        if !shared.set_brief(
+                            &task.session_id,
+                            brief.clone(),
+                            started_at,
+                            session_title.clone(),
+                        ) {
+                            // Ended (or just-ended) row: merge into the store.
+                            let brief_for_merge = brief.clone();
+                            let merged =
+                                fleet::store::merge_session(&task.session_id, move |row| {
+                                    row.brief = Some(brief_for_merge);
+                                    if let Some(t) = session_title {
+                                        row.session_title = Some(t);
+                                    }
+                                    if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
+                                        row.brief_dirty_at = None;
+                                    }
+                                });
+                            if merged {
+                                shared.poke();
+                            }
+                        }
+                        // Progress flows onto linked todos (display-only —
+                        // never status; progress is reported, not judged).
+                        let line = fleet::briefs::progress_line(&brief);
+                        let changed = crate::todo::handlers::apply_brief_progress(
+                            &mut planner_state.write(),
+                            &task.session_id,
+                            &line,
+                            chrono::Utc::now(),
+                        );
+                        if !changed.is_empty() {
+                            let p = planner_state.peek();
+                            for id in &changed {
+                                if let Some(t) = p.todo(id) {
+                                    if let Err(e) = crate::todo::store::save_todo(t) {
+                                        tracing::error!("progress persist failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!(
+                        "fleet briefs: generation failed for {}: {e}",
+                        task.session_id
+                    ),
+                    Err(_) => tracing::warn!(
+                        "fleet briefs: generation timed out for {}",
+                        task.session_id
+                    ),
+                }
+            }
+        });
+    });
 
     // Pattern: Grounded App Initialization
     // Masks transient desyncs during the first render tick
@@ -494,6 +1231,12 @@ fn app() -> Element {
                 }).await;
 
                 if let Ok(sm) = loaded_secrets {
+                    // Verify + activate the stored Pro license (if any) now
+                    // that the secret cache is hydrated.
+                    crate::entitlement::hydrate_from_stored_key(
+                        sm.get(crate::entitlement::LICENSE_KEYCHAIN_KEY)
+                            .map(|s| s.as_str()),
+                    );
                     // Update secret manager with loaded secrets
                     secret_manager.set(sm);
 
@@ -660,6 +1403,12 @@ fn app() -> Element {
                 .await;
 
                 if let Ok(sm) = loaded_secrets {
+                    // Verify + activate the stored Pro license (if any) now
+                    // that the secret cache is hydrated.
+                    crate::entitlement::hydrate_from_stored_key(
+                        sm.get(crate::entitlement::LICENSE_KEYCHAIN_KEY)
+                            .map(|s| s.as_str()),
+                    );
                     secret_manager.set(sm);
 
                     // Phase 1: Read all secrets (immutable borrow) and collect migration tasks
@@ -1070,7 +1819,7 @@ fn app() -> Element {
     // This use_effect subscribes to changes in active_composio_profile
     {
         // Track key profile properties to detect changes (API key, base URL, etc.)
-        let mut prev_profile_signature: Signal<Option<String>> = use_signal(|| None);
+        let mut prev_profile_signature: Signal<Option<log_utils::ProfileSignature>> = use_signal(|| None);
 
         use_effect(move || {
             // Don't reinitialize before secrets are loaded — the profile's api_key
@@ -1079,25 +1828,27 @@ fn app() -> Element {
                 return;
             }
 
-            // Create a signature of the active profile properties we care about
-            let current_signature = settings.read().get_active_profile().map(|p| {
-                format!(
-                    "{}:{}:{}:{}:{}",
-                    p.name,
-                    p.api_key.as_deref().unwrap_or(""),
-                    p.base_url.as_deref().unwrap_or(""),
-                    p.entity_id.as_deref().unwrap_or(""),
-                    p.user_id.as_deref().unwrap_or("")
-                )
-            });
+            // Create a signature of the active profile properties we care about.
+            // Holds the API key, so it is compared only — never logged
+            // (`describe_profile_change` prints field names, not values).
+            let current_signature: Option<log_utils::ProfileSignature> =
+                settings.read().get_active_profile().map(|p| {
+                    [
+                        p.name.clone(),
+                        p.api_key.clone().unwrap_or_default(),
+                        p.base_url.clone().unwrap_or_default(),
+                        p.entity_id.clone().unwrap_or_default(),
+                        p.user_id.clone().unwrap_or_default(),
+                    ]
+                });
 
             let previous = prev_profile_signature.peek().clone();
 
             // Only reinitialize if the profile signature actually changed
             if current_signature != previous {
                 tracing::info!(
-                    "Active Composio profile properties changed, reinitializing client: {:?}",
-                    current_signature
+                    "Active Composio profile properties changed, reinitializing client: {}",
+                    log_utils::describe_profile_change(previous.as_ref(), current_signature.as_ref())
                 );
 
                 // Invalidate caches - profile changed
@@ -1122,19 +1873,60 @@ fn app() -> Element {
     let mut show_session_manager = use_signal(|| false);
     let mut show_settings_panel = use_signal(|| false);
     let mut show_mcp_manager = use_signal(|| false);
-    let mut settings_panel_width = use_signal(|| ui_state.read().settings_panel_width);
-    let mut is_dragging = use_signal(|| false);
-    let mut drag_start_info = use_signal(|| (0.0, 0.0)); // (start_x, start_width)
-    let mut final_width_on_drag_end = use_signal(|| 0.0);
+    let mut show_quick_capture = use_signal(|| false);
+    // The planner is its own tab in the tab bar, not a sidebar: `open` is
+    // whether the tab exists, `active` whether it (vs. the selected session's
+    // chat) fills the main column. Selecting any session tab deactivates the
+    // planner without closing its tab.
+    // App-view tabs (planner/fleet) restore from UiState so they survive a
+    // restart — including which one was focused at exit.
+    let mut planner_tab_open = use_signal(|| ui_state.peek().planner_tab_open);
+    let mut planner_active = use_signal(|| ui_state.peek().planner_active);
+    let mut fleet_tab_open = use_signal(|| ui_state.peek().fleet_tab_open);
+    let mut fleet_active = use_signal(|| {
+        // Never restore both views active; planner wins the tie.
+        ui_state.peek().fleet_active && !ui_state.peek().planner_active
+    });
+    // Tabs as a left sidebar list instead of the top strip — a display
+    // preference toggled from Settings at runtime. Memoised so the frequent
+    // unrelated `ui_state` writes (tab persistence, widths) don't re-render
+    // the whole app; only a flip of this flag does.
+    let tabs_as_sidebar = use_memo(move || ui_state.read().tabs_as_sidebar);
+    // The user's requested Planner column widths. Shared with PlannerView
+    // (which edits them) and the layout solver below; automatic collapsing
+    // never writes them.
+    let planner_widths = use_context_provider(|| components::planner_view::PlannerWidths {
+        nav: Signal::new(ui_state.peek().planner_left_width),
+        timeline: Signal::new(ui_state.peek().planner_today_width),
+    });
+    let planner_focus_hint = use_context::<components::planner_view::PlannerFocusHint>().0;
+    // Drawer (History/Settings/MCP) and tab-sidebar widths as the user asked
+    // for them. The layout solver below decides what actually fits; it
+    // never writes back here, so saved widths return when space does.
+    let mut settings_panel_width = use_signal(|| ui_state.peek().settings_panel_width);
+    let mut tab_sidebar_width = use_signal(|| ui_state.peek().tab_sidebar_width);
+    let mut tab_sidebar_railed = use_signal(|| ui_state.peek().tab_sidebar_railed);
     let mut last_known_size = use_signal(|| PhysicalSize::new(0, 0));
+    // Window logical width for the layout solver (updated on resize).
+    let mut window_logical_width = use_signal(|| {
+        window
+            .inner_size()
+            .to_logical::<f64>(window.scale_factor())
+            .width
+    });
     let mut tray_icon = use_signal::<Option<TrayIcon>>(|| None);
     let mut show_confirm_modal = use_context_provider(|| Signal::new(false));
+    let mut show_tidy = use_signal(|| false);
     let mut session_to_delete =
         use_context_provider(|| SessionToDeleteContext(Signal::new(String::new())));
     let mut save_error =
         use_context_provider(|| crate::components::shared::SaveErrorContext(Signal::new(None))).0;
 
     let mut chat_command = use_context_provider(|| Signal::new(None::<ChatCommand>));
+    let mut pending_chat_seed = use_context_provider(|| {
+        crate::components::shared::PendingChatSeedContext(Signal::new(None))
+    })
+    .0;
 
     // Tab state - initialized from UiState or with current active session
     let mut open_tabs = use_signal(|| {
@@ -1179,6 +1971,39 @@ fn app() -> Element {
     });
     use_context_provider(|| SessionIdContext(current_session_id));
 
+    // ── Agent-time budget tick ───────────────────────────────────────────────
+    // While a lease is held, re-check today's minutes and spend every 30 s and
+    // stop the run when it is over (usage events re-check sooner). Agent time
+    // only ever starts through ChatCommand::AgentTimeStart: the person's
+    // Start, or the grant's scheduled window, which this tick fires at most
+    // once a day (agent_time_runtime::scheduled_start_now).
+    {
+        let planner_state = planner_state;
+        let session_state = session_state;
+        let mut chat_command = chat_command;
+        use_future(move || async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    agent_time_runtime::TICK_SECS,
+                ))
+                .await;
+                // Release gate: with Agent time hidden nothing here runs —
+                // no budget enforcement (no lease can exist) and, above
+                // all, no scheduled window.
+                if !settings.peek().agent_time_enabled() {
+                    continue;
+                }
+                let streaming = STREAMING_SESSIONS.peek().clone();
+                agent_time_runtime::tick(planner_state, session_state, &streaming);
+                let planner_enabled = settings.peek().planner_enabled;
+                let due = agent_time_runtime::scheduled_start_now(&planner_state.peek(), planner_enabled);
+                if due {
+                    chat_command.set(Some(ChatCommand::AgentTimeStart));
+                }
+            }
+        });
+    }
+
     // ── AI-settable timer scheduler ──────────────────────────────────────────
     // Polls every 5s for due timers (HOBBES_SET_TIMER) and fires them: focus the
     // window + toast, and for `prompt` mode enqueue the prompt and switch to its
@@ -1201,14 +2026,24 @@ fn app() -> Element {
                     .values()
                     .any(|s| s.scheduled_timers.iter().any(|t| t.is_due(now)))
                 {
-                    let mut state = session_state.write();
-                    for session in state.sessions.values_mut() {
-                        for t in session.scheduled_timers.iter_mut() {
-                            if t.is_due(now) {
-                                t.status = crate::timers::TimerStatus::Fired;
-                                missed.push(t.label.clone().unwrap_or_else(|| "(timer)".into()));
+                    let mut missed_timers: Vec<crate::timers::ScheduledTimer> = Vec::new();
+                    {
+                        let mut state = session_state.write();
+                        for session in state.sessions.values_mut() {
+                            for t in session.scheduled_timers.iter_mut() {
+                                if t.is_due(now) {
+                                    t.status = crate::timers::TimerStatus::Fired;
+                                    missed.push(t.label.clone().unwrap_or_else(|| "(timer)".into()));
+                                    missed_timers.push(t.clone());
+                                }
                             }
                         }
+                    }
+                    for t in &missed_timers {
+                        crate::session_events::log_event(
+                            &t.session_id,
+                            crate::session_events::SessionEvent::TimerFired { timer: t.clone() },
+                        );
                     }
                 }
                 if !missed.is_empty() {
@@ -1247,6 +2082,12 @@ fn app() -> Element {
                                 }
                             }
                         }
+                    }
+                    for t in &fired {
+                        crate::session_events::log_event(
+                            &t.session_id,
+                            crate::session_events::SessionEvent::TimerFired { timer: t.clone() },
+                        );
                     }
                     crate::session::SessionState::save_async(&session_state.read(), None);
 
@@ -1299,6 +2140,10 @@ fn app() -> Element {
         let mut ui = ui_state.write();
         ui.open_tabs = open_tabs.read().clone();
         ui.active_tab_index = *active_tab_index.read();
+        ui.planner_tab_open = *planner_tab_open.read();
+        ui.planner_active = *planner_active.read();
+        ui.fleet_tab_open = *fleet_tab_open.read();
+        ui.fleet_active = *fleet_active.read();
 
         // Snapshot targets for Pattern 12 persistence
         let ui_snapshot = ui.clone();
@@ -1332,6 +2177,10 @@ fn app() -> Element {
 
     // Tab switching - use signal copies directly in closures
     let mut switch_tab_fn = move |idx: usize| {
+        // Selecting a chat tab brings its chat forward; the planner/fleet
+        // tabs (if open) stay in the bar, just no longer active.
+        planner_active.set(false);
+        fleet_active.set(false);
         let tabs = open_tabs.read();
         if idx < tabs.len() {
             let session_id = tabs[idx].clone();
@@ -1342,7 +2191,98 @@ fn app() -> Element {
         }
     };
 
+    // Next/Prev Tab cycling: builds the visible tab strip in tab_bar.rs's
+    // left-to-right render order (chat tabs, then Planner, then Fleet),
+    // finds where we currently are in it, and moves with wraparound. Landing
+    // on a chat item reuses `switch_tab_fn` rather than only poking
+    // `active_tab_index`, so it gets whatever else that path does.
+    //
+    // In sidebar mode the walk follows what the sidebar shows instead (see
+    // `sidebar_nav_stops`): Planner, Fleet, then chats in arranged order.
+    // `by_group` jumps to the first tab of the next/previous group.
+    let mut cycle_tab_fn = move |forward: bool, by_group: bool| {
+        if *tabs_as_sidebar.peek() {
+            let (nav, grouped) = sidebar_nav_stops(
+                &open_tabs.peek(),
+                &session_state.peek(),
+                &planner_state.peek(),
+                &settings.peek(),
+                ui_state.peek().tab_sidebar_order,
+                *planner_tab_open.peek(),
+                *fleet_tab_open.peek(),
+            );
+            let current = if *planner_active.peek() {
+                tab_list::NavTarget::Planner
+            } else if *fleet_active.peek() {
+                tab_list::NavTarget::Fleet
+            } else {
+                tab_list::NavTarget::Chat(*active_tab_index.peek())
+            };
+            let next = if by_group {
+                tab_list::nav_step_group(&nav, current, forward, grouped)
+            } else {
+                tab_list::nav_step(&nav, current, forward)
+            };
+            match next {
+                Some(tab_list::NavTarget::Chat(idx)) => switch_tab_fn(idx),
+                Some(tab_list::NavTarget::Planner) => {
+                    planner_active.set(true);
+                    fleet_active.set(false);
+                }
+                Some(tab_list::NavTarget::Fleet) => {
+                    fleet_active.set(true);
+                    planner_active.set(false);
+                }
+                None => {}
+            }
+            return;
+        }
+        let strip = build_tab_strip(
+            open_tabs.peek().len(),
+            *planner_tab_open.peek(),
+            *fleet_tab_open.peek(),
+        );
+        if strip.len() <= 1 {
+            return;
+        }
+        let current = if *planner_active.peek() {
+            strip.iter().position(|i| *i == StripItem::Planner)
+        } else if *fleet_active.peek() {
+            strip.iter().position(|i| *i == StripItem::Fleet)
+        } else {
+            let idx = *active_tab_index.peek();
+            strip.iter().position(|i| *i == StripItem::Chat(idx))
+        }
+        .unwrap_or(0);
+        let next = cycle_index(current, strip.len(), forward);
+        match strip[next] {
+            StripItem::Chat(idx) => switch_tab_fn(idx),
+            StripItem::Planner => {
+                planner_active.set(true);
+                fleet_active.set(false);
+            }
+            StripItem::Fleet => {
+                fleet_active.set(true);
+                planner_active.set(false);
+            }
+        }
+    };
+
     let mut delete_session_fn = move |id_to_delete: String| {
+        // A stream still writing to this session would otherwise keep
+        // burning tokens/API calls for output that's about to be discarded
+        // (the session itself is going away). Request StreamBridge cancel
+        // it — StreamManagerContext isn't reachable from this root-scope
+        // closure, see STREAMING_SESSIONS/CANCEL_STREAM_REQUEST above.
+        // This is best-effort/racy with the delete below by design: even if
+        // the stream keeps running a moment longer, the session is removed
+        // from `state.sessions` immediately, so further writes are no-ops,
+        // and the session_events tombstone (session_store::delete_session,
+        // enforced in write_event_rows) stops its journal from growing.
+        if STREAMING_SESSIONS.peek().contains(&id_to_delete) {
+            CANCEL_STREAM_REQUEST.write().insert(id_to_delete.clone());
+        }
+
         let mut state = session_state.write();
         state.delete_session(&id_to_delete);
         drop(state);
@@ -1392,6 +2332,48 @@ fn app() -> Element {
                 &closing_session_id,
             );
 
+            // No cache keep-alive pings for a tab that is no longer open.
+            llm::claude::keepalive::cancel_session(&closing_session_id);
+
+            // The fleet row (if the bridge is armed) leaves the live map,
+            // taking a closing brief from the conversation summary with it.
+            let closing_summary = session_state
+                .peek()
+                .sessions
+                .get(&closing_session_id)
+                .map(|s| &s.active_context.conversation_summary)
+                .filter(|cs| {
+                    !cs.summary.trim().is_empty() || !cs.current_task.trim().is_empty()
+                })
+                .and_then(|cs| serde_json::to_value(cs).ok());
+            fleet::bridge::report_with_brief(
+                &closing_session_id,
+                "",
+                fleet::bridge::HobbesSignal::Closed,
+                closing_summary,
+            );
+
+            // A closed tab's terminal shell dies with it — unless a stream
+            // is still writing into this session. Per stream_manager.rs
+            // (~309-312), a closed tab intentionally keeps its background
+            // stream running (the session survives on disk, closing is not
+            // deleting), and that stream's tool calls may still be using the
+            // terminal. Killing the pty out from under a running turn would
+            // break it, so skip the kill here and let it happen on a later
+            // close of the same session once it's no longer streaming.
+            if STREAMING_SESSIONS.peek().contains(&closing_session_id) {
+                tracing::info!(
+                    session_id = %closing_session_id,
+                    "close_tab: session still streaming, deferring terminal kill."
+                );
+            } else {
+                let mgr = mcp_manager.peek().clone();
+                let sid = closing_session_id.clone();
+                spawn(async move {
+                    mgr.kill_terminal_session(&sid).await;
+                });
+            }
+
             // Delete the session if it has no messages (empty tab).
             // Sessions with messages are preserved in History.
             {
@@ -1431,6 +2413,8 @@ fn app() -> Element {
     };
 
     let mut new_tab_fn = move || {
+        planner_active.set(false);
+        fleet_active.set(false);
         let new_id = session_state.write().create_session(active_profile_id());
         let mut tabs = open_tabs.read().clone();
         tabs.push(new_id.clone());
@@ -1440,20 +2424,135 @@ fn app() -> Element {
         current_session_id.set(new_id);
     };
 
+    // Tidy tabs, confirmed: file the chosen tabs (the chat-bar chip's path:
+    // set the tag, mark it user-decided, journal it, one P-009 save), then
+    // close the chosen tabs through `close_tab_fn` (sessions stay in
+    // History). Closing goes highest index first so earlier indices stay
+    // valid; `close_tab_fn` doesn't follow the active tab when a tab to its
+    // left goes, so the active chat is re-pinned afterwards.
+    let apply_tidy_fn = move |apply: components::tab_tidy::TidyApply| {
+        if !apply.tag.is_empty() {
+            for (sid, pid) in &apply.tag {
+                {
+                    let mut state = session_state.write();
+                    if let Some(s) = state.sessions.get_mut(sid) {
+                        s.project_id = Some(pid.clone());
+                        s.project_tag_user_set = true;
+                    }
+                }
+                crate::session_events::log_event(
+                    sid,
+                    crate::session_events::SessionEvent::ProjectTagged {
+                        project_id: Some(pid.clone()),
+                        user_set: true,
+                    },
+                );
+            }
+            SessionState::save_signal(&session_state, None);
+        }
+        if !apply.close.is_empty() {
+            let keep_id = current_session_id.peek().clone();
+            let mut idxs: Vec<usize> = open_tabs
+                .peek()
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| apply.close.contains(id) && **id != keep_id)
+                .map(|(i, _)| i)
+                .collect();
+            idxs.sort_unstable_by(|a, b| b.cmp(a));
+            for idx in idxs {
+                close_tab_fn(idx);
+            }
+            let pos = open_tabs.peek().iter().position(|id| *id == keep_id);
+            if let Some(pos) = pos {
+                active_tab_index.set(pos);
+                current_session_id.set(keep_id.clone());
+                session_state.write().active_session_id = keep_id.clone();
+                sync_profile_from_session(&keep_id);
+            }
+        }
+        show_tidy.set(false);
+    };
+
     // Call the summarization scheduler hook BEFORE the hotkey manager
     processing::summarization_scheduler::use_summarization_scheduler();
+
+    // Background calendar sync: an immediate pass on launch, then every 15
+    // minutes (or on CalendarSyncMsg::SyncNow). Gated internally on
+    // settings.planner_enabled.
+    todo::calendar_sync::use_calendar_sync();
 
     // Unconditionally call the hotkey manager hook, passing in the permission status signal.
     // The hook itself will handle the conditional logic internally.
     hotkey::use_hotkey_manager(permission_status_signal);
 
     // This handler continuously updates the last known size during a resize.
+    let window_for_resize = window.clone();
     use_wry_event_handler(move |event, _| {
         if let Event::WindowEvent { event, .. } = event {
             if let WindowEvent::Resized(new_size) = event {
                 last_known_size.set(*new_size);
+                let logical = new_size
+                    .to_logical::<f64>(window_for_resize.scale_factor())
+                    .width;
+                if (*window_logical_width.peek() - logical).abs() >= 0.5 {
+                    window_logical_width.set(logical);
+                }
             }
         }
+    });
+
+    // What gives way when the window is too narrow for the requested widths
+    // (layout_budget::solve_chat). A memo over signals only, so the app
+    // re-renders when the *outcome* changes, not on every resize event.
+    // The Planner has its own give-way policy (layout_budget::solve_planner);
+    // it only applies while the Planner is the visible view.
+    let planner_layout = use_memo(move || {
+        let drawer_open = *show_session_manager.read()
+            || *show_settings_panel.read()
+            || *show_mcp_manager.read();
+        // The timeline only exists on Today (the default before the Planner
+        // has mounted and reported its selection).
+        let show_timeline = planner_focus_hint.read().as_ref().is_none_or(|sel| {
+            *sel == components::planner_view::PlannerSelection::View(todo::views::TodoView::Today)
+        });
+        layout_budget::solve_planner(&layout_budget::PlannerLayoutInput {
+            window_width: *window_logical_width.read(),
+            sidebar: tabs_as_sidebar().then(|| layout_budget::SidebarRequest {
+                width: *tab_sidebar_width.read(),
+                user_railed: *tab_sidebar_railed.read(),
+            }),
+            drawer_width: drawer_open.then(|| *settings_panel_width.read()),
+            nav_width: *planner_widths.nav.read(),
+            show_timeline,
+            timeline_width: *planner_widths.timeline.read(),
+        })
+    });
+    let chat_layout = use_memo(move || {
+        if *planner_active.read() {
+            let p = planner_layout.read();
+            return layout_budget::ChatLayout {
+                sidebar_mode: p.sidebar_mode,
+                sidebar_width: p.sidebar_width,
+                drawer_width: p.drawer_width,
+                drawer_nav_railed: p.drawer_nav_railed,
+                main_width: p.main_width,
+            };
+        }
+        let drawer_open = *show_session_manager.read()
+            || *show_settings_panel.read()
+            || *show_mcp_manager.read();
+        layout_budget::solve_chat(&layout_budget::ChatLayoutInput {
+            window_width: *window_logical_width.read(),
+            sidebar: tabs_as_sidebar().then(|| layout_budget::SidebarRequest {
+                width: *tab_sidebar_width.read(),
+                user_railed: *tab_sidebar_railed.read(),
+            }),
+            drawer: drawer_open.then(|| layout_budget::DrawerRequest {
+                width: *settings_panel_width.read(),
+                has_inner_nav: *show_settings_panel.read(),
+            }),
+        })
     });
 
     let menu_handler = use_coroutine(move |mut rx: UnboundedReceiver<MenuAction>| async move {
@@ -1461,6 +2560,7 @@ fn app() -> Element {
             tracing::info!("MenuHandler received action: {:?}", action);
             match action {
                 MenuAction::Quit => {
+                    llm::claude::keepalive::shutdown();
                     let mut app_quit = APP_QUIT.write();
                     *app_quit = true;
                 }
@@ -1475,6 +2575,17 @@ fn app() -> Element {
                 MenuAction::Mcp => {
                     tracing::info!("MenuAction::Mcp triggered");
                     chat_command.set(Some(ChatCommand::ToggleMcp));
+                }
+                MenuAction::Planner => {
+                    tracing::info!("MenuAction::Planner triggered");
+                    chat_command.set(Some(ChatCommand::TogglePlanner));
+                }
+                MenuAction::Fleet => {
+                    tracing::info!("MenuAction::Fleet triggered");
+                    chat_command.set(Some(ChatCommand::ToggleFleet));
+                }
+                MenuAction::QuickCapture => {
+                    chat_command.set(Some(ChatCommand::ToggleQuickCapture));
                 }
                 MenuAction::Profile => {
                     tracing::info!("MenuAction::Profile triggered");
@@ -1503,6 +2614,9 @@ fn app() -> Element {
                         "settings" => Some(MenuAction::Settings),
                         "view_history" => Some(MenuAction::History),
                         "view_mcp" => Some(MenuAction::Mcp),
+                        "view_planner" => Some(MenuAction::Planner),
+                        "view_fleet" => Some(MenuAction::Fleet),
+                        "view_quick_capture" => Some(MenuAction::QuickCapture),
                         "view_profile" => Some(MenuAction::Profile),
                         "view_attachments" => Some(MenuAction::Attachments),
                         _ => None,
@@ -1517,19 +2631,58 @@ fn app() -> Element {
         });
     });
 
-    // Effect to manage the tray icon's visibility based on settings
+    // The single tray icon is owned by the focus-timer sync effect below —
+    // it reads both `settings.show_tray_icon` and the planner's focus state,
+    // so the icon exists when either wants it (the icon hosts the timer for
+    // the duration of a focus session even with the setting off).
+
+    // ── Tray icon + focus timer (single owner) ───────────────────────────
+    // While a todo is in focus, the tray icon mirrors the FocusBar's live
+    // readout (macOS: menu-bar title text; Windows: tooltip) and reverts to
+    // plain when focus ends. The effect reacts to every planner and settings
+    // change (focus start/stop/complete, show_tray_icon toggle → immediate),
+    // and a ~30s ticker keeps the elapsed minutes honest in between. Runs on
+    // the main thread (a macOS requirement for tray creation), like all
+    // effects. Tray listening starts inside `tray::init_tray`.
+    let mut focus_tray_tick = use_signal(|| 0u64);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            focus_tray_tick += 1;
+        }
+    });
     use_effect(move || {
-        let show = settings.read().show_tray_icon;
-        if show {
-            if tray_icon.peek().is_none() {
-                tray_icon.set(Some(tray::init_tray()));
-                tracing::debug!("Tray icon has been created.");
-            }
+        let _subscribe = *focus_tray_tick.read();
+        let show_tray = settings.read().show_tray_icon;
+        let snapshot = if settings.read().planner_enabled {
+            focus_tray::focus_snapshot(&planner_state.read(), chrono::Utc::now())
         } else {
-            if tray_icon.peek().is_some() {
-                tray_icon.set(None);
-                tracing::debug!("Tray icon has been removed.");
-            }
+            None
+        };
+        focus_tray::sync_tray(
+            &mut tray_icon.write(),
+            show_tray,
+            snapshot.as_ref(),
+        );
+    });
+
+    // Focus-timer tray clicks: surface the window and reveal the focused
+    // todo in the planner. Direct signal sets (not ChatCommand::TogglePlanner)
+    // because a toggle would close the planner when it is already open.
+    let window_for_focus_tray = window.clone();
+    use_effect(move || {
+        let clicks = *focus_tray::FOCUS_TRAY_CLICKS.read();
+        if clicks == 0 {
+            return; // initial run at mount — nothing was clicked yet
+        }
+        *WINDOW_VISIBLE.write() = true;
+        window_for_focus_tray.set_minimized(false);
+        window_for_focus_tray.set_visible(true);
+        window_for_focus_tray.set_focus();
+        planner_tab_open.set(true);
+        planner_active.set(true);
+        if let Some(id) = planner_state.peek().focused().map(|t| t.id.clone()) {
+            *focus_tray::PLANNER_REVEAL_TODO.write() = Some(id);
         }
     });
 
@@ -1540,6 +2693,23 @@ fn app() -> Element {
         let app_quit = *APP_QUIT.read();
 
         if app_quit {
+            // Flush any in-flight async saves synchronously before the
+            // window (and process) goes away — `save_async` hands rows off
+            // to a background blocking task, and nothing guarantees that
+            // task runs to completion once `window.close()` tears the
+            // runtime down. `SessionState::save()` / `SettingsManager::save()`
+            // reuse the same machinery, just inline on this thread. The
+            // session save is cheap when nothing changed (per-row
+            // fingerprints skip clean sessions); the settings save always
+            // rewrites settings.json and its .bak, changed or not.
+            if let Err(e) = session_state.peek().save() {
+                tracing::error!("Final session save on quit failed: {}", e);
+            }
+            if let Err(e) = settings_manager.peek().save(&settings.peek()) {
+                tracing::error!("Final settings save on quit failed: {}", e);
+            }
+            tracing::info!("Quitting Hobbes");
+            flush_logs();
             window_clone.close();
             return;
         }
@@ -1566,23 +2736,6 @@ fn app() -> Element {
         }
     });
 
-    // This effect saves the settings panel width when the user stops dragging
-    use_effect(move || {
-        let new_width = final_width_on_drag_end();
-        if new_width > 0.0 {
-            spawn(async move {
-                settings_panel_width.set(new_width);
-                let mut current_ui_state = ui_state.write();
-                if current_ui_state.settings_panel_width != new_width {
-                    current_ui_state.settings_panel_width = new_width;
-                    let uism = ui_state_manager.read();
-                    uism.save_async(current_ui_state.clone(), None);
-                }
-                final_width_on_drag_end.set(0.0); // Reset after saving
-            });
-        }
-    });
-
     // Debounced window resize saver
     // This effect runs whenever last_known_size changes (due to resize events)
     let window_resize_handler = window.clone();
@@ -1590,9 +2743,6 @@ fn app() -> Element {
         let physical_size = last_known_size.read();
         if physical_size.width > 0 && physical_size.height > 0 {
             let mut session_state = session_state;
-            let show_session_manager = show_session_manager;
-            let show_settings_panel = show_settings_panel;
-            let show_mcp_manager = show_mcp_manager;
 
             // Capture the current values we need for calculation
             let current_physical_size = *physical_size;
@@ -1607,15 +2757,13 @@ fn app() -> Element {
                 let scale_factor = window.scale_factor();
                 let logical_size = current_physical_size.to_logical::<f64>(scale_factor);
 
-                let sidebar_visible = *show_session_manager.read()
-                    || *show_settings_panel.read()
-                    || *show_mcp_manager.read();
-                let sidebar_width = if sidebar_visible {
-                    settings_panel_width()
-                } else {
-                    0.0
-                };
-                let content_width = logical_size.width - sidebar_width;
+                // Subtract the open drawer at the width it actually takes
+                // (the solver may have shrunk it). The tab sidebar is
+                // deliberately not counted: unlike the drawers it is still
+                // showing at the next launch, so it's part of the window's
+                // normal content width.
+                let drawer_width = chat_layout.peek().drawer_width.unwrap_or(0.0);
+                let content_width = logical_size.width - drawer_width;
 
                 session_state
                     .write()
@@ -1631,6 +2779,27 @@ fn app() -> Element {
     // Listens for global commands from hotkeys, menu, or child components
     use_effect(move || {
         let cmd_opt = chat_command.read().clone();
+
+        // Reopen tabs for continuations that landed while the parent was
+        // closed (or never opened, for a `claude_code` dispatch fired from
+        // a planner row) — see `PENDING_TAB_REOPEN`. Unconditional so this
+        // effect also re-runs whenever the global gains a new id, not only
+        // when `chat_command` itself changes.
+        let reopen_ids = drain_pending_tab_reopens();
+        if !reopen_ids.is_empty() {
+            let mut tabs = open_tabs.read().clone();
+            let mut changed = false;
+            for id in reopen_ids {
+                if !tabs.contains(&id) {
+                    tabs.push(id);
+                    changed = true;
+                }
+            }
+            if changed {
+                open_tabs.set(tabs);
+            }
+        }
+
         if let Some(cmd) = cmd_opt {
             tracing::debug!("App handling global ChatCommand: {:?}", cmd);
 
@@ -1649,7 +2818,25 @@ fn app() -> Element {
                     state.selected_byoa_slug = slug;
                 }
                 ChatCommand::SwitchTab(idx) => {
-                    switch_tab_fn(idx);
+                    // Sidebar mode: Cmd+N is the Nth *chat* as the sidebar
+                    // lists it (Planner/Fleet are not counted, as in the
+                    // strip today). Out of range does nothing.
+                    if *tabs_as_sidebar.peek() {
+                        let (nav, _) = sidebar_nav_stops(
+                            &open_tabs.peek(),
+                            &session_state.peek(),
+                            &planner_state.peek(),
+                            &settings.peek(),
+                            ui_state.peek().tab_sidebar_order,
+                            false,
+                            false,
+                        );
+                        if let Some(real) = tab_list::nav_chat_at(&nav, idx) {
+                            switch_tab_fn(real);
+                        }
+                    } else {
+                        switch_tab_fn(idx);
+                    }
                 }
                 ChatCommand::SwitchProfile(idx) => {
                     let profiles = settings.peek().composio_profiles.clone();
@@ -1690,6 +2877,12 @@ fn app() -> Element {
                         }
 
                         if session_changed {
+                            crate::session_events::log_event(
+                                &current_session_id.read().clone(),
+                                crate::session_events::SessionEvent::ComposioProfileSet {
+                                    profile: settings.peek().active_composio_profile.clone(),
+                                },
+                            );
                             SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }
@@ -1744,6 +2937,14 @@ fn app() -> Element {
                             // Session-only pin: do NOT update global settings so other
                             // tabs keep their current connector/model unaffected.
                             if session_changed {
+                                crate::session_events::log_event(
+                                    &current_session_id.read().clone(),
+                                    crate::session_events::SessionEvent::ConnectorPinned {
+                                        connector_id: Some(instance.id.clone()),
+                                        provider: Some(format!("{:?}", instance.provider())),
+                                        model: Some(new_model.clone()),
+                                    },
+                                );
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
                         } else {
@@ -1782,6 +2983,14 @@ fn app() -> Element {
                             // other tabs keep their current connector unaffected. Global
                             // changes belong in the Settings panel, not the per-tab picker.
                             if session_changed {
+                                crate::session_events::log_event(
+                                    &current_session_id.read().clone(),
+                                    crate::session_events::SessionEvent::ConnectorPinned {
+                                        connector_id: Some(instance.id.clone()),
+                                        provider: Some(format!("{:?}", instance.provider())),
+                                        model: None,
+                                    },
+                                );
                                 SessionState::save_async(&session_state.read(), Some(save_error));
                             }
                             tracing::info!(
@@ -1828,6 +3037,219 @@ fn app() -> Element {
                         show_session_manager.set(false);
                     }
                 }
+                ChatCommand::StartTodoInChat(text) => {
+                    // Sequenced in ONE effect: open the tab (which deactivates
+                    // the planner), then park the seed. ChatInput's consuming
+                    // effect fires after this render commits — textarea
+                    // visible, seed applied exactly once. Racing two consumers
+                    // on chat_command lost the seed whenever the async command
+                    // clear ran first.
+                    new_tab_fn();
+                    pending_chat_seed.set(Some(text));
+                }
+                ChatCommand::DispatchTodoToAgent(todo_id) => {
+                    // A row dispatch gets a review chat: mirrors
+                    // StartTodoInChat/new_tab_fn's tab creation, but with no
+                    // seeded draft — Hobbes announces the hand-off itself —
+                    // and named/tagged after the todo before it's shown.
+                    let todo_snapshot = planner_state.peek().todo(&todo_id).cloned();
+                    if let Some(todo) = todo_snapshot {
+                        let title = todo.title.clone();
+
+                        planner_active.set(false);
+                        fleet_active.set(false);
+                        let new_id = session_state.write().create_session(active_profile_id());
+
+                        let session_name = crate::fleet::truncate_summary(&title, 60);
+                        session_state.write().set_session_title_programmatic(
+                            &new_id,
+                            Some(session_name),
+                            Some("🐯".to_string()),
+                        );
+
+                        {
+                            let mut state = session_state.write();
+                            if let Some(s) = state.sessions.get_mut(&new_id) {
+                                s.project_id = todo.project_id.clone();
+                                s.project_tag_user_set = true;
+                            }
+                        }
+                        crate::session_events::log_event(
+                            &new_id,
+                            crate::session_events::SessionEvent::ProjectTagged {
+                                project_id: todo.project_id.clone(),
+                                user_set: true,
+                            },
+                        );
+
+                        let intro_msg = crate::components::chat::Message {
+                            id: uuid::Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: crate::components::shared::MessageContent::Text {
+                                content: crate::fleet::dispatch_intro_text(&title),
+                                thought_signature: None,
+                                thought_summary: None,
+                                signature_provider: None,
+                            },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(s) = state.sessions.get_mut(&new_id) {
+                                s.messages.push(intro_msg.clone());
+                            }
+                        }
+                        crate::session_events::log_event(
+                            &new_id,
+                            crate::session_events::SessionEvent::AssistantMessage {
+                                message: intro_msg,
+                            },
+                        );
+
+                        // Open + focus the tab (new_tab_fn's own sequence).
+                        let mut tabs = open_tabs.read().clone();
+                        tabs.push(new_id.clone());
+                        open_tabs.set(tabs.clone());
+                        active_tab_index.set(tabs.len() - 1);
+                        session_state.write().active_session_id = new_id.clone();
+                        current_session_id.set(new_id.clone());
+
+                        let dispatch_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+                            session_state,
+                            settings,
+                            skill_registry,
+                            permission_manager,
+                            mcp_context,
+                            planner: planner_state,
+                            chat_command,
+                        };
+                        match crate::components::builtin_tools::dispatch_todo_to_background(
+                            dispatch_ctx,
+                            &todo_id,
+                            None,
+                            Some(new_id.clone()),
+                        ) {
+                            Ok(msg) => tracing::info!("dispatch: {msg}"),
+                            Err(e) => {
+                                tracing::error!("dispatch: dispatch_todo_to_background failed: {e}");
+                                let err_msg = crate::components::chat::Message {
+                                    id: uuid::Uuid::new_v4(),
+                                    author: "Hobbes".to_string(),
+                                    content: crate::components::shared::MessageContent::Error {
+                                        message: e,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                };
+                                {
+                                    let mut state = session_state.write();
+                                    if let Some(s) = state.sessions.get_mut(&new_id) {
+                                        s.messages.push(err_msg.clone());
+                                    }
+                                }
+                                crate::session_events::log_event(
+                                    &new_id,
+                                    crate::session_events::SessionEvent::AssistantMessage {
+                                        message: err_msg,
+                                    },
+                                );
+                                // Leave the tab open — the error is visible
+                                // right there rather than only in the log.
+                            }
+                        }
+                        crate::session::SessionState::save_signal(&session_state, None);
+                    } else {
+                        tracing::warn!(
+                            "DispatchTodoToAgent: unknown todo id {todo_id}; nothing dispatched"
+                        );
+                    }
+                }
+                ChatCommand::TogglePlanner => {
+                    // First invocation opens the tab and focuses it; afterwards
+                    // it toggles focus between planner and chat. Closing the
+                    // tab is only ever done from its ✕ — a toggle that silently
+                    // removed the tab would make the icon feel destructive.
+                    if !*planner_tab_open.peek() {
+                        planner_tab_open.set(true);
+                        planner_active.set(true);
+                    } else {
+                        let now_active = !*planner_active.peek();
+                        planner_active.set(now_active);
+                    }
+                    if *planner_active.peek() {
+                        fleet_active.set(false);
+                    }
+                }
+                ChatCommand::ToggleQuickCapture => {
+                    let open = *show_quick_capture.peek();
+                    show_quick_capture.set(!open);
+                }
+                ChatCommand::ToggleFleet => {
+                    // Mirror of TogglePlanner: first invocation opens+focuses,
+                    // then toggles; the ✕ is the only way to close the tab.
+                    if !*fleet_tab_open.peek() {
+                        fleet_tab_open.set(true);
+                        fleet_active.set(true);
+                    } else {
+                        let now_active = !*fleet_active.peek();
+                        fleet_active.set(now_active);
+                    }
+                    if *fleet_active.peek() {
+                        planner_active.set(false);
+                    }
+                }
+                ChatCommand::NextTab => {
+                    cycle_tab_fn(true, false);
+                }
+                ChatCommand::PrevTab => {
+                    cycle_tab_fn(false, false);
+                }
+                ChatCommand::NextTabGroup => {
+                    cycle_tab_fn(true, true);
+                }
+                ChatCommand::PrevTabGroup => {
+                    cycle_tab_fn(false, true);
+                }
+                ChatCommand::TidyTabs => {
+                    show_tidy.set(true);
+                }
+                // Agent-time runtime controls (agent_time_runtime.rs). Start
+                // comes from the person or the scheduled window; the run gets its own background
+                // tab and never steals focus.
+                ChatCommand::AgentTimeStart => {
+                    match agent_time_runtime::start_now(planner_state, session_state, settings) {
+                        Ok(chat_id) => {
+                            let mut tabs = open_tabs.read().clone();
+                            if !tabs.contains(&chat_id) {
+                                tabs.push(chat_id);
+                                open_tabs.set(tabs);
+                            }
+                        }
+                        Err(r) => {
+                            tracing::info!("Agent time not started: {}", r.message());
+                            flash_timer_toast(format!("Agent time: {}", r.message()));
+                        }
+                    }
+                }
+                ChatCommand::AgentTimePause => {
+                    agent_time_runtime::halt(
+                        planner_state,
+                        session_state,
+                        crate::todo::model::AgentTimeEndReason::Paused,
+                    );
+                }
+                ChatCommand::AgentTimeStop => {
+                    agent_time_runtime::halt(
+                        planner_state,
+                        session_state,
+                        crate::todo::model::AgentTimeEndReason::Stopped,
+                    );
+                }
                 ChatCommand::DeleteSession(target_id) => {
                     if !target_id.is_empty() {
                         if settings.peek().confirm_on_delete {
@@ -1839,8 +3261,19 @@ fn app() -> Element {
                     }
                 }
                 ChatCommand::CloseTab => {
-                    let idx = *active_tab_index.read();
-                    close_tab_fn(idx);
+                    // Cmd+W closes what the user is looking at: an active
+                    // planner/fleet view closes its own tab; only when a chat
+                    // is forward does it close the chat tab.
+                    if *fleet_active.peek() {
+                        fleet_active.set(false);
+                        fleet_tab_open.set(false);
+                    } else if *planner_active.peek() {
+                        planner_active.set(false);
+                        planner_tab_open.set(false);
+                    } else {
+                        let idx = *active_tab_index.read();
+                        close_tab_fn(idx);
+                    }
                 }
                 ChatCommand::SwitchToSession(session_id) => {
                     // Lazy hydration: sessions opened from History may not be
@@ -1848,6 +3281,11 @@ fn app() -> Element {
                     let mut hydrated = session_state.peek().sessions.contains_key(&session_id);
                     if !hydrated {
                         if let Some(session) = crate::session_store::load_session(&session_id) {
+                            // Drift guard (debug builds): compare the stored row
+                            // against its journal projection; warn on divergence,
+                            // never block hydration.
+                            #[cfg(debug_assertions)]
+                            crate::session_events::debug_check_drift(&session);
                             session_state
                                 .write()
                                 .sessions
@@ -1863,20 +3301,37 @@ fn app() -> Element {
                     let tabs = open_tabs.read().clone();
                     if !hydrated {
                         // Fall through to command clearing without switching.
-                    } else if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
-                        active_tab_index.set(idx);
-                        current_session_id.set(session_id.clone());
-                        session_state.write().active_session_id = session_id.clone();
-                        sync_profile_from_session(&session_id);
                     } else {
-                        let mut new_tabs = tabs;
-                        new_tabs.push(session_id.clone());
-                        let new_idx = new_tabs.len() - 1;
-                        open_tabs.set(new_tabs);
-                        active_tab_index.set(new_idx);
-                        current_session_id.set(session_id.clone());
-                        session_state.write().active_session_id = session_id.clone();
-                        sync_profile_from_session(&session_id);
+                        // Bring the chat forward — an active planner/fleet
+                        // view would otherwise keep covering the switched-to
+                        // session (their tabs stay in the strip).
+                        planner_active.set(false);
+                        fleet_active.set(false);
+                        if let Some(idx) = tabs.iter().position(|id| id == &session_id) {
+                            active_tab_index.set(idx);
+                            current_session_id.set(session_id.clone());
+                            session_state.write().active_session_id = session_id.clone();
+                            sync_profile_from_session(&session_id);
+                        } else {
+                            let mut new_tabs = tabs;
+                            new_tabs.push(session_id.clone());
+                            let new_idx = new_tabs.len() - 1;
+                            open_tabs.set(new_tabs);
+                            active_tab_index.set(new_idx);
+                            current_session_id.set(session_id.clone());
+                            session_state.write().active_session_id = session_id.clone();
+                            sync_profile_from_session(&session_id);
+                        }
+                    }
+                }
+                ChatCommand::OpenTabInBackground(session_id) => {
+                    // As AgentTimeStart does for its own tab: listed, not focused.
+                    if session_state.peek().sessions.contains_key(&session_id) {
+                        let mut tabs = open_tabs.read().clone();
+                        if !tabs.contains(&session_id) {
+                            tabs.push(session_id);
+                            open_tabs.set(tabs);
+                        }
                     }
                 }
                 ChatCommand::NewChat => {
@@ -1917,6 +3372,38 @@ fn app() -> Element {
                 // SummarizationScheduler component removed; hook called above.
                 if *is_app_initialized.read() {
                     StreamManager {
+                    // Mirrors `StreamManagerContext.streaming_sessions` into a
+                    // root-level GlobalSignal. `StreamManagerContext` is only
+                    // reachable by consume_context from *descendants* of this
+                    // `StreamManager` element (Dioxus contexts flow parent →
+                    // child); `app()`'s own closures (close_tab_fn,
+                    // delete_session_fn, the ChatCommand handler) run in the
+                    // root scope, an ancestor of `StreamManager`, so they
+                    // cannot consume it directly. `StreamBridge` is mounted
+                    // *inside* `StreamManager` specifically to bridge that gap.
+                    StreamBridge {}
+                    // Cmd+K quick capture into the Planner, over any view.
+                    components::quick_capture::QuickCapture { open: show_quick_capture }
+                    if show_tidy() {
+                        {
+                            let streaming = STREAMING_SESSIONS.read().clone();
+                            let (tabs, todos, projects) = tidy_inputs(
+                                &open_tabs.read(),
+                                &session_state.read(),
+                                &planner_state.read(),
+                                &streaming,
+                            );
+                            rsx! {
+                                components::tab_tidy::TidyTabsSheet {
+                                    tabs,
+                                    todos,
+                                    projects,
+                                    on_apply: apply_tidy_fn,
+                                    on_cancel: move |_| show_tidy.set(false),
+                                }
+                            }
+                        }
+                    }
                     ConfirmDeleteModal {
                         is_visible: show_confirm_modal,
                         title: "Delete Session".to_string(),
@@ -1970,112 +3457,163 @@ fn app() -> Element {
                                 // When the user releases the mouse, save the last known size.
 
 
-                            // Session Manager Sidebar
-                            if *show_session_manager.read() {
+                            // Tab list sidebar (UiState::tabs_as_sidebar). Not part of
+                            // the History/Settings/MCP group below: those are transient
+                            // tool panels sharing one width slot, while this is
+                            // persistent navigation with its own width — a tool panel
+                            // opens to its right. Same open-tabs state and handlers as
+                            // the TabBar (top-tabs mode). It carries the Hobbes menu
+                            // and the only + in this mode; the top strip isn't shown.
+                            if tabs_as_sidebar() {
                                 div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Session Manager Panel
-                                    div {
-                                        id: "session-manager-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        components::session_manager::SessionManager {}
-                                    }
-                                    // Draggable Divider
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
-                                }
-                            }
-
-                            // Settings Panel Sidebar
-                            if *show_settings_panel.read() {
-                                div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // Settings Panel
-                                    div {
-                                        id: "settings-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        // This is the correct location for the settings panel component
-                                        components::settings_panel::SettingsPanel {}
-                                    }
-                                    // Draggable Divider
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
-                                }
-                            }
-
-                            // MCP Manager Sidebar
-                            if *show_mcp_manager.read() {
-                                div {
-                                    class: "flex flex-row h-full shrink-0",
-                                    // MCP Manager Panel
-                                    div {
-                                        id: "mcp-manager-panel",
-                                        style: "width: {settings_panel_width}px;",
-                                        class: "bg-section text-fg h-full",
-                                        components::mcp_marketplace::McpMarketplace {}
-                                    }
-                                    // Draggable Divider
-                                    div {
-                                        class: "w-2 cursor-col-resize bg-primary-700 hover:bg-primary-500 transition-colors",
-                                        onmousedown: move |event| {
-                                            drag_start_info.set((event.data.screen_coordinates().x, settings_panel_width()));
-                                            is_dragging.set(true);
-                                        },
-                                    }
-                                }
-                            }
-
-                            // Mouse move handler for resizing
-                            if *is_dragging.read() {
-                                div {
-                                    class: "fixed inset-0 z-50", // Covers the whole screen to capture mouse events
-                                    onmousemove: move |event| {
-                                        if *is_dragging.read() {
-                                            let (start_x, start_width) = drag_start_info();
-                                            let delta_x = event.data.screen_coordinates().x - start_x;
-                                            let new_width = start_width + delta_x;
-                                            if new_width > 200.0 && new_width < 800.0 {
-                                                let panel_id = if *show_settings_panel.read() {
-                                                    "settings-panel"
-                                                } else if *show_mcp_manager.read() {
-                                                    "mcp-manager-panel"
-                                                } else {
-                                                    "session-manager-panel"
-                                                };
-                                                let js = format!("document.getElementById('{}').style.width = '{}px';", panel_id, new_width);
-                                                let _ = document::eval(&js);
-                                                final_width_on_drag_end.set(new_width);
+                                    class: "h-full shrink-0",
+                                    {
+                                        let tabs = open_tabs.read();
+                                        let state = session_state.read();
+                                        let entries: Vec<components::tab_sidebar::TabSidebarEntry> = tabs.iter().map(|id| {
+                                            let s = state.sessions.get(id);
+                                            let last_updated = s.map(|s| s.last_updated).unwrap_or_else(chrono::Utc::now);
+                                            components::tab_sidebar::TabSidebarEntry {
+                                                session_id: id.clone(),
+                                                title: s.map(|s| s.display_title()).unwrap_or_else(|| "New Session".to_string()),
+                                                emoji: s.and_then(|s| s.tab_emoji.clone()),
+                                                date: s.map(|s| s.short_date()).unwrap_or_default(),
+                                                topic: s.and_then(|s| s.tab_topic()),
+                                                profile: s.and_then(|s| {
+                                                    settings.read().resolve_session_profile_display_name(
+                                                        s.composio_profile.as_deref(),
+                                                    )
+                                                }),
+                                                project_id: s.and_then(|s| s.project_id.clone()),
+                                                last_updated,
+                                                started: s.and_then(|s| s.messages.first()).map(|m| m.created_at).unwrap_or(last_updated),
+                                            }
+                                        }).collect();
+                                        rsx! {
+                                            components::tab_sidebar::TabSidebar {
+                                                tabs: entries,
+                                                active_tab_index: *active_tab_index.read(),
+                                                on_select_tab: switch_tab_fn,
+                                                on_close_tab: close_tab_fn,
+                                                on_new_tab: move |_| new_tab_fn(),
+                                                planner_tab_open: *planner_tab_open.read(),
+                                                planner_active: *planner_active.read(),
+                                                on_select_planner: move |_| {
+                                                    planner_active.set(true);
+                                                    fleet_active.set(false);
+                                                },
+                                                on_close_planner: move |_| {
+                                                    planner_active.set(false);
+                                                    planner_tab_open.set(false);
+                                                },
+                                                fleet_tab_open: *fleet_tab_open.read(),
+                                                fleet_active: *fleet_active.read(),
+                                                fleet_attention: fleet_state.read().attention_count(),
+                                                on_select_fleet: move |_| {
+                                                    fleet_active.set(true);
+                                                    planner_active.set(false);
+                                                },
+                                                on_close_fleet: move |_| {
+                                                    fleet_active.set(false);
+                                                    fleet_tab_open.set(false);
+                                                },
+                                                width: chat_layout().sidebar_width,
+                                                rail: chat_layout().sidebar_mode.is_rail(),
+                                                edge_border: chat_layout().sidebar_mode == layout_budget::SidebarMode::AutoRail,
                                             }
                                         }
-                                    },
-                                    onmouseup: move |_| {
-                                        is_dragging.set(false);
-                                    },
-                                    onmouseleave: move |_| {
-                                        // If mouse leaves the overlay, stop dragging
-                                        if *is_dragging.read() {
-                                            is_dragging.set(false);
-                                        }
                                     }
+                                }
+                                // The solver's automatic rail is temporary and not
+                                // user-resizable; every other state gets the divider.
+                                if chat_layout().sidebar_mode != layout_budget::SidebarMode::AutoRail {
+                                    components::column_divider::ColumnDivider {
+                                        width: tab_sidebar_width().clamp(layout_budget::SIDEBAR_MIN_WIDTH, layout_budget::SIDEBAR_MAX_WIDTH),
+                                        railed: tab_sidebar_railed(),
+                                        min: layout_budget::SIDEBAR_MIN_WIDTH,
+                                        max: layout_budget::SIDEBAR_MAX_WIDTH,
+                                        default: layout_budget::SIDEBAR_DEFAULT_WIDTH,
+                                        side: components::column_divider::ColumnSide::Left,
+                                        label: "Resize tab sidebar".to_string(),
+                                        rail: Some(components::column_divider::RailSnap {
+                                            below: layout_budget::SIDEBAR_SNAP_TO_RAIL_BELOW,
+                                            rail_width: layout_budget::SIDEBAR_RAIL_WIDTH,
+                                        }),
+                                        on_resize: move |w: components::column_divider::ColumnWidth| {
+                                            tab_sidebar_width.set(w.width);
+                                            tab_sidebar_railed.set(w.railed);
+                                        },
+                                        on_commit: move |w: components::column_divider::ColumnWidth| {
+                                            tab_sidebar_width.set(w.width);
+                                            tab_sidebar_railed.set(w.railed);
+                                            let mut ui = ui_state.write();
+                                            if ui.tab_sidebar_width != w.width || ui.tab_sidebar_railed != w.railed {
+                                                ui.tab_sidebar_width = w.width;
+                                                ui.tab_sidebar_railed = w.railed;
+                                                ui_state_manager.read().save_async(ui.clone(), None);
+                                            }
+                                        },
+                                    }
+                                }
+                            }
+
+                            // Drawers (History / Settings / MCP) share one width slot,
+                            // resolved by the layout solver from settings_panel_width.
+                            if *show_session_manager.read() {
+                                div {
+                                    id: "session-manager-panel",
+                                    style: "width: {chat_layout().drawer_width.unwrap_or_default()}px;",
+                                    class: "bg-section text-fg h-full shrink-0",
+                                    components::session_manager::SessionManager {}
+                                }
+                            }
+                            if *show_settings_panel.read() {
+                                div {
+                                    id: "settings-panel",
+                                    style: "width: {chat_layout().drawer_width.unwrap_or_default()}px;",
+                                    class: "bg-section text-fg h-full shrink-0",
+                                    components::settings_panel::SettingsPanel {
+                                        nav_railed: chat_layout().drawer_nav_railed,
+                                    }
+                                }
+                            }
+                            if *show_mcp_manager.read() {
+                                div {
+                                    id: "mcp-manager-panel",
+                                    style: "width: {chat_layout().drawer_width.unwrap_or_default()}px;",
+                                    class: "bg-section text-fg h-full shrink-0",
+                                    components::mcp_marketplace::McpMarketplace {}
+                                }
+                            }
+                            if let Some(drawer_width) = chat_layout().drawer_width {
+                                components::column_divider::ColumnDivider {
+                                    width: drawer_width,
+                                    min: layout_budget::DRAWER_MIN_WIDTH,
+                                    max: layout_budget::DRAWER_MAX_WIDTH,
+                                    default: layout_budget::DRAWER_DEFAULT_WIDTH,
+                                    side: components::column_divider::ColumnSide::Left,
+                                    label: if *show_settings_panel.read() { "Resize settings".to_string() } else if *show_mcp_manager.read() { "Resize MCP tools".to_string() } else { "Resize history".to_string() },
+                                    on_resize: move |w: components::column_divider::ColumnWidth| {
+                                        settings_panel_width.set(w.width);
+                                    },
+                                    on_commit: move |w: components::column_divider::ColumnWidth| {
+                                        settings_panel_width.set(w.width);
+                                        let mut ui = ui_state.write();
+                                        if ui.settings_panel_width != w.width {
+                                            ui.settings_panel_width = w.width;
+                                            ui_state_manager.read().save_async(ui.clone(), None);
+                                        }
+                                    },
                                 }
                             }
 
                             // Main Chat Window
                             div {
                                 class: "flex-1 flex flex-col min-h-0 min-w-0 border-t border-primary-700/50",
-                                {
+                                // Top tab strip — top-tabs mode only. In sidebar mode the
+                                // content starts at the window's top edge.
+                                if !tabs_as_sidebar() {
+                                    {
                                     let tabs = open_tabs.read();
                                     let state = session_state.read();
                                     rsx! {
@@ -2083,20 +3621,82 @@ fn app() -> Element {
                                             open_tabs: tabs.clone(),
                                             tab_names: tabs.iter().map(|id| {
                                                 state.sessions.get(id)
-                                                    .map(|s| s.name.clone())
+                                                    .map(|s| s.display_title())
                                                     .unwrap_or_else(|| "New Session".to_string())
+                                            }).collect(),
+                                            tab_emoji: tabs.iter().map(|id| {
+                                                state.sessions.get(id).and_then(|s| s.tab_emoji.clone())
+                                            }).collect(),
+                                            tab_date: tabs.iter().map(|id| {
+                                                state.sessions.get(id)
+                                                    .map(|s| s.short_date())
+                                                    .unwrap_or_default()
+                                            }).collect(),
+                                            tab_topic: tabs.iter().map(|id| {
+                                                state.sessions.get(id).and_then(|s| s.tab_topic())
+                                            }).collect(),
+                                            tab_profile: tabs.iter().map(|id| {
+                                                state.sessions.get(id).and_then(|s| {
+                                                    settings.read().resolve_session_profile_display_name(
+                                                        s.composio_profile.as_deref(),
+                                                    )
+                                                })
                                             }).collect(),
                                             active_tab_index: *active_tab_index.read(),
                                             on_select_tab: switch_tab_fn,
                                             on_close_tab: close_tab_fn,
                                             on_new_tab: move |_| new_tab_fn(),
+                                            planner_tab_open: *planner_tab_open.read(),
+                                            planner_active: *planner_active.read(),
+                                            on_select_planner: move |_| {
+                                                planner_active.set(true);
+                                                fleet_active.set(false);
+                                            },
+                                            on_close_planner: move |_| {
+                                                planner_active.set(false);
+                                                planner_tab_open.set(false);
+                                            },
+                                            fleet_tab_open: *fleet_tab_open.read(),
+                                            fleet_active: *fleet_active.read(),
+                                            fleet_attention: fleet_state.read().attention_count(),
+                                            on_select_fleet: move |_| {
+                                                fleet_active.set(true);
+                                                planner_active.set(false);
+                                            },
+                                            on_close_fleet: move |_| {
+                                                fleet_active.set(false);
+                                                fleet_tab_open.set(false);
+                                            },
                                         }
+                                    }
                                     }
                                 }
 
-                                components::chat::ChatWindow {
-                                    on_content_resize: move |_| {},
-                                    on_interaction: move |_| {},
+                                // ChatWindow stays mounted while the planner or fleet
+                                // is shown — unmounting it mid-stream would drop live
+                                // streaming updates, so visibility is toggled with CSS.
+                                div {
+                                    class: if *planner_active.read() || *fleet_active.read() { "hidden" } else { "flex-1 flex flex-col min-h-0 min-w-0" },
+                                    components::chat::ChatWindow {
+                                        on_content_resize: move |_| {},
+                                        on_interaction: move |_| {},
+                                    }
+                                }
+                                if *planner_active.read() {
+                                    div {
+                                        class: "flex-1 min-h-0 min-w-0",
+                                        components::planner_view::PlannerView {
+                                            nav_railed: planner_layout().nav_railed,
+                                            nav_width: planner_layout().nav_width,
+                                            timeline_width: planner_layout().timeline_width,
+                                        }
+                                    }
+                                }
+                                if *fleet_active.read() {
+                                    div {
+                                        class: "flex-1 min-h-0 min-w-0 flex flex-col",
+                                        components::fleet_view::FleetView {}
+                                    }
                                 }
                             }
                         }
@@ -2107,6 +3707,49 @@ fn app() -> Element {
             }
         }
     }
+}
+
+/// Bridges `StreamManagerContext.streaming_sessions` (only reachable by
+/// descendants of the `StreamManager` component) out to the root-scope
+/// `STREAMING_SESSIONS` GlobalSignal, so `app()`'s own tab-close/delete
+/// logic can consult live streaming state without a Dioxus context lookup.
+/// Renders nothing; mounted as a child of `StreamManager` purely for its
+/// scope position. See the comment at that call site and at
+/// `STREAMING_SESSIONS`'s definition for why this indirection exists.
+#[component]
+fn StreamBridge() -> Element {
+    let stream_manager = consume_context::<StreamManagerContext>();
+    use_effect(move || {
+        let sessions = stream_manager.streaming_sessions.read().clone();
+        // Only write on a real change: an unconditional write marks the
+        // global dirty every run and wakes every reader (including the tab
+        // machinery) for nothing.
+        if *STREAMING_SESSIONS.peek() != sessions {
+            *STREAMING_SESSIONS.write() = sessions;
+        }
+    });
+    // Reverse direction: root-scope code (delete_session_fn) can't call
+    // `stream_manager.cancel_stream()` itself — it has no `StreamManagerContext`
+    // — so it drops the target session id in `CANCEL_STREAM_REQUEST` and this
+    // effect (which *does* hold the context) performs the actual cancel.
+    use_effect(move || {
+        // Drain-then-act: `drain_cancel_stream_requests` both subscribes
+        // this effect to the global (only a `.read()` does that) and takes
+        // the whole pending set in one write, so no guard is alive while
+        // `cancel_stream` runs and a request arriving mid-flush isn't
+        // clobbered by a blanket clear.
+        let pending = drain_cancel_stream_requests();
+        for session_id in pending {
+            if let Some(message_id) = stream_manager.active_message_for_session(&session_id) {
+                tracing::info!(
+                    session_id = %session_id,
+                    "StreamBridge: cancelling stream for deleted session."
+                );
+                stream_manager.cancel_stream(&message_id, &session_id);
+            }
+        }
+    });
+    rsx! {}
 }
 
 #[component]
@@ -2141,5 +3784,96 @@ fn LoadingScreen() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Regression tests for the `StreamBridge` cancel-drain effect.
+///
+/// The bug these pin down: inside a `use_effect`, only `.read()` registers
+/// the effect's reactive context. An effect whose body *only* writes a
+/// GlobalSignal runs once at mount and is never woken again, so a cancel id
+/// inserted later by `delete_session_fn` was never acted on.
+#[cfg(test)]
+mod stream_bridge_cancel_tests {
+    use super::*;
+    use dioxus::dioxus_core::NoOpMutations;
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// One entry per run of the probe effect, holding what it drained.
+        static DRAINED: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Mirrors `StreamBridge`'s cancel effect, minus the context it needs:
+    /// it calls the same drain helper and records the result.
+    #[allow(non_snake_case)]
+    fn CancelProbe() -> Element {
+        use_effect(|| {
+            let pending = drain_cancel_stream_requests();
+            DRAINED.with(|d| d.borrow_mut().push(pending));
+        });
+        rsx! {}
+    }
+
+    /// Pump the dom a bounded number of times so a missed wake-up fails the
+    /// assertion instead of hanging the test.
+    fn pump(dom: &mut VirtualDom) {
+        for _ in 0..8 {
+            dom.render_immediate(&mut NoOpMutations);
+        }
+    }
+
+    #[test]
+    fn cancel_request_inserted_after_mount_is_drained() {
+        let mut dom = VirtualDom::new(CancelProbe);
+        crate::test_support::rebuild_or_fail(&mut dom);
+        pump(&mut dom);
+
+        // Mount run sees nothing pending.
+        assert_eq!(
+            DRAINED.with(|d| d.borrow().clone()),
+            vec![Vec::<String>::new()],
+            "effect should run once at mount with an empty queue"
+        );
+
+        // What `delete_session_fn` does, from outside the effect.
+        dom.in_runtime(|| {
+            CANCEL_STREAM_REQUEST
+                .write()
+                .insert("session-to-cancel".to_string());
+        });
+        pump(&mut dom);
+
+        let runs = DRAINED.with(|d| d.borrow().clone());
+        assert!(
+            runs.iter()
+                .any(|r| r.as_slice() == ["session-to-cancel".to_string()]),
+            "a write after mount must re-run the effect (only .read() subscribes); runs were {runs:?}"
+        );
+        dom.in_runtime(|| {
+            assert!(
+                CANCEL_STREAM_REQUEST.read().is_empty(),
+                "the drain must clear the queue"
+            );
+        });
+    }
+
+    #[test]
+    fn idle_effect_runs_do_not_loop_forever() {
+        let mut dom = VirtualDom::new(CancelProbe);
+        crate::test_support::rebuild_or_fail(&mut dom);
+        pump(&mut dom);
+        dom.in_runtime(|| {
+            CANCEL_STREAM_REQUEST.write().insert("a".to_string());
+        });
+        pump(&mut dom);
+
+        // Mount run + the drain run. If the drain wrote unconditionally it
+        // would re-dirty its own subscription and spin.
+        let runs = DRAINED.with(|d| d.borrow().len());
+        assert!(
+            runs <= 3,
+            "effect should settle after draining, ran {runs} times"
+        );
     }
 }

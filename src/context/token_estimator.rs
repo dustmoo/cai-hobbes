@@ -62,8 +62,11 @@ pub fn estimate_message_tokens_with_ratio(message: &ChatMessage, chars_per_token
                 tokens += (content_str.chars().count() as f64 / json_ratio).ceil() as usize;
             }
             ContentBlock::Image { .. } => {
-                // Images vary wildly; use a conservative fixed estimate
-                tokens += 256;
+                // Images vary wildly; use a conservative fixed estimate.
+                // Attachments are capped at 1568px on the long edge
+                // (chat_input::MAX_ATTACHMENT_EDGE), which costs ~1.6k
+                // tokens on Claude and up to ~2.4k on Qwen-VL style models.
+                tokens += 1600;
             }
             ContentBlock::Thinking { text, .. } => {
                 tokens += estimate_tokens_with_ratio(text, chars_per_token);
@@ -232,6 +235,9 @@ mod tests {
     fn test_messages_to_drop_under_budget() {
         let prompt = LlmPrompt {
             system: Some("You are a helpful assistant.".to_string()),
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
                 content: vec![ContentBlock::Text {
@@ -259,7 +265,7 @@ mod tests {
             ChatMessage { role: ChatRole::User, content: vec![ContentBlock::Text { text: "E".repeat(50) }] },
             ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "F".repeat(50) }] },
         ];
-        let prompt = LlmPrompt { system: None, messages, tools: vec![] };
+        let prompt = LlmPrompt { system: None, system_volatile_offset: None, turn_scoped: Vec::new(), history_rewritten: false, messages, tools: vec![] };
         // Budget tight enough to force dropping messages[0..4] (only last 2 protected)
         let (dropped, _) = messages_to_drop(&prompt, 200, 2, DEFAULT_CHARS_PER_TOKEN);
         // first_kept must be 0 (all old messages dropped) or a User message index
@@ -286,7 +292,7 @@ mod tests {
             ChatMessage { role: ChatRole::Assistant, content: vec![ContentBlock::Text { text: "E".repeat(300) }] },
         ];
         // protected_window=3 → raw protected_start=2 (User "C") — already on a boundary
-        let prompt = LlmPrompt { system: None, messages, tools: vec![] };
+        let prompt = LlmPrompt { system: None, system_volatile_offset: None, turn_scoped: Vec::new(), history_rewritten: false, messages, tools: vec![] };
         let (dropped, _) = messages_to_drop(&prompt, 250, 3, DEFAULT_CHARS_PER_TOKEN);
         if dropped > 0 && dropped < prompt.messages.len() {
             assert_eq!(prompt.messages[dropped].role, ChatRole::User,
@@ -312,6 +318,9 @@ mod tests {
         }
         let prompt = LlmPrompt {
             system: Some("System".to_string()),
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages,
             tools: vec![],
         };

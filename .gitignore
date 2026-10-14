@@ -7,6 +7,11 @@
 **/*.rs.bk
 .env
 
+# Vim swap files
+*.swp
+*.swo
+*~
+
 /context_portal
 
 # Local MCP server configurations
@@ -37,6 +42,11 @@ RooFlow_temp_*archive/
 node_modules/
 npm-debug.log
 
+# Generated: build.rs copies this from node_modules/mermaid/dist at compile
+# time (see sync_mermaid_bundle() in build.rs). Regenerate by hand with
+# `npm run sync:mermaid` if you need it outside a cargo build.
+assets/mermaid.min.js
+
 # Temporary Debugging Artifacts
 check_output*.json
 *_payload*.json
@@ -48,6 +58,11 @@ tools.json
 docs/
 
 # Security - Local Keys
+# License signing keypair for the mint helper — the private key must never
+# be committed or shipped (the *.key rule below also covers it; listed
+# explicitly so the intent is unmissable).
+scripts/mint_license/keys/
+scripts/mint_license/target/
 *.p12
 *.key
 *.certSigningRequest
@@ -87,3 +102,7 @@ credentials/
 out.txt
 test_actual.py
 __pycache__/
+
+# Provisioning profile dumps (contain team/device IDs) and build scratch
+*profile*.plist
+build_errors.txt

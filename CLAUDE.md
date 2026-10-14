@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 # Development (hot-reload UI)
 dx serve --platform desktop
+npm run build:css   # after adding Tailwind classes
+npm run sync:mermaid   # manual refresh of assets/mermaid.min.js; build.rs does this automatically on every build, so you only need this by hand (e.g. to inspect the pinned copy without building)
 
 # Run all tests
 cargo test --release
@@ -17,7 +19,11 @@ cargo test --release <test_name>
 # Lint
 cargo clippy --release
 
-# Production build (macOS .app bundle)
+# Hand Dustin a testable build (the Pro build: signed + notarized, no keychain prompts)
+cargo test --release && cargo clippy --release && ./scripts/build_pro.sh && ./scripts/notarize.sh
+# App output: target/dx/Hobbes/release/macos/pro/Hobbes.app  (open -n it)
+
+# Unsigned production build — rarely needed now that the Pro build writes logs (see Logs below)
 dx build --release
 # App output: target/dx/Hobbes/release/macos/Hobbes.app
 
@@ -28,7 +34,9 @@ dx build --release
 ./scripts/build_windows.ps1 -Release
 ```
 
-The build system runs Tailwind CSS at compile time via `build.rs` — `npm ci` must be run once before building, and `node_modules/` must be present.
+**Handing over a build.** Do not `cargo build`/`dx build` as the verification step. Run tests and clippy, then `./scripts/build_pro.sh && ./scripts/notarize.sh` and open the Pro app. The unsigned `dx build` app prompts for keychain credentials on every launch; the Pro build doesn't. The Pro build writes the same log file as debug builds (see Logs below), so debug with it too.
+
+Tailwind classes are compiled by `npm run build:css` (input `tailwind.css` → `assets/tailwind.css`, which `main.rs` inlines). The Tailwind step in `build.rs` writes an unused `assets/output.css`, so a plain `cargo build` does NOT pick up new utility classes — run `npm run build:css` after adding classes to any `rsx!`. `npm ci` must be run once so `node_modules/` exists.
 
 ### CI Workflows
 
@@ -37,6 +45,10 @@ The build system runs Tailwind CSS at compile time via `build.rs` — `npm ci` m
 - **Release** (`.github/workflows/release.yml`) — triggers on `v*` tags; builds signed macOS DMG and signed Windows installer.
 
 To release: merge to `main`, push a `vX.Y.Z` tag.
+
+## Working Style
+
+**Right-size the model to the task.** When orchestrating sub-agents, use the smallest model that can do the job well and work as a team: Opus only for work that spans several interacting components or needs subtle correctness reasoning (reactivity rules, concurrency, cross-provider behaviour); Sonnet for contained refactors, layout changes, and features with a clear spec; Haiku for mechanical nits, comment and doc updates, test scaffolding from an explicit spec, and verification passes. Partition files between concurrent agents so no two edit the same file, and run the full `cargo test --release` + `cargo clippy --release` once on the combined tree rather than per agent.
 
 ---
 
@@ -98,9 +110,10 @@ The prompt builder is **session-aware**: it resolves the connector/context windo
 
 `McpManager` manages all tool servers as an `Arc<McpManager>`. Lock ordering is **mandatory** (P-010): always acquire `servers` before `dynamic_local_tools` before `dynamic_composio_tools`. Violations cause ABBA deadlocks.
 
-Two virtual built-in servers are registered for AI introspection:
-- `hobbes-core` (via `CoreClient`) — `HOBBES_UPDATE_SCRATCHPAD`, `HOBBES_PAGE_RESULT`. Dispatched in `stream_manager.rs` before MCP dispatch (requires `SessionState`).
+Three virtual built-in servers are registered for AI introspection:
+- `hobbes-core` (via `CoreClient`) — `HOBBES_UPDATE_SCRATCHPAD`, `HOBBES_PAGE_RESULT`, `HOBBES_INVOKE_SKILL`, `HOBBES_SET_TIMER`, `HOBBES_LIST_TIMERS`, `HOBBES_CANCEL_TIMER`. All dispatch through `components::builtin_tools::dispatch_builtin_tool` before MCP dispatch (they need `SessionState` and the skill/permission registries). Both the streaming path and the approval-resume path call it — add new built-ins there, never at a call site (P-015).
 - `hobbes-meta` — `MCP_LOAD_SERVER_TOOLS`, `MCP_UNLOAD_SERVER_TOOLS`.
+- `hobbes-planner` (via `PlannerClient`) — `HOBBES_TODO_CREATE`, `HOBBES_TODO_UPDATE`, `HOBBES_TODO_LIST`, `HOBBES_PLAN_DAY`, `HOBBES_TIME_BLOCK`, `HOBBES_PROJECT_LIST`, `HOBBES_PROJECT_UPSERT`, `HOBBES_CALENDAR_LIST`. Dispatches through the same `dispatch_builtin_tool` (P-015); handlers live in `src/todo/handlers.rs` over the global `Signal<PlannerState>`. Gated by `settings.planner_enabled` (tools withheld from the prompt and refused at dispatch when off); today's plan is injected into system context as `planner_today` when `planner_inject_today_context` is on.
 
 Composio integration uses explicit per-user OAuth (P-002 through P-007) — see `SYSTEM_PATTERNS.md` for the full 6-point reconnect lifecycle.
 
@@ -122,7 +135,7 @@ Streaming and summarization state is **per-session**, not global:
 - **Sessions**: SQLite at `~/.config/com.hobbes.app/sessions.db` (macOS: `~/Library/Application Support/...`), one row per session + a `meta` key/value table (lifetime counters, active session, window size, tool-call history). On first launch, `session_store::init()` runs a one-time import of the legacy `sessions.json` and `sessions-archive.jsonl` (guarded by the `migrated_from_json` meta key); the JSON files are left in place but no longer read or written — don't run pre-SQLite builds afterwards, their writes won't be seen.
 - **Settings**: same config dir, `settings.json`
 - **Credentials**: macOS Keychain via `SecretManager` (biometric-protected). Windows via `keyring` crate. Never call keychain APIs directly from components — use `secret_manager::save_secret_to_keychain()` (P-011).
-- **Logs**: daily rolling log at `~/Library/Application Support/com.hobbes.app/hobbes.log`
+- **Logs**: daily files `logs/hobbes.YYYY-MM-DD.log` in the config dir (macOS `~/Library/Application Support/com.hobbes.app/logs/`, Windows `%LOCALAPPDATA%\com.hobbes.app\logs\`), 7 kept, written by debug and release builds alike. Release filter: `warn,Hobbes=info,rmcp=warn,h2=error,hyper=error,hyper_util=error,rustls=error`; debug: `info,Hobbes=debug`. The target is `Hobbes` (capital H; `windows_app` on Windows) — filters are case-sensitive. Overrides: `HOBBES_LOG` (filter; `RUST_LOG` is ignored), `HOBBES_LOG_STDERR=1` (release stderr; on by default only on a TTY), `HOBBES_DEBUG_DUMPS=1` (full request/response JSON dumps to `$TMPDIR/hobbes_debug_logs/` — private content, opt-in only). Never log secrets or user content at INFO+: use `log_utils::{net_err, redact_url, truncate_for_log}`; one INFO line per turn ("Turn complete").
 
 ### Clippy Configuration
 

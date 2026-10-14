@@ -95,6 +95,9 @@ impl SecretManager {
             }
         }
 
+        // Missing indexed entries (stale index rows) are common and harmless;
+        // count them and log one summary instead of a WARN each.
+        let mut index_failures = 0usize;
         // Load custom tool credentials from the index (BYOA)
         match keychain_ffi::find_generic_password_with_context(
             "composio_custom_keys_index",
@@ -113,11 +116,8 @@ impl SecretManager {
                                 tracing::debug!("Loaded custom tool secret with context: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to load indexed secret '{}' with context: {}",
-                                    key,
-                                    e
-                                );
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed secret '{}' with context: {}", key, e);
                             }
                         }
                     }
@@ -128,31 +128,38 @@ impl SecretManager {
             }
         }
 
-        // Load per-connector LLM API keys from their index
-        match keychain_ffi::find_generic_password_with_context(
+        // Load per-connector LLM API keys and per-subscription calendar URLs
+        // from their discovery indexes.
+        for index_key in [
             secret_types::LLM_KEYS_INDEX_KEY,
-            context,
-        ) {
-            Ok(index_csv) => {
-                for key in secret_types::parse_index_csv(&index_csv) {
-                    match keychain_ffi::find_generic_password_with_context(key, context) {
-                        Ok(value) => {
-                            self.secrets.insert(key.to_string(), value);
-                            tracing::debug!("Loaded LLM connector key with context: {}", key);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to load indexed LLM key '{}' with context: {}",
-                                key,
-                                e
-                            );
+            secret_types::CAL_KEYS_INDEX_KEY,
+        ] {
+            match keychain_ffi::find_generic_password_with_context(index_key, context) {
+                Ok(index_csv) => {
+                    for key in secret_types::parse_index_csv(&index_csv) {
+                        match keychain_ffi::find_generic_password_with_context(key, context) {
+                            Ok(value) => {
+                                self.secrets.insert(key.to_string(), value);
+                                tracing::debug!("Loaded indexed key with context: {}", key);
+                            }
+                            Err(e) => {
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed key '{}' with context: {}", key, e);
+                            }
                         }
                     }
                 }
+                Err(_) => {
+                    tracing::debug!("No index found for {}.", index_key);
+                }
             }
-            Err(_) => {
-                tracing::debug!("No LLM connector key index found.");
-            }
+        }
+
+        if index_failures > 0 {
+            tracing::info!(
+                "{} indexed keychain secret(s) could not be loaded (details at DEBUG)",
+                index_failures
+            );
         }
 
         self.migrate_legacy_keys();
@@ -243,6 +250,9 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
+        // Missing indexed entries (stale index rows) are common and harmless;
+        // count them and log one summary instead of a WARN each.
+        let mut index_failures = 0usize;
         // Feature: Dynamic Tool Credentials via Index Key
         // We maintain a comma-separated list of custom keys in `composio_custom_keys_index`.
         match keychain_ffi::find_generic_password("composio_custom_keys_index") {
@@ -257,7 +267,8 @@ impl SecretManagerTrait for SecretManager {
                                 tracing::debug!("Loaded custom tool secret: {}", key);
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to load indexed secret '{}': {}", key, e);
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed secret '{}': {}", key, e);
                             }
                         }
                     }
@@ -268,24 +279,38 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
-        // Load per-connector LLM API keys from their index
-        match keychain_ffi::find_generic_password(secret_types::LLM_KEYS_INDEX_KEY) {
-            Ok(index_csv) => {
-                for key in secret_types::parse_index_csv(&index_csv) {
-                    match keychain_ffi::find_generic_password(key) {
-                        Ok(value) => {
-                            self.secrets.insert(key.to_string(), value);
-                            tracing::debug!("Loaded LLM connector key: {}", key);
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to load indexed LLM key '{}': {}", key, e);
+        // Load per-connector LLM API keys and per-subscription calendar URLs
+        // from their discovery indexes.
+        for index_key in [
+            secret_types::LLM_KEYS_INDEX_KEY,
+            secret_types::CAL_KEYS_INDEX_KEY,
+        ] {
+            match keychain_ffi::find_generic_password(index_key) {
+                Ok(index_csv) => {
+                    for key in secret_types::parse_index_csv(&index_csv) {
+                        match keychain_ffi::find_generic_password(key) {
+                            Ok(value) => {
+                                self.secrets.insert(key.to_string(), value);
+                                tracing::debug!("Loaded indexed key: {}", key);
+                            }
+                            Err(e) => {
+                                index_failures += 1;
+                                tracing::debug!("Failed to load indexed key '{}': {}", key, e);
+                            }
                         }
                     }
                 }
+                Err(_) => {
+                    tracing::debug!("No index found for {}.", index_key);
+                }
             }
-            Err(_) => {
-                tracing::debug!("No LLM connector key index found.");
-            }
+        }
+
+        if index_failures > 0 {
+            tracing::info!(
+                "{} indexed keychain secret(s) could not be loaded (details at DEBUG)",
+                index_failures
+            );
         }
 
         self.migrate_legacy_keys();

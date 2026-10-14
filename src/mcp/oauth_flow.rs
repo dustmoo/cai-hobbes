@@ -632,7 +632,7 @@ pub async fn open_browser(url: &str, chrome_profile: Option<&str>) -> Result<(),
             tracing::info!(
                 "Opening URL in Chrome profile '{}': {}",
                 profile_dir,
-                url_clone
+                crate::log_utils::redact_url(&url_clone)
             );
             return std::process::Command::new("open")
                 .args([

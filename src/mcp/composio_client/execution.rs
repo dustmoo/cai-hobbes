@@ -88,7 +88,7 @@ pub async fn add_toolkit_to_server(
         // Construct the new MCP URL for the caller to save
         let base_domain = api_base.replace("/api/v3", "");
         let new_url = format!("{}/v3/mcp/{}/mcp", base_domain, new_server_id);
-        tracing::info!("Created new server with URL: {}", new_url);
+        tracing::info!("Created new server {} at {}", new_server_id, crate::log_utils::redact_url(&new_url));
 
         // Create instance to bind user to this server
         if let Some(ref user_id) = client.user_id {
@@ -99,27 +99,33 @@ pub async fn add_toolkit_to_server(
 
         (new_server_id, new_server, Some(new_url))
     } else {
-        // MATCHING LOGIC: Prioritize the exact target_server_id if provided
-        let mut target_server = None;
-        if !target_server_id.is_empty() {
-            target_server = items
+        // MATCHING LOGIC: The server id pinned in base_url is authoritative.
+        // Silently falling back to items.first() used to retarget writes at a
+        // different server (curation and toolkit bindings landed on the wrong
+        // object), so a pinned-but-missing id is now a hard error.
+        let found = if !target_server_id.is_empty() {
+            items
                 .iter()
-                .find(|s| s.get("id").and_then(|id| id.as_str()) == Some(target_server_id));
-        }
-
-        // Fallback to first if not found, or matching by toolkit if possible?
-        // For now, let's just be more logging-heavy about the choice.
-        let found = target_server
-            .or_else(|| {
-                if !target_server_id.is_empty() {
-                    tracing::warn!("Target server ID '{}' not found in Registry list. Falling back to first available.", target_server_id);
-                }
-                items.first()
-            })
-            .ok_or_else(|| {
+                .find(|s| s.get("id").and_then(|id| id.as_str()) == Some(target_server_id))
+                .ok_or_else(|| {
+                    tracing::error!(
+                        "Target server ID '{}' not found in Registry list ({} servers). Refusing to guess.",
+                        target_server_id,
+                        items.len()
+                    );
+                    format!(
+                        "Configured MCP server '{}' no longer exists on Composio. \
+                         Use 'Recreate Server' to provision a fresh one.",
+                        target_server_id
+                    )
+                })?
+        } else {
+            // No server pinned yet (initial setup): adopt the first existing server.
+            items.first().ok_or_else(|| {
                 tracing::error!("Registry returned empty items list after successful list call");
                 "No MCP servers found for this account".to_string()
-            })?;
+            })?
+        };
 
         let id = found
             .get("id")
@@ -314,7 +320,15 @@ pub async fn add_toolkit_to_server(
     // Determine which tools to add: use pre-selected or preserve existing
     let mut use_all_tools = false;
     let tools_added = if let Some(pre_selected) = selected_tools {
-        // Use pre-selected tools (from LLM smart selection)
+        // Use pre-selected tools (from LLM smart selection or saved curation)
+
+        // WHITELIST GUARD: if the server is in all-tools mode (empty
+        // allowed_tools) and has other toolkits bound, writing a whitelist for
+        // just this toolkit would silently disable all the others — expand
+        // their full tool lists first.
+        if custom_tools.is_empty() && final_toolkits.len() > 1 {
+            custom_tools = expand_all_mode_whitelist(client, &final_toolkits, toolkit_slug).await;
+        }
 
         // PRUNING FIX: Remove existing tools for THIS toolkit before adding selection.
         // This ensures the AI's selection actually replaces the "all tools" default.
@@ -529,6 +543,47 @@ fn toolkit_tool_prefix(toolkit_slug: &str) -> String {
     format!("{}_", toolkit_slug.to_uppercase().replace("-", "_"))
 }
 
+/// Full `allowed_tools` whitelist of the current server (empty = all-tools mode).
+pub async fn server_allowed_tools(client: &ComposioClient) -> Result<Vec<String>, String> {
+    let (_, server_obj) = fetch_server_config(client).await?;
+    Ok(extract_allowed_tools(&server_obj))
+}
+
+/// Composio's `allowed_tools` has two-mode semantics: empty = every tool of
+/// every bound toolkit is served; non-empty = strict whitelist. Writing a
+/// whitelist for ONE toolkit onto an all-mode server would therefore silently
+/// disable every other toolkit. This expands the other bound toolkits' full
+/// tool lists (via the tools enum) so they keep serving after the write.
+async fn expand_all_mode_whitelist(
+    client: &ComposioClient,
+    server_toolkits: &[String],
+    curated_slug: &str,
+) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for slug in server_toolkits {
+        if slug.eq_ignore_ascii_case(curated_slug) {
+            continue;
+        }
+        match super::discovery::get_toolkit_tools_detailed(client, slug).await {
+            Ok(tools) => expanded.extend(tools.into_iter().map(|(name, _)| name)),
+            Err(e) => tracing::warn!(
+                "[WHITELIST GUARD] Could not expand tools for '{}': {} — its tools may \
+                 be unavailable until re-curated via Edit Tools",
+                slug,
+                e
+            ),
+        }
+    }
+    tracing::info!(
+        "[WHITELIST GUARD] Server was in all-tools mode; expanded {} tools across {} other \
+         toolkits before curating '{}'",
+        expanded.len(),
+        server_toolkits.len().saturating_sub(1),
+        curated_slug
+    );
+    expanded
+}
+
 /// Get the currently enabled (allowed) tools for a specific toolkit on the
 /// user's MCP server. An empty result means no whitelist entries exist for the
 /// toolkit — i.e. all of its tools are enabled by the backend default.
@@ -558,18 +613,8 @@ pub async fn set_toolkit_enabled_tools(
     let (server_id, server_obj) = fetch_server_config(client).await?;
     let prefix = toolkit_tool_prefix(toolkit_slug);
 
-    // Keep other toolkits' entries untouched; replace only this toolkit's.
-    let mut allowed_tools: Vec<String> = extract_allowed_tools(&server_obj)
-        .into_iter()
-        .filter(|t| !t.to_uppercase().starts_with(&prefix))
-        .collect();
-    for tool in enabled_tools {
-        if !allowed_tools.contains(&tool) {
-            allowed_tools.push(tool);
-        }
-    }
-
-    // PATCH with the same field set used elsewhere (Mandate 5: string arrays).
+    // Extracted before the whitelist build so the all-mode guard can see the
+    // full set of bound toolkits (Mandate 5: string arrays).
     let toolkits: Vec<String> = server_obj
         .get("toolkits")
         .and_then(|t| t.as_array())
@@ -585,6 +630,24 @@ pub async fn set_toolkit_enabled_tools(
                 .collect()
         })
         .unwrap_or_default();
+
+    let existing_allowed = extract_allowed_tools(&server_obj);
+    // Keep other toolkits' entries untouched; replace only this toolkit's.
+    // If the server is in all-tools mode (empty whitelist), expand the other
+    // toolkits' full tool lists first so this write doesn't disable them.
+    let mut allowed_tools: Vec<String> = if existing_allowed.is_empty() && toolkits.len() > 1 {
+        expand_all_mode_whitelist(client, &toolkits, toolkit_slug).await
+    } else {
+        existing_allowed
+            .into_iter()
+            .filter(|t| !t.to_uppercase().starts_with(&prefix))
+            .collect()
+    };
+    for tool in enabled_tools {
+        if !allowed_tools.contains(&tool) {
+            allowed_tools.push(tool);
+        }
+    }
     let auth_config_ids: Vec<String> = server_obj
         .get("auth_config_ids")
         .and_then(|a| a.as_array())
@@ -910,9 +973,9 @@ async fn create_mcp_server(
     tracing::info!(
         "Creating new MCP server with initial toolkit '{}': {}",
         toolkit_slug,
-        url
+        crate::log_utils::redact_url(&url)
     );
-    tracing::debug!("POST {} with payload: {:?}", url, payload);
+    tracing::debug!("POST {} with payload: {:?}", crate::log_utils::redact_url(&url), payload);
 
     let response = client
         .client
@@ -981,9 +1044,40 @@ pub async fn create_fresh_mcp_server(
         "[RECREATE] Fresh server {} (seeded with '{}') at {}",
         server_id,
         seed_toolkit,
-        new_url
+        crate::log_utils::redact_url(&new_url)
     );
     Ok((server_id, new_url))
+}
+
+/// Soft-delete an MCP server on Composio.
+/// Endpoint: DELETE /api/v3/mcp/{server_id} — returns `{id, deleted: true}`.
+/// Used by Recreate to retire the old server after a successful migration so
+/// abandoned servers don't accumulate (and can never be mis-targeted again).
+pub async fn delete_mcp_server(client: &ComposioClient, server_id: &str) -> Result<(), String> {
+    let api_base = client.get_api_base_url();
+    let url = format!("{}/mcp/{}", api_base, server_id);
+
+    tracing::info!("Deleting MCP server {}", server_id);
+
+    let response = client
+        .client
+        .delete(&url)
+        .header("x-api-key", &client.api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to delete MCP server: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "Failed to delete MCP server {} ({}): {}",
+            server_id, status, text
+        ));
+    }
+
+    tracing::info!("Deleted MCP server {}", server_id);
+    Ok(())
 }
 
 /// Create an MCP instance to bind a user to a server.
@@ -1001,12 +1095,7 @@ async fn create_mcp_instance(
         "user_id": user_id
     });
 
-    tracing::info!(
-        "Creating MCP instance for user '{}' on server '{}': {}",
-        user_id,
-        server_id,
-        url
-    );
+    tracing::info!("Creating MCP instance on server '{}'", server_id);
 
     let response = client
         .client
@@ -1089,7 +1178,7 @@ pub async fn execute_tool(
             if let Some(obj) = arguments.as_object_mut() {
                 for (k, v) in context {
                     if !obj.contains_key(&k) {
-                        tracing::info!(
+                        tracing::debug!(
                             "[CONTEXT] Injecting context param '{}' for toolkit '{}'",
                             k,
                             tk_slug
@@ -1330,9 +1419,9 @@ pub async fn execute_tool(
                                 && (text.contains("No connected account")
                                     || text.contains("valid connection not found"))
                             {
-                                tracing::info!(
+                                tracing::debug!(
                                     "[AUTH] Detected MCP Protocol error (substring match): {}",
-                                    text
+                                    crate::log_utils::truncate_for_log(text, crate::log_utils::LOG_BODY_MAX_CHARS)
                                 );
                                 needs_auth = true;
                                 error_msg = text.to_string();

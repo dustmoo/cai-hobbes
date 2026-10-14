@@ -53,27 +53,37 @@ impl LlmConnector for OpenAiCompatConnector {
         // Protected window of 6 messages ensures recent context is always preserved.
         if let Some(max_tokens) = self.config.max_context_tokens {
             // Use the per-provider chars_per_token ratio for accurate estimation
-            let chars_per_token = self.config.context_tuning.chars_per_token
+            let chars_per_token = self
+                .config
+                .context_tuning
+                .chars_per_token
                 .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
 
             // Log token budget breakdown for diagnostics
-            let system_tokens = prompt_data
-                .system
-                .as_ref()
-                .map_or(0, |s| crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token));
+            let system_tokens = prompt_data.system.as_ref().map_or(0, |s| {
+                crate::context::token_estimator::estimate_tokens_with_ratio(s, chars_per_token)
+            });
             let message_tokens: usize = prompt_data
                 .messages
                 .iter()
-                .map(|m| crate::context::token_estimator::estimate_message_tokens_with_ratio(m, chars_per_token))
+                .map(|m| {
+                    crate::context::token_estimator::estimate_message_tokens_with_ratio(
+                        m,
+                        chars_per_token,
+                    )
+                })
                 .sum();
             let json_ratio = chars_per_token.min(2.5);
             let tool_tokens: usize = prompt_data
                 .tools
                 .iter()
                 .map(|t| {
-                    crate::context::token_estimator::estimate_tokens_with_ratio(&t.name, chars_per_token)
-                        + (t.description.chars().count() as f64 / json_ratio).ceil() as usize
-                        + (t.parameters.to_string().chars().count() as f64 / json_ratio).ceil() as usize
+                    crate::context::token_estimator::estimate_tokens_with_ratio(
+                        &t.name,
+                        chars_per_token,
+                    ) + (t.description.chars().count() as f64 / json_ratio).ceil() as usize
+                        + (t.parameters.to_string().chars().count() as f64 / json_ratio).ceil()
+                            as usize
                         + 10
                 })
                 .sum();
@@ -85,11 +95,20 @@ impl LlmConnector for OpenAiCompatConnector {
 
             let dropped = prompt_data.enforce_context_budget(max_tokens, 6, chars_per_token);
             if dropped > 0 {
-                tracing::warn!(
-                    "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window",
-                    dropped,
-                    max_tokens
-                );
+                if crate::log_utils::first_time(&format!("oai_compat_trim:{}", self.config.model)) {
+                    tracing::info!(
+                        "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window (model '{}'; further trims logged at DEBUG)",
+                        dropped,
+                        max_tokens,
+                        self.config.model
+                    );
+                } else {
+                    tracing::debug!(
+                        "OpenAI Compat: Trimmed {} oldest messages to fit {} token context window",
+                        dropped,
+                        max_tokens
+                    );
+                }
             }
         }
 
@@ -117,9 +136,8 @@ impl LlmConnector for OpenAiCompatConnector {
             .expect("Failed to serialize OpenAI request body");
 
         // Type alias for the unified stream used by both raw TCP and reqwest paths.
-        type SseStream = std::pin::Pin<
-            Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>,
-        >;
+        type SseStream =
+            std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Vec<u8>, String>> + Send>>;
 
         // Autorecovery: retry once on transient stream decode errors (HTTPS path only).
         // For plain HTTP / raw TCP the connection RST is handled as a clean stream end; no retry needed.
@@ -173,7 +191,9 @@ impl LlmConnector for OpenAiCompatConnector {
                     request_builder =
                         request_builder.header("Authorization", format!("Bearer {}", api_key));
                 } else {
-                    tracing::warn!("OpenAI Compat: No API key configured — request will be unauthenticated");
+                    tracing::warn!(
+                        "OpenAI Compat: No API key configured — request will be unauthenticated"
+                    );
                 }
 
                 let response = match request_builder.send().await {
@@ -261,7 +281,7 @@ impl LlmConnector for OpenAiCompatConnector {
                             tool_call.tool_name,
                             tool_call.server_name
                         );
-                        let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                        let _ = tx.send(StreamMessage::ToolCall(Box::new(tool_call)));
                     }
                 };
 
@@ -315,11 +335,14 @@ impl LlmConnector for OpenAiCompatConnector {
                                     loop {
                                         if inside_tool_call {
                                             // We're accumulating a tool call — look for </tool_call>
-                                            if let Some(end_pos) = text_to_process.find("</tool_call>")
+                                            if let Some(end_pos) =
+                                                text_to_process.find("</tool_call>")
                                             {
                                                 // Complete the tool call buffer
-                                                tool_call_buffer.push_str(&text_to_process[..end_pos]);
-                                                let after = text_to_process[end_pos + 12..].to_string(); // skip "</tool_call>"
+                                                tool_call_buffer
+                                                    .push_str(&text_to_process[..end_pos]);
+                                                let after =
+                                                    text_to_process[end_pos + 12..].to_string(); // skip "</tool_call>"
 
                                                 // Parse the buffered JSON and emit as tool call
                                                 Self::parse_inline_tool_call(
@@ -342,10 +365,12 @@ impl LlmConnector for OpenAiCompatConnector {
                                             }
                                         } else {
                                             // Not inside a tool call — look for <tool_call>
-                                            if let Some(start_pos) = text_to_process.find("<tool_call>")
+                                            if let Some(start_pos) =
+                                                text_to_process.find("<tool_call>")
                                             {
                                                 // Emit text before the tag
-                                                remaining_text.push_str(&text_to_process[..start_pos]);
+                                                remaining_text
+                                                    .push_str(&text_to_process[..start_pos]);
                                                 inside_tool_call = true;
                                                 text_to_process =
                                                     text_to_process[start_pos + 11..].to_string(); // skip "<tool_call>"
@@ -371,13 +396,17 @@ impl LlmConnector for OpenAiCompatConnector {
                                             &mut inside_channel_think,
                                         );
 
-                                        for (is_channel_thinking, segment_text) in channel_segments {
+                                        for (is_channel_thinking, segment_text) in channel_segments
+                                        {
                                             if is_channel_thinking {
                                                 // Route to thinking display
-                                                if let Some(ref mut summary) = accumulated_thought_summary {
+                                                if let Some(ref mut summary) =
+                                                    accumulated_thought_summary
+                                                {
                                                     summary.push_str(&segment_text);
                                                 } else {
-                                                    accumulated_thought_summary = Some(segment_text.clone());
+                                                    accumulated_thought_summary =
+                                                        Some(segment_text.clone());
                                                 }
                                                 let _ = tx.send(StreamMessage::Text {
                                                     content: String::new(),
@@ -408,7 +437,8 @@ impl LlmConnector for OpenAiCompatConnector {
                                                             {
                                                                 summary.push_str(&text);
                                                             } else {
-                                                                accumulated_thought_summary = Some(text.clone());
+                                                                accumulated_thought_summary =
+                                                                    Some(text.clone());
                                                             }
                                                             let _ = tx.send(StreamMessage::Text {
                                                                 content: String::new(),
@@ -430,9 +460,7 @@ impl LlmConnector for OpenAiCompatConnector {
                                     }
                                 }
                                 StreamEvent::ToolCall {
-                                    name,
-                                    arguments,
-                                    ..
+                                    name, arguments, ..
                                 } => {
                                     // OpenAI streams tool calls incrementally:
                                     //   Chunk 1: id + name (arguments empty)
@@ -498,7 +526,7 @@ impl LlmConnector for OpenAiCompatConnector {
                         tracing::error!(
                             "OpenAI Compat Stream Error: {}\n  unparsed SSE buffer: {:?}",
                             e,
-                            &sse_buffer[..sse_buffer.len().min(300)],
+                            crate::log_utils::truncate_for_log(&sse_buffer, crate::log_utils::LOG_BODY_MAX_CHARS),
                         );
 
                         // Autorecovery: if no data has been sent yet and we have retries left,
@@ -551,7 +579,7 @@ impl LlmConnector for OpenAiCompatConnector {
                 self.config.summary_model, self.config.model
             );
             return Err(Box::new(std::io::Error::other(
-                "No model configured for summarization. Please select a model in OpenAI settings."
+                "No model configured for summarization. Please select a model in OpenAI settings.",
             )) as Box<dyn std::error::Error + Send + Sync>);
         }
 
@@ -579,7 +607,9 @@ You MUST respond with valid JSON containing exactly these fields:
   - "key_topics": Main topics discussed (array of short strings).
   - "key_decisions": Important decisions made (array of short strings).
   - "active_profile": The active Composio profile name if mentioned.
-  - "blockers": Current blockers or open issues (array of short strings)."#;
+  - "blockers": Current blockers or open issues (array of short strings).
+- "tab_title": A 2-4 word topic for this chat's browser-tab-style label (e.g. "Fix login bug"). Empty string if unclear.
+- "tab_emoji": A single emoji that specifically captures this chat's topic — reach for the most precise, least-generic match to the actual subject matter (a tool, domain, object, or action mentioned), not a default like 💬, 🤖, 📝, ✅, or 🚀. Vary your choice across different chats rather than reusing a small favorite set. Examples of specific picks: "🐛" for a bug hunt, "🧮" for a math problem, "🗺️" for trip planning, "🔐" for auth work, "🍞" for a baking recipe."#;
 
         let user_message = format!(
             "Previous Summary:\n---\n{}\n---\n\nRecent Messages:\n---\n{}\n---",
@@ -596,12 +626,11 @@ You MUST respond with valid JSON containing exactly these fields:
             "stream": false
         });
 
-        // Dump truncated JSON to verify model is actually in the serialized body
         let body_str = serde_json::to_string(&request_body).unwrap_or_default();
         tracing::debug!(
-            "Summarizer request: endpoint='{}', body_start='{}'",
-            endpoint,
-            &body_str[..body_str.len().min(200)],
+            "Summarizer request: endpoint='{}', model='{}'",
+            crate::log_utils::redact_url(&endpoint),
+            request_body.get("model").and_then(|m| m.as_str()).unwrap_or("?"),
         );
 
         let client = Client::builder()
@@ -625,28 +654,52 @@ You MUST respond with valid JSON containing exactly these fields:
                         request_builder.header("Authorization", format!("Bearer {}", api_key));
                 }
                 match request_builder.send().await {
-                    Ok(r) => { result = Some(r); break; }
-                    Err(e) if attempt < MAX_SUMMARIZER_RETRIES && (e.is_connect() || e.is_timeout()) => {
-                        tracing::warn!(
-                            "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {}",
-                            attempt + 1, e
-                        );
+                    Ok(r) => {
+                        result = Some(r);
+                        break;
+                    }
+                    Err(e)
+                        if attempt < MAX_SUMMARIZER_RETRIES
+                            && (e.is_connect() || e.is_timeout()) =>
+                    {
+                        let e = crate::log_utils::net_err(e);
+                        // First connection failure per endpoint at WARN, the
+                        // rest (every summarizer call on a dead endpoint) at DEBUG.
+                        let key = format!("oai_summarizer_conn:{}", crate::log_utils::redact_url(&endpoint));
+                        if crate::log_utils::first_time(&key) {
+                            tracing::warn!(
+                                "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {} (further connection errors logged at DEBUG)",
+                                attempt + 1, e
+                            );
+                        } else {
+                            tracing::debug!(
+                                "OpenAI Compat summarizer: connection error on attempt {} — retrying in 2s: {}",
+                                attempt + 1, e
+                            );
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        last_err = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        last_err = Some(e.into());
                     }
                     Err(e) => {
-                        last_err = Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                        last_err = Some(crate::log_utils::net_err(e).into());
                         break;
                     }
                 }
             }
-            result.ok_or_else(|| last_err.unwrap_or_else(|| Box::new(std::io::Error::other("summarizer send failed"))))?
+            result.ok_or_else(|| {
+                last_err
+                    .unwrap_or_else(|| Box::new(std::io::Error::other("summarizer send failed")))
+            })?
         };
 
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            tracing::error!("OpenAI Compat summarization error [{}]: {}", status, body);
+            tracing::error!(
+                "OpenAI Compat summarization error [{}]: {}",
+                status,
+                crate::log_utils::truncate_for_log(&body, crate::log_utils::LOG_BODY_MAX_CHARS)
+            );
             return Err(Box::new(std::io::Error::other(format!(
                 "Summarization API request failed with status {}: {}",
                 status, body
@@ -661,22 +714,8 @@ You MUST respond with valid JSON containing exactly these fields:
         // Extract content from OpenAI response format:
         // { "choices": [{ "message": { "content": "..." } }] }
         if let Some(content) = response_json["choices"][0]["message"]["content"].as_str() {
-            // Try parsing as JSON
-            if let Ok(json_value) = serde_json::from_str(content) {
+            if let Some(json_value) = super::extract_json_object(content) {
                 return Ok(json_value);
-            }
-
-            // Fallback: extract JSON from markdown code block
-            if let Some(start) = content.find('{') {
-                if let Some(end) = content.rfind('}') {
-                    let potential_json = &content[start..=end];
-                    if let Ok(json_value) = serde_json::from_str(potential_json) {
-                        tracing::warn!(
-                            "OpenAI Compat: Parsed summary JSON from markdown code block."
-                        );
-                        return Ok(json_value);
-                    }
-                }
             }
 
             // Last resort: wrap raw text as summary
@@ -748,7 +787,8 @@ You MUST respond with valid JSON containing exactly these fields:
             .header("Content-Type", "application/json")
             .json(&request_body);
         if let Some(api_key) = &self.config.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
         let response = request_builder.send().await.map_err(|e| e.to_string())?;
@@ -875,6 +915,18 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                 ChatRole::Tool => "tool",
             };
 
+            // Mid-conversation system message (ledger entry / turn tail):
+            // many local servers' chat templates reject a system message
+            // that isn't first, so it goes as user-role context text. Real
+            // OpenAI accepts system messages anywhere and keeps the role.
+            if msg.role == ChatRole::System && !messages.is_empty() && !self.is_real_openai() {
+                let joined = text_parts.join("\n");
+                if !joined.is_empty() {
+                    crate::llm::convert::push_context_as_user(&mut messages, &joined, "text");
+                }
+                continue;
+            }
+
             // Build the message based on what we found
             if let Some((call_id, _name, content_str)) = tool_result {
                 // Tool result message — OpenAI requires role=tool + tool_call_id
@@ -944,8 +996,8 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                     && messages[i - 1].get("role").and_then(|r| r.as_str()) == Some("assistant")
                     && messages[i - 1].get("tool_calls").is_some();
                 // Also allow consecutive tool results (multiple tools in one turn)
-                let follows_another_tool = i > 0
-                    && messages[i - 1].get("role").and_then(|r| r.as_str()) == Some("tool");
+                let follows_another_tool =
+                    i > 0 && messages[i - 1].get("role").and_then(|r| r.as_str()) == Some("tool");
 
                 if !has_preceding_tool_calls && !follows_another_tool {
                     tracing::warn!(
@@ -1059,114 +1111,115 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                 }
 
                 match serde_json::from_str::<Value>(json_str) {
-                Ok(val) => {
-                    if let Some(choices) = val["choices"].as_array() {
-                        if let Some(choice) = choices.first() {
-                            // Text delta
-                            if let Some(content) = choice["delta"]["content"].as_str() {
-                                events.push(StreamEvent::Text {
-                                    content: content.to_string(),
-                                });
-                            }
+                    Ok(val) => {
+                        if let Some(choices) = val["choices"].as_array() {
+                            if let Some(choice) = choices.first() {
+                                // Text delta
+                                if let Some(content) = choice["delta"]["content"].as_str() {
+                                    events.push(StreamEvent::Text {
+                                        content: content.to_string(),
+                                    });
+                                }
 
-                            // Tool calls delta — OpenAI streams these incrementally:
-                            //   First chunk:  {"index": 0, "id": "call_xxx", "function": {"name": "fn_name", "arguments": ""}}
-                            //   Later chunks: {"index": 0, "function": {"arguments": "{\"key\": "}}
-                            //   More chunks:  {"index": 0, "function": {"arguments": "\"value\"}"}}
-                            // We emit each delta as a StreamEvent::ToolCall.
-                            // The accumulation happens in generate_content_stream.
-                            if let Some(tool_calls) = choice["delta"]["tool_calls"].as_array() {
-                                for tc in tool_calls {
-                                    let id = tc
-                                        .get("id")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let name_raw = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("name"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or_default();
-                                    let args_fragment = tc
-                                        .get("function")
-                                        .and_then(|f| f.get("arguments"))
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                // Tool calls delta — OpenAI streams these incrementally:
+                                //   First chunk:  {"index": 0, "id": "call_xxx", "function": {"name": "fn_name", "arguments": ""}}
+                                //   Later chunks: {"index": 0, "function": {"arguments": "{\"key\": "}}
+                                //   More chunks:  {"index": 0, "function": {"arguments": "\"value\"}"}}
+                                // We emit each delta as a StreamEvent::ToolCall.
+                                // The accumulation happens in generate_content_stream.
+                                if let Some(tool_calls) = choice["delta"]["tool_calls"].as_array() {
+                                    for tc in tool_calls {
+                                        let id = tc
+                                            .get("id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let name_raw = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or_default();
+                                        let args_fragment = tc
+                                            .get("function")
+                                            .and_then(|f| f.get("arguments"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
 
-                                    if !name_raw.is_empty() {
-                                        // Pass raw name through — resolution happens in
-                                        // generate_content_stream using the tool_name_map.
-                                        events.push(StreamEvent::ToolCall {
-                                            id,
-                                            name: name_raw.to_string(),
-                                            server_name: None,
-                                            arguments: json!(args_fragment),
-                                            signature: None,
-                                        });
-                                    } else {
-                                        // Continuation chunk — just argument fragments
-                                        events.push(StreamEvent::ToolCall {
-                                            id,
-                                            name: String::new(), // empty = continuation
-                                            server_name: None,
-                                            arguments: json!(args_fragment),
+                                        if !name_raw.is_empty() {
+                                            // Pass raw name through — resolution happens in
+                                            // generate_content_stream using the tool_name_map.
+                                            events.push(StreamEvent::ToolCall {
+                                                id,
+                                                name: name_raw.to_string(),
+                                                server_name: None,
+                                                arguments: json!(args_fragment),
+                                                signature: None,
+                                            });
+                                        } else {
+                                            // Continuation chunk — just argument fragments
+                                            events.push(StreamEvent::ToolCall {
+                                                id,
+                                                name: String::new(), // empty = continuation
+                                                server_name: None,
+                                                arguments: json!(args_fragment),
+                                                signature: None,
+                                            });
+                                        }
+                                    }
+                                }
+
+                                // Native reasoning content (multiple field names across providers):
+                                // - "reasoning_content": DeepSeek API
+                                // - "reasoning": vLLM with Qwen 3.5 (--enable-reasoning)
+                                let reasoning = choice["delta"]["reasoning_content"]
+                                    .as_str()
+                                    .or_else(|| choice["delta"]["reasoning"].as_str());
+                                if let Some(reasoning) = reasoning {
+                                    if !reasoning.is_empty() {
+                                        events.push(StreamEvent::Thinking {
+                                            text: reasoning.to_string(),
                                             signature: None,
                                         });
                                     }
                                 }
                             }
+                        }
 
-                            // Native reasoning content (multiple field names across providers):
-                            // - "reasoning_content": DeepSeek API
-                            // - "reasoning": vLLM with Qwen 3.5 (--enable-reasoning)
-                            let reasoning = choice["delta"]["reasoning_content"]
-                                .as_str()
-                                .or_else(|| choice["delta"]["reasoning"].as_str());
-                            if let Some(reasoning) = reasoning {
-                                if !reasoning.is_empty() {
-                                    events.push(StreamEvent::Thinking {
-                                        text: reasoning.to_string(),
-                                        signature: None,
-                                    });
-                                }
+                        // Usage
+                        if let Some(usage) = val.get("usage") {
+                            // Optional usage parsing
+                            if let (Some(p), Some(c), Some(t)) = (
+                                usage["prompt_tokens"].as_u64(),
+                                usage["completion_tokens"].as_u64(),
+                                usage["total_tokens"].as_u64(),
+                            ) {
+                                events.push(StreamEvent::Usage(UsageData {
+                                    prompt_tokens: p as i32,
+                                    completion_tokens: c as i32,
+                                    total_tokens: t as i32,
+                                    cached_content_tokens: None,
+                                    cache_creation_tokens: None,
+                                    thoughts_tokens: None,
+                                    // Billed only for the real OpenAI API with a key;
+                                    // local/keyless endpoints are free (Some(0.0)).
+                                    cost: crate::llm::openai_pricing::turn_cost(
+                                        &self.config.endpoint,
+                                        self.config.api_key.is_some(),
+                                        &self.config.model,
+                                        p as i64,
+                                        c as i64,
+                                    ),
+                                }));
                             }
                         }
                     }
-
-                    // Usage
-                    if let Some(usage) = val.get("usage") {
-                        // Optional usage parsing
-                        if let (Some(p), Some(c), Some(t)) = (
-                            usage["prompt_tokens"].as_u64(),
-                            usage["completion_tokens"].as_u64(),
-                            usage["total_tokens"].as_u64(),
-                        ) {
-                            events.push(StreamEvent::Usage(UsageData {
-                                prompt_tokens: p as i32,
-                                completion_tokens: c as i32,
-                                total_tokens: t as i32,
-                                cached_content_tokens: None,
-                                thoughts_tokens: None,
-                                // Billed only for the real OpenAI API with a key;
-                                // local/keyless endpoints are free (Some(0.0)).
-                                cost: crate::llm::openai_pricing::turn_cost(
-                                    &self.config.endpoint,
-                                    self.config.api_key.is_some(),
-                                    &self.config.model,
-                                    p as i64,
-                                    c as i64,
-                                ),
-                            }));
-                        }
+                    Err(e) => {
+                        tracing::debug!(
+                            "SSE parse: dropped non-JSON line ({}): {:?}",
+                            e,
+                            crate::log_utils::truncate_for_log(json_str, 120)
+                        );
                     }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        "SSE parse: dropped non-JSON line ({}): {:?}",
-                        e,
-                        &json_str[..json_str.len().min(120)]
-                    );
-                }
                 }
             }
         }
@@ -1313,7 +1366,7 @@ impl OpenAiCompatConnector {
         resolve_fn: &dyn Fn(&str) -> (String, String),
     ) {
         let trimmed = buffer.trim();
-        tracing::trace!("OpenAI Compat: Parsing inline tool_call: {}", trimmed);
+        tracing::trace!("OpenAI Compat: Parsing inline tool_call ({} chars)", trimmed.len());
 
         match serde_json::from_str::<Value>(trimmed) {
             Ok(val) => {
@@ -1333,7 +1386,7 @@ impl OpenAiCompatConnector {
                 } else {
                     tracing::warn!(
                         "OpenAI Compat: Inline tool_call JSON missing 'name': {}",
-                        trimmed
+                        crate::log_utils::truncate_for_log(trimmed, crate::log_utils::LOG_BODY_MAX_CHARS)
                     );
                     return;
                 };
@@ -1353,13 +1406,13 @@ impl OpenAiCompatConnector {
                     tool_name,
                     server_name
                 );
-                let _ = tx.send(StreamMessage::ToolCall(tool_call));
+                let _ = tx.send(StreamMessage::ToolCall(Box::new(tool_call)));
             }
             Err(e) => {
                 tracing::warn!(
                     "OpenAI Compat: Failed to parse inline tool_call JSON: {} — raw: {}",
                     e,
-                    trimmed
+                    crate::log_utils::truncate_for_log(trimmed, crate::log_utils::LOG_BODY_MAX_CHARS)
                 );
                 // Fall back to emitting as text so the user at least sees it
                 let _ = tx.send(StreamMessage::Text {
@@ -1384,9 +1437,12 @@ impl OpenAiCompatConnector {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
         // Parse http://host:port/path
-        let without_scheme = endpoint
-            .strip_prefix("http://")
-            .ok_or_else(|| format!("raw_tcp_stream: endpoint must start with http://, got: {}", endpoint))?;
+        let without_scheme = endpoint.strip_prefix("http://").ok_or_else(|| {
+            format!(
+                "raw_tcp_stream: endpoint must start with http://, got: {}",
+                endpoint
+            )
+        })?;
 
         let (host_port, path) = if let Some(slash_pos) = without_scheme.find('/') {
             (&without_scheme[..slash_pos], &without_scheme[slash_pos..])
@@ -1480,8 +1536,7 @@ impl OpenAiCompatConnector {
 
         // 200 OK: spawn a task that reads the body and feeds chunks into an mpsc channel.
         // When the connection closes (RST or EOF) the task simply returns — clean end.
-        let (chunk_tx, chunk_rx) =
-            tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(64);
+        let (chunk_tx, chunk_rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(64);
 
         tokio::spawn(async move {
             if is_chunked {
@@ -1493,12 +1548,7 @@ impl OpenAiCompatConnector {
                         Ok(_) => {}
                     }
                     // Strip chunk extensions (e.g. "a;ext=val")
-                    let hex_str = size_line
-                        .trim()
-                        .split(';')
-                        .next()
-                        .unwrap_or("")
-                        .trim();
+                    let hex_str = size_line.trim().split(';').next().unwrap_or("").trim();
                     let chunk_size = match usize::from_str_radix(hex_str, 16) {
                         Ok(n) => n,
                         Err(_) => {
@@ -1622,3 +1672,90 @@ impl OpenAiCompatConnector {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::ChatMessage;
+
+    fn connector(endpoint: &str) -> OpenAiCompatConnector {
+        OpenAiCompatConnector::new(OpenAiCompatConfig {
+            endpoint: endpoint.to_string(),
+            model: "local-model".to_string(),
+            ..Default::default()
+        })
+    }
+
+    fn text(role: ChatRole, t: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: vec![ContentBlock::Text { text: t.into() }],
+        }
+    }
+
+    fn prompt(system: Option<&str>, messages: Vec<ChatMessage>) -> LlmPrompt {
+        LlmPrompt {
+            system: system.map(str::to_string),
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
+            messages,
+            tools: vec![],
+        }
+    }
+
+    #[test]
+    fn mid_conversation_system_becomes_user_context_on_local_servers() {
+        let c = connector("http://localhost:1234/v1");
+        let p = prompt(
+            Some("persona"),
+            vec![
+                text(ChatRole::User, "hi"),
+                text(ChatRole::System, "L1"),
+                text(ChatRole::System, "T1"),
+                ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: vec![ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "x".into(),
+                        arguments: json!({}),
+                        signature: None,
+                    }],
+                },
+                ChatMessage {
+                    role: ChatRole::Tool,
+                    content: vec![ContentBlock::ToolResult {
+                        call_id: "c1".into(),
+                        name: "x".into(),
+                        content: json!("ok"),
+                    }],
+                },
+                text(ChatRole::System, "T2"),
+            ],
+        );
+        let req = c.to_native_request(&p, true);
+        let msgs = req["messages"].as_array().unwrap();
+        // Only the top-level persona is role system.
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["system", "user", "assistant", "tool", "user"]);
+        assert_eq!(msgs[0]["content"], "persona");
+        // Merged into the preceding user turn (strict-alternation templates).
+        assert_eq!(msgs[1]["content"], "hi\n\n[Context]\nL1\n\n[Context]\nT1");
+        // After a tool result: a separate user message.
+        assert_eq!(msgs[4]["content"], "[Context]\nT2");
+        // Deterministic.
+        assert_eq!(req, c.to_native_request(&p, true));
+    }
+
+    #[test]
+    fn system_first_or_on_real_openai_keeps_the_system_role() {
+        let local = connector("http://localhost:1234/v1");
+        let p = prompt(None, vec![text(ChatRole::System, "L0"), text(ChatRole::User, "hi")]);
+        let req = local.to_native_request(&p, true);
+        assert_eq!(req["messages"][0], json!({ "role": "system", "content": "L0" }));
+
+        let openai = connector("https://api.openai.com/v1");
+        let p = prompt(Some("persona"), vec![text(ChatRole::User, "hi"), text(ChatRole::System, "T1")]);
+        let req = openai.to_native_request(&p, true);
+        assert_eq!(req["messages"][2], json!({ "role": "system", "content": "T1" }));
+    }
+}

@@ -15,6 +15,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "claude_api_key",        // Claude API key (provider-scoped)
     "openai_compat_api_key", // OpenAI-compatible API key (provider-scoped)
     "smithery_api_key",      // Smithery API key
+    "hobbes_license",        // Hobbes Pro license key (entitlement::LICENSE_KEYCHAIN_KEY)
 ];
 
 /// Prefix for Composio profile API keys (e.g., "composio_api_key_default")
@@ -36,6 +37,20 @@ pub fn llm_key_name(connector_id: &str) -> String {
 /// Key name for the CSV index of all per-connector LLM API keys.
 /// Needed so `load_all_from_keychain` can discover dynamically-named keys.
 pub const LLM_KEYS_INDEX_KEY: &str = "llm_connector_keys_index";
+
+/// Prefix for per-subscription calendar feed URLs (e.g., "cal_url_<uuid>").
+/// ICS "secret address" URLs embed access tokens, so they are secrets and
+/// live in the keychain — settings holds only the subscription id.
+pub const CAL_URL_PREFIX: &str = "cal_url_";
+
+/// Build the full keychain key for a calendar subscription's feed URL.
+pub fn cal_url_key_name(subscription_id: &str) -> String {
+    format!("{}{}", CAL_URL_PREFIX, subscription_id)
+}
+
+/// Key name for the CSV index of all calendar feed URL keys.
+/// Needed so `load_all_from_keychain` can discover dynamically-named keys.
+pub const CAL_KEYS_INDEX_KEY: &str = "cal_keys_index";
 
 /// Prefix for custom tool credentials (e.g., "composio_tool_slack__api_key")
 pub const CUSTOM_TOOL_PREFIX: &str = "composio_tool_";
@@ -358,6 +373,56 @@ pub trait SecretManagerTrait {
         }
         Ok(())
     }
+
+    /// Get the feed URL for a calendar subscription.
+    #[allow(dead_code)] // consumer is the Phase 2 ICS fetcher / Phase 4 settings UI
+    fn get_cal_url(&self, subscription_id: &str) -> Option<&String> {
+        self.get(&cal_url_key_name(subscription_id))
+    }
+
+    /// Set the feed URL for a calendar subscription and keep the discovery
+    /// index current so `load_all_from_keychain` finds it on next launch.
+    /// `biometric` controls the protection of the URL itself; the index is
+    /// always written unprotected — it must stay readable without a
+    /// biometric prompt so startup discovery works before authentication.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI (URL paste)
+    fn set_cal_url(
+        &mut self,
+        subscription_id: &str,
+        value: String,
+        biometric: bool,
+    ) -> Result<(), String> {
+        let key = cal_url_key_name(subscription_id);
+        self.set_with_protection(&key, value, biometric)?;
+
+        let current_index = self
+            .get_named_index_from_keychain(CAL_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        let new_index = add_to_index_csv(&current_index, &key);
+        if new_index != current_index {
+            self.set_with_protection(CAL_KEYS_INDEX_KEY, new_index, false)?;
+            tracing::info!("Updated calendar URL key index with: {}", key);
+        }
+        Ok(())
+    }
+
+    /// Delete the feed URL for a calendar subscription and update the index.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI (remove subscription)
+    fn delete_cal_url(&mut self, subscription_id: &str) -> Result<(), String> {
+        let key = cal_url_key_name(subscription_id);
+        let _ = self.delete(&key);
+
+        let current_index = self
+            .get_named_index_from_keychain(CAL_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        if !current_index.is_empty() {
+            let new_index = remove_from_index_csv(&current_index, &key);
+            // Same as set_cal_url: the index must never carry a biometric ACL.
+            self.set_with_protection(CAL_KEYS_INDEX_KEY, new_index, false)?;
+            tracing::info!("Removed calendar URL key from index: {}", key);
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -483,6 +548,19 @@ mod tests {
         assert_eq!(parse_index_csv(&idx).len(), 2);
         let idx = remove_from_index_csv(&idx, &llm_key_name("a"));
         assert_eq!(parse_index_csv(&idx), vec![llm_key_name("b")]);
+    }
+
+    #[test]
+    fn test_cal_url_key_name_and_index_roundtrip() {
+        let key = cal_url_key_name("sub-42");
+        assert_eq!(key, "cal_url_sub-42");
+        assert!(key.starts_with(CAL_URL_PREFIX));
+
+        let idx = add_to_index_csv("", &cal_url_key_name("a"));
+        let idx = add_to_index_csv(&idx, &cal_url_key_name("b"));
+        assert_eq!(parse_index_csv(&idx).len(), 2);
+        let idx = remove_from_index_csv(&idx, &cal_url_key_name("a"));
+        assert_eq!(parse_index_csv(&idx), vec![cal_url_key_name("b")]);
     }
 
     #[test]

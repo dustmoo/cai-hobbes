@@ -156,6 +156,9 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
+        // Missing indexed entries (stale index rows) are common and harmless;
+        // count them and log one summary instead of a WARN each.
+        let mut index_failures = 0usize;
         // Feature: Dynamic Tool Credentials via Index Key
         if let Ok(entry) = Entry::new(SERVICE_NAME, "composio_custom_keys_index") {
             if let Ok(index_csv) = entry.get_password() {
@@ -170,11 +173,8 @@ impl SecretManagerTrait for SecretManager {
                                     tracing::debug!("Loaded custom tool secret: {}", key);
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
-                                        "Failed to load indexed secret '{}': {}",
-                                        key,
-                                        e
-                                    );
+                                    index_failures += 1;
+                                    tracing::debug!("Failed to load indexed secret '{}': {}", key, e);
                                 }
                             }
                         }
@@ -183,23 +183,37 @@ impl SecretManagerTrait for SecretManager {
             }
         }
 
-        // Load per-connector LLM API keys from their index
-        if let Ok(entry) = Entry::new(SERVICE_NAME, secret_types::LLM_KEYS_INDEX_KEY) {
-            if let Ok(index_csv) = entry.get_password() {
-                for key in secret_types::parse_index_csv(&index_csv) {
-                    if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
-                        match entry.get_password() {
-                            Ok(value) => {
-                                self.secrets.insert(key.to_string(), value);
-                                tracing::debug!("Loaded LLM connector key: {}", key);
-                            }
-                            Err(e) => {
-                                tracing::warn!("Failed to load indexed LLM key '{}': {}", key, e);
+        // Load per-connector LLM API keys and per-subscription calendar URLs
+        // from their discovery indexes.
+        for index_key in [
+            secret_types::LLM_KEYS_INDEX_KEY,
+            secret_types::CAL_KEYS_INDEX_KEY,
+        ] {
+            if let Ok(entry) = Entry::new(SERVICE_NAME, index_key) {
+                if let Ok(index_csv) = entry.get_password() {
+                    for key in secret_types::parse_index_csv(&index_csv) {
+                        if let Ok(entry) = Entry::new(SERVICE_NAME, key) {
+                            match entry.get_password() {
+                                Ok(value) => {
+                                    self.secrets.insert(key.to_string(), value);
+                                    tracing::debug!("Loaded indexed key: {}", key);
+                                }
+                                Err(e) => {
+                                    index_failures += 1;
+                                    tracing::debug!("Failed to load indexed key '{}': {}", key, e);
+                                }
                             }
                         }
                     }
                 }
             }
+        }
+
+        if index_failures > 0 {
+            tracing::info!(
+                "{} indexed keychain secret(s) could not be loaded (details at DEBUG)",
+                index_failures
+            );
         }
 
         tracing::info!(

@@ -1,5 +1,7 @@
 #![allow(non_snake_case)]
-use crate::{components::chat_input::ChatCommand, session::SessionState, session_store};
+use crate::{
+    components::chat_input::ChatCommand, session::SessionState, session_store, settings::Settings,
+};
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use sublime_fuzzy::best_match;
@@ -10,6 +12,7 @@ pub struct SessionManagerProps {}
 pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let mut session_state = use_context::<Signal<SessionState>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
+    let settings = use_context::<Signal<Settings>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
 
@@ -89,6 +92,9 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
         if let Some(live) = sessions.sessions.get(&meta.id) {
             meta.name = live.name.clone();
             meta.message_count = live.messages.len() as i64;
+            meta.tab_title = live.tab_title.clone();
+            meta.tab_emoji = live.tab_emoji.clone();
+            meta.name_user_set = live.name_user_set;
         }
     }
 
@@ -101,18 +107,34 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     }
 
     let paginated_sessions = page_metas;
+    let count_label = if total_items == 1 {
+        "1 chat".to_string()
+    } else {
+        format!("{total_items} chats")
+    };
+    let hotkey_label = crate::hotkey::display_combo(&settings.read().hotkeys.toggle_history);
 
     rsx! {
     // Main content of the session manager
     div {
-        class: "flex flex-col bg-app text-fg h-full w-full p-4",
-            h2 { class: "text-lg font-bold mb-4", "Sessions" }
+        class: "flex flex-col bg-app text-fg h-full w-full",
+
+            // Header
+            div {
+                class: "h-11 flex items-baseline gap-2.5 px-4 border-b border-subtle shrink-0",
+                span { class: "text-base font-semibold", "History" }
+                span { class: "font-mono text-[11px] text-fg-muted", "{count_label}" }
+                span { class: "ml-auto font-mono text-[11px] text-fg-muted", "{hotkey_label}" }
+            }
+
+            div {
+                class: "flex flex-col flex-1 min-h-0 p-4",
 
             // Search Input
             div {
                 class: "mb-4 relative",
                 input {
-                    class: "w-full bg-input text-fg border border-primary-600 rounded-md py-2 pl-10 pr-4 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 placeholder-gray-400",
+                    class: "h-8 bg-app border border-faint rounded px-2.5 pl-8 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-primary-500 w-full",
                     placeholder: "Search chats...",
                     value: "{filter_query}",
                     oninput: move |evt| {
@@ -121,7 +143,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     }
                 }
                 div {
-                    class: "absolute left-2.5 top-2.5 text-fg-muted",
+                    class: "absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-muted",
                     Icon {
                         icon: fi_icons::FiSearch,
                         width: 14,
@@ -131,12 +153,20 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
             }
             div {
                 class: "flex-1 overflow-y-auto min-h-0",
+                if paginated_sessions.is_empty() {
+                    div { class: "text-sm text-fg-muted px-2 py-8", "No chats found." }
+                } else {
+                    span { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium px-2", "Chats" }
+                }
                 ul {
-                    class: "space-y-2",
+                    class: "space-y-0.5 mt-1",
                     {paginated_sessions.iter().map(|session| {
-                        let active_class = if session.id == active_id { "bg-btn-primary" } else { "" };
+                        let active_class = if session.id == active_id { "bg-section" } else { "" };
                         let session_id = session.id.clone();
-                        let session_name = session.name.clone();
+                        let session_name = session.display_title();
+                        let session_emoji = session.display_emoji().map(str::to_string);
+                        let session_summary = session.summary.clone();
+                        let session_date = format_session_date(&session.last_updated);
 
                         let id_click = session_id.clone();
                         let id_edit = session_id.clone();
@@ -147,58 +177,89 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
                         rsx! {
                             li {
-                                class: "flex items-center justify-between p-2 rounded-md cursor-pointer hover:bg-card {active_class}",
+                                class: "group grid grid-cols-[minmax(0,1fr)_auto] gap-3 items-center py-2 px-2 rounded hover:bg-section cursor-pointer {active_class}",
                                 key: "{session_id}",
                                 onclick: move |_| {
                                     if editing_session_id.read().is_none() {
                                         chat_command.set(Some(ChatCommand::SwitchToSession(id_click.clone())));
                                     }
                                 },
-                                if editing_session_id.read().as_ref() == Some(&session_id) {
-                                    input {
-                                        class: "flex-grow bg-input text-fg rounded-md p-1 focus:outline-none focus:ring-2 focus:ring-primary-500",
-                                        value: "{temp_session_name.read()}",
-                                        oninput: move |evt| temp_session_name.set(evt.value()),
-                                        onkeydown: move |evt| {
-                                            if evt.key() == Key::Enter {
-                                                session_state.write().update_session_name(&id_keydown, temp_session_name.read().clone());
-                                                editing_session_id.set(None);
-                                            } else if evt.key() == Key::Escape {
+                                div {
+                                    class: "min-w-0 flex items-start gap-1.5",
+                                    // Fixed-width emoji column (same glyph treatment as
+                                    // the tab sidebar) so titles stay aligned for
+                                    // chats that have no emoji yet.
+                                    span {
+                                        class: "w-5 shrink-0 text-center text-[13px] leading-5",
+                                        if let Some(e) = &session_emoji { "{e}" }
+                                    }
+                                    div {
+                                        class: "min-w-0 flex-1",
+                                    if editing_session_id.read().as_ref() == Some(&session_id) {
+                                        input {
+                                            class: "w-full bg-input text-fg rounded p-1 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500",
+                                            value: "{temp_session_name.read()}",
+                                            oninput: move |evt| temp_session_name.set(evt.value()),
+                                            onkeydown: move |evt| {
+                                                if evt.key() == Key::Enter {
+                                                    session_state.write().update_session_name(&id_keydown, temp_session_name.read().clone());
+                                                    editing_session_id.set(None);
+                                                } else if evt.key() == Key::Escape {
+                                                    editing_session_id.set(None);
+                                                }
+                                            },
+                                            onblur: move |_| {
+                                                session_state.write().update_session_name(&id_blur, temp_session_name.read().clone());
                                                 editing_session_id.set(None);
                                             }
-                                        },
-                                        onblur: move |_| {
-                                            session_state.write().update_session_name(&id_blur, temp_session_name.read().clone());
-                                            editing_session_id.set(None);
+                                        }
+                                    } else {
+                                        div {
+                                            class: "text-sm text-fg break-words", title: "{session_name}", "{session_name}"
+                                        }
+                                        if !session_summary.is_empty() {
+                                            div {
+                                                class: "text-xs text-fg-muted truncate", "{session_summary}"
+                                            }
                                         }
                                     }
-                                } else {
-                                    span { class: "flex-grow select-none truncate", "{session_name}" }
+                                    }
                                 },
                                 div {
-                                    class: "flex items-center ml-2",
-                                    button {
-                                        class: "p-1 rounded-md text-fg-muted hover:bg-input hover:text-fg mr-1",
-                                        onclick: move |event| {
-                                            event.stop_propagation();
-                                            temp_session_name.set(name_edit.clone());
-                                            editing_session_id.set(Some(id_edit.clone()));
-                                        },
-                                        Icon {
-                                            icon: fi_icons::FiEdit2,
-                                            width: 14,
-                                            height: 14,
-                                        }
+                                    class: "flex items-center gap-2",
+                                    span {
+                                        class: "font-mono text-[11px] text-fg-muted tabular-nums whitespace-nowrap",
+                                        "{session_date}"
                                     }
-                                    button {
-                                        class: "p-1 rounded-md text-fg-muted hover:bg-red-600 hover:text-fg",
-                                        onclick: move |event| {
-                                            event.stop_propagation();
-                                            // Signal to main.rs that we want to delete this specific session
-                                            // Pass the ID explicitly through the command payload
-                                            chat_command.set(Some(ChatCommand::DeleteSession(id_delete.clone())));
-                                        },
-                                        "X"
+                                    div {
+                                        class: "flex items-center opacity-0 group-hover:opacity-100",
+                                        button {
+                                            class: "p-1 rounded text-fg-muted hover:bg-card hover:text-fg mr-1",
+                                            onclick: move |event| {
+                                                event.stop_propagation();
+                                                temp_session_name.set(name_edit.clone());
+                                                editing_session_id.set(Some(id_edit.clone()));
+                                            },
+                                            Icon {
+                                                icon: fi_icons::FiEdit2,
+                                                width: 14,
+                                                height: 14,
+                                            }
+                                        }
+                                        button {
+                                            class: "p-1 rounded text-fg-muted hover:bg-red-600 hover:text-fg",
+                                            onclick: move |event| {
+                                                event.stop_propagation();
+                                                // Signal to main.rs that we want to delete this specific session
+                                                // Pass the ID explicitly through the command payload
+                                                chat_command.set(Some(ChatCommand::DeleteSession(id_delete.clone())));
+                                            },
+                                            Icon {
+                                                icon: fi_icons::FiTrash2,
+                                                width: 14,
+                                                height: 14,
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -247,7 +308,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                         class: "flex justify-between items-center px-2 text-xs text-fg-muted",
                         span { "Sessions per page:" }
                         select {
-                            class: "bg-input border border-primary-600 rounded px-2 py-1 text-fg text-xs focus:outline-none focus:ring-1 focus:ring-primary-500 cursor-pointer",
+                            class: "bg-input border border-faint rounded px-2 py-1 text-fg text-xs focus:outline-none focus:ring-1 focus:ring-primary-500 cursor-pointer",
                             value: "{items_per_page.read()}",
                             onchange: move |evt| {
                                 if let Ok(val) = evt.value().parse::<usize>() {
@@ -271,6 +332,15 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                     "✨ New Chat"
                 }
             }
+            }
         }
     }
+}
+
+/// Formats a fixed-width RFC3339 `last_updated` timestamp as a short
+/// human date for the row's right-aligned meta column (e.g. "Sep 16").
+fn format_session_date(last_updated: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(last_updated)
+        .map(|dt| dt.format("%b %-d").to_string())
+        .unwrap_or_default()
 }

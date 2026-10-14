@@ -6,6 +6,7 @@ use crate::components::shared::{StreamMessage, ToolCallStatus};
 
 use crate::services::tool_call_summarizer::ToolCallSummarizer;
 use crate::session::SessionState;
+use crate::session_events::{log_event, log_events, SessionEvent};
 use crate::settings::Settings;
 use dioxus::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -29,6 +30,11 @@ pub struct StreamManagerContext {
     permission_manager: Signal<crate::context::permissions::PermissionManager>,
     skill_registry: Signal<crate::skills::SkillRegistry>,
     mcp_context: Signal<crate::mcp::manager::McpContext>,
+    /// The global planner — needed by the built-in planner tools, which run on
+    /// the streaming path here (P-015: dispatch stays in builtin_tools).
+    planner_state: Signal<crate::todo::PlannerState>,
+    /// The UI command bus (HOBBES_DISPATCH focuses freshly created tabs).
+    chat_command: Signal<Option<crate::components::chat_input::ChatCommand>>,
     pub stream_activity: Signal<u64>,
     pub streaming_sessions: Signal<HashSet<String>>,
     stream_session_map: Signal<HashMap<Uuid, String>>,
@@ -41,6 +47,64 @@ pub struct StreamManagerContext {
 }
 
 impl StreamManagerContext {
+    /// Report this session's lifecycle into the fleet (no-op while the
+    /// bridge is disarmed). Name lookup peeks — never subscribes. Turn
+    /// completions carry the conversation summary so the fleet row gets a
+    /// re-entry brief without any transcript or extra LLM call.
+    fn fleet_report(&self, session_id: &str, signal: crate::fleet::bridge::HobbesSignal) {
+        if !crate::fleet::bridge::enabled() {
+            return;
+        }
+        let (name, summary_json) = {
+            let state = self.session_state.peek();
+            match state.sessions.get(session_id) {
+                Some(s) => {
+                    let cs = &s.active_context.conversation_summary;
+                    let json = (!cs.summary.trim().is_empty()
+                        || !cs.current_task.trim().is_empty())
+                    .then(|| serde_json::to_value(cs).ok())
+                    .flatten();
+                    (s.name.clone(), json)
+                }
+                None => (String::new(), None),
+            }
+        };
+        let brief_source = summary_json.clone();
+        let is_turn_end = matches!(
+            signal,
+            crate::fleet::bridge::HobbesSignal::TurnCompleted
+                | crate::fleet::bridge::HobbesSignal::Closed
+        );
+        crate::fleet::bridge::report_with_brief(session_id, &name, signal, summary_json);
+
+        // Progress flows onto todos linked to THIS chat session too
+        // (display-only, mirroring the transcript-brief path).
+        if is_turn_end {
+            if let Some(brief) = brief_source.and_then(|v| {
+                crate::fleet::briefs::brief_from_summary_value(&v, chrono::Utc::now(), false)
+            }) {
+                let line = crate::fleet::briefs::progress_line(&brief);
+                let mut planner = self.planner_state;
+                let changed = crate::todo::handlers::apply_brief_progress(
+                    &mut planner.write(),
+                    session_id,
+                    &line,
+                    chrono::Utc::now(),
+                );
+                if !changed.is_empty() {
+                    let p = planner.peek();
+                    for id in &changed {
+                        if let Some(t) = p.todo(id) {
+                            if let Err(e) = crate::todo::store::save_todo(t) {
+                                tracing::error!("progress persist failed: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     pub fn is_streaming(self, message_id: &Uuid) -> bool {
         self.stream_receivers.read().contains_key(message_id)
     }
@@ -58,7 +122,10 @@ impl StreamManagerContext {
             return true;
         }
         // Fallback: check map of active stream handles to catch continuations
-        self.stream_session_map.read().values().any(|v| v == session_id)
+        self.stream_session_map
+            .read()
+            .values()
+            .any(|v| v == session_id)
     }
 
     /// Find the active message_id for a given session (for cancel).
@@ -82,21 +149,33 @@ impl StreamManagerContext {
         }
     }
 
+    /// The provider that will actually mint this turn's `thought_signature`
+    /// (resolved connector instance's provider, falling back to the legacy
+    /// global `active_llm` when no connector instance is configured). Used to
+    /// stamp `signature_provider` on assembled messages/tool calls so a later
+    /// mid-chat model switch never replays one provider's opaque signature
+    /// blob to another.
+    fn resolved_provider(&self, session_id: &str) -> crate::settings::LlmProvider {
+        match self.effective_connector(session_id) {
+            Some(inst) => inst.provider(),
+            None => self.settings.read().active_llm,
+        }
+    }
+
     /// The session's resolved OpenAI-compat config when watch-word recovery
     /// is enabled on it. Watch words are a per-instance OpenAI-compat
     /// feature: gate on the session's resolved connector config, not the
     /// global one.
     fn watch_word_config(&self, session_id: &str) -> Option<crate::settings::OpenAiCompatConfig> {
-        self.effective_connector(session_id).and_then(|inst| {
-            match inst.config {
+        self.effective_connector(session_id)
+            .and_then(|inst| match inst.config {
                 crate::settings::ProviderInstanceConfig::OpenAiCompat(c)
                     if c.watch_words_enabled =>
                 {
                     Some(c)
                 }
                 _ => None,
-            }
-        })
+            })
     }
 
     /// The chat model a session resolves to (session override → provider default).
@@ -136,7 +215,7 @@ impl StreamManagerContext {
 
         match (matches_global, instance) {
             (false, Some(inst)) => {
-                tracing::info!(
+                tracing::debug!(
                     session_id,
                     connector = %inst.name,
                     provider = inst.provider().display_name(),
@@ -159,8 +238,11 @@ impl StreamManagerContext {
         profile_id: Option<String>,
     ) {
         self.streaming_sessions.write().insert(session_id.clone());
-        self.stream_session_map.write().insert(message_id, session_id.clone());
-        tracing::info!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
+        self.stream_session_map
+            .write()
+            .insert(message_id, session_id.clone());
+        self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnStarted);
+        tracing::debug!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
         let (stream_tx, stream_rx) = mpsc::unbounded_channel::<StreamMessage>();
 
@@ -168,9 +250,20 @@ impl StreamManagerContext {
         self.stream_receivers.write().insert(message_id, stream_rx);
         *self.stream_activity.write() += 1;
 
+        // Resolve which provider will mint this turn's thought_signature(s) so
+        // assembled messages/tool calls below can be stamped with provenance
+        // (see `signature_provider` on MessageContent::Text / ToolCall).
+        let stream_provider = self.resolved_provider(&session_id);
+        // Resolve the connector name / model this turn is actually running
+        // under, so minted tool calls can be stamped with turn-time
+        // provenance (see `ToolCall::with_turn_provenance`) — history that a
+        // later profile/connector switch must not relabel.
+        let stream_connector_name = self.effective_connector(&session_id).map(|inst| inst.name);
+        let stream_model = self.effective_model(&session_id);
+
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
-            tracing::info!(message_id = %message_id, "Stream master task SPAWNED.");
+            tracing::debug!(message_id = %message_id, "Stream master task SPAWNED.");
             // Keep the built prompt and MCP context so we can re-send a trimmed
             // version if the provider rejects the prompt as too large
             // (adapt-to-error self-calibration, handled in the Error arm).
@@ -245,8 +338,9 @@ impl StreamManagerContext {
                         // its receiver — stream_tx.send() returns Err. We must NOT break
                         // the loop here; the background LLM stream must continue running
                         // and writing to session_state so the data is preserved.
-                        let has_renderable_content =
-                            !content.is_empty() || thought_signature.is_some() || thought_summary.is_some();
+                        let has_renderable_content = !content.is_empty()
+                            || thought_signature.is_some()
+                            || thought_summary.is_some();
                         if has_renderable_content && !ui_disconnected {
                             if stream_tx
                                 .send(StreamMessage::Text {
@@ -280,11 +374,15 @@ impl StreamManagerContext {
                                     content: msg_content,
                                     thought_signature: msg_thought_sig,
                                     thought_summary: msg_thought_sum,
+                                    signature_provider: msg_sig_provider,
                                 } = &mut msg.content
                                 {
                                     *msg_content = final_text_for_this_turn.clone();
                                     *msg_thought_sig = thought_signature_for_this_turn.clone();
                                     *msg_thought_sum = thought_summary_for_this_turn.clone();
+                                    *msg_sig_provider = thought_signature_for_this_turn
+                                        .is_some()
+                                        .then_some(stream_provider);
                                 }
                             }
                         }
@@ -318,9 +416,9 @@ impl StreamManagerContext {
                                     .map(|s| settings.chat_model_for_session(s))
                                     .unwrap_or_else(|| settings.active_chat_model());
                                 let scope = match instance.as_ref().map(|i| &i.config) {
-                                    Some(crate::settings::ProviderInstanceConfig::OpenAiCompat(
-                                        c,
-                                    )) => c.endpoint.clone(),
+                                    Some(
+                                        crate::settings::ProviderInstanceConfig::OpenAiCompat(c),
+                                    ) => c.endpoint.clone(),
                                     Some(crate::settings::ProviderInstanceConfig::Claude(_)) => {
                                         "claude".to_string()
                                     }
@@ -386,33 +484,43 @@ impl StreamManagerContext {
 
                         // Save error message to session
                         {
-                            let mut state = self.session_state.write();
-                            if is_first_message {
-                                // Update the placeholder message with the error
-                                if let Some(msg) =
-                                    state.get_message_mut_in_session(&session_id, &message_id)
-                                {
-                                    msg.content =
-                                        crate::components::shared::MessageContent::Error {
-                                            message: error_msg.clone(),
+                            let mut error_snapshot: Option<crate::components::chat::Message> = None;
+                            {
+                                let mut state = self.session_state.write();
+                                if is_first_message {
+                                    // Update the placeholder message with the error
+                                    if let Some(msg) =
+                                        state.get_message_mut_in_session(&session_id, &message_id)
+                                    {
+                                        msg.content =
+                                            crate::components::shared::MessageContent::Error {
+                                                message: error_msg.clone(),
+                                            };
+                                        error_snapshot = Some(msg.clone());
+                                    }
+                                } else {
+                                    // Create a new error message
+                                    let new_id = Uuid::new_v4();
+                                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                                        let message = crate::components::chat::Message {
+                                            id: new_id,
+                                            author: "Hobbes".to_string(),
+                                            content:
+                                                crate::components::shared::MessageContent::Error {
+                                                    message: error_msg.clone(),
+                                                },
+                                            attachments: Vec::new(),
+                                            comments: Vec::new(),
+                                            created_at: chrono::Utc::now(),
+                                            usage: None,
                                         };
+                                        error_snapshot = Some(message.clone());
+                                        session.messages.push(message);
+                                    }
                                 }
-                            } else {
-                                // Create a new error message
-                                let new_id = Uuid::new_v4();
-                                if let Some(session) = state.sessions.get_mut(&session_id) {
-                                    session.messages.push(crate::components::chat::Message {
-                                        id: new_id,
-                                        author: "Hobbes".to_string(),
-                                        content: crate::components::shared::MessageContent::Error {
-                                            message: error_msg.clone(),
-                                        },
-                                        attachments: Vec::new(),
-                                        comments: Vec::new(),
-                                        created_at: chrono::Utc::now(),
-                                        usage: None,
-                                    });
-                                }
+                            }
+                            if let Some(message) = error_snapshot {
+                                log_event(&session_id, SessionEvent::AssistantMessage { message });
                             }
                         }
 
@@ -425,7 +533,12 @@ impl StreamManagerContext {
                         stream_error_occurred = true;
                         break;
                     }
-                    StreamMessage::ToolCall(mut tool_call) => {
+                    StreamMessage::ToolCall(tool_call_box) => {
+                        // Unbox immediately: `StreamMessage::ToolCall` boxes its
+                        // payload only to keep the enum itself small in transit;
+                        // everything downstream here still works with an owned
+                        // `ToolCall`.
+                        let mut tool_call = *tool_call_box;
                         // Mark as generated since we got a tool call
                         self.content_generated.write().insert(message_id);
 
@@ -466,45 +579,71 @@ impl StreamManagerContext {
                             if thought_signature_for_this_turn.is_none() {
                                 thought_signature_for_this_turn =
                                     tool_call.thought_signature.clone();
-                                tracing::info!(
-                                    "Captured thought_signature from tool call '{}': '{}'",
-                                    tool_call.tool_name,
-                                    tool_call
-                                        .thought_signature
-                                        .as_ref()
-                                        .map(|s| if s.len() > 30 { &s[..30] } else { s })
-                                        .unwrap_or("None")
+                                tracing::debug!(
+                                    "Captured thought_signature from tool call '{}'",
+                                    tool_call.tool_name
                                 );
                             }
                         } else if thought_signature_for_this_turn.is_some() {
                             // Propagate captured signature to this tool call
                             tool_call.thought_signature = thought_signature_for_this_turn.clone();
-                            tracing::info!("Propagated thought_signature to tool call '{}' from earlier in turn", tool_call.tool_name);
-                        } else {
+                            tracing::debug!("Propagated thought_signature to tool call '{}' from earlier in turn", tool_call.tool_name);
+                        } else if stream_provider == crate::settings::LlmProvider::Gemini {
+                            // Only Gemini requires signatures on function calls.
                             tracing::warn!("Tool call '{}' has NO thought_signature and none available to propagate!", tool_call.tool_name);
+                        } else {
+                            tracing::debug!("Tool call '{}' has no thought_signature (not required by {:?})", tool_call.tool_name, stream_provider);
                         }
 
+                        // Stamp provenance: record which provider minted the
+                        // thought_signature now attached to this tool call (captured
+                        // or propagated above), so a later mid-chat provider switch
+                        // never replays it to an incompatible provider.
+                        tool_call = tool_call.with_signature_provider(stream_provider);
+                        tool_call = tool_call.with_turn_provenance(
+                            profile_id.clone(),
+                            stream_connector_name.clone(),
+                            Some(stream_model.clone()),
+                        );
+                        // Every call in this response shares the turn's placeholder id,
+                        // so the prompt builder can find the latest round.
+                        tool_call.round_id = Some(message_id.to_string());
+
                         tool_call_count += 1;
+                        let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
                         let tool_call_message_id = {
                             let mut state = self.session_state.write();
                             // Message Upgrading: Only the FIRST tool call upgrades the
                             // placeholder.  Subsequent parallel tool calls always get their
                             // own message so every invocation is visible to the user.
-                            if !first_tool_call_placed && (is_first_message || final_text_for_this_turn.is_empty()) {
+                            if !first_tool_call_placed
+                                && (is_first_message || final_text_for_this_turn.is_empty())
+                            {
                                 first_tool_call_placed = true;
-                                if let Some(msg) =
-                                    state.get_message_mut_in_session(&session_id, &message_id)
-                                {
-                                    msg.content =
-                                        crate::components::shared::MessageContent::ToolCall(
-                                            tool_call.clone(),
-                                        );
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    if let Some(msg) =
+                                        session.messages.iter_mut().find(|m| m.id == message_id)
+                                    {
+                                        msg.content =
+                                            crate::components::shared::MessageContent::ToolCall(
+                                                tool_call.clone(),
+                                            );
+                                    }
+                                    // The placeholder was minted at turn start —
+                                    // before the prompt was even built. Restamp it to
+                                    // the moment the stream emitted this call, so the
+                                    // activity stream measures the step's real start
+                                    // (and `completed_at - created_at` its real
+                                    // duration) instead of the whole round trip.
+                                    session.restamp_message(&message_id, chrono::Utc::now());
+                                    tool_call_snapshot =
+                                        session.messages.iter().find(|m| m.id == message_id).cloned();
                                 }
                                 message_id
                             } else {
                                 let new_id = Uuid::new_v4();
                                 if let Some(session) = state.sessions.get_mut(&session_id) {
-                                    session.messages.push(crate::components::chat::Message {
+                                    let message = crate::components::chat::Message {
                                         id: new_id,
                                         author: "Hobbes".to_string(),
                                         content:
@@ -515,11 +654,22 @@ impl StreamManagerContext {
                                         comments: Vec::new(),
                                         created_at: chrono::Utc::now(),
                                         usage: None,
-                                    });
+                                    };
+                                    tool_call_snapshot = Some(message.clone());
+                                    session.messages.push(message);
                                 }
                                 new_id
                             }
                         };
+                        // Notify the scroll effect: a tool-call card just appeared.
+                        *self.stream_activity.write() += 1;
+                        self.fleet_report(
+                            &session_id,
+                            crate::fleet::bridge::HobbesSignal::Activity,
+                        );
+                        if let Some(message) = tool_call_snapshot {
+                            log_event(&session_id, SessionEvent::ToolCall { message });
+                        }
 
                         let mcp_manager = self.mcp_manager;
                         let mut session_state = self.session_state;
@@ -533,220 +683,150 @@ impl StreamManagerContext {
                                     .unwrap_or(serde_json::Value::Null);
                             let profile_id = profile_id_inner;
 
-                            // Intercept HOBBES_PAGE_RESULT before MCP dispatch —
-                            // requires SessionState.page_queue which McpManager doesn't have.
-                            if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
-                                let page_budget = crate::session::compute_page_budget(
-                                    &self.settings.read(),
-                                    session_state.read().sessions.get(&session_id_inner),
+                            // Built-in tools run here, before MCP dispatch — they
+                            // need SessionState and the skill/permission registries
+                            // that McpManager doesn't own. The same dispatcher backs
+                            // the approval-resume path in chat.rs; see
+                            // components::builtin_tools.
+                            let builtin_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+                                session_state,
+                                settings: self.settings,
+                                skill_registry: self.skill_registry,
+                                permission_manager: self.permission_manager,
+                                mcp_context: self.mcp_context,
+                                planner: self.planner_state,
+                                chat_command: self.chat_command,
+                            };
+
+                            // A model skill load the user hasn't pre-approved is
+                            // held exactly like an MCP call that needs approval:
+                            // the message becomes a PermissionRequest (rendered as
+                            // the skill approval bubble) and no result is sent.
+                            // Approve flips it back to a Running ToolCall, which
+                            // the resume path in chat.rs dispatches. Built-ins
+                            // that always ask (HOBBES_PROJECT_MERGE) are held
+                            // the same way, every time (`builtin_needs_approval`).
+                            //
+                            // Agent time (SYMBIOTIC_PLANNER.md §3): every call
+                            // from an agent-time chat passes the scope gate
+                            // first. Deny/no-intent → refused with a tool
+                            // error; an outside effect → held for approval
+                            // here, bypassing trust rules and always-allow
+                            // (use_mcp_tool is never reached). The resume
+                            // path in chat.rs runs the same gate.
+                            let agent_time_gate =
+                                crate::components::builtin_tools::agent_time_gate(
+                                    builtin_ctx,
+                                    &tool_call,
+                                    &args_json,
+                                    &session_id_inner,
+                                    false,
                                 );
-                                let (status, response_str) =
-                                    session_state.write().handle_page_result(&args_json, "", page_budget);
-
-
-                                // Update message with result
+                            if agent_time_gate
+                                == crate::components::builtin_tools::AgentTimeGate::ForceApproval
+                                || (agent_time_gate
+                                    == crate::components::builtin_tools::AgentTimeGate::Proceed
+                                    && crate::components::builtin_tools::builtin_needs_approval(
+                                        builtin_ctx,
+                                        &tool_call,
+                                        &args_json,
+                                        &session_id_inner,
+                                    ))
+                            {
+                                let mut pending_snapshot: Option<
+                                    crate::components::chat::Message,
+                                > = None;
                                 {
                                     let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
+                                    if let Some(msg) = state.get_message_mut_in_session(
+                                        &session_id_inner,
+                                        &tool_call_message_id,
+                                    ) {
+                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(tc.clone());
+                                            pending_snapshot = Some(msg.clone());
                                         }
                                     }
-                                    state.touch_session(&session_id_inner);
                                 }
-
-                                let record = crate::components::shared::ToolCallRecord {
-                                    call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult {
-                                        status,
-                                        response: response_str,
-                                    },
-                                    profile_color: {
-                                        let settings_read = self.settings.read();
-                                        crate::components::shared::resolve_profile_color(
-                                            profile_id.as_ref(),
-                                            &settings_read,
-                                        )
-                                    },
-                                };
-                                let _ = tool_results_tx_clone.send(record);
+                                *self.stream_activity.write() += 1;
+                                if let Some(message) = pending_snapshot {
+                                    log_event(
+                                        &session_id_inner,
+                                        SessionEvent::ToolResult { message },
+                                    );
+                                }
                                 completed_tool_tasks_clone
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 return;
                             }
 
-                            // Intercept HOBBES_UPDATE_SCRATCHPAD before MCP dispatch.
-                            if tool_call.tool_name == "HOBBES_UPDATE_SCRATCHPAD" {
-                                let (status, response_str) =
-                                    session_state.write().handle_scratchpad_update(&args_json, &session_id_inner, &self.settings.read());
-
-                                // Persist so the scratchpad survives app restart
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
-                                        }
-                                    }
-                                    state.touch_session(&session_id_inner);
+                            let builtin_outcome = match agent_time_gate {
+                                crate::components::builtin_tools::AgentTimeGate::Refuse(
+                                    message,
+                                ) => Some(crate::components::builtin_tools::BuiltinOutcome {
+                                    status: ToolCallStatus::Error,
+                                    response: message,
+                                    persist: true,
+                                }),
+                                _ => {
+                                    crate::components::builtin_tools::dispatch_builtin_tool(
+                                        builtin_ctx,
+                                        &tool_call,
+                                        &args_json,
+                                        &session_id_inner,
+                                        profile_id.as_ref(),
+                                        false,
+                                    )
+                                    .await
                                 }
-                                crate::session::SessionState::save_async(&session_state.read(), None);
+                            };
+                            if let Some(outcome) = builtin_outcome {
+                                let crate::components::builtin_tools::BuiltinOutcome {
+                                    status,
+                                    response,
+                                    persist,
+                                } = outcome;
 
-                                let record = crate::components::shared::ToolCallRecord {
-                                    call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult {
-                                        status,
-                                        response: response_str,
-                                    },
-                                    profile_color: {
-                                        let settings_read = self.settings.read();
-                                        crate::components::shared::resolve_profile_color(
-                                            profile_id.as_ref(),
-                                            &settings_read,
-                                        )
-                                    },
-                                };
-                                let _ = tool_results_tx_clone.send(record);
-                                completed_tool_tasks_clone
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                return;
-                            }
-
-                            // Intercept HOBBES_INVOKE_SKILL before MCP dispatch — the
-                            // model-invocation path for skills. Executes the skill
-                            // (capability registration only), persists the payload into
-                            // session.loaded_skills, and returns the instruction manual
-                            // as the tool result.
-                            if tool_call.tool_name == "HOBBES_INVOKE_SKILL" {
-                                let skill_name = args_json
-                                    .get("name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let arguments = args_json
-                                    .get("arguments")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-
-                                let skill_opt = self.skill_registry.read().get_skill(&skill_name);
-                                let (status, response_str) = match skill_opt {
-                                    None => (
-                                        ToolCallStatus::Error,
-                                        format!(
-                                            "Skill '{}' not found. Only skills listed under available_skills in your system context can be invoked.",
-                                            skill_name
-                                        ),
-                                    ),
-                                    Some(skill) if skill.metadata.disable_model_invocation => (
-                                        ToolCallStatus::Error,
-                                        format!(
-                                            "Skill '{}' has model invocation disabled. The user must invoke it themselves with /{}.",
-                                            skill_name, skill_name
-                                        ),
-                                    ),
-                                    Some(skill) => {
-                                        let permission = self
-                                            .permission_manager
-                                            .read()
-                                            .check_skill_permission(&skill.metadata.name);
-                                        if permission
-                                            != crate::context::permissions::PermissionStatus::Allowed
-                                        {
-                                            (
-                                                ToolCallStatus::Error,
-                                                format!(
-                                                    "The user has disabled auto-approval for skill '{}'. Ask them to run /{} themselves or enable the skill in Settings → Permissions.",
-                                                    skill_name, skill_name
-                                                ),
-                                            )
-                                        } else {
-                                            let mut skill_call =
-                                                crate::components::shared::SkillCall {
-                                                    execution_id: uuid::Uuid::new_v4().to_string(),
-                                                    skill_name: skill.metadata.name.clone(),
-                                                    arguments,
-                                                    status: crate::components::shared::SkillCallStatus::Running,
-                                                    response: String::new(),
-                                                    instructions: skill.instructions.clone(),
-                                                    path: skill.path.clone(),
-                                                    has_scripts: !skill.scripts.is_empty(),
-                                                    raw_output: None,
-                                                    profile_color: {
-                                                        let settings_read = self.settings.read();
-                                                        crate::components::shared::resolve_profile_color(
-                                                            profile_id.as_ref(),
-                                                            &settings_read,
-                                                        )
-                                                    },
-                                                };
-                                            let mcp_context = {
-                                                // Use the reactively-synced McpContext signal
-                                                // (P-001: never get_mcp_context().await mid-turn)
-                                                let mut ctx = self.mcp_context.read().clone();
-                                                ctx.enrich_from_settings(&self.settings.read());
-                                                ctx
-                                            };
-                                            match crate::skills::execute_skill(
-                                                &mut skill_call,
-                                                Some(&mcp_context),
-                                            )
-                                            .await
-                                            {
-                                                Ok(result) => {
-                                                    let completed = result.status
-                                                        == crate::components::shared::SkillCallStatus::Completed;
-                                                    if completed {
-                                                        // Persist so the skill stays in system
-                                                        // context for all future turns
-                                                        let mut state = session_state.write();
-                                                        if let Some(session) = state
-                                                            .sessions
-                                                            .get_mut(&session_id_inner)
-                                                        {
-                                                            session.loaded_skills.insert(
-                                                                skill_call.skill_name.clone(),
-                                                                result.output.clone(),
-                                                            );
-                                                        }
-                                                        drop(state);
-                                                        tracing::info!(
-                                                            "Model invoked skill '{}' — persisted into session.loaded_skills",
-                                                            skill_call.skill_name
-                                                        );
-                                                        (ToolCallStatus::Completed, result.output)
-                                                    } else {
-                                                        (ToolCallStatus::Error, result.output)
-                                                    }
-                                                }
-                                                Err(e) => (
-                                                    ToolCallStatus::Error,
-                                                    format!("Skill invocation failed: {}", e),
-                                                ),
+                                {
+                                    let mut result_snapshot: Option<
+                                        crate::components::chat::Message,
+                                    > = None;
+                                    {
+                                        let mut state = session_state.write();
+                                        if let Some(msg) = state.get_message_mut_in_session(
+                                            &session_id_inner,
+                                            &tool_call_message_id,
+                                        ) {
+                                            if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                                                tc.status = status;
+                                                tc.response = response.clone();
+                                                tc.completed_at = Some(chrono::Utc::now());
                                             }
+                                            result_snapshot = Some(msg.clone());
                                         }
+                                        state.touch_session(&session_id_inner);
                                     }
-                                };
-
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
-                                        }
+                                    if let Some(message) = result_snapshot {
+                                        log_event(
+                                            &session_id_inner,
+                                            SessionEvent::ToolResult { message },
+                                        );
                                     }
-                                    state.touch_session(&session_id_inner);
                                 }
-                                crate::session::SessionState::save_async(&session_state.read(), None);
+                                // Notify the scroll effect: the card's status/response changed size.
+                                *self.stream_activity.write() += 1;
+                                if persist {
+                                    crate::session::SessionState::save_async(
+                                        &session_state.read(),
+                                        None,
+                                    );
+                                }
 
                                 let record = crate::components::shared::ToolCallRecord {
                                     call: tool_call.clone(),
                                     result: crate::components::shared::ToolResult {
                                         status,
-                                        response: response_str,
+                                        response,
                                     },
                                     profile_color: {
                                         let settings_read = self.settings.read();
@@ -762,55 +842,24 @@ impl StreamManagerContext {
                                 return;
                             }
 
-                            // Intercept HOBBES timer tools before MCP dispatch.
-                            if matches!(
-                                tool_call.tool_name.as_str(),
-                                "HOBBES_SET_TIMER" | "HOBBES_LIST_TIMERS" | "HOBBES_CANCEL_TIMER"
-                            ) {
-                                let (status, response_str) = match tool_call.tool_name.as_str() {
-                                    "HOBBES_SET_TIMER" => session_state
-                                        .write()
-                                        .handle_set_timer(&args_json, &session_id_inner),
-                                    "HOBBES_LIST_TIMERS" => {
-                                        session_state.read().handle_list_timers(&session_id_inner)
+                            // Per-session context for EVERY tool call: the
+                            // trust gate scopes rules by project and logs
+                            // decisions with session identity; the terminal
+                            // additionally uses the resolved cwd.
+                            let session_ctx = {
+                                let state = session_state.peek();
+                                state.sessions.get(&session_id_inner).map(|s| {
+                                    crate::mcp::terminal_client::TerminalCtx {
+                                        session_id: session_id_inner.clone(),
+                                        cwd: crate::mcp::terminal_client::resolve_session_cwd(
+                                            s,
+                                            &self.planner_state.peek(),
+                                            &self.settings.peek(),
+                                        ),
+                                        project_id: s.project_id.clone(),
                                     }
-                                    _ => session_state
-                                        .write()
-                                        .handle_cancel_timer(&args_json, &session_id_inner),
-                                };
-
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_in_session(&session_id_inner, &tool_call_message_id) {
-                                        if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
-                                            tc.status = status;
-                                            tc.response = response_str.clone();
-                                        }
-                                    }
-                                    state.touch_session(&session_id_inner);
-                                }
-                                crate::session::SessionState::save_async(&session_state.read(), None);
-
-                                let record = crate::components::shared::ToolCallRecord {
-                                    call: tool_call.clone(),
-                                    result: crate::components::shared::ToolResult {
-                                        status,
-                                        response: response_str,
-                                    },
-                                    profile_color: {
-                                        let settings_read = self.settings.read();
-                                        crate::components::shared::resolve_profile_color(
-                                            profile_id.as_ref(),
-                                            &settings_read,
-                                        )
-                                    },
-                                };
-                                let _ = tool_results_tx_clone.send(record);
-                                completed_tool_tasks_clone
-                                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                return;
-                            }
-
+                                })
+                            };
                             let result_receiver = mcp_manager
                                 .read()
                                 .use_mcp_tool(
@@ -819,6 +868,7 @@ impl StreamManagerContext {
                                     args_json,
                                     false,
                                     profile_id.clone(),
+                                    session_ctx,
                                 )
                                 .await;
 
@@ -859,8 +909,13 @@ impl StreamManagerContext {
                                                     .await
                                                 {
                                                     Ok(url) => {
-                                                        tracing::info!("Successfully initiated Composio auth flow. URL: {}", url);
-                                                        (ToolCallStatus::AuthRequired, url, false, None)
+                                                        tracing::info!("Successfully initiated Composio auth flow ({})", crate::log_utils::redact_url(&url));
+                                                        (
+                                                            ToolCallStatus::AuthRequired,
+                                                            url,
+                                                            false,
+                                                            None,
+                                                        )
                                                     }
                                                     Err(e) => {
                                                         tracing::error!("Failed to initiate Composio auth flow: {}", e);
@@ -897,7 +952,7 @@ impl StreamManagerContext {
                                             } else {
                                                 // ── Image-aware content extraction ───────────────────────────
                                                 // Scan aggregated_content for image blobs. Save them to disk
-                                                // (max 768px tall) and build a text-only response string.
+                                                // (max 1568px long edge) and build a text-only response string.
                                                 // The file path is stored in tc.cached_image_path so
                                                 // prompt_builder can inject it as ContentBlock::Image on the
                                                 // next continuation turn.
@@ -910,22 +965,31 @@ impl StreamManagerContext {
 
                                                     // MCP image content: {"type":"image","data":"<b64>","mimeType":"image/png"}
                                                     // Also handle nested {"blob":"<b64>"} from EmbeddedResource.
-                                                    let b64_candidate = json_val.get("data")
+                                                    let b64_candidate = json_val
+                                                        .get("data")
                                                         .or_else(|| json_val.get("blob"))
                                                         .and_then(|v| v.as_str());
 
                                                     if let Some(b64) = b64_candidate {
-                                                        let mime = json_val.get("mimeType")
+                                                        let mime = json_val
+                                                            .get("mimeType")
                                                             .or_else(|| json_val.get("mime_type"))
                                                             .and_then(|m| m.as_str())
                                                             .unwrap_or("image/png");
                                                         // Only save actual image types, not arbitrary blobs
                                                         if mime.starts_with("image/") {
-                                                            if let Some(path) = save_tool_image(b64, mime).await {
-                                                                let path_str = format!("file://{}", path.display());
+                                                            if let Some(path) =
+                                                                save_tool_image(b64, mime).await
+                                                            {
+                                                                let path_str = format!(
+                                                                    "file://{}",
+                                                                    path.display()
+                                                                );
                                                                 // Keep only the most recent image per tool loop
-                                                                captured_image_path = Some(path_str.clone());
-                                                                let file_name = path.file_name()
+                                                                captured_image_path =
+                                                                    Some(path_str.clone());
+                                                                let file_name = path
+                                                                    .file_name()
                                                                     .unwrap_or_default()
                                                                     .to_string_lossy();
                                                                 text_parts.push(format!(
@@ -937,7 +1001,9 @@ impl StreamManagerContext {
                                                                     path.display(), b64.len()
                                                                 );
                                                             } else {
-                                                                tracing::warn!("Failed to cache tool image");
+                                                                tracing::warn!(
+                                                                    "Failed to cache tool image"
+                                                                );
                                                                 text_parts.push("[Screenshot captured but failed to save]".to_string());
                                                             }
                                                             continue; // don't also serialize as text
@@ -945,11 +1011,15 @@ impl StreamManagerContext {
                                                     }
 
                                                     // Text content
-                                                    if let Some(text) = json_val.get("text").and_then(|t| t.as_str()) {
+                                                    if let Some(text) = json_val
+                                                        .get("text")
+                                                        .and_then(|t| t.as_str())
+                                                    {
                                                         text_parts.push(text.to_string());
                                                     } else {
                                                         // Fallback: compact JSON for non-image, non-text blobs
-                                                        let s = serde_json::to_string(&json_val).unwrap_or_default();
+                                                        let s = serde_json::to_string(&json_val)
+                                                            .unwrap_or_default();
                                                         if !s.is_empty() && s != "null" {
                                                             text_parts.push(s);
                                                         }
@@ -962,7 +1032,12 @@ impl StreamManagerContext {
                                                     text_parts.join("\n")
                                                 };
 
-                                                (final_status, text_response, false, captured_image_path)
+                                                (
+                                                    final_status,
+                                                    text_response,
+                                                    false,
+                                                    captured_image_path,
+                                                )
                                             }
                                         }
                                     }
@@ -982,16 +1057,21 @@ impl StreamManagerContext {
 
                             let mut state = session_state.write();
 
+                            let mut result_snapshot: Option<crate::components::chat::Message> =
+                                None;
                             if let Some(msg) = state.get_message_mut_in_session(
                                 &session_id_inner,
                                 &tool_call_message_id,
                             ) {
                                 if is_permission_request {
-                                    if let Ok(tc) =
+                                    if let Ok(mut tc) =
                                         serde_json::from_str::<crate::components::shared::ToolCall>(
                                             &response_str,
                                         )
                                     {
+                                        if let crate::components::shared::MessageContent::ToolCall(orig) = &msg.content {
+                                            tc.round_id = orig.round_id.clone();
+                                        }
                                         msg.content = crate::components::shared::MessageContent::PermissionRequest(tc);
                                     }
                                 } else if let crate::components::shared::MessageContent::ToolCall(
@@ -1000,11 +1080,20 @@ impl StreamManagerContext {
                                 {
                                     tc.status = status;
                                     tc.response = response_str.clone();
+                                    tc.completed_at = Some(chrono::Utc::now());
                                     // Store image path for prompt_builder vision injection
                                     if image_path.is_some() {
                                         tc.cached_image_path = image_path.clone();
                                     }
+                                    result_snapshot = Some(msg.clone());
                                 }
+                            }
+                            drop(state);
+                            // Notify the scroll effect: the card's status/response changed size
+                            // (or it became a PermissionRequest prompt).
+                            *self.stream_activity.write() += 1;
+                            if let Some(message) = result_snapshot {
+                                log_event(&session_id_inner, SessionEvent::ToolResult { message });
                             }
 
                             if !is_permission_request {
@@ -1052,6 +1141,16 @@ impl StreamManagerContext {
                                 .count()
                                 as i32;
                         }
+                        drop(state);
+
+                        // Agent time: charge this chat's new spend to the open
+                        // agent-time session and re-check the budget (stops the
+                        // run — lease closed, stream cancelled — when over).
+                        crate::agent_time_runtime::on_usage(
+                            self.planner_state,
+                            self.session_state,
+                            &session_id,
+                        );
 
                         // Forward usage to UI
                         if stream_tx.send(StreamMessage::Usage(usage_data)).is_err() {
@@ -1062,18 +1161,91 @@ impl StreamManagerContext {
             }
 
             if !final_text_for_this_turn.trim().is_empty() {
-                let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                    if let crate::components::shared::MessageContent::Text {
-                        content,
-                        thought_signature,
-                        thought_summary,
-                    } = &mut msg.content
-                    {
-                        *content = final_text_for_this_turn.clone();
-                        *thought_signature = thought_signature_for_this_turn.clone();
-                        *thought_summary = thought_summary_for_this_turn.clone();
+                let mut final_snapshot: Option<crate::components::chat::Message> = None;
+                {
+                    let now = chrono::Utc::now();
+                    let mut state = self.session_state.write();
+                    if let Some(session) = state.sessions.get_mut(&session_id) {
+                        let placeholder_is_text = session
+                            .messages
+                            .iter()
+                            .find(|m| m.id == message_id)
+                            .map(|m| {
+                                matches!(
+                                    m.content,
+                                    crate::components::shared::MessageContent::Text { .. }
+                                )
+                            });
+                        match placeholder_is_text {
+                            Some(true) => {
+                                if let Some(msg) =
+                                    session.messages.iter_mut().find(|m| m.id == message_id)
+                                {
+                                    if let crate::components::shared::MessageContent::Text {
+                                        content,
+                                        thought_signature,
+                                        thought_summary,
+                                        signature_provider,
+                                    } = &mut msg.content
+                                    {
+                                        *content = final_text_for_this_turn.clone();
+                                        *thought_signature =
+                                            thought_signature_for_this_turn.clone();
+                                        *thought_summary = thought_summary_for_this_turn.clone();
+                                        *signature_provider = thought_signature_for_this_turn
+                                            .is_some()
+                                            .then_some(stream_provider);
+                                    }
+                                }
+                                // The reply follows this turn's work. Its
+                                // placeholder was pushed at turn start, so when
+                                // tool calls landed after it, leaving it in place
+                                // renders the activity block BELOW the answer that
+                                // block produced. Move it past them (vec order and
+                                // `created_at` together, so the journal replays the
+                                // same layout).
+                                final_snapshot = if tool_call_count > 0 {
+                                    session.move_message_to_end(&message_id, now)
+                                } else {
+                                    session.messages.iter().find(|m| m.id == message_id).cloned()
+                                };
+                            }
+                            // The placeholder was upgraded into this turn's FIRST
+                            // tool call, so text that arrived after it has nowhere
+                            // to land — it used to be dropped on the floor. Give it
+                            // its own message, after the calls it followed.
+                            Some(false) => {
+                                let created_at = match session.messages.last() {
+                                    Some(last) => now.max(last.created_at),
+                                    None => now,
+                                };
+                                let message = crate::components::chat::Message {
+                                    id: Uuid::new_v4(),
+                                    author: "Hobbes".to_string(),
+                                    content: crate::components::shared::MessageContent::Text {
+                                        content: final_text_for_this_turn.clone(),
+                                        thought_signature: thought_signature_for_this_turn.clone(),
+                                        thought_summary: thought_summary_for_this_turn.clone(),
+                                        signature_provider: thought_signature_for_this_turn
+                                            .is_some()
+                                            .then_some(stream_provider),
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at,
+                                    usage: None,
+                                };
+                                session.messages.push(message.clone());
+                                final_snapshot = Some(message);
+                            }
+                            // Message gone (cancelled/rewound mid-turn): nothing to
+                            // finalize, and nothing to resurrect.
+                            None => {}
+                        }
                     }
+                }
+                if let Some(message) = final_snapshot {
+                    log_event(&session_id, SessionEvent::AssistantMessage { message });
                 }
             } else if tool_call_count == 0 && thought_summary_for_this_turn.is_some() {
                 // No meaningful text content, no tool calls, but thinking WAS produced.
@@ -1082,20 +1254,31 @@ impl StreamManagerContext {
                 // Promote the thinking content to be the visible response text so the
                 // user sees the analysis directly instead of a hidden "Thinking Process."
                 let promoted_text = thought_summary_for_this_turn.clone().unwrap_or_default();
-                let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                    if let crate::components::shared::MessageContent::Text {
-                        content,
-                        thought_signature,
-                        thought_summary,
-                    } = &mut msg.content
-                    {
-                        *content = promoted_text.clone();
-                        *thought_signature = thought_signature_for_this_turn.clone();
-                        // Clear thought_summary since we promoted it to content —
-                        // no need to show it twice under "Thinking Process"
-                        *thought_summary = None;
+                let mut final_snapshot: Option<crate::components::chat::Message> = None;
+                {
+                    let mut state = self.session_state.write();
+                    if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                        if let crate::components::shared::MessageContent::Text {
+                            content,
+                            thought_signature,
+                            thought_summary,
+                            signature_provider,
+                        } = &mut msg.content
+                        {
+                            *content = promoted_text.clone();
+                            *thought_signature = thought_signature_for_this_turn.clone();
+                            // Clear thought_summary since we promoted it to content —
+                            // no need to show it twice under "Thinking Process"
+                            *thought_summary = None;
+                            *signature_provider = thought_signature_for_this_turn
+                                .is_some()
+                                .then_some(stream_provider);
+                            final_snapshot = Some(msg.clone());
+                        }
                     }
+                }
+                if let Some(message) = final_snapshot {
+                    log_event(&session_id, SessionEvent::AssistantMessage { message });
                 }
                 // Also forward to UI so the bubble renders
                 let _ = stream_tx.send(StreamMessage::Text {
@@ -1109,13 +1292,20 @@ impl StreamManagerContext {
                 // Surface this to the user instead of going blank (loud failure).
                 tracing::warn!("Model returned empty response — no text, thinking, or tool calls.");
                 let empty_msg = "⚠️ The model returned an empty response. This can happen when the context is too large or the model doesn't understand the instructions. Try sending your message again or switching to a different model.";
-                let mut state = self.session_state.write();
-                if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
-                    if let crate::components::shared::MessageContent::Text { content, .. } =
-                        &mut msg.content
-                    {
-                        *content = empty_msg.to_string();
+                let mut final_snapshot: Option<crate::components::chat::Message> = None;
+                {
+                    let mut state = self.session_state.write();
+                    if let Some(msg) = state.get_message_mut_in_session(&session_id, &message_id) {
+                        if let crate::components::shared::MessageContent::Text { content, .. } =
+                            &mut msg.content
+                        {
+                            *content = empty_msg.to_string();
+                            final_snapshot = Some(msg.clone());
+                        }
                     }
+                }
+                if let Some(message) = final_snapshot {
+                    log_event(&session_id, SessionEvent::AssistantMessage { message });
                 }
                 let _ = stream_tx.send(StreamMessage::Text {
                     content: empty_msg.to_string(),
@@ -1147,28 +1337,42 @@ impl StreamManagerContext {
                     // Don't trigger continuation; user needs to approve the permission request(s).
                     // Save and clean up.
                     if !collected_records.is_empty() {
-                        self.session_state
-                            .write()
-                            .tool_call_history
-                            .extend(collected_records.clone());
+                        if let Some(session) =
+                            self.session_state.write().sessions.get_mut(&session_id)
+                        {
+                            session.tool_call_history.extend(collected_records.clone());
+                        }
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
+            self.stream_receivers.write().remove(&message_id);
+                self.stream_receivers.write().remove(&message_id);
+                    // A placeholder absorbed by a live activity block never
+                    // mounted a bubble, so nobody ever took its receiver —
+                    // drop it here rather than leaking the turn's chunks.
+                    self.stream_receivers.write().remove(&message_id);
                     self.stream_session_map.write().remove(&message_id);
                     crate::session::SessionState::save_async(&self.session_state.read(), None);
                     on_complete();
                     self.streaming_sessions.write().remove(&session_id);
                     *self.stream_activity.write() += 1; // Notify TabBar: stream ended
                     self.scheduler.send(SchedulerSignal::Activity);
+                    self.fleet_report(
+                        &session_id,
+                        crate::fleet::bridge::HobbesSignal::GateWaiting {
+                            tool_name: format!(
+                                "{} tool call(s)",
+                                tool_call_count - collected_records.len()
+                            ),
+                        },
+                    );
                     return; // Wait for user to approve
                 }
 
-                self.session_state
-                    .write()
-                    .tool_call_history
-                    .extend(collected_records.clone());
-                // Tools were called in this turn. Increment the turn counter and trigger a continuation.
+                // Tools were called in this turn. Record them against THIS
+                // session and increment its turn counter, then continue.
                 if let Some(session) = self.session_state.write().sessions.get_mut(&session_id) {
+                    session.tool_call_history.extend(collected_records.clone());
                     session.increment_turn_count();
                 }
 
@@ -1191,10 +1395,13 @@ impl StreamManagerContext {
                 // Without this, turns chain too fast for the 5s idle timer to fire,
                 // causing the model to lose context on long tool loops.
                 {
-                    let msg_count = self.session_state.read()
-                        .sessions.get(&session_id)
-                        .map(|s| s.messages.len())
-                        .unwrap_or(0);
+                    let (msg_count, needs_identity) = self
+                        .session_state
+                        .read()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| (s.messages.len(), s.wants_tab_identity()))
+                        .unwrap_or((0, false));
                     let (tuning, context_tokens, enable_summarization) = {
                         let settings_guard = self.settings.read();
                         let state_guard = self.session_state.read();
@@ -1232,7 +1439,15 @@ impl StreamManagerContext {
                         "Proactive summarizer: dynamic threshold resolved"
                     );
 
-                    if msg_count >= threshold && msg_count > 0 && enable_summarization {
+                    // A tab still wanting its title (none yet, or a provisional
+                    // one now old enough to replace) also summarizes here: a tab
+                    // working in the background (e.g. HOBBES_DISPATCH) is never
+                    // the active tab when the idle scheduler fires, so this is
+                    // its only chance to get an emoji/topic.
+                    if (msg_count >= threshold || needs_identity)
+                        && msg_count > 0
+                        && enable_summarization
+                    {
                         // Overlap guard: skip if a proactive summary is already in-flight for THIS session.
                         if self.summarizing_sessions.read().contains(&session_id) {
                             tracing::debug!(
@@ -1241,32 +1456,43 @@ impl StreamManagerContext {
                             );
                         } else {
                             tracing::info!(
-                                session_id, msg_count, effective_limit, threshold,
-                                "Proactive summarization: messages approaching history limit"
+                                session_id,
+                                msg_count,
+                                effective_limit,
+                                threshold,
+                                needs_identity,
+                                "Proactive summarization: history limit or untitled tab"
                             );
-                            let session_snapshot = self.session_state.read()
-                                .sessions.get(&session_id).cloned();
+                            let session_snapshot =
+                                self.session_state.read().sessions.get(&session_id).cloned();
                             let settings_snapshot = self.settings.read().clone();
                             if let Some(active_session) = session_snapshot {
                                 let connector = self.connector_for_session(&session_id);
                                 let prev_summary = serde_json::to_string(
-                                    &active_session.active_context.conversation_summary
-                                ).unwrap_or_else(|_| "{}".to_string());
+                                    &active_session.active_context.conversation_summary,
+                                )
+                                .unwrap_or_else(|_| "{}".to_string());
 
                                 // Format last 5 messages for the summarizer
-                                let messages_text: Vec<String> = active_session.messages.iter()
-                                    .rev().take(5).rev()
-                                    .map(|m| format!("{}: {}", m.author, m.content.display_summary()))
+                                let messages_text: Vec<String> = active_session
+                                    .messages
+                                    .iter()
+                                    .rev()
+                                    .take(5)
+                                    .rev()
+                                    .map(|m| {
+                                        format!("{}: {}", m.author, m.content.display_summary())
+                                    })
                                     .collect();
 
                                 let active_profile_name = settings_snapshot
-                                    .active_composio_profile.as_deref()
+                                    .active_composio_profile
+                                    .as_deref()
                                     .and_then(|id| settings_snapshot.profile_name_for_id(id))
                                     .unwrap_or("None")
                                     .to_string();
-                                let system_note = format!(
-                                    "[System: Active Profile '{}']", active_profile_name
-                                );
+                                let system_note =
+                                    format!("[System: Active Profile '{}']", active_profile_name);
                                 let recent = std::iter::once(system_note)
                                     .chain(messages_text)
                                     .collect::<Vec<_>>()
@@ -1277,11 +1503,12 @@ impl StreamManagerContext {
                                     self.summarizing_sessions.write().insert(session_id.clone());
                                     let mut summarizing_sessions = self.summarizing_sessions;
                                     let session_id_clone = session_id.clone();
-                                    
+
                                     // Timeout safety net: blindly clear the flag after 30 seconds
                                     let sid = session_id.clone();
                                     dioxus::prelude::spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        tokio::time::sleep(std::time::Duration::from_secs(30))
+                                            .await;
                                         if summarizing_sessions.peek().contains(&sid) {
                                             tracing::warn!(session_id = %sid, "Proactive summarization timed out, forcibly resetting flag.");
                                             summarizing_sessions.write().remove(&sid);
@@ -1290,18 +1517,70 @@ impl StreamManagerContext {
 
                                     // Fire-and-forget: don't block continuation on LLM call.
                                     let mut session_state = self.session_state;
+                                    let planner_state = self.planner_state;
                                     dioxus::prelude::spawn(async move {
-                                        match connector.summarize_conversation(prev_summary, recent).await {
+                                        match connector
+                                            .summarize_conversation(prev_summary, recent)
+                                            .await
+                                        {
                                             Ok(summary_json) => {
-                                                if let Ok(summary) = serde_json::from_value::<crate::session::ConversationSummary>(summary_json) {
+                                                if let Ok(summary) = serde_json::from_value::<
+                                                    crate::session::ConversationSummary,
+                                                >(
+                                                    summary_json
+                                                ) {
                                                     tracing::info!(session_id = %session_id_clone, "Proactive summary updated (background)");
-                                                    let mut state = session_state.write();
-                                                    if let Some(session) = state.sessions.get_mut(&session_id_clone) {
-                                                        session.active_context.conversation_summary = summary;
+                                                    let summary_value =
+                                                        serde_json::to_value(&summary)
+                                                            .unwrap_or(serde_json::Value::Null);
+                                                    // Tab identity (emoji/topic) rides the same
+                                                    // background summary — no extra LLM call.
+                                                    // See `apply_tab_identity_from_summary`'s
+                                                    // doc comment: every caller that computes a
+                                                    // ConversationSummary must call this, or a
+                                                    // tab's emoji/topic silently never gets set.
+                                                    let tab_titled = {
+                                                        let mut state = session_state.write();
+                                                        state
+                                                            .sessions
+                                                            .get_mut(&session_id_clone)
+                                                            .and_then(|session| {
+                                                                let titled = crate::session::apply_tab_identity_from_summary(
+                                                                    session, &summary,
+                                                                );
+                                                                session
+                                                                    .active_context
+                                                                    .conversation_summary = summary;
+                                                                titled
+                                                            })
+                                                    };
+                                                    log_event(
+                                                        &session_id_clone,
+                                                        SessionEvent::SummaryComputed {
+                                                            summary: summary_value,
+                                                        },
+                                                    );
+                                                    if let Some((emoji, title)) = tab_titled {
+                                                        log_event(
+                                                            &session_id_clone,
+                                                            SessionEvent::TabTitled {
+                                                                emoji,
+                                                                title,
+                                                            },
+                                                        );
                                                     }
+                                                    // Fresh summary → maybe auto-tag the
+                                                    // session to a planner project.
+                                                    crate::services::project_tagger::maybe_auto_tag(
+                                                        &session_id_clone,
+                                                        session_state,
+                                                        planner_state,
+                                                    );
                                                 }
                                             }
-                                            Err(e) => tracing::warn!(session_id = %session_id_clone, "Proactive summarization failed: {}", e),
+                                            Err(e) => {
+                                                tracing::warn!(session_id = %session_id_clone, "Proactive summarization failed: {}", e)
+                                            }
                                         }
                                         summarizing_sessions.write().remove(&session_id_clone);
                                     });
@@ -1315,42 +1594,81 @@ impl StreamManagerContext {
 
                 // Check turn limit BEFORE triggering continuation.
                 // Without this gate the AI continuation loop runs indefinitely.
-                let turn_count = self.session_state.read().sessions.get(&session_id)
-                    .map(|s| s.current_ai_turn_count).unwrap_or(0);
-                if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
+                let turn_count = self
+                    .session_state
+                    .read()
+                    .sessions
+                    .get(&session_id)
+                    .map(|s| s.current_ai_turn_count)
+                    .unwrap_or(0);
+                if self
+                    .permission_manager
+                    .read()
+                    .is_turn_limit_reached_for(turn_count)
+                {
                     let max_turns = self.settings.read().permission_settings.max_ai_turns;
-                    tracing::info!(session_id, "Turn limit reached ({} turns). Halting continuation.", max_turns);
+                    tracing::info!(
+                        session_id,
+                        "Turn limit reached ({} turns). Halting continuation.",
+                        max_turns
+                    );
                     let warning_msg = format!(
                         "Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.",
                         max_turns
                     );
-                    let mut state = self.session_state.write();
-                    if let Some(session) = state.sessions.get_mut(&session_id) {
-                        session.messages.push(crate::components::chat::Message {
-                            id: Uuid::new_v4(),
-                            author: "Hobbes".to_string(),
-                            content: crate::components::shared::MessageContent::Text {
-                                content: warning_msg,
-                                thought_signature: None,
-                                thought_summary: None,
-                            },
-                            attachments: Vec::new(),
-                            comments: Vec::new(),
-                            created_at: chrono::Utc::now(),
-                            usage: None,
-                        });
+                    let warning_message = crate::components::chat::Message {
+                        id: Uuid::new_v4(),
+                        author: "Hobbes".to_string(),
+                        content: crate::components::shared::MessageContent::Text {
+                            content: warning_msg,
+                            thought_signature: None,
+                            thought_summary: None,
+                            signature_provider: None,
+                        },
+                        attachments: Vec::new(),
+                        comments: Vec::new(),
+                        created_at: chrono::Utc::now(),
+                        usage: None,
+                    };
+                    {
+                        let mut state = self.session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&session_id) {
+                            session.messages.push(warning_message.clone());
+                        }
                     }
+                    log_event(
+                        &session_id,
+                        SessionEvent::AssistantMessage {
+                            message: warning_message,
+                        },
+                    );
                     return; // Stop — user must send a message to reset and continue.
                 }
 
-                self.continuation_controller.write().trigger_continuation(session_id.clone());
+                // Agent time: a chat whose lease was closed (paused, stopped,
+                // over budget) mid-round must not loop back into the model.
+                if crate::agent_time_runtime::continuation_blocked(
+                    &self.planner_state.peek(),
+                    &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                    &session_id,
+                ) {
+                    tracing::info!(session_id, "Continuation skipped: agent time has ended in this chat.");
+                    return;
+                }
+
+                self.continuation_controller
+                    .write()
+                    .trigger_continuation(session_id.clone());
                 return; // End this stream task. The continuation will start a new one.
             }
 
             // If we reach here, it means tool_call_count was 0.
             // Before finalizing the turn, check for watch word matches
             // that indicate the model stalled mid-response (OpenAI-compat only).
-            if self.check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id).await {
+            if self
+                .check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id)
+                .await
+            {
                 return; // Watch word recovery triggered continuation — end this stream task.
             }
 
@@ -1361,8 +1679,13 @@ impl StreamManagerContext {
                 if let Some(recovery_config) = self.watch_word_config(&session_id) {
                     let max_recoveries = recovery_config.max_watch_word_recoveries;
 
-                    let recovery_count = self.session_state.read().sessions.get(&session_id)
-                        .map(|s| s.watch_word_recovery_count).unwrap_or(0);
+                    let recovery_count = self
+                        .session_state
+                        .read()
+                        .sessions
+                        .get(&session_id)
+                        .map(|s| s.watch_word_recovery_count)
+                        .unwrap_or(0);
 
                     if recovery_count < max_recoveries {
                         tracing::info!(
@@ -1377,42 +1700,76 @@ impl StreamManagerContext {
                              The connection to the model was interrupted. Please continue where you left off and complete the task.".to_string();
 
                         {
-                            let mut state = self.session_state.write();
-                            if let Some(session) = state.sessions.get_mut(&session_id) {
-                                session.watch_word_recovery_count += 1;
-                                session.messages.push(crate::components::chat::Message {
-                                    id: Uuid::new_v4(),
-                                    author: "User".to_string(),
-                                    content: crate::components::shared::MessageContent::Text {
-                                        content: recovery_text,
-                                        thought_signature: None,
-                                        thought_summary: None,
-                                    },
-                                    attachments: Vec::new(),
-                                    comments: Vec::new(),
-                                    created_at: chrono::Utc::now(),
-                                    usage: None,
-                                });
-                                session.increment_turn_count();
+                            let recovery_message = crate::components::chat::Message {
+                                id: Uuid::new_v4(),
+                                author: "User".to_string(),
+                                content: crate::components::shared::MessageContent::Text {
+                                    content: recovery_text,
+                                    thought_signature: None,
+                                    thought_summary: None,
+                                    signature_provider: None,
+                                },
+                                attachments: Vec::new(),
+                                comments: Vec::new(),
+                                created_at: chrono::Utc::now(),
+                                usage: None,
+                            };
+                            {
+                                let mut state = self.session_state.write();
+                                if let Some(session) = state.sessions.get_mut(&session_id) {
+                                    session.watch_word_recovery_count += 1;
+                                    session.messages.push(recovery_message.clone());
+                                    session.increment_turn_count();
+                                }
                             }
+                            log_event(
+                                &session_id,
+                                SessionEvent::UserMessage {
+                                    message: recovery_message,
+                                },
+                            );
                         }
 
                         // Check turn limit before triggering continuation
-                        let turn_count = self.session_state.read().sessions.get(&session_id)
-                            .map(|s| s.current_ai_turn_count).unwrap_or(0);
-                        if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
-                            tracing::info!(session_id, "Stream error recovery halted: turn limit reached.");
+                        let turn_count = self
+                            .session_state
+                            .read()
+                            .sessions
+                            .get(&session_id)
+                            .map(|s| s.current_ai_turn_count)
+                            .unwrap_or(0);
+                        if self
+                            .permission_manager
+                            .read()
+                            .is_turn_limit_reached_for(turn_count)
+                        {
+                            tracing::info!(
+                                session_id,
+                                "Stream error recovery halted: turn limit reached."
+                            );
                         } else {
                             // Clean up current stream state before triggering retry.
                             self.active_stream_handles.write().remove(&message_id);
                             self.content_generated.write().remove(&message_id);
+                            self.stream_receivers.write().remove(&message_id);
                             self.stream_session_map.write().remove(&message_id);
-                            crate::session::SessionState::save_async(&self.session_state.read(), None);
+                            crate::session::SessionState::save_async(
+                                &self.session_state.read(),
+                                None,
+                            );
                             on_complete();
                             self.streaming_sessions.write().remove(&session_id);
                             *self.stream_activity.write() += 1;
 
-                            self.continuation_controller.write().trigger_continuation(session_id.clone());
+                            if !crate::agent_time_runtime::continuation_blocked(
+                                &self.planner_state.peek(),
+                                &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                                &session_id,
+                            ) {
+                                self.continuation_controller
+                                    .write()
+                                    .trigger_continuation(session_id.clone());
+                            }
                             return; // End this stream task. Continuation will retry.
                         }
                     } else {
@@ -1426,31 +1783,63 @@ impl StreamManagerContext {
             }
 
             // The turn is truly over — no tool calls, no watch word recovery, no error recovery.
-            tracing::info!(message_id = %message_id, "LLM stream COMPLETE.");
+            // This is the single INFO line per turn (model + token counts),
+            // emitted once usage is known, below.
+            tracing::debug!(message_id = %message_id, "LLM stream COMPLETE.");
+            let mut turn_usage_logged = false;
 
             // Record usage to the standalone usage log (audit ledger).
             // This captures the final usage data for the turn, avoiding the
             // double-counting that would occur if we recorded on every SSE chunk.
             {
                 let state = self.session_state.read();
-                if let Some(msg) = state.sessions.get(&session_id)
+                if let Some(msg) = state
+                    .sessions
+                    .get(&session_id)
                     .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
                 {
                     if let Some(usage) = &msg.usage {
                         let model = self.effective_model(&session_id);
-                        self.usage_log.write().record(crate::usage_log::UsageLogEntry {
-                            timestamp: chrono::Utc::now(),
-                            session_id: session_id.clone(),
+                        tracing::info!(
+                            message_id = %message_id,
+                            "Turn complete: model={} prompt={} completion={} thoughts={:?} cached={:?} cache_write={:?} total={}",
                             model,
-                            prompt_tokens: usage.prompt_tokens,
-                            completion_tokens: usage.completion_tokens,
-                            total_tokens: usage.total_tokens,
-                            thoughts_tokens: usage.thoughts_tokens,
-                            cached_content_tokens: usage.cached_content_tokens,
-                            cost: usage.cost,
-                        });
+                            usage.prompt_tokens,
+                            usage.completion_tokens,
+                            usage.thoughts_tokens,
+                            usage.cached_content_tokens,
+                            usage.cache_creation_tokens,
+                            usage.total_tokens
+                        );
+                        turn_usage_logged = true;
+                        self.usage_log
+                            .write()
+                            .record(crate::usage_log::UsageLogEntry {
+                                timestamp: chrono::Utc::now(),
+                                session_id: session_id.clone(),
+                                model,
+                                prompt_tokens: usage.prompt_tokens,
+                                completion_tokens: usage.completion_tokens,
+                                total_tokens: usage.total_tokens,
+                                thoughts_tokens: usage.thoughts_tokens,
+                                cached_content_tokens: usage.cached_content_tokens,
+                                cache_creation_tokens: usage.cache_creation_tokens,
+                                cost: usage.cost,
+                                kind: crate::usage_log::UsageKind::Turn,
+                                cache: crate::llm::claude::keepalive::take_turn_telemetry(
+                                    &session_id,
+                                ),
+                            });
                     }
                 }
+            }
+
+            if !turn_usage_logged {
+                tracing::info!(
+                    message_id = %message_id,
+                    "Turn complete: model={} (no usage reported)",
+                    self.effective_model(&session_id)
+                );
             }
 
             {
@@ -1475,17 +1864,29 @@ impl StreamManagerContext {
             // become historical. Fire-and-forget; never blocks turn completion.
             self.spawn_tool_result_summaries(&session_id, &settings);
 
+            // Agent time: the model stopped (no tool calls left), so nothing
+            // drives it further — the run is over; close the lease.
+            crate::agent_time_runtime::on_turn_complete(
+                self.planner_state,
+                self.session_state,
+                &session_id,
+            );
+
             on_complete();
             self.streaming_sessions.write().remove(&session_id);
             *self.stream_activity.write() += 1; // Notify TabBar: stream ended
             self.scheduler.send(SchedulerSignal::Activity);
-            tracing::info!(message_id = %message_id, "Completion signal SENT.");
+            self.fleet_report(
+                &session_id,
+                crate::fleet::bridge::HobbesSignal::TurnCompleted,
+            );
+            tracing::debug!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
             self.active_stream_handles.write().remove(&message_id);
             self.content_generated.write().remove(&message_id); // Cleanup
             self.stream_session_map.write().remove(&message_id);
-            tracing::info!(message_id = %message_id, "Active stream handle removed.");
+            tracing::debug!(message_id = %message_id, "Active stream handle removed.");
         });
 
         // Store the handle so we can abort it if needed
@@ -1500,11 +1901,7 @@ impl StreamManagerContext {
     /// the facts in context. The size threshold is the provider's historical
     /// per-result budget, so on a large window (where results stay full anyway)
     /// few or no summaries are generated and no tokens are wasted.
-    fn spawn_tool_result_summaries(
-        &self,
-        session_id: &str,
-        settings: &crate::settings::Settings,
-    ) {
+    fn spawn_tool_result_summaries(&self, session_id: &str, settings: &crate::settings::Settings) {
         let pending = {
             let state = self.session_state.read();
             let Some(session) = state.sessions.get(session_id) else {
@@ -1613,8 +2010,13 @@ impl StreamManagerContext {
             return false;
         }
 
-        let recovery_count = self.session_state.read().sessions.get(session_id)
-            .map(|s| s.watch_word_recovery_count).unwrap_or(0);
+        let recovery_count = self
+            .session_state
+            .read()
+            .sessions
+            .get(session_id)
+            .map(|s| s.watch_word_recovery_count)
+            .unwrap_or(0);
 
         if recovery_count >= max_recoveries {
             if watch_words.iter().any(|ww| ww.matches(final_text)) {
@@ -1672,6 +2074,7 @@ impl StreamManagerContext {
                         content: recovery_text,
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: Vec::new(),
                     comments: Vec::new(),
@@ -1683,10 +2086,30 @@ impl StreamManagerContext {
         }
 
         // Check turn limit before triggering continuation
-        let turn_count = self.session_state.read().sessions.get(session_id)
-            .map(|s| s.current_ai_turn_count).unwrap_or(0);
-        if self.permission_manager.read().is_turn_limit_reached_for(turn_count) {
-            tracing::info!(session_id, "Watch word recovery halted: turn limit reached.");
+        let turn_count = self
+            .session_state
+            .read()
+            .sessions
+            .get(session_id)
+            .map(|s| s.current_ai_turn_count)
+            .unwrap_or(0);
+        if self
+            .permission_manager
+            .read()
+            .is_turn_limit_reached_for(turn_count)
+        {
+            tracing::info!(
+                session_id,
+                "Watch word recovery halted: turn limit reached."
+            );
+            return false;
+        }
+        // Agent time ended in this chat: no recovery turn.
+        if crate::agent_time_runtime::continuation_blocked(
+            &self.planner_state.peek(),
+            &crate::agent_time_runtime::LEASED_CHATS.peek(),
+            session_id,
+        ) {
             return false;
         }
 
@@ -1698,7 +2121,9 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1;
 
-        self.continuation_controller.write().trigger_continuation(session_id.to_string());
+        self.continuation_controller
+            .write()
+            .trigger_continuation(session_id.to_string());
         true
     }
 
@@ -1718,14 +2143,18 @@ impl StreamManagerContext {
         //    The model may have already produced useful text/thinking content
         //    that the user wants to keep. Only remove orphaned Running tool
         //    call messages (they have no results and break the next prompt).
-        {
+        let (partial_message, removed_message_ids, stopped_calls) = {
             let mut state = self.session_state.write();
 
             // Check if the AI message has any content worth preserving.
-            let has_content = state.sessions.get(session_id)
+            let has_content = state
+                .sessions
+                .get(session_id)
                 .and_then(|s| s.messages.iter().find(|m| m.id == *message_id))
                 .map(|msg| {
-                    if let crate::components::shared::MessageContent::Text { content, .. } = &msg.content {
+                    if let crate::components::shared::MessageContent::Text { content, .. } =
+                        &msg.content
+                    {
                         !content.trim().is_empty()
                     } else {
                         false
@@ -1735,18 +2164,34 @@ impl StreamManagerContext {
 
             if !has_content {
                 // No content was generated — remove the empty placeholder.
+                // (Never journaled: streaming placeholders don't hit the log.)
                 state.remove_message_in_session(session_id, message_id);
             }
 
-            // Trim trailing orphaned Running tool calls
+            // Snapshot the preserved partial for the journal — end-of-turn
+            // finalization will never run for this turn, so StreamCancelled is
+            // the only event carrying the partial text.
+            let partial_message = if has_content {
+                state
+                    .sessions
+                    .get(session_id)
+                    .and_then(|s| s.messages.iter().find(|m| m.id == *message_id))
+                    .cloned()
+            } else {
+                None
+            };
+
+            // Trim trailing orphaned Running tool calls. Their ToolCall events
+            // WERE journaled at dispatch — record the removals so replay drops
+            // them too.
+            let mut removed_message_ids: Vec<Uuid> = Vec::new();
             if let Some(session) = state.sessions.get_mut(session_id) {
-                let mut removed_count = 0;
                 while let Some(last) = session.messages.last() {
                     if let crate::components::shared::MessageContent::ToolCall(tc) = &last.content {
                         if tc.status == crate::components::shared::ToolCallStatus::Running {
                             let orphan_id = last.id;
                             session.messages.pop();
-                            removed_count += 1;
+                            removed_message_ids.push(orphan_id);
                             tracing::info!(
                                 message_id = %orphan_id,
                                 "Removed orphaned Running tool call after cancel."
@@ -1756,18 +2201,57 @@ impl StreamManagerContext {
                     }
                     break;
                 }
-                if removed_count > 0 {
+                if !removed_message_ids.is_empty() {
+                    session.prune_orphaned_ledger();
                     tracing::info!(
                         "Removed {} orphaned Running tool call(s) after stream cancellation.",
-                        removed_count
+                        removed_message_ids.len()
                     );
                 }
             }
 
+            // Calls still running earlier in the turn (a parallel call that
+            // never returned) were cut off too: end them, marked as stopped,
+            // so the activity stream says "cancelled" for these and only these.
+            let stopped_calls = state
+                .sessions
+                .get_mut(session_id)
+                .map(|s| {
+                    s.cancel_running_calls(
+                        crate::components::shared::CANCELLED_BY_STOP,
+                        chrono::Utc::now(),
+                    )
+                })
+                .unwrap_or_default();
+
             // Clear stale tool_call_history from the cancelled turn so the
             // next prompt doesn't include CRITICAL RECOVERY INSTRUCTION or
-            // stale tool context.
-            state.tool_call_history.clear();
+            // stale tool context. Scoped to the cancelled stream's session so
+            // a concurrently streaming tab keeps its in-flight history.
+            if let Some(session) = state.sessions.get_mut(session_id) {
+                session.tool_call_history.clear();
+            }
+
+            (partial_message, removed_message_ids, stopped_calls)
+        };
+
+        if partial_message.is_some() || !removed_message_ids.is_empty() {
+            log_event(
+                session_id,
+                SessionEvent::StreamCancelled {
+                    partial_message,
+                    removed_message_ids,
+                },
+            );
+        }
+        if !stopped_calls.is_empty() {
+            log_events(
+                session_id,
+                stopped_calls
+                    .into_iter()
+                    .map(|message| SessionEvent::ToolResult { message })
+                    .collect(),
+            );
         }
 
         // 3. Remove the stream receiver
@@ -1780,6 +2264,10 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1; // Notify TabBar: stream cancelled
         self.stream_session_map.write().remove(message_id);
+        self.fleet_report(
+            session_id,
+            crate::fleet::bridge::HobbesSignal::TurnCompleted,
+        );
         tracing::info!(message_id = %message_id, "Stream cancellation process complete.");
     }
 
@@ -1821,6 +2309,9 @@ pub fn StreamManager(props: StreamManagerProps) -> Element {
         permission_manager,
         skill_registry: consume_context::<Signal<crate::skills::SkillRegistry>>(),
         mcp_context: consume_context::<Signal<crate::mcp::manager::McpContext>>(),
+        planner_state: consume_context::<Signal<crate::todo::PlannerState>>(),
+        chat_command: consume_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>(
+        ),
         stream_activity: Signal::new(0),
         streaming_sessions: Signal::new(HashSet::new()),
         stream_session_map: Signal::new(HashMap::new()),
@@ -1844,6 +2335,158 @@ mod tests {
     use crate::settings::Settings;
     use dioxus_signals::Signal;
     use std::path::PathBuf;
+
+    /// Build the message pair a turn starts with: the user prompt and the
+    /// assistant placeholder that the stream writes into.
+    fn seeded_session(state: &mut SessionState) -> (String, Uuid) {
+        let session_id = state.create_session_raw(None);
+        let placeholder_id = Uuid::new_v4();
+        let session = state.sessions.get_mut(&session_id).unwrap();
+        let t0 = chrono::Utc::now() - chrono::Duration::seconds(30);
+        session.messages.push(crate::components::chat::Message {
+            id: Uuid::new_v4(),
+            author: "User".to_string(),
+            content: crate::components::shared::MessageContent::Text {
+                content: "what's on today?".to_string(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: t0,
+            usage: None,
+        });
+        session.messages.push(crate::components::chat::Message {
+            id: placeholder_id,
+            author: "Hobbes".to_string(),
+            content: crate::components::shared::MessageContent::Text {
+                content: String::new(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: t0,
+            usage: None,
+        });
+        (session_id, placeholder_id)
+    }
+
+    /// The first tool call of a turn upgrades the turn-start placeholder in
+    /// place. Restamping it at emission is what makes the step's clock real:
+    /// `created_at` is when the stream emitted the call, `completed_at` when
+    /// its result landed — not the turn-start stamp the placeholder carried.
+    #[test]
+    fn tool_call_message_is_stamped_at_emission_not_turn_start() {
+        let mut state = SessionState::default();
+        let (session_id, placeholder_id) = seeded_session(&mut state);
+        let turn_start = state.sessions[&session_id].messages[1].created_at;
+
+        // Emission: the placeholder becomes the call, stamped now.
+        let emitted_at = {
+            let session = state.sessions.get_mut(&session_id).unwrap();
+            if let Some(msg) = session.messages.iter_mut().find(|m| m.id == placeholder_id) {
+                msg.content = crate::components::shared::MessageContent::ToolCall(
+                    crate::components::shared::ToolCall::new(
+                        "hobbes-terminal".to_string(),
+                        "HOBBES_TERMINAL_EXEC".to_string(),
+                        serde_json::json!({ "command": "date" }),
+                        None,
+                        None,
+                    ),
+                );
+            }
+            session
+                .restamp_message(&placeholder_id, chrono::Utc::now())
+                .expect("placeholder is in the vec")
+        };
+        assert!(
+            emitted_at > turn_start,
+            "the call must be stamped at emission, not at turn start"
+        );
+
+        // Result: completion stamps the call, strictly after its start.
+        let completed_at = chrono::Utc::now() + chrono::Duration::seconds(2);
+        if let Some(msg) = state.get_message_mut_in_session(&session_id, &placeholder_id) {
+            if let crate::components::shared::MessageContent::ToolCall(tc) = &mut msg.content {
+                tc.status = crate::components::shared::ToolCallStatus::Completed;
+                tc.response = "Mon 15 Sep".to_string();
+                tc.completed_at = Some(completed_at);
+            }
+        }
+
+        let msg = &state.sessions[&session_id].messages[1];
+        assert_eq!(msg.created_at, emitted_at);
+        let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content else {
+            panic!("placeholder should have been upgraded to a tool call");
+        };
+        assert_eq!(
+            (tc.completed_at.unwrap() - msg.created_at).num_seconds(),
+            2,
+            "duration must be measured from emission"
+        );
+        // Ordering invariant: the vec stays created_at-monotonic.
+        let stamps: Vec<_> = state.sessions[&session_id]
+            .messages
+            .iter()
+            .map(|m| m.created_at)
+            .collect();
+        assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    /// A turn that streams prose *and* a tool call: the reply is finalized
+    /// into the turn-start placeholder, which must end up after the call it
+    /// preceded — vec order and `created_at` moving together.
+    #[test]
+    fn finalized_reply_moves_past_the_turn_s_tool_calls() {
+        let mut state = SessionState::default();
+        let (session_id, placeholder_id) = seeded_session(&mut state);
+        let session = state.sessions.get_mut(&session_id).unwrap();
+
+        // A later tool call gets its own message (the placeholder already holds text).
+        let call_id = Uuid::new_v4();
+        session.messages.push(crate::components::chat::Message {
+            id: call_id,
+            author: "Hobbes".to_string(),
+            content: crate::components::shared::MessageContent::ToolCall(
+                crate::components::shared::ToolCall::new(
+                    "hobbes-terminal".to_string(),
+                    "HOBBES_TERMINAL_EXEC".to_string(),
+                    serde_json::json!({ "command": "date" }),
+                    None,
+                    None,
+                ),
+            ),
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        });
+
+        // Finalization: write the prose, then move it past the turn's calls.
+        if let Some(msg) = session.messages.iter_mut().find(|m| m.id == placeholder_id) {
+            if let crate::components::shared::MessageContent::Text { content, .. } =
+                &mut msg.content
+            {
+                *content = "You have three things today.".to_string();
+            }
+        }
+        let moved = session
+            .move_message_to_end(&placeholder_id, chrono::Utc::now())
+            .expect("placeholder is in the vec");
+
+        let ids: Vec<_> = session.messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids[1], call_id, "the tool call now precedes the reply");
+        assert_eq!(ids[2], placeholder_id);
+        assert!(moved.created_at >= session.messages[1].created_at);
+        let stamps: Vec<_> = session.messages.iter().map(|m| m.created_at).collect();
+        assert!(
+            stamps.windows(2).all(|w| w[0] <= w[1]),
+            "vec order must stay created_at-monotonic"
+        );
+    }
 
     #[tokio::test]
     async fn test_stream_registration_and_deregistration() {
@@ -1870,6 +2513,7 @@ mod tests {
             });
             let scheduler = use_coroutine(|_| async {});
             let mut stream_manager = use_context_provider(|| StreamManagerContext {
+                chat_command: Signal::new(None),
                 stream_receivers: Signal::new(HashMap::new()),
                 active_stream_handles: Signal::new(HashMap::new()),
                 llm_connector,
@@ -1885,6 +2529,7 @@ mod tests {
                     servers: Vec::new(),
                     connected_toolkit_slugs: Vec::new(),
                 }),
+                planner_state: Signal::new(crate::todo::PlannerState::default()),
                 stream_activity: Signal::new(0),
                 streaming_sessions: Signal::new(HashSet::new()),
                 stream_session_map: Signal::new(HashMap::new()),
@@ -1919,7 +2564,7 @@ mod tests {
             rsx! { div {} }
         });
 
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
         dom.wait_for_suspense().await;
     }
 
@@ -1948,6 +2593,7 @@ mod tests {
             });
             let scheduler = use_coroutine(|_| async {});
             let stream_manager = use_context_provider(|| StreamManagerContext {
+                chat_command: Signal::new(None),
                 stream_receivers: Signal::new(HashMap::new()),
                 active_stream_handles: Signal::new(HashMap::new()),
                 llm_connector,
@@ -1963,6 +2609,7 @@ mod tests {
                     servers: Vec::new(),
                     connected_toolkit_slugs: Vec::new(),
                 }),
+                planner_state: Signal::new(crate::todo::PlannerState::default()),
                 stream_activity: Signal::new(0),
                 streaming_sessions: Signal::new(HashSet::new()),
                 stream_session_map: Signal::new(HashMap::new()),
@@ -1981,7 +2628,100 @@ mod tests {
             rsx! { div {} }
         });
 
-        dom.rebuild_in_place();
+        crate::test_support::rebuild_or_fail(&mut dom);
+        dom.wait_for_suspense().await;
+    }
+
+    /// `resolved_provider` is the exact lookup `start_stream` uses to derive
+    /// `stream_provider`, which is then stamped onto assembled `MessageContent::Text`
+    /// / `ToolCall` values as `signature_provider` (see the `StreamMessage::Text`
+    /// and `StreamMessage::ToolCall(..)` arms in `start_stream`'s master task).
+    /// There is no existing harness for driving a fabricated LLM stream through
+    /// `start_stream` itself (it spawns a real `LlmConnector::generate_content_stream`
+    /// call with no seam for injecting fake `StreamMessage`s), so this test instead
+    /// pins down the provider-resolution step that feeds the stamp: a session
+    /// pinned to a Claude connector instance must resolve to `LlmProvider::Claude`,
+    /// not the global default.
+    #[tokio::test]
+    async fn test_resolved_provider_uses_session_pinned_connector() {
+        let mut dom = VirtualDom::new(|| {
+            let mut settings_val = Settings::default();
+            let claude_id = settings_val
+                .add_connector(
+                    "My Claude",
+                    crate::settings::ProviderInstanceConfig::Claude(
+                        crate::settings::ClaudeConfig::default(),
+                    ),
+                )
+                .expect("add_connector should succeed");
+
+            let mut session_state_val = SessionState::new();
+            let session_id = session_state_val.create_session_raw(None);
+            if let Some(session) = session_state_val.sessions.get_mut(&session_id) {
+                session.llm_connector_id = Some(claude_id.clone());
+            }
+
+            let session_state = use_context_provider(|| Signal::new(session_state_val));
+            let settings = use_context_provider(|| Signal::new(settings_val));
+            let permission_manager =
+                use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
+            let mcp_manager = use_context_provider(|| {
+                Signal::new(McpManager::new(
+                    PathBuf::new(),
+                    permission_manager,
+                    secret_manager,
+                    settings,
+                ))
+            });
+            let continuation_controller =
+                use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| {
+                Signal::new(Arc::new(crate::llm::GeminiConnector::new(
+                    settings.read().gemini_config.clone(),
+                )) as Arc<dyn crate::llm::LlmConnector>)
+            });
+            let scheduler = use_coroutine(|_| async {});
+            let stream_manager = use_context_provider(|| StreamManagerContext {
+                chat_command: Signal::new(None),
+                stream_receivers: Signal::new(HashMap::new()),
+                active_stream_handles: Signal::new(HashMap::new()),
+                llm_connector,
+                session_state,
+                mcp_manager,
+                tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+                settings,
+                continuation_controller,
+                scheduler,
+                permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
+                planner_state: Signal::new(crate::todo::PlannerState::default()),
+                stream_activity: Signal::new(0),
+                streaming_sessions: Signal::new(HashSet::new()),
+                stream_session_map: Signal::new(HashMap::new()),
+                content_generated: Signal::new(HashSet::new()),
+                save_error_signal: Signal::new(None),
+                usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+                summarizing_sessions: Signal::new(HashSet::new()),
+            });
+
+            // Global default is Gemini (Settings::default()), but the session is
+            // pinned to the Claude connector instance — resolution must follow
+            // the pin, not the global default, or a mid-chat switch would stamp
+            // the wrong provider on the signature.
+            assert_eq!(
+                stream_manager.resolved_provider(&session_id),
+                crate::settings::LlmProvider::Claude
+            );
+
+            rsx! { div {} }
+        });
+
+        crate::test_support::rebuild_or_fail(&mut dom);
         dom.wait_for_suspense().await;
     }
 }
@@ -1990,8 +2730,8 @@ mod tests {
 // Image caching helper
 // ============================================================================
 
-/// Decode a base64 image blob from an MCP tool result, resize it to at most
-/// 768 px tall (preserving aspect ratio), re-encode as JPEG, persist to the
+/// Decode a base64 image blob from an MCP tool result, fit it to
+/// `chat_input::MAX_ATTACHMENT_EDGE` on the long edge (preserving aspect ratio), re-encode as JPEG, persist to the
 /// same `generated_images/` directory used by `image_client.rs`, and return
 /// the saved path.
 ///
@@ -2005,17 +2745,13 @@ async fn save_tool_image(data_b64: &str, _mime_type: &str) -> Option<std::path::
 
     // Resize on a blocking thread so we don't stall the async executor.
     let resized_bytes = tokio::task::spawn_blocking(move || {
-        use image::imageops::FilterType;
         use image::ImageFormat;
 
         let img = image::load_from_memory(&bytes).ok()?;
 
-        // Cap at 768 px tall; scale width proportionally.
-        let resized = if img.height() > 768 {
-            img.resize(u32::MAX, 768, FilterType::Lanczos3)
-        } else {
-            img
-        };
+        // Same long-edge cap as attachments: a 768px-tall cap made wide
+        // desktop screenshots too blurry for the model to read.
+        let resized = crate::components::chat_input::fit_attachment(img);
 
         let mut buf = std::io::Cursor::new(Vec::new());
         resized.write_to(&mut buf, ImageFormat::Jpeg).ok()?;

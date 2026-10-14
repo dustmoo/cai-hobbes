@@ -199,55 +199,55 @@ body {
     margin: 20px 0px 0px auto;
 }
 
-/* Toggle Switch Component */
+/* Toggle Switch Component — geometry/colors match the `Toggle` rsx component
+   (settings_panel.rs) so pre-existing `.toggle-switch` markup renders
+   identically. Uses theme vars so `.light` picks up equivalent values
+   automatically (see Theme Variables block above). */
 .toggle-switch {
-    width: 2.75rem;
-    /* 44px = w-11 */
-    height: 1.5rem;
-    /* 24px = h-6 */
-    background-color: #4b5563;
-    /* bg-gray-600 */
+    width: 34px;
+    height: 18px;
+    background-color: var(--color-bg-card);
+    border: 1px solid var(--color-border-muted);
     border-radius: 9999px;
     position: relative;
     cursor: pointer;
-    transition: background-color 0.2s;
+    transition: background-color 0.2s, border-color 0.2s;
+    box-sizing: border-box;
 }
 
 .toggle-switch::after {
     content: '';
     position: absolute;
-    top: 2px;
-    left: 2px;
-    width: 1.25rem;
-    /* 20px = h-5 w-5 */
-    height: 1.25rem;
-    background-color: white;
-    border: 1px solid #d1d5db;
+    top: 1px;
+    left: 1px;
+    width: 14px;
+    height: 14px;
+    background-color: var(--color-text-primary);
     border-radius: 9999px;
-    transition: transform 0.2s;
+    transition: left 0.2s, top 0.2s;
 }
 
 .toggle-switch.active {
-    background-color: #3B5998;
-    /* primary-500 */
+    background-color: var(--color-btn-primary-hover);
+    border-color: var(--color-btn-primary-hover);
 }
 
 .toggle-switch.active::after {
-    transform: translateX(100%);
-    border-color: white;
+    top: 2px;
+    left: 18px;
 }
 
-/* Small toggle variant for granular settings */
+/* Small toggle variant for granular settings — 28x15 */
 .toggle-switch-sm {
-    width: 2.25rem;
-    /* 36px = w-9 */
-    height: 1.25rem;
-    /* 20px = h-5 */
-    background-color: #4b5563;
+    width: 28px;
+    height: 15px;
+    background-color: var(--color-bg-card);
+    border: 1px solid var(--color-border-muted);
     border-radius: 9999px;
     position: relative;
     cursor: pointer;
-    transition: background-color 0.2s;
+    transition: background-color 0.2s, border-color 0.2s;
+    box-sizing: border-box;
 }
 
 .toggle-switch-sm::after {
@@ -255,23 +255,20 @@ body {
     position: absolute;
     top: 2px;
     left: 2px;
-    width: 1rem;
-    /* 16px = h-4 w-4 */
-    height: 1rem;
-    background-color: white;
-    border: 1px solid #d1d5db;
+    width: 11px;
+    height: 11px;
+    background-color: var(--color-text-primary);
     border-radius: 9999px;
-    transition: transform 0.2s;
+    transition: left 0.2s;
 }
 
 .toggle-switch-sm.active {
-    background-color: #5B86C1;
-    /* primary-400 */
+    background-color: var(--color-btn-primary-hover);
+    border-color: var(--color-btn-primary-hover);
 }
 
 .toggle-switch-sm.active::after {
-    transform: translateX(100%);
-    border-color: white;
+    left: 15px;
 }
 
 /* Session Cost Ticker Animation */
@@ -289,4 +286,176 @@ body {
 
 .cost-tick {
     animation: cost-pulse 0.6s ease-out;
+}
+
+/* Mermaid diagram reveal: a plain opacity fade when a rendered SVG replaces
+ * its source-code placeholder (src/components/mermaid.rs). Opacity is
+ * compositor-only — it adds no extra layout pass — so this makes the arrival
+ * read as deliberate without adding to the one unavoidable height jump from
+ * the placeholder's shape to the diagram's. Respects reduced-motion. */
+@keyframes mermaid-reveal-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+.mermaid-reveal {
+    animation: mermaid-reveal-fade 220ms ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+    .mermaid-reveal {
+        animation: none;
+    }
+}
+
+/* Stop-control mascot (src/components/chat_input.rs's `TigerStopMascot`):
+ * the personality comes from real sprite-frame swaps (blink, ear-perk —
+ * see TIGER_GRID_BLINK/TIGER_GRID_EARS_UP in pixel_icons.rs). `.tiger-idle`
+ * is static; `.tiger-pounce` is the one-shot reaction when Stop is clicked.
+ * Both share a fixed transform-origin so they read as weight shifting rather
+ * than spinning in place. */
+.tiger-idle {
+    display: inline-flex;
+    transform-origin: 50% 85%;
+}
+
+@keyframes tiger-pounce-anim {
+    0% {
+        transform: scale(1);
+    }
+    35% {
+        transform: scale(0.78, 1.18) translateY(2px);
+    }
+    65% {
+        transform: scale(1.12, 0.9) translateY(-1px);
+    }
+    100% {
+        transform: scale(1);
+    }
+}
+.tiger-pounce {
+    display: inline-flex;
+    transform-origin: 50% 85%;
+    animation: tiger-pounce-anim 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .tiger-pounce {
+        animation: none;
+    }
+}
+
+/* Empty-chat bubble: the three pixel dots drift up and down in turn, a slow
+ * idle "breathing" rather than the quick pulse of an active typing
+ * indicator. Each dot is staggered by an inline `animation-delay`. */
+@keyframes bubble-typing {
+    0%, 100% {
+        opacity: 0.45;
+    }
+    50% {
+        opacity: 0.9;
+    }
+}
+.bubble-typing-dot {
+    animation: bubble-typing 4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+    .bubble-typing-dot {
+        animation: none;
+    }
+}
+
+/*
+ * Chat tab identity layers (emoji · date · topic) degrade per-tab, based on
+ * that tab's own rendered width — the same idea Chrome/Safari use for their
+ * own tab strips — instead of a single global tier computed from how many
+ * tabs happen to be open. `container-type: inline-size` turns the tab's own
+ * flex-item box into a size query context its own children (.tab-date) can
+ * react to; as flex-shrink narrows one tab because a neighbor opened, only
+ * that tab's own layers drop out, gradually, instead of every open tab
+ * losing its date/topic in the same frame the moment a fixed tab-count
+ * threshold was crossed (the previous behavior — see the removed
+ * `Density`/`tab_density` in tab_bar.rs). The active tab (see tab_bar.rs)
+ * never wears .tab-date at all, so it's exempt from this and always shows
+ * every layer regardless of width.
+ *
+ * The topic itself is never hidden outright (unlike the date) — it always
+ * renders, truncating with an ellipsis via `.tab-topic-track` as its tab
+ * narrows, and the hover marquee below lets a truncated one be read without
+ * needing the tab any wider.
+ */
+.tab-item {
+    container-type: inline-size;
+}
+@container (max-width: 84px) {
+    .tab-item .tab-date {
+        display: none;
+    }
+}
+
+/*
+ * Hover marquee for a tab's date + topic text — they slide as ONE unit
+ * (rather than the topic moving while the date sits frozen next to it).
+ * `--tab-topic-shift` is set per-tab, inline, from the combined text's
+ * character count (tab_bar.rs's `tab_text_marquee_shift_px`) — a cheap
+ * Rust-side estimate rather than a live DOM measurement, so this stays pure
+ * CSS/no document::eval per this codebase's animation convention (see the
+ * tiger sprite animations above). Overshooting the estimate just means a
+ * short label pauses briefly at the fully-scrolled position before
+ * resetting; undershooting would clip real content, so the estimate in
+ * tab_bar.rs is deliberately generous.
+ *
+ * `.tab-topic-track` clips and ellipsizes normally; on hover (after a short
+ * delay via `animation-delay`, so a passing hover doesn't trigger it) the
+ * ellipsis turns off and the inner `.tab-topic-text` (the date+topic row)
+ * slides to reveal the rest, then resets. `.tab-topic-text`'s display is set
+ * here rather than left to its Tailwind `inline-flex` class in tab_bar.rs —
+ * main.css loads after tailwind.css (see main.rs), so a same-specificity
+ * Tailwind utility would otherwise lose to a conflicting rule here; setting
+ * it explicitly keeps this file the single source of truth for the
+ * animated element's box type.
+ */
+.tab-topic-track {
+    display: block;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+.tab-item:hover .tab-topic-track {
+    text-overflow: clip;
+}
+.tab-topic-text {
+    display: inline-flex;
+    align-items: center;
+    white-space: nowrap;
+}
+@keyframes tab-topic-marquee {
+    0%,
+    12% {
+        transform: translateX(0);
+    }
+    88%,
+    100% {
+        transform: translateX(var(--tab-topic-shift, 0px));
+    }
+}
+.tab-item:hover .tab-topic-text {
+    animation: tab-topic-marquee 3.2s ease-in-out 650ms 1 both;
+}
+@media (prefers-reduced-motion: reduce) {
+    .tab-item:hover .tab-topic-text {
+        animation: none;
+    }
+}
+
+/* Planner list-order popover: a 120ms scale-in from its anchor corner. */
+@keyframes planner-pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to { opacity: 1; transform: scale(1); }
+}
+.planner-pop-in {
+  transform-origin: top right;
+  animation: planner-pop-in 120ms cubic-bezier(.2, .7, .2, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  .planner-pop-in { animation: none; }
 }

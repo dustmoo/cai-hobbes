@@ -55,9 +55,10 @@ pub async fn validate_gemini_api_key(api_key: &str) -> Result<(), String> {
     }
 
     let client = Client::new();
-    let url = format!("{}?key={}&pageSize=1", MODELS_API_URL, api_key);
+    // Key goes in the x-goog-api-key header, never the URL.
+    let url = format!("{}?pageSize=1", MODELS_API_URL);
 
-    match client.get(&url).send().await {
+    match crate::llm::gemini::with_gemini_key(client.get(&url), api_key).send().await {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
@@ -69,7 +70,7 @@ pub async fn validate_gemini_api_key(api_key: &str) -> Result<(), String> {
                 Err(format!("API error ({}): {}", status, error_text))
             }
         }
-        Err(e) => Err(format!("Network error: {}", e)),
+        Err(e) => Err(format!("Network error: {}", crate::log_utils::net_err(e))),
     }
 }
 
@@ -100,12 +101,15 @@ pub async fn fetch_gemini_models(
 
     // Fetch all pages of models
     loop {
-        let mut url = format!("{}?key={}", MODELS_API_URL, api_key);
+        let mut url = MODELS_API_URL.to_string();
         if let Some(token) = &page_token {
-            url.push_str(&format!("&pageToken={}", token));
+            url.push_str(&format!("?pageToken={}", token));
         }
 
-        let response = client.get(&url).send().await?;
+        let response = crate::llm::gemini::with_gemini_key(client.get(&url), api_key)
+            .send()
+            .await
+            .map_err(|e| e.without_url())?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -116,7 +120,8 @@ pub async fn fetch_gemini_models(
             )));
         }
 
-        let list_response: ModelsListResponse = response.json().await?;
+        let list_response: ModelsListResponse =
+            response.json().await.map_err(|e| e.without_url())?;
         all_models.extend(list_response.models);
 
         if list_response.next_page_token.is_none() {

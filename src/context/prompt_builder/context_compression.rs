@@ -8,10 +8,19 @@ impl<'a> PromptBuilder<'a> {
     /// 1. Core (never omit): system_persona, user_name, current_time, scratchpad
     /// 2. Skill (compress before omit): loaded_skills instruction_manuals
     /// 3. Context (trim): conversation_summary, entities
-    /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction
+    /// 4. Enrichment (omit first): composio_context, mcp_servers, user_instruction, planner_today
+    ///
+    /// `fixed_text_chars` is the size of the free text rendered around the map
+    /// (persona, turn instructions, block headers). The map is the combined
+    /// SYSTEM_CONTEXT + TURN_CONTEXT content, so the tiers apply across both
+    /// parts. Decisions depend on the total size, which includes volatile
+    /// content: a stable key (composio_context, mcp_servers, user_instruction)
+    /// is dropped only once the total crosses the budget, which changes the
+    /// cached prefix at that point. That is rare (the budget is ~20% of the
+    /// window) and unavoidable without breaking the priority order.
     pub(crate) fn compose_system_for_budget(
         system_context_map: &mut serde_json::Map<String, serde_json::Value>,
-        persona: &str,
+        fixed_text_chars: usize,
         max_context_tokens: Option<usize>,
         tuning: &crate::settings::ResolvedContextTuning,
     ) {
@@ -24,7 +33,7 @@ impl<'a> PromptBuilder<'a> {
         let map_size = serde_json::to_string(&serde_json::Value::Object(system_context_map.clone()))
             .map(|s| s.len())
             .unwrap_or(0);
-        let mut running_size = persona.len() + map_size;
+        let mut running_size = fixed_text_chars + map_size;
 
         if running_size <= system_budget_chars { return; }
 
@@ -34,15 +43,22 @@ impl<'a> PromptBuilder<'a> {
         if let Some(scratch) = system_context_map.get("scratchpad") {
             let scratch_chars = serde_json::to_string(scratch).map(|s| s.len()).unwrap_or(0);
             if scratch_chars > system_budget_chars / 2 {
-                tracing::warn!(
-                    "Scratchpad ({} chars) exceeds 50% of system budget ({} chars). \
-                     Consider calling HOBBES_UPDATE_SCRATCHPAD to condense it.",
-                    scratch_chars, system_budget_chars
-                );
+                if crate::log_utils::first_time("scratchpad_over_half_budget") {
+                    tracing::warn!(
+                        "Scratchpad ({} chars) exceeds 50% of system budget ({} chars). \
+                         Consider calling HOBBES_UPDATE_SCRATCHPAD to condense it.",
+                        scratch_chars, system_budget_chars
+                    );
+                } else {
+                    tracing::debug!(
+                        "Scratchpad ({} chars) exceeds 50% of system budget ({} chars).",
+                        scratch_chars, system_budget_chars
+                    );
+                }
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "System context composition: {} chars vs {} budget ({}K model). Compressing.",
             running_size, system_budget_chars, max_tokens / 1000
         );
@@ -56,8 +72,10 @@ impl<'a> PromptBuilder<'a> {
         // These keys are NEVER removed or modified by any compression tier.
         // scratchpad is the AI's persistent session memory — immune to all compression.
 
-        // Tier 4: Drop enrichment sections
-        for key in ["composio_context", "mcp_servers", "user_instruction"] {
+        // Tier 4: Drop enrichment sections.
+        // planner_today is deliberately last: it is the freshest enrichment
+        // (today's plan) and should outlive the other three under pressure.
+        for key in ["composio_context", "mcp_servers", "user_instruction", "planner_today"] {
             if running_size <= system_budget_chars { return; }
             if let Some(removed) = system_context_map.remove(key) {
                 // Account for key + value + quotes/colon/comma overhead
@@ -135,7 +153,7 @@ impl<'a> PromptBuilder<'a> {
             }
         }
 
-        tracing::info!(
+        tracing::debug!(
             "System context composition complete: ~{} chars (budget: {})",
             running_size, system_budget_chars
         );

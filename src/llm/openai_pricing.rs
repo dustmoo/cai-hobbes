@@ -8,7 +8,8 @@
 //! Prices are USD per 1M tokens. This is a **manually maintained** table that
 //! drifts as OpenAI revises pricing — re-verify against the official page and
 //! bump the date when you touch it (see SYSTEM_PATTERNS P-013).
-//! Last verified: 2026-06-17.
+//! Last verified: 2026-09-17. Added the new gpt-6 flagship tier (`gpt-6-astra`)
+//! and the gpt-5.6 family (`sol`/`terra`/`luna`); confirmed gpt-5.5 unchanged.
 //! Reasoning tokens are billed as output tokens and are already included in the
 //! reported output count, so no special handling is needed. Cached-input
 //! discounts are recorded for reference but not yet applied (our stream parsers
@@ -27,6 +28,16 @@ pub struct OpenAiPrice {
 /// and `gpt-5-mini` are matched before the bare `gpt-5` entry. Matching is by
 /// `starts_with`, which also covers dated snapshots (`gpt-5-2026-…`).
 const PRICES: &[(&str, OpenAiPrice)] = &[
+    // ── gpt-6 family ──────────────────────────────────────────────────
+    ("gpt-6-astra", OpenAiPrice { input_per_1m: 10.0, cached_input_per_1m: 1.0, output_per_1m: 50.0 }),
+    // ── gpt-5.6 family ────────────────────────────────────────────────
+    // Sol's standard rate is $5/$0.50/$30 (same as gpt-5.5); OpenAI is running a
+    // promotional rate of $4/$0.40/$20 through at least 2026-11-21. We record the
+    // current (promotional) rate here — re-check after that date and revert to
+    // standard if the promo has ended.
+    ("gpt-5.6-sol", OpenAiPrice { input_per_1m: 4.0, cached_input_per_1m: 0.40, output_per_1m: 20.0 }),
+    ("gpt-5.6-terra", OpenAiPrice { input_per_1m: 2.0, cached_input_per_1m: 0.20, output_per_1m: 12.0 }),
+    ("gpt-5.6-luna", OpenAiPrice { input_per_1m: 0.20, cached_input_per_1m: 0.02, output_per_1m: 1.20 }),
     // ── gpt-5.5 family ────────────────────────────────────────────────
     ("gpt-5.5-pro", OpenAiPrice { input_per_1m: 30.0, cached_input_per_1m: 30.0, output_per_1m: 180.0 }),
     ("gpt-5.5", OpenAiPrice { input_per_1m: 5.0, cached_input_per_1m: 0.50, output_per_1m: 30.0 }),
@@ -136,6 +147,50 @@ mod tests {
         assert_eq!(rate("o3").output_per_1m, 8.0);
         assert_eq!(rate("o3-mini").output_per_1m, 4.40);
         assert_eq!(rate("o4-mini").output_per_1m, 4.40);
+    }
+
+    #[test]
+    fn gpt6_and_gpt5_6_family_prices_resolve_correctly() {
+        assert_eq!(rate("gpt-6-astra").input_per_1m, 10.0);
+        assert_eq!(rate("gpt-6-astra").cached_input_per_1m, 1.0);
+        assert_eq!(rate("gpt-6-astra").output_per_1m, 50.0);
+
+        assert_eq!(rate("gpt-5.6-sol").input_per_1m, 4.0);
+        assert_eq!(rate("gpt-5.6-sol").cached_input_per_1m, 0.40);
+        assert_eq!(rate("gpt-5.6-sol").output_per_1m, 20.0);
+
+        assert_eq!(rate("gpt-5.6-terra").input_per_1m, 2.0);
+        assert_eq!(rate("gpt-5.6-terra").output_per_1m, 12.0);
+
+        assert_eq!(rate("gpt-5.6-luna").input_per_1m, 0.20);
+        assert_eq!(rate("gpt-5.6-luna").output_per_1m, 1.20);
+
+        // gpt-5.5 is unchanged by the new tiers above it.
+        assert_eq!(rate("gpt-5.5").input_per_1m, 5.0);
+        assert_eq!(rate("gpt-5.5").output_per_1m, 30.0);
+    }
+
+    #[test]
+    fn gpt5_6_and_gpt6_do_not_fall_through_to_gpt5_or_gpt5_5() {
+        // gpt-5.6-* must not collapse to the bare gpt-5 rate ($1.25/$10) nor to
+        // gpt-5.5's rate ($5/$30) — each has its own confirmed entry.
+        let gpt5 = price_for_model("gpt-5").unwrap();
+        let gpt5_5 = price_for_model("gpt-5.5").unwrap();
+        for v in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let p = price_for_model(v).unwrap();
+            assert_ne!(p, gpt5, "{v} must not inherit bare gpt-5 pricing");
+            assert_ne!(p, gpt5_5, "{v} must not inherit gpt-5.5 pricing");
+        }
+        // gpt-6-astra is a distinct family with no colliding prefix.
+        let astra = price_for_model("gpt-6-astra").unwrap();
+        assert_ne!(astra, gpt5);
+        assert_ne!(astra, gpt5_5);
+    }
+
+    #[test]
+    fn gpt6_and_gpt5_6_dated_snapshots_match_their_family() {
+        assert_eq!(price_for_model("gpt-6-astra-2026-09-03"), price_for_model("gpt-6-astra"));
+        assert_eq!(price_for_model("gpt-5.6-sol-2026-09-03"), price_for_model("gpt-5.6-sol"));
     }
 
     #[test]

@@ -75,6 +75,14 @@ pub struct HotkeySettings {
     pub toggle_history: String,
     #[serde(default = "default_toggle_mcp")]
     pub toggle_mcp: String,
+    #[serde(default = "default_toggle_planner")]
+    pub toggle_planner: String,
+    #[serde(default = "default_toggle_fleet")]
+    pub toggle_fleet: String,
+    /// Open the quick-capture palette: one line straight into the Planner,
+    /// from anywhere in the app.
+    #[serde(default = "default_quick_capture")]
+    pub quick_capture: String,
     #[serde(default = "default_toggle_profile")]
     pub toggle_profile: String,
     #[serde(default = "default_toggle_provider")]
@@ -113,6 +121,21 @@ pub struct HotkeySettings {
     pub switch_tab_8: String,
     #[serde(default = "default_switch_tab_9")]
     pub switch_tab_9: String,
+    /// Cycle to the next tab in the visible strip (chat tabs, then Planner,
+    /// then Fleet — see `tab_bar.rs`'s render order), wrapping at the end.
+    #[serde(default = "default_next_tab")]
+    pub next_tab: String,
+    /// Cycle to the previous tab in the visible strip, wrapping at the start.
+    #[serde(default = "default_prev_tab")]
+    pub prev_tab: String,
+    /// Jump to the first tab of the next group in the sidebar (the
+    /// Planner/Fleet block counts as a group); plain next-tab when the
+    /// sidebar isn't grouped or the top strip is showing.
+    #[serde(default = "default_next_tab_group")]
+    pub next_tab_group: String,
+    /// Jump to the first tab of the previous group, wrapping.
+    #[serde(default = "default_prev_tab_group")]
+    pub prev_tab_group: String,
 }
 
 impl Default for HotkeySettings {
@@ -121,6 +144,9 @@ impl Default for HotkeySettings {
             toggle_settings: default_toggle_settings(),
             toggle_history: default_toggle_history(),
             toggle_mcp: default_toggle_mcp(),
+            toggle_planner: default_toggle_planner(),
+            toggle_fleet: default_toggle_fleet(),
+            quick_capture: default_quick_capture(),
             toggle_profile: default_toggle_profile(),
             toggle_provider: default_toggle_provider(),
             toggle_attachments: default_toggle_attachments(),
@@ -140,6 +166,10 @@ impl Default for HotkeySettings {
             switch_tab_7: default_switch_tab_7(),
             switch_tab_8: default_switch_tab_8(),
             switch_tab_9: default_switch_tab_9(),
+            next_tab: default_next_tab(),
+            prev_tab: default_prev_tab(),
+            next_tab_group: default_next_tab_group(),
+            prev_tab_group: default_prev_tab_group(),
         }
     }
 }
@@ -152,6 +182,20 @@ fn default_toggle_history() -> String {
 }
 fn default_toggle_mcp() -> String {
     "CmdOrCtrl+Shift+M".to_string()
+}
+// Shift+P is taken by the profile selector; T ("tasks") is free.
+fn default_toggle_planner() -> String {
+    "CmdOrCtrl+Shift+T".to_string()
+}
+// Shift+E ("exocortex") is used instead of F if F is ever claimed elsewhere;
+// F ("fleet") is free today.
+fn default_toggle_fleet() -> String {
+    "CmdOrCtrl+Shift+F".to_string()
+}
+// The command-palette convention (Slack, Linear, Raycast). Plain Cmd+K is
+// otherwise unclaimed here.
+fn default_quick_capture() -> String {
+    "CmdOrCtrl+K".to_string()
 }
 fn default_toggle_profile() -> String {
     "CmdOrCtrl+Shift+P".to_string()
@@ -207,6 +251,22 @@ default_switch_tab! {
     7 => default_switch_tab_7,
     8 => default_switch_tab_8,
     9 => default_switch_tab_9,
+}
+
+// Matches VS Code / browser-devtools tab-cycling convention, and this app's
+// existing Shift-prefixed tab-strip shortcuts (toggle_planner is Shift+T,
+// toggle_fleet is Shift+F).
+fn default_next_tab() -> String {
+    "CmdOrCtrl+Shift+]".to_string()
+}
+fn default_prev_tab() -> String {
+    "CmdOrCtrl+Shift+[".to_string()
+}
+fn default_next_tab_group() -> String {
+    "CmdOrCtrl+Alt+Shift+]".to_string()
+}
+fn default_prev_tab_group() -> String {
+    "CmdOrCtrl+Alt+Shift+[".to_string()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -268,6 +328,10 @@ pub struct Settings {
     pub max_summary_chars: usize,
     #[serde(default = "default_max_entity_count")]
     pub max_entity_count: usize,
+    /// User turns a loaded skill's full manual stays in context while unused
+    /// before it is replaced by a short stub. 0 = never stub.
+    #[serde(default = "default_skill_idle_turns")]
+    pub skill_idle_turns: usize,
     /// Fraction of the context window to allocate for active tool results (0.0–1.0).
     /// Default: 0.30 (30%). Used by `effective_tool_result_limit` for providers with
     /// finite context windows (OpenAI-compat, Claude).
@@ -313,6 +377,158 @@ pub struct Settings {
     /// Can be overridden per-provider in Context Tuning config.
     #[serde(default = "default_true")]
     pub compact_tool_results: bool,
+
+    // ── Planner ─────────────────────────────────────────────────────────────
+    /// Master switch for the built-in planner. When off, its tools are withheld
+    /// from the prompt and its view is hidden.
+    #[serde(default = "default_true")]
+    pub planner_enabled: bool,
+    /// Include today's plan in the system context so the assistant sees the day
+    /// without having to call a tool for it. Costs tokens on every turn.
+    #[serde(default = "default_true")]
+    pub planner_inject_today_context: bool,
+    /// Timeline bounds, "HH:MM" local time.
+    #[serde(default = "default_workday_start")]
+    pub planner_workday_start: String,
+    #[serde(default = "default_workday_end")]
+    pub planner_workday_end: String,
+    /// Default minutes of focused work a day is planned against.
+    #[serde(default = "default_daily_capacity_minutes")]
+    pub planner_daily_capacity_minutes: u32,
+    /// Roll unfinished todos scheduled for a past day forward onto today.
+    #[serde(default = "default_true")]
+    pub planner_auto_rollover: bool,
+    /// DEPRECATED: pre-subscription calendar stub. Migrated on load into a
+    /// disabled `CalendarSource::Composio` subscription and cleared; kept
+    /// serialized for downgrade safety.
+    #[serde(default)]
+    pub planner_calendar_profile: Option<String>,
+    /// External calendars mirrored into the timeline as read-only blocks.
+    #[serde(default)]
+    pub planner_calendar_subscriptions: Vec<CalendarSubscription>,
+    /// Whether firm busy external meetings count as planned time in the
+    /// day's capacity math (capacity itself stays the full configured day;
+    /// meeting time overlapping a task block is not double-counted — the
+    /// task wins). A day with 4h of meetings has 4h already spoken for. Opt
+    /// out to restore the old todo-only planned math. The field name
+    /// predates the additive model and is kept for settings serde compat.
+    #[serde(default = "default_true")]
+    pub planner_calendar_counts_against_capacity: bool,
+    /// Estimate auto-filled onto quick-added todos when the input carries no
+    /// `~duration` token. 0 disables the auto-fill.
+    #[serde(default)]
+    pub planner_default_estimate_minutes: u32,
+    /// Length of blocks created by clicking an empty timeline slot or by a
+    /// quick-add `@time` token on a todo without an estimate.
+    #[serde(default = "default_planner_block_minutes")]
+    pub planner_default_block_minutes: u32,
+    /// How priorities are labelled (Q1–Q4 or P1–P4, plus custom names).
+    #[serde(default)]
+    pub planner_priority: crate::todo::model::PriorityDisplay,
+    /// How the weekly review gives feedback (direct / balanced /
+    /// encouraging). Always visible and changeable; Hobbes may *suggest* a
+    /// switch from the acted/dismissed nudge counts
+    /// (`todo::measures::suggest_review_style`) but never switches silently.
+    #[serde(default)]
+    pub planner_review_style: crate::todo::model::ReviewStyle,
+    /// **Release gate for Agent time and Decisions** (SYMBIOTIC_PLANNER.md).
+    /// Off by default and deliberately not shown in Settings: both features
+    /// are hidden for release while they mature. When off, the Planner nav
+    /// hides "Decisions" and "Agent time", the agent-time scheduler never
+    /// starts a window, "Prep this" is hidden, the weekly review drops its
+    /// agent-time / judgment cards, and `HOBBES_AGENT_TIME` /
+    /// `HOBBES_DECISIONS` are withheld from every prompt and refused at
+    /// dispatch. To re-enable, set `"experimental_agent_time": true` in
+    /// settings.json and restart. Read it through
+    /// [`Settings::agent_time_enabled`], never directly.
+    #[serde(default)]
+    pub experimental_agent_time: bool,
+
+    // ── Fleet (Pro) ─────────────────────────────────────────────────────────
+    /// Master switch for fleet observation: when on (and Pro is active), the
+    /// localhost hook listener runs and the Fleet view appears in the
+    /// planner. Off by default — observing every Claude Code session on the
+    /// machine is strictly opt-in.
+    #[serde(default)]
+    pub fleet_enabled: bool,
+    /// Generate LLM re-entry briefs from observed sessions' transcripts
+    /// (uses the active connector's summary model). Only effective while
+    /// `fleet_enabled` and Pro are on.
+    #[serde(default = "default_true")]
+    pub fleet_briefs_enabled: bool,
+    /// Minutes of idle silence before a session retires off the live fleet
+    /// board (into Earlier today; any later event revives it with its banked
+    /// time). Clamped to 15–1440 at use.
+    #[serde(default = "default_fleet_retire_minutes")]
+    pub fleet_retire_minutes: u32,
+    /// When a background agent dispatched from a chat finishes, hand its
+    /// result back to that chat and let the conversation continue on its own.
+    #[serde(default = "default_true")]
+    pub dispatch_auto_continue: bool,
+
+    // ── Terminal ────────────────────────────────────────────────────────────
+    /// Register the native `hobbes-terminal` MCP server (persistent per-chat
+    /// zsh the AI can run commands in — always behind the tool-approval
+    /// flow). Off by default: a shell is the highest-risk tool in the app.
+    /// Takes effect at next launch (registration happens at manager init).
+    #[serde(default)]
+    pub terminal_enabled: bool,
+}
+
+impl Settings {
+    /// Whether Agent time and the Decisions queue are on: the planner is
+    /// enabled AND the hidden `experimental_agent_time` release gate is set.
+    /// The one switch every Agent-time / Decisions surface consults.
+    pub fn agent_time_enabled(&self) -> bool {
+        self.planner_enabled && self.experimental_agent_time
+    }
+
+    /// Add a trust rule, deduplicating on the full (server, tool,
+    /// command_prefix, project_id) tuple — returns the surviving rule's id.
+    pub fn add_trust_rule(
+        &mut self,
+        rule: crate::context::permissions::TrustRule,
+    ) -> String {
+        if let Some(existing) = self.permission_settings.trust_rules.iter().find(|r| {
+            r.server == rule.server
+                && r.tool == rule.tool
+                && r.command_prefix == rule.command_prefix
+                && r.project_id == rule.project_id
+        }) {
+            return existing.id.clone();
+        }
+        let id = rule.id.clone();
+        self.permission_settings.trust_rules.push(rule);
+        id
+    }
+
+    pub fn remove_trust_rule(&mut self, id: &str) -> bool {
+        let before = self.permission_settings.trust_rules.len();
+        self.permission_settings.trust_rules.retain(|r| r.id != id);
+        self.permission_settings.trust_rules.len() != before
+    }
+}
+
+fn default_fleet_retire_minutes() -> u32 {
+    360
+}
+
+fn default_planner_block_minutes() -> u32 {
+    30
+}
+
+fn default_workday_start() -> String {
+    "09:00".to_string()
+}
+
+fn default_workday_end() -> String {
+    "17:00".to_string()
+}
+
+/// Six hours — a realistic amount of focused work in a day, not eight. Planning
+/// against an honest number is the whole point of showing capacity.
+fn default_daily_capacity_minutes() -> u32 {
+    360
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -449,6 +665,13 @@ pub struct ComposioToolkitConfig {
     /// flag is what marks them as connected in the UI.
     #[serde(default)]
     pub no_auth: bool,
+    /// User's curated tool whitelist for this toolkit (Edit Tools modal).
+    /// `None` = no curation, all tools enabled. This local copy is the durable
+    /// source of truth: the Composio server's `allowed_tools` is a projection
+    /// of it, and it is re-applied on server recreation and toolkit re-add so
+    /// curation survives server wipes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
 }
 
 impl ComposioToolkitConfig {
@@ -466,6 +689,77 @@ impl ComposioToolkitConfig {
 /// Maximum number of LLM connector instances across all provider kinds.
 /// Matches the 10-model-slot / digit-hotkey idiom used elsewhere.
 pub const MAX_LLM_CONNECTORS: usize = 10;
+
+/// One model the user has made available for delegated work
+/// ([`Settings::allowed_models`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllowedModel {
+    pub connector_id: String,
+    pub connector_name: String,
+    pub provider: LlmProvider,
+    pub model: String,
+}
+
+impl AllowedModel {
+    pub fn choice(&self) -> ModelChoice {
+        ModelChoice {
+            connector_id: self.connector_id.clone(),
+            connector_name: self.connector_name.clone(),
+            provider: self.provider,
+            model: Some(self.model.clone()),
+        }
+    }
+}
+
+/// A validated connector (+ optional model) to pin a session to
+/// ([`Settings::resolve_model_choice`]). `model: None` = the connector's own
+/// active model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub connector_id: String,
+    pub connector_name: String,
+    pub provider: LlmProvider,
+    pub model: Option<String>,
+}
+
+/// `"Claude: claude-haiku-5-5, claude-opus-5-5; Gemini: gemini-3.7-flash"`:
+/// the allowed list grouped by connector, in the list's (stable) order.
+pub fn allowed_models_listing(allowed: &[AllowedModel]) -> String {
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for a in allowed {
+        match groups.last_mut() {
+            Some((id, models)) if *id == a.connector_id => models.push(&a.model),
+            _ => groups.push((a.connector_id.clone(), vec![&a.model])),
+        }
+    }
+    groups
+        .iter()
+        .map(|(id, models)| {
+            let name = allowed
+                .iter()
+                .find(|a| &a.connector_id == id)
+                .map(|a| a.connector_name.as_str())
+                .unwrap_or("");
+            format!("{name}: {}", models.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// A short human label for a model slug, as a card or toast shows it:
+/// `claude-haiku-5-5` → "Haiku 5.5", `gemini-3.7-flash` → "Gemini 3.7
+/// Flash"; anything else is shown as-is.
+pub fn short_model_label(slug: &str) -> String {
+    let s = slug.trim();
+    if s.starts_with("claude-") {
+        let name = crate::llm::claude_models::ClaudeModel::from_slug(s).display_name();
+        return name.strip_prefix("Claude ").unwrap_or(&name).to_string();
+    }
+    if s.starts_with("gemini") || s.starts_with("models/gemini") {
+        return crate::llm::gemini::GeminiModel::from_slug(s).display_name();
+    }
+    s.to_string()
+}
 
 /// A named LLM connector instance ("flavor") — one configured endpoint/key
 /// combination of a given provider kind. Mirrors the ComposioProfile pattern.
@@ -497,6 +791,42 @@ impl ProviderInstance {
     }
 }
 
+/// Where a calendar subscription's events come from.
+///
+/// The transport-specific details live here; everything downstream (sync loop,
+/// cache, materialization, UI) is transport-agnostic.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CalendarSource {
+    /// An ICS/webcal feed. The URL is a secret (Google/Outlook "secret
+    /// address" feeds embed tokens) and lives in the keychain as
+    /// `cal_url_<subscription_id>` — settings holds only the id.
+    Ics {},
+    /// A Google Calendar read through a Composio profile's connection.
+    Composio {
+        profile_id: String,
+        calendar_id: String,
+    },
+}
+
+/// A read-only external calendar mirrored into the planner timeline.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct CalendarSubscription {
+    #[serde(default = "default_uuid")]
+    pub id: String,
+    pub name: String,
+    /// Hex color (e.g. "#4f9cf9") tinting this subscription's blocks.
+    #[serde(default = "default_calendar_color")]
+    pub color: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub source: CalendarSource,
+}
+
+fn default_calendar_color() -> String {
+    "#4f9cf9".to_string()
+}
+
 /// A Composio profile containing connection settings for one Composio account
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ComposioProfile {
@@ -519,6 +849,12 @@ pub struct ComposioProfile {
     /// Prevents OAuth credentials from landing in the wrong Chrome profile.
     #[serde(default)]
     pub chrome_profile_directory: Option<String>,
+    /// Curation (`enabled_tools`) of toolkits the user has removed, keyed by
+    /// slug. Held so a later re-add restores the user's tool selection instead
+    /// of re-running LLM selection from scratch (delete → re-add is the normal
+    /// reauth dance and must not lose curation).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub retained_curation: HashMap<String, Vec<String>>,
 }
 
 fn default_profile_color() -> String {
@@ -541,6 +877,7 @@ impl Default for ComposioProfile {
             toolkit_configs: Vec::new(),
             color: default_profile_color(),
             chrome_profile_directory: None,
+            retained_curation: HashMap::new(),
         }
     }
 }
@@ -563,7 +900,15 @@ impl ComposioProfile {
 
     /// Remove a toolkit's config entry (used when a toolkit is fully removed
     /// from the Composio server). Mirrors `Settings::remove_profile`.
+    /// The toolkit's tool curation is retained so a later re-add restores it.
     pub fn remove_toolkit_config(&mut self, slug: &str) {
+        for c in &self.toolkit_configs {
+            if c.slug.eq_ignore_ascii_case(slug) {
+                if let Some(tools) = c.enabled_tools.clone().filter(|t| !t.is_empty()) {
+                    self.retained_curation.insert(c.slug.to_lowercase(), tools);
+                }
+            }
+        }
         self.toolkit_configs
             .retain(|c| !c.slug.eq_ignore_ascii_case(slug));
     }
@@ -595,6 +940,7 @@ impl Default for Settings {
                 granular_permissions,
                 mcp_server_permissions: HashMap::new(),
                 skill_permissions: HashMap::new(),
+                trust_rules: Vec::new(),
                 max_ai_turns: 25,
             },
             confirm_on_delete: true,
@@ -609,6 +955,7 @@ impl Default for Settings {
             max_active_tool_output_length: default_max_active_tool_output_length(),
             max_summary_chars: default_max_summary_chars(),
             max_entity_count: default_max_entity_count(),
+            skill_idle_turns: default_skill_idle_turns(),
             tool_result_budget_ratio: default_tool_result_budget_ratio(),
             image_generation_config: ImageGenerationConfig::default(),
             composio_profiles: Vec::new(),
@@ -624,6 +971,25 @@ impl Default for Settings {
             model_icons: HashMap::new(),
             enable_summarization: true,
             compact_tool_results: true,
+            planner_enabled: true,
+            planner_inject_today_context: true,
+            planner_workday_start: default_workday_start(),
+            planner_workday_end: default_workday_end(),
+            planner_daily_capacity_minutes: default_daily_capacity_minutes(),
+            planner_auto_rollover: true,
+            planner_calendar_profile: None,
+            planner_calendar_subscriptions: Vec::new(),
+            planner_calendar_counts_against_capacity: true,
+            planner_default_estimate_minutes: 0,
+            experimental_agent_time: false,
+            planner_default_block_minutes: default_planner_block_minutes(),
+            planner_priority: Default::default(),
+            planner_review_style: Default::default(),
+            fleet_enabled: false,
+            fleet_briefs_enabled: true,
+            fleet_retire_minutes: default_fleet_retire_minutes(),
+            dispatch_auto_continue: true,
+            terminal_enabled: false,
         }
     }
 }
@@ -633,9 +999,27 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
     let slug = model_slug.to_lowercase();
     // Match specific variants first for visual distinction
 
+    // --- Claude family (checked first: no branch existed for it at all —
+    // every Claude model silently fell through to the generic "pro"/"flash"/
+    // 🤖 fallbacks below, which happened to look plausible enough that the
+    // gap went unnoticed) ---
+    if slug.contains("fable") {
+        "🎭".to_string()
+    } else if slug.contains("opus") {
+        "🧠".to_string()
+    } else if slug.contains("sonnet") {
+        "🎻".to_string()
+    } else if slug.contains("haiku") {
+        "🍃".to_string()
     // --- Gemini family ---
-    if slug.contains("experimental") {
+    } else if slug.contains("experimental") {
         "🧪".to_string()
+    } else if slug.contains("gemini-3.8")
+        || slug.contains("gemini-3.7")
+        || slug.contains("gemini-3.6")
+        || slug.contains("gemini-3.5")
+    {
+        "⚡".to_string()
     } else if slug.contains("gemini-3.1") {
         "✨".to_string()
     } else if slug.contains("image") {
@@ -983,6 +1367,124 @@ impl Settings {
         }
     }
 
+    // ========================================================================
+    // Calendar subscriptions
+    // ========================================================================
+
+    /// Look up a calendar subscription by its stable ID.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI
+    pub fn calendar_subscription_by_id(&self, id: &str) -> Option<&CalendarSubscription> {
+        self.planner_calendar_subscriptions
+            .iter()
+            .find(|s| s.id == id)
+    }
+
+    /// Mutable lookup of a calendar subscription by its stable ID.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI (enable toggle, color)
+    pub fn calendar_subscription_by_id_mut(
+        &mut self,
+        id: &str,
+    ) -> Option<&mut CalendarSubscription> {
+        self.planner_calendar_subscriptions
+            .iter_mut()
+            .find(|s| s.id == id)
+    }
+
+    /// Add a calendar subscription with a unique display name (auto-suffixed
+    /// like `add_connector`). Returns its ID.
+    pub fn add_calendar_subscription(
+        &mut self,
+        name: &str,
+        color: &str,
+        source: CalendarSource,
+    ) -> String {
+        let base_name = if name.trim().is_empty() {
+            "Calendar".to_string()
+        } else {
+            name.trim().to_string()
+        };
+        let mut unique_name = base_name.clone();
+        let mut counter = 1;
+        while self
+            .planner_calendar_subscriptions
+            .iter()
+            .any(|s| s.name == unique_name)
+        {
+            counter += 1;
+            unique_name = format!("{base_name} {counter}");
+        }
+        let subscription = CalendarSubscription {
+            id: Uuid::new_v4().to_string(),
+            name: unique_name,
+            color: if color.trim().is_empty() {
+                default_calendar_color()
+            } else {
+                color.trim().to_string()
+            },
+            enabled: true,
+            source,
+        };
+        let id = subscription.id.clone();
+        self.planner_calendar_subscriptions.push(subscription);
+        id
+    }
+
+    /// Remove a calendar subscription by ID. Returns whether one was removed.
+    /// The caller owns the follow-up cleanup (cached events, blocks, keychain
+    /// URL) — this only edits settings.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI
+    pub fn remove_calendar_subscription(&mut self, id: &str) -> bool {
+        let before = self.planner_calendar_subscriptions.len();
+        self.planner_calendar_subscriptions.retain(|s| s.id != id);
+        self.planner_calendar_subscriptions.len() != before
+    }
+
+    /// Rename a calendar subscription, keeping display names unique.
+    #[allow(dead_code)] // consumer is the Phase 4 settings UI
+    pub fn rename_calendar_subscription(&mut self, id: &str, name: &str) {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let taken = self
+            .planner_calendar_subscriptions
+            .iter()
+            .any(|s| s.id != id && s.name == trimmed);
+        if taken {
+            return;
+        }
+        if let Some(s) = self.calendar_subscription_by_id_mut(id) {
+            s.name = trimmed.to_string();
+        }
+    }
+
+    /// One-time migration: convert the legacy `planner_calendar_profile` stub
+    /// into a disabled Composio subscription and clear the field. Disabled
+    /// because the stub never synced anything — enabling is an explicit user
+    /// action once the Composio fetcher lands. Returns true when it changed
+    /// anything (caller persists).
+    pub fn migrate_legacy_calendar_profile(&mut self) -> bool {
+        let Some(profile_id) = self.planner_calendar_profile.take() else {
+            return false;
+        };
+        if profile_id.trim().is_empty() {
+            return true; // cleared a meaningless value; still worth persisting
+        }
+        let id = self.add_calendar_subscription(
+            "Google Calendar",
+            &default_calendar_color(),
+            CalendarSource::Composio {
+                profile_id,
+                calendar_id: "primary".into(),
+            },
+        );
+        if let Some(s) = self.calendar_subscription_by_id_mut(&id) {
+            s.enabled = false;
+        }
+        tracing::info!("Migrated legacy planner_calendar_profile to a disabled calendar subscription");
+        true
+    }
+
     /// The connector a session should use.
     /// Resolution: session's pinned connector ID → first connector matching the
     /// session's legacy pinned provider kind → globally active connector.
@@ -1015,6 +1517,135 @@ impl Settings {
             ProviderInstanceConfig::Claude(c) => {
                 c.api_key.is_some() || std::env::var("ANTHROPIC_API_KEY").is_ok()
             }
+        }
+    }
+
+    /// The models the user has made available for delegated work (a
+    /// dispatched chat, agent time): for each configured connector, its
+    /// non-empty quick-switch slots plus its active and summary models.
+    /// Sorted by connector name (then id), then model slug, and deduplicated,
+    /// so the list is stable: it rides in the cached tool prefix and must
+    /// change only when the settings do.
+    pub fn allowed_models(&self) -> Vec<AllowedModel> {
+        let mut out: Vec<AllowedModel> = Vec::new();
+        for inst in self.llm_connectors.iter().filter(|c| self.is_connector_configured(c)) {
+            let summary = match &inst.config {
+                ProviderInstanceConfig::Gemini(c) => Some(c.summary_model.clone()),
+                ProviderInstanceConfig::OpenAiCompat(c) => c.summary_model.clone(),
+                ProviderInstanceConfig::Claude(c) => c.summary_model.clone(),
+            };
+            let candidates = inst
+                .config
+                .model_slots()
+                .iter()
+                .cloned()
+                .chain(std::iter::once(inst.config.chat_model()))
+                .chain(summary);
+            for m in candidates {
+                let m = m.trim();
+                if m.is_empty() {
+                    continue;
+                }
+                out.push(AllowedModel {
+                    connector_id: inst.id.clone(),
+                    connector_name: inst.name.trim().to_string(),
+                    provider: inst.provider(),
+                    model: m.to_string(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.connector_name
+                .to_lowercase()
+                .cmp(&b.connector_name.to_lowercase())
+                .then_with(|| a.connector_id.cmp(&b.connector_id))
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        out.dedup_by(|a, b| a.connector_id == b.connector_id && a.model == b.model);
+        out
+    }
+
+    /// Validate a model choice for delegated work against
+    /// [`Self::allowed_models`]. `connector` is a connector instance name
+    /// (case-insensitive) or id; `model` a model slug.
+    ///
+    /// - neither: `Ok(None)` (the user's default applies);
+    /// - connector only: that connector with its own active model;
+    /// - model only: the connector offering it (the global active connector
+    ///   when it does, else the first in list order);
+    /// - both: the model must be one of that connector's.
+    ///
+    /// Anything else is an error naming what is allowed: never a silent
+    /// fallback to some other connector or model.
+    pub fn resolve_model_choice(
+        &self,
+        connector: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<ModelChoice>, String> {
+        let connector = connector.map(str::trim).filter(|c| !c.is_empty());
+        let model = model.map(str::trim).filter(|m| !m.is_empty());
+        if connector.is_none() && model.is_none() {
+            return Ok(None);
+        }
+        let allowed = self.allowed_models();
+        let listing = || {
+            if allowed.is_empty() {
+                "no connector is configured".to_string()
+            } else {
+                format!("allowed: {}", allowed_models_listing(&allowed))
+            }
+        };
+        let inst = match connector {
+            Some(c) => {
+                let found = self
+                    .llm_connectors
+                    .iter()
+                    .find(|i| i.id == c)
+                    .or_else(|| self.llm_connectors.iter().find(|i| i.name.trim().eq_ignore_ascii_case(c)));
+                match found {
+                    Some(i) if self.is_connector_configured(i) => Some(i),
+                    Some(i) => {
+                        return Err(format!(
+                            "connector '{}' isn't configured (no API key or endpoint); {}",
+                            i.name,
+                            listing()
+                        ))
+                    }
+                    None => return Err(format!("unknown connector '{c}'; {}", listing())),
+                }
+            }
+            None => None,
+        };
+        match (inst, model) {
+            (Some(i), None) => Ok(Some(ModelChoice {
+                connector_id: i.id.clone(),
+                connector_name: i.name.clone(),
+                provider: i.provider(),
+                model: None,
+            })),
+            (Some(i), Some(m)) => allowed
+                .iter()
+                .find(|a| a.connector_id == i.id && a.model.eq_ignore_ascii_case(m))
+                .map(|a| Some(a.choice()))
+                .ok_or_else(|| {
+                    format!(
+                        "model '{m}' isn't available on connector '{}'; {}",
+                        i.name,
+                        listing()
+                    )
+                }),
+            (None, Some(m)) => {
+                let active = self.active_connector().map(|a| a.id.clone());
+                let offering: Vec<&AllowedModel> =
+                    allowed.iter().filter(|a| a.model.eq_ignore_ascii_case(m)).collect();
+                offering
+                    .iter()
+                    .find(|a| Some(&a.connector_id) == active.as_ref())
+                    .or_else(|| offering.first())
+                    .map(|a| Some(a.choice()))
+                    .ok_or_else(|| format!("model '{m}' isn't one the user has made available; {}", listing()))
+            }
+            (None, None) => Ok(None),
         }
     }
 
@@ -1264,6 +1895,7 @@ impl Settings {
                 toolkit_configs: Vec::new(),
                 color: default_profile_color(),
                 chrome_profile_directory: None,
+                retained_curation: HashMap::new(),
             };
             let profile_id = profile.id.clone();
             self.add_profile(profile);
@@ -1388,6 +2020,10 @@ fn default_max_entity_count() -> usize {
     50
 }
 
+fn default_skill_idle_turns() -> usize {
+    6
+}
+
 fn default_tool_result_budget_ratio() -> f64 {
     0.30
 }
@@ -1497,8 +2133,10 @@ impl SettingsManager {
             settings.migrate_active_profile_name_to_id();
             settings.sync_chat_model_to_slots();
             settings.seed_default_claude_slots_if_empty();
-            if settings.migrate_legacy_llm_config() && self.save(&settings).is_err() {
-                tracing::error!("Failed to persist migrated LLM connector settings.");
+            let migrated_llm = settings.migrate_legacy_llm_config();
+            let migrated_calendar = settings.migrate_legacy_calendar_profile();
+            if (migrated_llm || migrated_calendar) && self.save(&settings).is_err() {
+                tracing::error!("Failed to persist migrated settings.");
             }
             return settings;
         }
@@ -1621,6 +2259,7 @@ impl SettingsManager {
         // (Mirrors the happy-path call at L793.)
         settings.migrate_active_profile_name_to_id();
         settings.migrate_legacy_llm_config();
+        settings.migrate_legacy_calendar_profile();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
@@ -1672,6 +2311,7 @@ pub enum SettingsTab {
     General,
     Mcp,
     Behavior,
+    Planner,
     Data,
     Permissions,
     Hotkeys,
@@ -1679,6 +2319,8 @@ pub enum SettingsTab {
     Skills,
     About,
     ImageGen,
+    Fleet,
+    Terminal,
 }
 
 impl Default for SettingsTab {
@@ -1690,6 +2332,19 @@ impl Default for SettingsTab {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct UiState {
     pub settings_panel_width: f64,
+    /// Planner view column widths (px), user-resizable like the sidebars.
+    #[serde(default = "default_planner_left_width")]
+    pub planner_left_width: f64,
+    #[serde(default = "default_planner_today_width")]
+    pub planner_today_width: f64,
+    /// Per-list display order (sort lens + grouping), keyed by the planner's
+    /// `list_key()`: "today", "upcoming", "inbox", …, or "project:{id}".
+    /// Missing = Manual. A view preference, never written to the todos.
+    #[serde(default)]
+    pub planner_list_orders: std::collections::HashMap<String, crate::todo::views::ListOrder>,
+    /// The Today rail's visible time range (preset or custom). Missing = Workday.
+    #[serde(default)]
+    pub planner_rail_view: Option<crate::components::planner_range::RailView>,
     /// Default state for tool call Arguments section (expanded or collapsed)
     #[serde(default = "default_true", alias = "show_tool_arguments")]
     pub default_tool_arguments_open: bool,
@@ -1747,6 +2402,10 @@ pub struct UiState {
     pub show_attachments_icon: bool,
     #[serde(default = "default_true")]
     pub show_model_selector: bool,
+    #[serde(default = "default_true")]
+    pub show_planner_icon: bool,
+    #[serde(default = "default_true")]
+    pub show_fleet_icon: bool,
     /// Whether model quick-switch slots section is expanded in settings
     #[serde(default = "default_true")]
     pub show_model_slots: bool,
@@ -1759,16 +2418,102 @@ pub struct UiState {
     /// Currently focused tab index (0-based)
     #[serde(default)]
     pub active_tab_index: usize,
+    /// App-view tabs (planner/fleet) survive restarts: whether each tab is
+    /// in the strip, and whether it was the focused view at exit.
+    #[serde(default)]
+    pub planner_tab_open: bool,
+    #[serde(default)]
+    pub planner_active: bool,
+    #[serde(default)]
+    pub fleet_tab_open: bool,
+    #[serde(default)]
+    pub fleet_active: bool,
+    /// Show open tabs as a vertical list in a left sidebar instead of the
+    /// top strip (which then keeps only the app chrome). Off = the strip.
+    /// On by default since v0.12.2 (see `tabs_sidebar_default_applied`).
+    #[serde(default = "default_true")]
+    pub tabs_as_sidebar: bool,
+    /// One-time marker for the v0.12.2 switch to side tabs by default.
+    /// `tabs_as_sidebar` always serialises, so a saved `false` can't tell
+    /// "chose the top strip" from "never touched it" (pre-release builds
+    /// saved the old default). A file without this marker is flipped to the
+    /// sidebar once on load ([`UiState::apply_tab_layout_default`]); from
+    /// then on the saved choice is the user's and is kept.
+    #[serde(default)]
+    pub tabs_sidebar_default_applied: bool,
+    /// The tab sidebar's display order (sort lens + grouping). A view
+    /// preference, never written to `open_tabs`. Missing = open order.
+    #[serde(default)]
+    pub tab_sidebar_order: crate::tab_list::TabListOrder,
+    /// The tab sidebar's full width (px, 180–400). Kept while the sidebar is
+    /// railed — by the user or by the layout solver — so it comes back.
+    #[serde(default = "default_tab_sidebar_width")]
+    pub tab_sidebar_width: f64,
+    /// The user snapped the tab sidebar to its 48px emoji rail. The layout
+    /// solver's automatic rail is temporary and never written here.
+    #[serde(default)]
+    pub tab_sidebar_railed: bool,
+    /// Show a small "Tidy tabs?" pill in the sidebar header once more than
+    /// `tidy_tabs_threshold` tabs are open. Off = tidy only when asked.
+    #[serde(default)]
+    pub tidy_tabs_nudge: bool,
+    /// Open-tab count above which the nudge appears.
+    #[serde(default = "default_tidy_tabs_threshold")]
+    pub tidy_tabs_threshold: usize,
+}
+
+fn default_tidy_tabs_threshold() -> usize {
+    20
 }
 
 fn default_token_display_mode() -> String {
     "all".to_string()
 }
 
+fn default_tab_sidebar_width() -> f64 {
+    crate::layout_budget::SIDEBAR_DEFAULT_WIDTH
+}
+
+fn default_planner_left_width() -> f64 {
+    208.0
+}
+
+fn default_planner_today_width() -> f64 {
+    320.0
+}
+
+impl UiState {
+    /// The one-time v0.12.2 migration to side tabs by default: a state saved
+    /// before the marker existed moves to the sidebar and gets the marker.
+    /// Returns whether anything changed (the caller saves). A user who picks
+    /// the top strip afterwards keeps it — the marker is already set.
+    pub fn apply_tab_layout_default(&mut self) -> bool {
+        if self.tabs_sidebar_default_applied {
+            return false;
+        }
+        self.tabs_as_sidebar = true;
+        self.tabs_sidebar_default_applied = true;
+        true
+    }
+
+    /// Drop saved list orders for projects that no longer exist. Leftover
+    /// keys are harmless; this just keeps ui_state.json from accreting them.
+    pub fn prune_planner_list_orders(&mut self, live_project_ids: &[&str]) {
+        self.planner_list_orders.retain(|key, _| match key.strip_prefix("project:") {
+            Some(id) => live_project_ids.contains(&id),
+            None => true,
+        });
+    }
+}
+
 impl Default for UiState {
     fn default() -> Self {
         Self {
             settings_panel_width: 420.0, // Comfortable width for 1440px window
+            planner_left_width: default_planner_left_width(),
+            planner_today_width: default_planner_today_width(),
+            planner_list_orders: std::collections::HashMap::new(),
+            planner_rail_view: None,
             default_tool_arguments_open: true,
             default_tool_response_open: false,
             default_tool_thought_open: false,
@@ -1781,6 +2526,17 @@ impl Default for UiState {
             llm_config_collapsed: false,
             open_tabs: Vec::new(),
             active_tab_index: 0,
+            planner_tab_open: false,
+            planner_active: false,
+            fleet_tab_open: false,
+            fleet_active: false,
+            tabs_as_sidebar: true,
+            tabs_sidebar_default_applied: true,
+            tab_sidebar_order: crate::tab_list::TabListOrder::default(),
+            tab_sidebar_width: default_tab_sidebar_width(),
+            tab_sidebar_railed: false,
+            tidy_tabs_nudge: false,
+            tidy_tabs_threshold: default_tidy_tabs_threshold(),
             mcp_instructions_collapsed: false,
             composio_toolkit_expanded: false,
             selected_byoa_slug: None,
@@ -1792,6 +2548,8 @@ impl Default for UiState {
             show_provider_selector: true,
             show_attachments_icon: true,
             show_model_selector: true,
+            show_planner_icon: true,
+            show_fleet_icon: true,
             show_model_slots: true,
         }
     }
@@ -1821,10 +2579,17 @@ impl UiStateManager {
             Err(_) => return UiState::default(),
         };
 
-        serde_json::from_str(&content).unwrap_or_else(|e| {
+        let mut state: UiState = serde_json::from_str(&content).unwrap_or_else(|e| {
             tracing::error!("Failed to deserialize UI state, using default: {}", e);
             UiState::default()
-        })
+        });
+        if state.apply_tab_layout_default() {
+            tracing::info!("UI state: switched to side tabs (the new default), once");
+            if let Err(e) = self.save(&state) {
+                tracing::warn!("Failed to save migrated UI state: {}", e);
+            }
+        }
+        state
     }
 
     pub fn save(&self, state: &UiState) -> Result<(), std::io::Error> {
@@ -1956,6 +2721,144 @@ mod tests {
     use super::*;
 
     #[test]
+    fn old_ui_state_without_tab_sidebar_fields_loads_defaults() {
+        let state: UiState = serde_json::from_str(
+            r#"{"settings_panel_width": 512.0, "tabs_as_sidebar": true}"#,
+        )
+        .unwrap();
+        assert_eq!(state.tab_sidebar_width, 256.0);
+        assert!(!state.tab_sidebar_railed);
+        assert_eq!(state.settings_panel_width, 512.0);
+        assert!(state.tabs_as_sidebar);
+
+        let fresh = UiState::default();
+        assert_eq!(fresh.tab_sidebar_width, 256.0);
+        assert!(!fresh.tab_sidebar_railed);
+    }
+
+    #[test]
+    fn tab_sidebar_fields_round_trip() {
+        let state = UiState {
+            tab_sidebar_width: 312.0,
+            tab_sidebar_railed: true,
+            ..UiState::default()
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(back.tab_sidebar_width, 312.0);
+        assert!(back.tab_sidebar_railed);
+    }
+
+    #[test]
+    fn ui_state_without_list_orders_loads_manual() {
+        let mut state: UiState = serde_json::from_str(r#"{"settings_panel_width": 400.0}"#).unwrap();
+        assert!(state.planner_list_orders.is_empty(), "missing field = every list Manual");
+
+        use crate::todo::views::{ListOrder, SortKey};
+        let sorted = ListOrder { key: SortKey::Priority, ..Default::default() };
+        state.planner_list_orders.insert("today".into(), sorted);
+        state.planner_list_orders.insert("project:gone".into(), sorted);
+        state.planner_list_orders.insert("project:live".into(), sorted);
+        let json = serde_json::to_string(&state).unwrap();
+        let mut back: UiState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.planner_list_orders.get("today"), Some(&sorted));
+
+        back.prune_planner_list_orders(&["live"]);
+        assert!(back.planner_list_orders.contains_key("today"));
+        assert!(back.planner_list_orders.contains_key("project:live"));
+        assert!(!back.planner_list_orders.contains_key("project:gone"));
+    }
+
+    #[test]
+    fn ui_state_without_tab_sidebar_fields_gets_side_tabs() {
+        let state: UiState = serde_json::from_str(r#"{"settings_panel_width": 400.0}"#).unwrap();
+        assert!(state.tabs_as_sidebar, "missing field = side tabs, the v0.12.2 default");
+        assert!(state.tab_sidebar_order.is_manual());
+
+        use crate::tab_list::{TabGroupBy, TabListOrder, TabSortKey};
+        use crate::todo::views::SortDir;
+        let mut state = state;
+        state.tabs_as_sidebar = true;
+        state.tab_sidebar_order = TabListOrder {
+            key: TabSortKey::Recent,
+            dir: SortDir::Desc,
+            group: TabGroupBy::Project,
+        };
+        let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(back.tabs_as_sidebar);
+        assert_eq!(back.tab_sidebar_order, state.tab_sidebar_order);
+    }
+
+    #[test]
+    fn fresh_installs_default_to_side_tabs_and_need_no_migration() {
+        let mut fresh = UiState::default();
+        assert!(fresh.tabs_as_sidebar);
+        assert!(fresh.tabs_sidebar_default_applied);
+        assert!(!fresh.apply_tab_layout_default(), "nothing to migrate");
+    }
+
+    #[test]
+    fn a_pre_marker_top_strip_moves_to_side_tabs_once() {
+        // Pre-release builds always saved the old default `false`.
+        let mut state: UiState =
+            serde_json::from_str(r#"{"settings_panel_width": 400.0, "tabs_as_sidebar": false}"#).unwrap();
+        assert!(!state.tabs_sidebar_default_applied);
+        assert!(state.apply_tab_layout_default());
+        assert!(state.tabs_as_sidebar && state.tabs_sidebar_default_applied);
+
+        // The user then picks the top strip: that choice survives reloads.
+        state.tabs_as_sidebar = false;
+        let mut back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(!back.apply_tab_layout_default());
+        assert!(!back.tabs_as_sidebar, "an explicit top-strip choice after the switch is kept");
+    }
+
+    #[test]
+    fn ui_state_manager_load_migrates_and_persists_the_side_tab_default() {
+        let dir = std::env::temp_dir().join(format!("hobbes-ui-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui_state.json");
+        std::fs::write(&path, r#"{"settings_panel_width": 400.0, "tabs_as_sidebar": false}"#).unwrap();
+        let manager = UiStateManager::new(path.clone());
+        let loaded = manager.load();
+        assert!(loaded.tabs_as_sidebar);
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["tabs_sidebar_default_applied"], serde_json::json!(true));
+
+        // Choose the top strip, save, reload: kept.
+        let mut chosen = loaded;
+        chosen.tabs_as_sidebar = false;
+        manager.save(&chosen).unwrap();
+        assert!(!manager.load().tabs_as_sidebar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_time_and_decisions_are_hidden_by_default() {
+        let s = Settings::default();
+        assert!(!s.experimental_agent_time);
+        assert!(!s.agent_time_enabled());
+        // The switch needs the planner as well.
+        let mut on = Settings { experimental_agent_time: true, ..Settings::default() };
+        assert!(on.agent_time_enabled());
+        on.planner_enabled = false;
+        assert!(!on.agent_time_enabled());
+    }
+
+    /// Every Claude model slug used to fall through `get_default_model_icon`'s
+    /// generic fallbacks with no dedicated branch at all — silently plausible
+    /// (a Sonnet slug matching "pro" never occurs, so it landed on the bare
+    /// 🤖 default) rather than loudly broken, which is why it went unnoticed.
+    #[test]
+    fn claude_models_get_a_dedicated_icon_not_the_generic_fallback() {
+        assert_eq!(get_default_model_icon("claude-fable-5-1"), "🎭");
+        assert_eq!(get_default_model_icon("claude-opus-5"), "🧠");
+        assert_eq!(get_default_model_icon("claude-sonnet-5"), "🎻");
+        assert_eq!(get_default_model_icon("claude-haiku-4-5"), "🍃");
+        // The legacy 4.x ladder must resolve the same way.
+        assert_eq!(get_default_model_icon("claude-opus-4-8"), "🧠");
+    }
+
+    #[test]
     fn remove_toolkit_config_drops_matching_slug_case_insensitively() {
         let mut profile = ComposioProfile::default();
         for slug in ["gmail", "github", "slack"] {
@@ -1978,12 +2881,44 @@ mod tests {
     }
 
     #[test]
+    fn remove_toolkit_config_retains_curation_for_readd() {
+        let mut profile = ComposioProfile::default();
+        profile.toolkit_configs.push(ComposioToolkitConfig {
+            slug: "gmail".to_string(),
+            display_name: "Gmail".to_string(),
+            enabled_tools: Some(vec!["GMAIL_FETCH_EMAILS".to_string()]),
+            ..Default::default()
+        });
+        profile.toolkit_configs.push(ComposioToolkitConfig {
+            slug: "github".to_string(),
+            display_name: "GitHub".to_string(),
+            ..Default::default()
+        });
+
+        // Curated toolkit: removal stashes its curation for a later re-add.
+        profile.remove_toolkit_config("Gmail");
+        assert!(profile.toolkit_configs.iter().all(|c| c.slug != "gmail"));
+        assert_eq!(
+            profile.retained_curation.get("gmail"),
+            Some(&vec!["GMAIL_FETCH_EMAILS".to_string()])
+        );
+
+        // Uncurated toolkit: nothing to retain.
+        profile.remove_toolkit_config("github");
+        assert!(!profile.retained_curation.contains_key("github"));
+    }
+
+    #[test]
     fn seed_fills_empty_claude_slots() {
         let mut s = Settings::default();
         s.claude_config.model_slots = vec![]; // simulate a persisted empty vec
         s.seed_default_claude_slots_if_empty();
         assert_eq!(s.claude_config.model_slots.len(), 10);
-        assert_eq!(s.claude_config.model_slots[0], "claude-opus-4-8");
+        // Mirrors `ClaudeModel::DEFAULT_CHAT_SLUG` via
+        // `default_claude_model_slots()` — kept as a literal here (rather
+        // than importing the constant) precisely so a slug change is a
+        // visible, reviewed diff in this test, not a silent pass-through.
+        assert_eq!(s.claude_config.model_slots[0], "claude-opus-5-5");
     }
 
     #[test]
@@ -2041,6 +2976,96 @@ mod tests {
     }
 
     // ========================================================================
+    // Calendar subscription tests
+    // ========================================================================
+
+    #[test]
+    fn calendar_subscription_crud() {
+        let mut s = Settings::default();
+
+        let id = s.add_calendar_subscription("Work", "#ff0000", CalendarSource::Ics {});
+        // Duplicate names auto-suffix like connectors.
+        let id2 = s.add_calendar_subscription("Work", "", CalendarSource::Ics {});
+        assert_eq!(s.planner_calendar_subscriptions.len(), 2);
+        let sub = s.calendar_subscription_by_id(&id).unwrap();
+        assert_eq!(sub.name, "Work");
+        assert_eq!(sub.color, "#ff0000");
+        assert!(sub.enabled);
+        let sub2 = s.calendar_subscription_by_id(&id2).unwrap();
+        assert_eq!(sub2.name, "Work 2");
+        assert_eq!(sub2.color, "#4f9cf9", "empty color falls back to the default");
+
+        // Rename keeps names unique: colliding rename is a no-op.
+        s.rename_calendar_subscription(&id2, "Work");
+        assert_eq!(s.calendar_subscription_by_id(&id2).unwrap().name, "Work 2");
+        s.rename_calendar_subscription(&id2, "  Personal  ");
+        assert_eq!(s.calendar_subscription_by_id(&id2).unwrap().name, "Personal");
+        s.rename_calendar_subscription(&id2, "   ");
+        assert_eq!(s.calendar_subscription_by_id(&id2).unwrap().name, "Personal");
+
+        assert!(s.remove_calendar_subscription(&id));
+        assert!(!s.remove_calendar_subscription(&id), "already gone");
+        assert!(s.calendar_subscription_by_id(&id).is_none());
+        assert_eq!(s.planner_calendar_subscriptions.len(), 1);
+    }
+
+    #[test]
+    fn calendar_source_serde_shape_is_tagged() {
+        let ics = serde_json::to_value(CalendarSource::Ics {}).unwrap();
+        assert_eq!(ics, serde_json::json!({"kind": "ics"}));
+
+        let composio = serde_json::to_value(CalendarSource::Composio {
+            profile_id: "p1".into(),
+            calendar_id: "primary".into(),
+        })
+        .unwrap();
+        assert_eq!(composio["kind"], "composio");
+        assert_eq!(composio["profile_id"], "p1");
+
+        // Round-trip through the subscription wrapper, exercising defaults.
+        let json = serde_json::json!({"name": "Work", "source": {"kind": "ics"}});
+        let sub: CalendarSubscription = serde_json::from_value(json).unwrap();
+        assert!(sub.enabled);
+        assert!(!sub.id.is_empty());
+        assert_eq!(sub.color, "#4f9cf9");
+    }
+
+    #[test]
+    fn legacy_calendar_profile_migrates_to_disabled_subscription() {
+        let mut s = Settings {
+            planner_calendar_profile: Some("profile-123".to_string()),
+            ..Default::default()
+        };
+
+        assert!(s.migrate_legacy_calendar_profile());
+        assert!(s.planner_calendar_profile.is_none(), "field must be cleared");
+        assert_eq!(s.planner_calendar_subscriptions.len(), 1);
+        let sub = &s.planner_calendar_subscriptions[0];
+        assert_eq!(sub.name, "Google Calendar");
+        assert!(!sub.enabled, "the stub never synced — enabling is explicit");
+        assert_eq!(
+            sub.source,
+            CalendarSource::Composio {
+                profile_id: "profile-123".into(),
+                calendar_id: "primary".into(),
+            }
+        );
+
+        // Idempotent: nothing left to migrate.
+        assert!(!s.migrate_legacy_calendar_profile());
+        assert_eq!(s.planner_calendar_subscriptions.len(), 1);
+
+        // An empty legacy value is cleared without minting a subscription.
+        let mut empty = Settings {
+            planner_calendar_profile: Some("  ".to_string()),
+            ..Default::default()
+        };
+        assert!(empty.migrate_legacy_calendar_profile());
+        assert!(empty.planner_calendar_subscriptions.is_empty());
+        assert!(empty.planner_calendar_profile.is_none());
+    }
+
+    // ========================================================================
     // Multi-connector ("flavors") tests
     // ========================================================================
 
@@ -2059,11 +3084,20 @@ mod tests {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+        tool_call_history: Vec::new(),
+        tab_emoji: None,
+        tab_title: None,
+        name_user_set: false,
+        tab_title_provisional: false,
+        history_anchor: None,
+        context_ledger: Vec::new(),
         }
     }
 
@@ -2317,5 +3351,140 @@ mod tests {
         let restored: crate::session::Session = serde_json::from_value(value).unwrap();
         assert_eq!(restored.llm_connector_id, None);
         assert_eq!(restored.llm_provider, Some(LlmProvider::Claude));
+    }
+
+    #[test]
+    fn hotkey_settings_default_has_fleet_toggle() {
+        assert!(!HotkeySettings::default().toggle_fleet.is_empty());
+    }
+
+    #[test]
+    fn hotkey_settings_legacy_json_without_fleet_field_uses_default() {
+        // A hotkeys blob persisted before `toggle_fleet` existed must still
+        // deserialize, falling back to the default combo.
+        let legacy = serde_json::json!({
+            "toggle_settings": "CmdOrCtrl+,",
+            "toggle_history": "CmdOrCtrl+Shift+H",
+            "toggle_mcp": "CmdOrCtrl+Shift+M",
+            "toggle_planner": "CmdOrCtrl+Shift+T",
+            "toggle_profile": "CmdOrCtrl+Shift+P",
+            "toggle_provider": "CmdOrCtrl+Shift+L",
+            "toggle_attachments": "CmdOrCtrl+Shift+A",
+            "toggle_tray": "CmdOrCtrl+Shift+Space",
+            "toggle_new_chat": "CmdOrCtrl+Shift+N",
+            "toggle_new_chat_with_memory": "CmdOrCtrl+Alt+N",
+            "toggle_scroll_to_bottom": "CmdOrCtrl+Shift+ArrowDown",
+            "toggle_focus_chat": "CmdOrCtrl+/",
+            "submit_chat": "CmdOrCtrl+Enter",
+            "cancel_generation": "CmdOrCtrl+.",
+            "switch_tab_1": "CmdOrCtrl+Shift+1",
+            "switch_tab_2": "CmdOrCtrl+Shift+2",
+            "switch_tab_3": "CmdOrCtrl+Shift+3",
+            "switch_tab_4": "CmdOrCtrl+Shift+4",
+            "switch_tab_5": "CmdOrCtrl+Shift+5",
+            "switch_tab_6": "CmdOrCtrl+Shift+6",
+            "switch_tab_7": "CmdOrCtrl+Shift+7",
+            "switch_tab_8": "CmdOrCtrl+Shift+8",
+            "switch_tab_9": "CmdOrCtrl+Shift+9",
+        });
+        let restored: HotkeySettings = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.toggle_fleet, default_toggle_fleet());
+        assert_eq!(restored.quick_capture, "CmdOrCtrl+K");
+    }
+}
+
+/// Test fixture for delegation model choice: a configured Claude connector
+/// (default slots: Opus 5.5, Sonnet 5.5, Haiku 5.5, Fable 5.1; summary
+/// Haiku 5.5), a configured local OpenAI-compatible one ("qwen-3.6", no
+/// slots), and an unconfigured one (no endpoint). Claude is the global
+/// active connector.
+#[cfg(test)]
+pub(crate) fn test_delegation_settings() -> Settings {
+    let mut s = Settings::default();
+    let local = OpenAiCompatConfig {
+        endpoint: "http://localhost:8000/v1".to_string(),
+        model: "qwen-3.6".to_string(),
+        ..Default::default()
+    };
+    s.add_connector("Local", ProviderInstanceConfig::OpenAiCompat(local)).unwrap();
+    s.add_connector("Unset", ProviderInstanceConfig::OpenAiCompat(OpenAiCompatConfig::default()))
+        .unwrap();
+    let claude = ClaudeConfig { api_key: Some("test-key".to_string()), ..Default::default() };
+    s.add_connector("Claude", ProviderInstanceConfig::Claude(claude)).unwrap();
+    s
+}
+
+#[cfg(test)]
+mod allowed_model_tests {
+    use super::*;
+
+    fn pairs(s: &Settings) -> Vec<(String, String)> {
+        s.allowed_models().into_iter().map(|a| (a.connector_name, a.model)).collect()
+    }
+
+    #[test]
+    fn allowed_list_is_slots_plus_active_and_summary_sorted_and_stable() {
+        let s = test_delegation_settings();
+        let p = pairs(&s);
+        let expect: Vec<(String, String)> = [
+            ("Claude", "claude-fable-5-1"),
+            ("Claude", "claude-haiku-5-5"),
+            ("Claude", "claude-opus-5-5"),
+            ("Claude", "claude-sonnet-5-5"),
+            ("Local", "qwen-3.6"),
+        ]
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+        assert_eq!(p, expect, "unconfigured connectors and empty slots are left out");
+
+        // Connector order in settings doesn't matter: the list is sorted.
+        let mut reordered = s.clone();
+        reordered.llm_connectors.reverse();
+        assert_eq!(pairs(&reordered), expect);
+        // Same input, same output.
+        assert_eq!(s.allowed_models(), s.allowed_models());
+        assert_eq!(
+            allowed_models_listing(&s.allowed_models()),
+            "Claude: claude-fable-5-1, claude-haiku-5-5, claude-opus-5-5, claude-sonnet-5-5; \
+             Local: qwen-3.6"
+        );
+    }
+
+    #[test]
+    fn model_choice_validates_against_the_allowed_list() {
+        let s = test_delegation_settings();
+        assert_eq!(s.resolve_model_choice(None, None).unwrap(), None);
+
+        let c = s.resolve_model_choice(Some("claude"), Some("claude-haiku-5-5")).unwrap().unwrap();
+        assert_eq!(c.connector_name, "Claude");
+        assert_eq!(c.provider, LlmProvider::Claude);
+        assert_eq!(c.model.as_deref(), Some("claude-haiku-5-5"));
+
+        // Model only: found on the connector offering it.
+        let c = s.resolve_model_choice(None, Some("qwen-3.6")).unwrap().unwrap();
+        assert_eq!(c.connector_name, "Local");
+        // Connector only (by id): its own active model.
+        let local_id = s.llm_connectors.iter().find(|c| c.name == "Local").unwrap().id.clone();
+        let c = s.resolve_model_choice(Some(&local_id), None).unwrap().unwrap();
+        assert_eq!((c.connector_id.as_str(), c.model.as_deref()), (local_id.as_str(), None));
+
+        // Errors list what is allowed; never a silent fallback.
+        let e = s.resolve_model_choice(None, Some("gpt-9")).unwrap_err();
+        assert!(e.contains("gpt-9") && e.contains("Claude: claude-fable-5-1"), "{e}");
+        let e = s.resolve_model_choice(Some("Bedrock"), Some("claude-haiku-5-5")).unwrap_err();
+        assert!(e.contains("unknown connector 'Bedrock'") && e.contains("allowed:"), "{e}");
+        let e = s.resolve_model_choice(Some("Local"), Some("claude-haiku-5-5")).unwrap_err();
+        assert!(e.contains("isn't available on connector 'Local'"), "{e}");
+        let e = s.resolve_model_choice(Some("Unset"), None).unwrap_err();
+        assert!(e.contains("isn't configured"), "{e}");
+    }
+
+    #[test]
+    fn short_labels_read_like_names() {
+        assert_eq!(short_model_label("claude-haiku-5-5"), "Haiku 5.5");
+        assert_eq!(short_model_label("gemini-3.7-flash"), "Gemini 3.7 Flash");
+        assert_eq!(short_model_label("qwen-3.6"), "qwen-3.6");
+        assert_eq!(short_model_label("sonnet"), "sonnet");
     }
 }

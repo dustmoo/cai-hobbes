@@ -101,6 +101,9 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 "toggle_settings" => chat_command.set(Some(ChatCommand::ToggleSettings)),
                 "toggle_history" => chat_command.set(Some(ChatCommand::ToggleHistory)),
                 "toggle_mcp" => chat_command.set(Some(ChatCommand::ToggleMcp)),
+                "toggle_planner" => chat_command.set(Some(ChatCommand::TogglePlanner)),
+                "toggle_fleet" => chat_command.set(Some(ChatCommand::ToggleFleet)),
+                "quick_capture" => chat_command.set(Some(ChatCommand::ToggleQuickCapture)),
                 "toggle_profile" => chat_command.set(Some(ChatCommand::ToggleProfile)),
                 "toggle_provider" => chat_command.set(Some(ChatCommand::ToggleProviderSelector)),
                 "open_attachments" => chat_command.set(Some(ChatCommand::OpenAttachments)),
@@ -117,6 +120,10 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 }
                 "cancel_generation" => chat_command.set(Some(ChatCommand::CancelGeneration)),
                 "close_tab" => chat_command.set(Some(ChatCommand::CloseTab)),
+                "next_tab" => chat_command.set(Some(ChatCommand::NextTab)),
+                "prev_tab" => chat_command.set(Some(ChatCommand::PrevTab)),
+                "next_tab_group" => chat_command.set(Some(ChatCommand::NextTabGroup)),
+                "prev_tab_group" => chat_command.set(Some(ChatCommand::PrevTabGroup)),
                 // Profile switching (session-local)
                 s if s.starts_with("switch_profile_") => {
                     if let Ok(idx) = s.replace("switch_profile_", "").parse::<usize>() {
@@ -204,6 +211,12 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                             if (lastPart === '.') return e.key === '.';
                             if (lastPart === 'space') return e.code === 'Space';
                             if (lastPart === 'arrowdown') return e.key === 'ArrowDown' || e.code === 'ArrowDown';
+                            // Bracket keys: match by physical code, not e.key. On a US
+                            // layout Shift+[ types as e.key curly-brace (not the bracket
+                            // itself), so a Shift binding like CmdOrCtrl+Shift+[ would
+                            // never match on e.key.
+                            if (lastPart === '[') return e.code === 'BracketLeft';
+                            if (lastPart === ']') return e.code === 'BracketRight';
                             
                             // Standard check for character keys
                             if (e.key.toLowerCase() === lastPart) return true;
@@ -218,6 +231,9 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         if (check(config.toggle_settings, event)) action = "toggle_settings";
                         else if (check(config.toggle_history, event)) action = "toggle_history";
                         else if (check(config.toggle_mcp, event)) action = "toggle_mcp";
+                        else if (check(config.toggle_planner, event)) action = "toggle_planner";
+                        else if (check(config.toggle_fleet, event)) action = "toggle_fleet";
+                        else if (check(config.quick_capture, event)) action = "quick_capture";
                         else if (check(config.toggle_profile, event)) action = "toggle_profile";
                         else if (check(config.toggle_provider, event)) action = "toggle_provider";
                         else if (check(config.toggle_attachments, event)) action = "open_attachments";
@@ -226,7 +242,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                         else if (check(config.toggle_focus_chat, event)) action = "focus_chat";
                         else if (check(config.toggle_scroll_to_bottom, event)) action = "scroll_bottom";
                         else if (check(config.cancel_generation, event)) action = "cancel_generation";
-                        
+                        else if (check(config.next_tab_group, event)) action = "next_tab_group";
+                        else if (check(config.prev_tab_group, event)) action = "prev_tab_group";
+                        else if (check(config.next_tab, event)) action = "next_tab";
+                        else if (check(config.prev_tab, event)) action = "prev_tab";
+
                         // Delete Session (Cmd+Backspace or Cmd+Delete) — only when NOT focused on an input.
                         // When focused, Cmd+Backspace is macOS "delete to beginning of line" and must pass through.
                         else if (!isInput && (event.metaKey || event.ctrlKey) && (event.key === 'Backspace' || event.key === 'Delete')) {{
@@ -303,6 +323,109 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
             }
         });
     });
+}
+
+/// Renders a stored hotkey combo (e.g. "CmdOrCtrl+Shift+T") the way a user on
+/// this platform expects to see it: symbol glyphs joined with no separator on
+/// macOS (`⇧⌘T`), `Ctrl+`-joined words elsewhere (`Ctrl+Shift+T`).
+pub fn display_combo(combo: &str) -> String {
+    display_combo_internal(combo, cfg!(target_os = "macos"))
+}
+
+/// Platform-parameterized implementation so both branches are unit-testable
+/// on a single machine.
+fn display_combo_internal(combo: &str, is_mac: bool) -> String {
+    let combo = combo.trim();
+    if combo.is_empty() {
+        return String::new();
+    }
+
+    let parts: Vec<&str> = combo.split('+').filter(|p| !p.is_empty()).collect();
+    let Some((key_part, mod_parts)) = parts.split_last() else {
+        return String::new();
+    };
+
+    if is_mac {
+        // Canonical macOS modifier order: Control, Option, Shift, Command.
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        let mut cmd = false;
+        for p in mod_parts {
+            match p.to_lowercase().as_str() {
+                "cmdorctrl" | "cmd" | "command" | "super" | "meta" => cmd = true,
+                "shift" => shift = true,
+                "alt" | "option" => alt = true,
+                "ctrl" | "control" => ctrl = true,
+                _ => {}
+            }
+        }
+
+        let mut out = String::new();
+        if ctrl {
+            out.push('⌃');
+        }
+        if alt {
+            out.push('⌥');
+        }
+        if shift {
+            out.push('⇧');
+        }
+        if cmd {
+            out.push('⌘');
+        }
+        out.push_str(&display_key_symbol(key_part));
+        out
+    } else {
+        let mut mods: Vec<String> = Vec::new();
+        for p in mod_parts {
+            let mapped = match p.to_lowercase().as_str() {
+                "cmdorctrl" | "cmd" | "command" | "super" | "meta" => "Ctrl".to_string(),
+                "shift" => "Shift".to_string(),
+                "alt" | "option" => "Alt".to_string(),
+                "ctrl" | "control" => "Ctrl".to_string(),
+                _ => capitalize(p),
+            };
+            if !mods.contains(&mapped) {
+                mods.push(mapped);
+            }
+        }
+        mods.push(display_key_symbol(key_part));
+        mods.join("+")
+    }
+}
+
+/// Maps a stored key token to what should be displayed for it. Single
+/// characters (letters, digits, and punctuation like `,`/`.`/`/`) are shown
+/// uppercased/as-is; named keys (as spelled by the JS matcher / hotkey
+/// defaults in `settings.rs`, e.g. `Space`, `ArrowDown`, `Enter`) map to their
+/// conventional symbol.
+fn display_key_symbol(key: &str) -> String {
+    match key.to_lowercase().as_str() {
+        "space" => "Space".to_string(),
+        "enter" | "return" => "⏎".to_string(),
+        "escape" | "esc" => "⎋".to_string(),
+        "backspace" => "⌫".to_string(),
+        "delete" => "⌦".to_string(),
+        "tab" => "⇥".to_string(),
+        "arrowup" | "up" => "↑".to_string(),
+        "arrowdown" | "down" => "↓".to_string(),
+        "arrowleft" | "left" => "←".to_string(),
+        "arrowright" | "right" => "→".to_string(),
+        "comma" => ",".to_string(),
+        "period" => ".".to_string(),
+        "slash" => "/".to_string(),
+        _ if key.chars().count() == 1 => key.to_uppercase(),
+        _ => capitalize(key),
+    }
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Checks if a Dioxus KeyboardEvent matches a hotkey string (e.g. "CmdOrCtrl+Enter").
@@ -435,5 +558,50 @@ mod tests {
             &Key::Character(".".to_string()),
             "CmdOrCtrl+."
         ));
+    }
+
+    #[test]
+    fn test_display_combo_mac_shift_letter() {
+        // Canonical macOS order is Control-Option-Shift-Command, so Command
+        // sits immediately before the key.
+        assert_eq!(display_combo_internal("CmdOrCtrl+Shift+T", true), "⇧⌘T");
+    }
+
+    #[test]
+    fn test_display_combo_mac_comma() {
+        assert_eq!(display_combo_internal("CmdOrCtrl+,", true), "⌘,");
+    }
+
+    #[test]
+    fn test_display_combo_mac_bracket() {
+        // Bracket keys fall through display_key_symbol's generic single-char
+        // branch (like comma/period already do) and render as the literal
+        // bracket, not a placeholder.
+        assert_eq!(display_combo_internal("CmdOrCtrl+Shift+[", true), "⇧⌘[");
+        assert_eq!(display_combo_internal("CmdOrCtrl+Shift+]", true), "⇧⌘]");
+    }
+
+    #[test]
+    fn test_display_combo_mac_alt_shift() {
+        assert_eq!(display_combo_internal("Alt+Shift+F", true), "⌥⇧F");
+    }
+
+    #[test]
+    fn test_display_combo_empty() {
+        assert_eq!(display_combo_internal("", true), "");
+        assert_eq!(display_combo_internal("", false), "");
+    }
+
+    #[test]
+    fn test_display_combo_non_mac() {
+        assert_eq!(
+            display_combo_internal("CmdOrCtrl+Shift+T", false),
+            "Ctrl+Shift+T"
+        );
+        assert_eq!(display_combo_internal("CmdOrCtrl+,", false), "Ctrl+,");
+        assert_eq!(
+            display_combo_internal("Alt+Shift+F", false),
+            "Alt+Shift+F"
+        );
     }
 }

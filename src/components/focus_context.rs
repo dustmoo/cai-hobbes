@@ -25,4 +25,6 @@ pub enum FocusContext {
     SettingsPanel,
     /// Skill editor overlay is open
     SkillEditorModal,
+    /// Quick-capture palette (Cmd+K) is open
+    QuickCapture,
 }

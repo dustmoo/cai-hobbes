@@ -1,23 +1,79 @@
 #![allow(non_snake_case)]
+use crate::components::chat_input::ChatCommand;
 use crate::components::stream_manager::StreamManagerContext;
 use crate::session::SessionState;
+use crate::settings::UiState;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
+
+/// How far (in negative px) the hover marquee should slide a tab's date +
+/// topic text — see `.tab-topic-track`/`.tab-topic-text` in main.css. Takes
+/// the full displayed string (date and topic together — they scroll as one
+/// unit so the date doesn't sit frozen while only the topic moves) and
+/// returns a cheap character-count estimate rather than a live DOM
+/// measurement (that would need `document::eval`, which this codebase's
+/// animation convention avoids for CSS-driven motion — see the tiger sprite
+/// animations). Deliberately generous: overshooting just means a short label
+/// pauses briefly at the fully-scrolled position before resetting, while
+/// undershooting would clip real content the user is trying to read.
+fn tab_text_marquee_shift_px(displayed_text: &str) -> i32 {
+    -(((displayed_text.chars().count() as i32) * 7) + 24)
+}
 
 #[derive(Props, PartialEq, Clone)]
 pub struct TabBarProps {
     pub open_tabs: Vec<String>,
+    /// Full label per tab (`Session::display_title`) — used as the rename
+    /// editing seed and as the fallback label when a tab has no emoji/topic
+    /// yet (a chat with no summary shows only the date, but the tooltip and
+    /// edit box still want the full display title).
     pub tab_names: Vec<String>,
+    /// AI-derived (or programmatic) tab emoji, `None` until a summary lands.
+    pub tab_emoji: Vec<Option<String>>,
+    /// Short creation date ("Sep 16"), always present.
+    pub tab_date: Vec<String>,
+    /// AI-derived topic, or the user's rename once one has happened
+    /// (`Session::tab_topic`) — `None` until a summary lands (and the user
+    /// hasn't renamed yet).
+    pub tab_topic: Vec<Option<String>>,
+    /// The session's resolved Composio profile display name, for the
+    /// collapsed-tab tooltip only (`settings.resolve_session_profile_display_name`).
+    pub tab_profile: Vec<Option<String>>,
     pub active_tab_index: usize,
     pub on_select_tab: EventHandler<usize>,
     pub on_close_tab: EventHandler<usize>,
     pub on_new_tab: EventHandler<()>,
+    /// The planner renders as its own tab rather than replacing the active
+    /// session's chat: open/active are separate so a chat tab can be selected
+    /// (deactivating the planner) without closing the planner tab.
+    pub planner_tab_open: bool,
+    pub planner_active: bool,
+    pub on_select_planner: EventHandler<()>,
+    pub on_close_planner: EventHandler<()>,
+    /// The fleet tab follows the planner-tab idiom: an app view pinned to
+    /// the strip, open/active tracked separately.
+    pub fleet_tab_open: bool,
+    pub fleet_active: bool,
+    /// Sessions needing the user right now — badges the fleet chip.
+    pub fleet_attention: usize,
+    pub on_select_fleet: EventHandler<()>,
+    pub on_close_fleet: EventHandler<()>,
+    /// False renders only the app chrome — tiger menu, History/MCP, new tab.
+    /// `main.rs` no longer uses it: in tab-sidebar mode the strip isn't
+    /// rendered at all and the sidebar header carries the menu and +.
+    #[props(default = true)]
+    pub show_tabs: bool,
 }
 
 pub fn TabBar(props: TabBarProps) -> Element {
     // Write-only: used only for update_session_name in editing handlers
     let mut session_state = use_context::<Signal<SessionState>>();
     let stream_manager = consume_context::<StreamManagerContext>();
+    // The app-chrome icons (Settings / History / MCP) live at the right end of
+    // this strip now, so the tab bar drives the same global command bus the
+    // chat bar used to. It is provided in `App`, above this component.
+    let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
+    let ui_state = use_context::<Signal<UiState>>();
     let mut editing_tab_id = use_signal(|| None::<String>);
     let mut temp_name = use_signal(String::new);
 
@@ -30,7 +86,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
         let _activity = stream_manager.stream_activity.read();
         // Also directly subscribe to streaming_sessions for immediate updates
         let _sessions = stream_manager.streaming_sessions.read();
-        let states: Vec<bool> = open_tabs_for_memo.iter()
+        let states: Vec<bool> = open_tabs_for_memo
+            .iter()
             .map(|id| stream_manager.is_session_streaming(id))
             .collect();
         states
@@ -40,13 +97,62 @@ pub fn TabBar(props: TabBarProps) -> Element {
         div {
             class: "flex items-center bg-section border-b border-primary-700/50 h-10 shrink-0 overflow-hidden",
 
-            // Tab items
-            for (idx, session_id) in props.open_tabs.iter().enumerate() {
-                {
-                    let is_active = idx == props.active_tab_index;
+            // App mark — the tiger anchors the window's top-left corner and
+            // doubles as the app menu (shared with the tab sidebar header).
+            crate::components::app_menu::AppMenuButton {
+                placement: crate::components::app_menu::AppMenuPlacement::Strip,
+            }
+
+            // Tab items — each chat tab's identity layers (emoji · date ·
+            // topic) degrade based on that tab's OWN rendered width (a CSS
+            // container query keyed to the ".tab-item" div below, in
+            // assets/main.css), not on how many tabs happen to be open.
+            // Previously this was a hard cliff computed purely from
+            // `open_tabs.len()` (see the removed `tab_density`/`Density`):
+            // three fixed tiers (<=6 tabs showed everything, 7-10 dropped
+            // the topic, >10 dropped the date too) that applied to every
+            // non-active tab identically and all at once. Opening one more
+            // tab that crossed a tier boundary made every other already-open
+            // tab lose information in the same frame — a jarring whole-strip
+            // "shift" a user could feel and reported getting lost from.
+            // Continuous per-tab shrinking (like real browser tabs) means
+            // each tab degrades only as its own box actually gets tight, and
+            // adding one tab nudges neighbors gradually instead of flipping
+            // a global switch. The active tab is still exempted (see
+            // `is_active` below) — it doesn't wear the CSS classes that
+            // container queries hide, so it always shows every layer
+            // regardless of width, same guarantee as before.
+            {
+                props.show_tabs.then(|| rsx! {
+                    for (idx, session_id) in props.open_tabs.iter().enumerate() {
+                        {
+                    // A session tab is never shown active while the planner tab
+                    // is — the session stays *selected* underneath, but exactly
+                    // one tab may carry the active styling.
+                    let is_active = idx == props.active_tab_index
+                        && !props.planner_active
+                        && !props.fleet_active;
                     let session_name = props.tab_names.get(idx)
                         .cloned()
                         .unwrap_or_else(|| "Unknown Session".to_string());
+                    let emoji = props.tab_emoji.get(idx).cloned().flatten();
+                    let date = props.tab_date.get(idx).cloned().unwrap_or_default();
+                    let topic = props.tab_topic.get(idx).cloned().flatten();
+                    let profile = props.tab_profile.get(idx).cloned().flatten();
+                    let has_summary = emoji.is_some() || topic.is_some();
+                    let show_emoji = emoji.is_some();
+                    // Collapsed tabs keep the full identity in the tooltip,
+                    // regardless of what the collapsed layers show.
+                    let tooltip = {
+                        let mut parts: Vec<String> = Vec::new();
+                        if let Some(e) = &emoji { parts.push(e.clone()); }
+                        if let Some(t) = topic.as_ref().or(has_summary.then_some(&session_name)) {
+                            parts.push(t.clone());
+                        }
+                        parts.push(date.clone());
+                        if let Some(p) = &profile { parts.push(p.clone()); }
+                        parts.join(" · ")
+                    };
                     let is_streaming = streaming_states.read().get(idx).cloned().unwrap_or(false);
                     let session_id_key = session_id.clone();
                     let id_edit = session_id.clone();
@@ -60,11 +166,25 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     rsx! {
                         div {
                             key: "{session_id_key}",
+                            // basis-64 (not min-w-0/auto): `.tab-item` below
+                            // carries `container-type: inline-size` for the
+                            // per-tab width-based degrading (see the
+                            // container-query doc comment above), and size
+                            // containment means this box's size can no
+                            // longer depend on ITS OWN content — an
+                            // auto/content flex-basis resolves to ~0 under
+                            // containment, which collapsed every tab to its
+                            // floor width regardless of how much room the
+                            // strip actually had. An explicit basis sidesteps
+                            // that entirely, and `grow` lets tabs fill real
+                            // spare width instead of leaving it empty next to
+                            // Planner/Fleet when few tabs are open.
                             class: if is_active {
-                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none bg-card border-b-2 border-b-primary-500"
+                                "tab-item group relative flex items-center h-full px-3 cursor-pointer basis-64 grow shrink min-w-10 max-w-64 overflow-hidden select-none bg-card border-b-2 border-b-primary-500"
                             } else {
-                                "group relative flex items-center h-full px-3 cursor-pointer min-w-0 max-w-64 shrink select-none hover:bg-card"
+                                "tab-item group relative flex items-center h-full px-3 cursor-pointer basis-64 grow shrink min-w-10 max-w-64 overflow-hidden select-none hover:bg-card"
                             },
+                            title: "{tooltip}",
                             onclick: move |_| {
                                 if !is_editing {
                                     on_select.call(idx);
@@ -148,8 +268,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                         class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse mr-1.5 shrink-0",
                                     }
                                 }
-                                span {
-                                    class: if is_active { "flex-1 truncate text-xs text-fg font-medium" } else { "flex-1 truncate text-xs text-fg-muted" },
+                                div {
+                                    class: "flex-1 min-w-0 flex items-center gap-1.5",
                                     onclick: move |evt| {
                                         if is_active {
                                             evt.stop_propagation();
@@ -157,7 +277,88 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                             editing_tab_id.set(Some(id_edit.clone()));
                                         }
                                     },
-                                    "{session_name}"
+                                    if show_emoji {
+                                        span {
+                                            class: "text-[13px] leading-none shrink-0",
+                                            "{emoji.clone().unwrap_or_default()}"
+                                        }
+                                    }
+                                    if !has_summary {
+                                        // No summary yet: the date is the whole label, as before.
+                                        span {
+                                            class: if is_active { "flex-1 truncate text-xs text-fg font-medium" } else { "flex-1 truncate text-xs text-fg-muted" },
+                                            "{date}"
+                                        }
+                                    } else {
+                                        {
+                                            let topic_text = topic.clone();
+                                            let marquee_source = match &topic_text {
+                                                Some(t) => format!("{date} {t}"),
+                                                None => date.clone(),
+                                            };
+                                            rsx! {
+                                                span {
+                                                    // `.tab-topic-track`
+                                                    // (main.css) truncates
+                                                    // date+topic together with
+                                                    // a single ellipsis
+                                                    // normally; on hover
+                                                    // (after a short delay) it
+                                                    // marquees BOTH as one
+                                                    // unit to reveal the rest,
+                                                    // instead of only the
+                                                    // topic moving while the
+                                                    // date sits frozen.
+                                                    // `--tab-topic-shift` is a
+                                                    // cheap character-count
+                                                    // estimate of how far it
+                                                    // needs to slide — see
+                                                    // `tab_text_marquee_shift_px`.
+                                                    class: "flex-1 min-w-0 tab-topic-track",
+                                                    style: "--tab-topic-shift: {tab_text_marquee_shift_px(&marquee_source)}px;",
+                                                    span {
+                                                        // display/align-items come from
+                                                        // `.tab-topic-text` in main.css (which
+                                                        // loads after tailwind.css, so it — not
+                                                        // a same-specificity Tailwind utility
+                                                        // here — is the one that must own
+                                                        // `display` for this element); `gap-1`
+                                                        // is still a plain Tailwind spacing
+                                                        // utility with nothing to conflict with.
+                                                        class: "tab-topic-text gap-1",
+                                                        span {
+                                                            // The .tab-date
+                                                            // container-query
+                                                            // class (main.css,
+                                                            // against the
+                                                            // ".tab-item"
+                                                            // wrapper) only
+                                                            // takes effect
+                                                            // when actually
+                                                            // present — the
+                                                            // active tab omits
+                                                            // it so it's
+                                                            // exempt from
+                                                            // width-based
+                                                            // hiding, same
+                                                            // guarantee the
+                                                            // old density
+                                                            // system gave it
+                                                            // explicitly.
+                                                            class: if is_active { "font-mono text-[11px] text-fg-muted tabular-nums shrink-0" } else { "tab-date font-mono text-[11px] text-fg-muted tabular-nums shrink-0" },
+                                                            "{date}"
+                                                        }
+                                                        if let Some(t) = &topic_text {
+                                                            span {
+                                                                class: if is_active { "text-xs text-fg font-medium" } else { "text-xs text-fg-muted" },
+                                                                "{t}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -179,6 +380,102 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         }
                     }
                 }
+                }
+            })
+            }
+
+            // Planner tab — a pinned app view, not a session: no rename, and
+            // closing it never touches session state.
+            if props.show_tabs && props.planner_tab_open {
+                div {
+                    class: if props.planner_active {
+                        "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none bg-card border-b-2 border-b-primary-500"
+                    } else {
+                        "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none hover:bg-card"
+                    },
+                    onclick: move |_| props.on_select_planner.call(()),
+                    Icon {
+                        icon: fi_icons::FiCheckSquare,
+                        width: 12,
+                        height: 12,
+                        class: if props.planner_active { "text-fg mr-1.5" } else { "text-fg-muted mr-1.5" },
+                    }
+                    span {
+                        class: if props.planner_active { "text-xs text-fg font-medium" } else { "text-xs text-fg-muted" },
+                        "Planner"
+                    }
+                    button {
+                        class: "ml-2 p-0.5 rounded-md hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            props.on_close_planner.call(());
+                        },
+                        Icon {
+                            icon: fi_icons::FiX,
+                            width: 12,
+                            height: 12,
+                        }
+                    }
+                }
+            }
+
+            // Fleet tab — same pinned-app-view idiom as the planner, plus an
+            // attention badge (sessions waiting on the user).
+            if props.show_tabs && props.fleet_tab_open {
+                div {
+                    class: if props.fleet_active {
+                        "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none bg-card border-b-2 border-b-primary-500"
+                    } else {
+                        "group relative flex items-center h-full px-3 cursor-pointer shrink-0 select-none hover:bg-card"
+                    },
+                    onclick: move |_| props.on_select_fleet.call(()),
+                    Icon {
+                        icon: crate::components::pixel_icons::HobbesTiger,
+                        width: 14,
+                        height: 14,
+                        class: if props.fleet_active { "mr-1.5" } else { "mr-1.5 opacity-70" },
+                    }
+                    span {
+                        class: if props.fleet_active { "text-xs text-fg font-medium" } else { "text-xs text-fg-muted" },
+                        "Fleet"
+                    }
+                    if props.fleet_attention > 0 {
+                        span {
+                            class: "ml-1.5 px-1.5 rounded-full text-[10px] font-bold",
+                            style: "background-color: #f59e0b22; color: #f59e0b; border: 1px solid #f59e0b;",
+                            "{props.fleet_attention}"
+                        }
+                    }
+                    button {
+                        class: "ml-2 p-0.5 rounded-md hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            props.on_close_fleet.call(());
+                        },
+                        Icon {
+                            icon: fi_icons::FiX,
+                            width: 12,
+                            height: 12,
+                        }
+                    }
+                }
+            }
+
+            // App chrome — Settings / History / MCP moved off the composer, which
+            // now carries only per-turn identity. Same commands, same visibility
+            // flags, just a home that isn't the message field.
+            div { class: "flex-1 min-w-0" }
+            TabBarIconButton {
+                icon: fi_icons::FiClock,
+                visible: ui_state.read().show_history_icon,
+                title: "History",
+                onclick: move |_| chat_command.set(Some(ChatCommand::ToggleHistory)),
+            }
+            TabBarIconButton {
+                icon: fi_icons::FiPackage,
+                visible: ui_state.read().show_mcp_icon,
+                title: "MCP Tools",
+                onclick: move |_| chat_command.set(Some(ChatCommand::ToggleMcp)),
             }
 
             // New tab button
@@ -193,5 +490,68 @@ pub fn TabBar(props: TabBarProps) -> Element {
                 }
             }
         }
+    }
+}
+
+/// A 32px icon button for the tab strip's right-hand app chrome. Deliberately
+/// local rather than reusing `shared::ChatBarIconButton`: that one is sized for
+/// the old 40px chat bar and is being retired from the composer.
+#[component]
+fn TabBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
+    icon: I,
+    onclick: EventHandler<MouseEvent>,
+    #[props(default = true)] visible: bool,
+    #[props(default = String::new())] title: String,
+) -> Element {
+    if !visible {
+        return rsx! {};
+    }
+
+    rsx! {
+        button {
+            class: "flex items-center justify-center w-8 h-8 shrink-0 rounded-md text-fg-muted hover:text-fg hover:bg-card focus:outline-none transition-colors",
+            onclick: move |evt| onclick.call(evt),
+            title: "{title}",
+            Icon {
+                width: 16,
+                height: 16,
+                icon: icon,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tab_text_marquee_tests {
+    use super::*;
+
+    #[test]
+    fn shift_is_always_negative_and_nonzero_even_for_empty_text() {
+        // Zero would leave the marquee's translateX(var(--tab-topic-shift))
+        // as a no-op, which is fine for genuinely empty text (there's
+        // nothing to reveal) — but the fixed 24px pad means it's still
+        // negative, matching the "always slide a little" behavior for any
+        // real (non-empty) label.
+        assert!(tab_text_marquee_shift_px("") < 0);
+    }
+
+    #[test]
+    fn longer_text_gets_a_larger_shift() {
+        let short = tab_text_marquee_shift_px("Short");
+        let long = tab_text_marquee_shift_px("A considerably longer chat topic");
+        assert!(long < short, "longer text should shift further: {long} vs {short}");
+    }
+
+    #[test]
+    fn date_and_topic_combined_shift_further_than_topic_alone() {
+        // The date rides along in the same marquee as the topic (they
+        // scroll as one unit), so the shift estimate must account for the
+        // date's characters too, not just the topic's.
+        let topic_only = tab_text_marquee_shift_px("Trust dispatch");
+        let date_and_topic = tab_text_marquee_shift_px("Sep 16 Trust dispatch");
+        assert!(
+            date_and_topic < topic_only,
+            "date+topic should shift further than topic alone: {date_and_topic} vs {topic_only}"
+        );
     }
 }

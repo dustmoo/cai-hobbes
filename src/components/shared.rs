@@ -48,6 +48,13 @@ pub fn set_chat_draft(
 #[derive(Clone, Copy, PartialEq)]
 pub struct SessionToDeleteContext(pub Signal<String>);
 
+/// Seed text awaiting the chat input after a planner todo is activated.
+/// main.rs writes it in the same effect that opens the new tab, so ChatInput's
+/// consuming effect necessarily runs after the render that unhid the chat —
+/// deterministic hand-off, no racing on the command signal.
+#[derive(Clone, Copy)]
+pub struct PendingChatSeedContext(pub Signal<Option<String>>);
+
 /// Context for surfacing async save errors to the UI via a dismissible toast.
 /// When `Some(msg)`, the toast is visible with the given error message.
 #[derive(Clone, Copy, PartialEq)]
@@ -61,6 +68,12 @@ pub enum MessageContent {
         thought_signature: Option<String>,
         #[serde(default)]
         thought_summary: Option<String>,
+        /// Which provider minted `thought_signature` (Claude and Gemini both
+        /// write opaque, mutually-incompatible blobs into that field, and
+        /// nothing else records which one produced a given blob). `None` on
+        /// legacy rows predating this field and on messages with no signature.
+        #[serde(default)]
+        signature_provider: Option<crate::settings::LlmProvider>,
     },
     ToolCall(ToolCall),
     PermissionRequest(ToolCall),
@@ -109,6 +122,12 @@ pub struct ToolCall {
     /// The actual thinking content (human-readable), separate from the encrypted signature
     #[serde(default)]
     pub thought_summary: Option<String>,
+    /// Which provider minted `thought_signature` (Claude and Gemini both write
+    /// opaque, mutually-incompatible blobs into that field, and nothing else
+    /// records which one produced a given blob). `None` on legacy rows
+    /// predating this field and on messages with no signature.
+    #[serde(default)]
+    pub signature_provider: Option<crate::settings::LlmProvider>,
     /// Filesystem path (`file:///…`) of a screenshot/image returned by this tool call.
     /// Set by stream_manager when MCP returns image content; read by prompt_builder to
     /// inject a `ContentBlock::Image` as vision input on the next continuation turn.
@@ -123,7 +142,47 @@ pub struct ToolCall {
     /// always retained for pagination/re-budgeting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_summary: Option<String>,
+    /// When the result was written back onto this call. Set by every site that
+    /// stamps `status`/`response` (the streaming path in `stream_manager` and
+    /// the approval-resume path in `chat.rs`). Paired with the owning
+    /// `Message::created_at` it yields the step's duration for the activity
+    /// stream. `None` on legacy rows and on calls still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The session's pinned Composio profile id at the moment this call was
+    /// minted. Paired with `connector_name`/`model` below, this is what lets
+    /// the activity stream label a finished turn with the provenance it
+    /// actually ran under, instead of the session's *current* pins (which may
+    /// have since changed). `None` on legacy rows and when no profile was
+    /// pinned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// The resolved connector instance's display name at turn time (see
+    /// `StreamManagerContext::effective_connector`). `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connector_name: Option<String>,
+    /// The effective chat model at turn time. `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Id of the stream turn (tool round) that minted this call; every call
+    /// the model emitted in one response shares it. Lets the prompt builder
+    /// tell the latest round apart from earlier back-to-back rounds, which are
+    /// otherwise adjacent `ToolCall` messages. `None` on legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_id: Option<String>,
+    /// Why this call never finished, when something stopped it: the user's
+    /// Stop, or Hobbes closing while it ran. A cancelled call is no longer
+    /// `Running` (see [`ToolCall::mark_cancelled`]); the activity stream says
+    /// "cancelled" only for these, never for a call still in flight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancelled: Option<String>,
 }
+
+/// Stop reason for a call cut off by the user's Stop.
+pub const CANCELLED_BY_STOP: &str = "Stopped by you";
+/// Stop reason for a call still in flight when Hobbes closed.
+pub const CANCELLED_BY_RESTART: &str = "Hobbes closed while it ran";
+
 
 pub enum StreamMessage {
     Text {
@@ -131,7 +190,10 @@ pub enum StreamMessage {
         thought_signature: Option<String>,
         thought_summary: Option<String>,
     },
-    ToolCall(ToolCall),
+    // Boxed: `ToolCall` carries several inline `String`/`Option<String>`
+    // fields (provenance stamps included) and is far larger than the other
+    // variants — boxing keeps `StreamMessage` itself small to pass around.
+    ToolCall(Box<ToolCall>),
     Error {
         message: String,
     },
@@ -148,12 +210,25 @@ pub struct UsageData {
     pub thoughts_tokens: Option<i32>,
     #[serde(default)]
     pub cached_content_tokens: Option<i32>,
+    /// Tokens written to the provider's prompt cache this request (Anthropic).
+    #[serde(default)]
+    pub cache_creation_tokens: Option<i32>,
     /// Calculated cost in USD
     #[serde(default)]
     pub cost: Option<f64>,
 }
 
 impl ToolCall {
+    /// End a call that will never finish: an error result naming `reason`
+    /// (the model sees it, and nothing re-runs it — the approval-resume path
+    /// collects only `Running` calls), stamped `cancelled` for the UI.
+    pub fn mark_cancelled(&mut self, reason: &str, now: chrono::DateTime<chrono::Utc>) {
+        self.status = ToolCallStatus::Error;
+        self.response = format!("Cancelled: {reason}. The call did not finish; its result is unknown.");
+        self.completed_at = Some(now);
+        self.cancelled = Some(reason.to_string());
+    }
+
     pub fn new(
         server_name: String,
         tool_name: String,
@@ -170,9 +245,45 @@ impl ToolCall {
             response: String::new(),
             thought_signature,
             thought_summary,
+            signature_provider: None,
             cached_image_path: None,
             result_summary: None,
+            completed_at: None,
+            profile_id: None,
+            connector_name: None,
+            model: None,
+            round_id: None,
+            cancelled: None,
         }
+    }
+
+    /// Attach signature provenance to a tool call built via [`ToolCall::new`].
+    /// `provider` is stamped only when `thought_signature` is actually present —
+    /// a `None` signature never needs an owning provider. Kept as a separate
+    /// builder (rather than a `ToolCall::new` parameter) so call sites in the
+    /// individual LLM connectors — which don't yet know their own provider at
+    /// construction time — don't all need updating; callers that DO know the
+    /// provider (e.g. `stream_manager`, which resolves it from the session's
+    /// connector) chain this on afterwards.
+    pub fn with_signature_provider(mut self, provider: crate::settings::LlmProvider) -> Self {
+        self.signature_provider = self.thought_signature.is_some().then_some(provider);
+        self
+    }
+
+    /// Stamp turn-time provenance (profile / connector / model) onto a tool
+    /// call as it's minted, so the activity stream can label a finished turn
+    /// with what it actually ran under rather than the session's current
+    /// pins. Called alongside `with_signature_provider` in `stream_manager`.
+    pub fn with_turn_provenance(
+        mut self,
+        profile_id: Option<String>,
+        connector_name: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        self.profile_id = profile_id;
+        self.connector_name = connector_name;
+        self.model = model;
+        self
     }
 }
 
@@ -344,6 +455,319 @@ pub fn ChatBarIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + Partia
                 height: 20,
                 icon: icon
             }
+        }
+    }
+}
+
+// --- Message timestamps ---------------------------------------------------
+//
+// Every caption under a message reads `Author · 8:04 AM`, and a divider marks
+// the first message of each local day. The pure helpers work on naive local
+// times so they can be tested without depending on the machine's timezone;
+// the `*_utc` wrappers convert a stored `created_at` to local time.
+
+fn to_local(ts: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDateTime {
+    ts.with_timezone(&chrono::Local).naive_local()
+}
+
+/// The short time shown in a caption, e.g. `8:04 AM`.
+pub fn caption_time(ts: chrono::NaiveDateTime) -> String {
+    ts.format("%-I:%M %p").to_string()
+}
+
+/// The full stamp shown on hover, e.g. `Fri, Sep 25, 2026 · 8:04:29 AM`.
+pub fn full_timestamp(ts: chrono::NaiveDateTime) -> String {
+    ts.format("%a, %b %-d, %Y · %-I:%M:%S %p").to_string()
+}
+
+/// Label for the divider before the first message of `day`:
+/// `Today · Fri, Sep 25`, `Yesterday · Thu, Sep 24`, `Tue, Sep 15`, or
+/// `Tue, Dec 9, 2025` once it's outside the current year.
+pub fn day_divider_label(day: chrono::NaiveDate, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let short = day.format("%a, %b %-d");
+    if day == today {
+        format!("Today · {short}")
+    } else if today.pred_opt() == Some(day) {
+        format!("Yesterday · {short}")
+    } else if day.year() == today.year() {
+        short.to_string()
+    } else {
+        day.format("%a, %b %-d, %Y").to_string()
+    }
+}
+
+/// Whether a caption should carry its time. A caption repeats the previous
+/// one's time only when the author and the local minute both match (e.g. an
+/// activity block and the reply that follows it in the same minute), and then
+/// the time is dropped.
+pub fn caption_shows_time(
+    prev: Option<(&str, chrono::NaiveDateTime)>,
+    cur: (&str, chrono::NaiveDateTime),
+) -> bool {
+    use chrono::Timelike;
+    match prev {
+        Some((prev_author, prev_ts)) => {
+            prev_author != cur.0
+                || prev_ts.date() != cur.1.date()
+                || prev_ts.hour() != cur.1.hour()
+                || prev_ts.minute() != cur.1.minute()
+        }
+        None => true,
+    }
+}
+
+/// [`caption_shows_time`] over stored UTC stamps.
+pub fn caption_shows_time_utc(
+    prev: Option<(&str, chrono::DateTime<chrono::Utc>)>,
+    cur: (&str, chrono::DateTime<chrono::Utc>),
+) -> bool {
+    caption_shows_time(prev.map(|(a, ts)| (a, to_local(ts))), (cur.0, to_local(cur.1)))
+}
+
+/// The divider label to render before a message stamped `cur`, or `None` when
+/// it falls on the same local day as the previous rendered message.
+pub fn day_divider_utc(
+    prev: Option<chrono::DateTime<chrono::Utc>>,
+    cur: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let day = to_local(cur).date();
+    if prev.map(|p| to_local(p).date()) == Some(day) {
+        return None;
+    }
+    Some(day_divider_label(day, chrono::Local::now().date_naive()))
+}
+
+/// The muted caption under a message: `Hobbes · 8:04 AM`, with the full
+/// stamp on hover. `show_time: false` renders the label alone (see
+/// [`caption_shows_time`]).
+#[component]
+pub fn MessageCaption(
+    label: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    #[props(default = true)] show_time: bool,
+    #[props(default = false)] align_right: bool,
+) -> Element {
+    let align = if align_right { "text-right" } else { "text-left" };
+    let local = to_local(created_at);
+    rsx! {
+        div {
+            class: "text-xs text-fg-muted mt-1 px-2 {align}",
+            "{label}"
+            if show_time {
+                span {
+                    class: "cursor-default",
+                    title: "{full_timestamp(local)}",
+                    " · {caption_time(local)}"
+                }
+            }
+        }
+    }
+}
+
+/// Centered hairline marking the first message of a local day.
+#[component]
+pub fn DayDivider(label: String) -> Element {
+    rsx! {
+        div {
+            class: "flex items-center gap-3 pt-1",
+            div { class: "flex-1 border-t border-faint" }
+            div { class: "text-[11px] font-semibold tracking-wide text-fg-muted", "{label}" }
+            div { class: "flex-1 border-t border-faint" }
+        }
+    }
+}
+
+#[cfg(test)]
+mod timestamp_tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    fn at(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32) -> chrono::NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, s)
+            .unwrap()
+    }
+
+    #[test]
+    fn caption_time_is_12h_without_leading_zero() {
+        assert_eq!(caption_time(at(2026, 9, 25, 8, 4, 29)), "8:04 AM");
+        assert_eq!(caption_time(at(2026, 9, 24, 21, 12, 0)), "9:12 PM");
+        assert_eq!(caption_time(at(2026, 9, 25, 0, 5, 0)), "12:05 AM");
+    }
+
+    #[test]
+    fn full_timestamp_has_date_and_seconds() {
+        assert_eq!(
+            full_timestamp(at(2026, 9, 25, 8, 4, 29)),
+            "Fri, Sep 25, 2026 · 8:04:29 AM"
+        );
+    }
+
+    #[test]
+    fn divider_labels_by_distance_from_today() {
+        let today = NaiveDate::from_ymd_opt(2026, 9, 25).unwrap();
+        let day = |m, d| NaiveDate::from_ymd_opt(2026, m, d).unwrap();
+        assert_eq!(day_divider_label(today, today), "Today · Fri, Sep 25");
+        assert_eq!(day_divider_label(day(9, 24), today), "Yesterday · Thu, Sep 24");
+        assert_eq!(day_divider_label(day(9, 15), today), "Tue, Sep 15");
+        assert_eq!(
+            day_divider_label(NaiveDate::from_ymd_opt(2025, 12, 9).unwrap(), today),
+            "Tue, Dec 9, 2025"
+        );
+    }
+
+    #[test]
+    fn yesterday_crosses_a_year_boundary() {
+        let today = NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        let dec31 = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
+        assert_eq!(day_divider_label(dec31, today), "Yesterday · Thu, Dec 31");
+    }
+
+    #[test]
+    fn time_hidden_only_for_same_author_same_minute() {
+        let t = at(2026, 9, 24, 21, 12, 5);
+        assert!(caption_shows_time(None, ("Hobbes", t)));
+        // Author changed.
+        assert!(caption_shows_time(Some(("User", t)), ("Hobbes", at(2026, 9, 24, 21, 12, 40))));
+        // Same author, same minute: activity block then its reply.
+        assert!(!caption_shows_time(Some(("Hobbes", t)), ("Hobbes", at(2026, 9, 24, 21, 12, 58))));
+        // Same author, a later minute: a long tool run still shows.
+        assert!(caption_shows_time(Some(("Hobbes", t)), ("Hobbes", at(2026, 9, 24, 21, 14, 0))));
+        // Same clock minute on a different day.
+        assert!(caption_shows_time(Some(("Hobbes", t)), ("Hobbes", at(2026, 9, 25, 21, 12, 5))));
+    }
+}
+
+#[cfg(test)]
+mod signature_provider_tests {
+    use super::*;
+    use crate::settings::LlmProvider;
+
+    /// A legacy `ToolCall` JSON row (predates `signature_provider`) must still
+    /// deserialize, with the new field defaulting to `None`.
+    #[test]
+    fn legacy_tool_call_json_deserializes_with_none_provider() {
+        let legacy_json = serde_json::json!({
+            "execution_id": "exec-1",
+            "server_name": "srv",
+            "tool_name": "tool",
+            "arguments": "{}",
+            "status": "Completed",
+            "response": "ok",
+            "thought_signature": "abc123",
+        });
+        let tc: ToolCall =
+            serde_json::from_value(legacy_json).expect("legacy ToolCall should deserialize");
+        assert_eq!(tc.signature_provider, None);
+        assert_eq!(tc.thought_signature.as_deref(), Some("abc123"));
+    }
+
+    /// A stamped `ToolCall` round-trips its `signature_provider` through serde.
+    #[test]
+    fn stamped_tool_call_round_trips_provider() {
+        let mut tc = ToolCall::new(
+            "srv".to_string(),
+            "tool".to_string(),
+            serde_json::json!({}),
+            Some("sig-blob".to_string()),
+            None,
+        );
+        tc = tc.with_signature_provider(LlmProvider::Claude);
+        assert_eq!(tc.signature_provider, Some(LlmProvider::Claude));
+
+        let json = serde_json::to_value(&tc).expect("serialize");
+        let round_tripped: ToolCall = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.signature_provider, Some(LlmProvider::Claude));
+    }
+
+    /// A legacy `ToolCall` JSON row (predates `profile_id`/`connector_name`/
+    /// `model`) must still deserialize, with all three defaulting to `None`.
+    #[test]
+    fn legacy_tool_call_json_deserializes_with_none_provenance() {
+        let legacy_json = serde_json::json!({
+            "execution_id": "exec-1",
+            "server_name": "srv",
+            "tool_name": "tool",
+            "arguments": "{}",
+            "status": "Completed",
+            "response": "ok",
+        });
+        let tc: ToolCall =
+            serde_json::from_value(legacy_json).expect("legacy ToolCall should deserialize");
+        assert_eq!(tc.profile_id, None);
+        assert_eq!(tc.connector_name, None);
+        assert_eq!(tc.model, None);
+    }
+
+    /// A stamped `ToolCall` round-trips its turn provenance through serde.
+    #[test]
+    fn stamped_tool_call_round_trips_turn_provenance() {
+        let tc = ToolCall::new(
+            "srv".to_string(),
+            "tool".to_string(),
+            serde_json::json!({}),
+            None,
+            None,
+        )
+        .with_turn_provenance(
+            Some("p2".to_string()),
+            Some("Claude work".to_string()),
+            Some("claude-fable-5-1".to_string()),
+        );
+
+        let json = serde_json::to_value(&tc).expect("serialize");
+        let round_tripped: ToolCall = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.profile_id.as_deref(), Some("p2"));
+        assert_eq!(round_tripped.connector_name.as_deref(), Some("Claude work"));
+        assert_eq!(round_tripped.model.as_deref(), Some("claude-fable-5-1"));
+    }
+
+    /// A legacy `MessageContent::Text` JSON row (predates `signature_provider`)
+    /// must still deserialize, with the new field defaulting to `None`.
+    #[test]
+    fn legacy_text_content_json_deserializes_with_none_provider() {
+        let legacy_json = serde_json::json!({
+            "Text": {
+                "content": "hello",
+                "thought_signature": "sig",
+                "thought_summary": "summary"
+            }
+        });
+        let content: MessageContent = serde_json::from_value(legacy_json)
+            .expect("legacy MessageContent::Text should deserialize");
+        match content {
+            MessageContent::Text {
+                signature_provider,
+                thought_signature,
+                ..
+            } => {
+                assert_eq!(signature_provider, None);
+                assert_eq!(thought_signature.as_deref(), Some("sig"));
+            }
+            other => panic!("expected Text variant, got {:?}", other),
+        }
+    }
+
+    /// A stamped `MessageContent::Text` round-trips its `signature_provider`.
+    #[test]
+    fn stamped_text_content_round_trips_provider() {
+        let content = MessageContent::Text {
+            content: "hello".to_string(),
+            thought_signature: Some("sig".to_string()),
+            thought_summary: None,
+            signature_provider: Some(LlmProvider::Claude),
+        };
+        let json = serde_json::to_value(&content).expect("serialize");
+        let round_tripped: MessageContent = serde_json::from_value(json).expect("deserialize");
+        match round_tripped {
+            MessageContent::Text {
+                signature_provider, ..
+            } => {
+                assert_eq!(signature_provider, Some(LlmProvider::Claude));
+            }
+            other => panic!("expected Text variant, got {:?}", other),
         }
     }
 }

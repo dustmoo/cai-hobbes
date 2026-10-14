@@ -2,6 +2,38 @@ use crate::llm::types::{LlmPrompt, ToolDefinition};
 use crate::llm::UsageData;
 use serde::{Deserialize, Serialize};
 
+/// Marks a mid-conversation `ChatRole::System` message that a connector has
+/// to send as user-role text (the provider, or a local server's chat
+/// template, rejects a system message that isn't first), so the model reads
+/// it as harness context rather than something the user said.
+pub const CONTEXT_PREFIX: &str = "[Context]\n";
+
+/// `text` with [`CONTEXT_PREFIX`] in front.
+pub fn context_text(text: &str) -> String {
+    format!("{CONTEXT_PREFIX}{text}")
+}
+
+/// Append a mid-conversation system message to an OpenAI-style message list
+/// as user-role context text. Merged into a directly preceding user message
+/// (strict-alternation chat templates reject two user turns in a row),
+/// otherwise a new user message. `text_part_type` is the content-part type
+/// for array content (`"text"` for Chat Completions, `"input_text"` for
+/// Responses). Deterministic: depends only on what precedes it.
+pub fn push_context_as_user(messages: &mut Vec<serde_json::Value>, text: &str, text_part_type: &str) {
+    let text = context_text(text);
+    if let Some(last) = messages.last_mut().filter(|m| m["role"] == "user") {
+        if let Some(s) = last["content"].as_str() {
+            last["content"] = serde_json::json!(format!("{s}\n\n{text}"));
+            return;
+        }
+        if let Some(parts) = last["content"].as_array_mut() {
+            parts.push(serde_json::json!({ "type": text_part_type, "text": text }));
+            return;
+        }
+    }
+    messages.push(serde_json::json!({ "role": "user", "content": text }));
+}
+
 /// Each provider implements this to convert neutral<->native formats.
 /// This replaces the current monolithic Gemini-specific conversion.
 pub trait LlmFormatConverter {

@@ -8,22 +8,22 @@ use super::forget_memory_modal::ForgetMemoryModal;
 use super::message_list::MessageList;
 use super::new_chat_memory_modal::NewChatMemoryModal;
 use super::quick_fix::QuickFix;
-use super::shared::{DraftContext, MessageContent, SessionIdContext, StreamMessage};
+use super::shared::{DraftContext, MessageCaption, MessageContent, SessionIdContext, StreamMessage};
 use crate::components::markdown_renderer::{MarkdownRenderer, ThinkingMarkdownRenderer};
 use crate::components::stream_manager::StreamManagerContext;
 use crate::context::permissions::PermissionManager;
 use crate::context::prompt_builder::PromptBuilder;
-use crate::mcp::manager::{is_composio_native, COMPOSIO_NATIVE_PREFIX};
 use crate::session::ActiveContext;
+use crate::session_events::{log_event, SessionEvent};
 use crate::settings::Settings;
 use dioxus::html::geometry::euclid::Rect;
 use dioxus::prelude::*;
-use std::collections::HashMap;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 use feature_clipboard::copy_to_clipboard;
 use hobbes_core::models::Attachment;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 use syntect::easy::HighlightLines;
@@ -89,8 +89,10 @@ pub fn ChatWindow(
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let mut settings = use_context::<Signal<Settings>>();
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
-    let _mcp_context = use_context::<Signal<crate::mcp::manager::McpContext>>();
+    let mcp_context_signal = use_context::<Signal<crate::mcp::manager::McpContext>>();
     let permission_manager = use_context::<Signal<PermissionManager>>();
+    let skill_registry = use_context::<Signal<crate::skills::SkillRegistry>>();
+    let planner_state = use_context::<Signal<crate::todo::PlannerState>>();
     let mut chat_command = use_context::<Signal<Option<super::chat_input::ChatCommand>>>();
 
     // Shared expansion state for <details> blocks in MarkdownRenderer.
@@ -120,12 +122,16 @@ pub fn ChatWindow(
     // Shared helper: fetch fresh MCP context for a session and update its active_context.
     // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
     let fetch_fresh_mcp_context = move |target_id: String, settings_snapshot: Settings| async move {
-        // Pass the profile ID directly (composio_profile is the stable ID)
+        // Pass the profile ID directly (composio_profile is the stable ID).
+        // A session with no pinned profile uses the global active one —
+        // `get_mcp_context(None)` would return every profile's Composio
+        // server, whose tools collide by name at the provider.
         let profile_id = session_state
             .read()
             .sessions
             .get(&target_id)
-            .and_then(|s| s.composio_profile.clone());
+            .and_then(|s| s.composio_profile.clone())
+            .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone()));
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
@@ -160,8 +166,22 @@ pub fn ChatWindow(
     let mut show_delete_confirm_modal = use_signal(|| false);
     let mut pending_delete_message_id = use_signal(|| None::<String>);
     let mut delete_message_count = use_signal(|| 0);
-    let mut has_new_comments = use_signal(|| false);
-    let mut has_pending_approvals = use_signal(|| false);
+    // Per-session, not global: a comment or an approval belongs to the tab it
+    // was made in, and both survive a tab switch while work is in flight.
+    let mut has_new_comments = use_signal(std::collections::HashSet::<String>::new);
+    // The global approval signal (see `tool_call_display::APPROVED_SESSIONS`),
+    // so Approve clicks outside this tree (Agent time panel, decision queue)
+    // reach the same resume effect below. Still provided as context for the
+    // existing consumers under this component.
+    let mut has_pending_approvals = crate::components::tool_call_display::APPROVED_SESSIONS.signal();
+    // Tool-call message ids currently being executed by the approval effect.
+    // Approval-pending and executing calls are both `ToolCallStatus::Running`
+    // (the status enum is matched in ~190 places, so a new variant is not
+    // worth the churn), which means a second approval in the same session
+    // would otherwise re-collect a call already in flight and run it twice.
+    // Ids are claimed in the collecting write and released when the result
+    // lands.
+    let mut claimed_tool_calls = use_signal(std::collections::HashSet::<uuid::Uuid>::new);
     // Dismiss state for the small-context-window warning banner.
     let mut ctx_window_warning_dismissed = use_signal(|| false);
     use_context_provider(|| has_pending_approvals);
@@ -181,34 +201,34 @@ pub fn ChatWindow(
     };
 
     // Sync mcp_context signal changes to the active session's mcp_tools
-    // This ensures the UI updates immediately when tools are loaded/unloaded
-    // We filter tools by the session's active profile to ensure isolation.
+    // This ensures the UI updates immediately when tools are loaded/unloaded.
+    // The shared context may have been built for another Composio profile
+    // (background refreshes follow the global active profile), so it is
+    // scoped to this session's profile: a session pinned elsewhere keeps its
+    // own profile's Composio tools and toolkit slugs.
     use_effect(move || {
-        let mut current_context = _mcp_context.read().clone();
+        let global_context = mcp_context_signal.read().clone();
+        let settings_read = settings.read();
         let mut state = session_state.write();
-        if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
-            let profile_id = session.composio_profile.clone();
+        let target_id = current_target_id.read().clone();
+        if let Some(session) = state.sessions.get_mut(&target_id) {
+            // Same resolution as `fetch_fresh_mcp_context`.
+            let profile_id = crate::mcp::manager::resolve_context_profile(
+                session.composio_profile.as_deref(),
+                &settings_read,
+            );
+            let profile_name = profile_id
+                .as_deref()
+                .and_then(|id| settings_read.profile_name_for_id(id));
+            let scoped = crate::mcp::manager::scope_context_to_profile(
+                &global_context,
+                session.active_context.mcp_tools.as_ref(),
+                profile_id.as_deref(),
+                profile_name,
+            );
 
-            // Filter servers to only include non-native or profile-matching native tools
-            // Use the server_name convention: config.name contains the display key,
-            // but we filter by matching the profile_id against the known session profile.
-            current_context.servers.retain(|s| {
-                if is_composio_native(&s.name) {
-                    if let Some(ref target_id) = profile_id {
-                        // Include singleton (legacy) or if name contains the target profile ID/name
-                        let suffix = s.name.strip_prefix("composio-native:").unwrap_or_default();
-                        suffix.is_empty() || suffix == target_id
-                    } else {
-                        // If no profile, only allow the legacy/default composio-native
-                        s.name == COMPOSIO_NATIVE_PREFIX
-                    }
-                } else {
-                    true
-                }
-            });
-
-            if !current_context.servers.is_empty() {
-                session.active_context.mcp_tools = Some(current_context);
+            if !scoped.servers.is_empty() {
+                session.active_context.mcp_tools = Some(scoped);
             } else {
                 session.active_context.mcp_tools = None;
             }
@@ -218,6 +238,10 @@ pub fn ChatWindow(
         // By reading the session state here, the effect becomes dependent on it.
         // Any change to messages will cause this to re-run.
         let _ = stream_update_trigger.read();
+        // Tool-call cards are written into session_state directly by the
+        // StreamManager (no MessageBubble on_content_update fires for them), so
+        // subscribe to stream_activity to auto-scroll when they appear/update.
+        let _ = stream_manager.stream_activity.read();
         let current_session_id = current_target_id.read().clone();
 
         let mut is_session_switch = false;
@@ -297,37 +321,70 @@ pub fn ChatWindow(
         }
     });
 
+    // Approved tool calls execute here, keyed by the session that OWNS them.
+    // The approval signal carries owning session ids, so a tab switch while an
+    // MCP call is in flight can never route the result into another chat.
     use_effect(move || {
-        if *has_pending_approvals.read() {
+        let pending: Vec<String> = has_pending_approvals.read().iter().cloned().collect();
+        if pending.is_empty() {
+            return;
+        }
+        // Clear up front; the re-run this write triggers sees an empty set.
+        has_pending_approvals.write().clear();
+
+        for owning_id in pending {
             spawn(async move {
                 let mut session_state = session_state;
                 let mcp_manager = mcp_manager;
-                let active_session_id = current_target_id.read().clone();
                 let mut tools_to_run = Vec::new();
 
                 // Indicate activity immediately
-                stream_manager.streaming_sessions.write().insert(active_session_id.clone());
-                // Clear the signal so we don't re-trigger loop
-                has_pending_approvals.set(false);
+                stream_manager
+                    .streaming_sessions
+                    .write()
+                    .insert(owning_id.clone());
+                *stream_manager.stream_activity.write() += 1;
+                // Approval given: the fleet row stops waiting right away
+                // (continuation would report too, but only after the tools run).
+                if crate::fleet::bridge::enabled() {
+                    let name = session_state
+                        .peek()
+                        .sessions
+                        .get(&owning_id)
+                        .map(|s| s.name.clone())
+                        .unwrap_or_default();
+                    crate::fleet::bridge::report(
+                        &owning_id,
+                        &name,
+                        crate::fleet::bridge::HobbesSignal::TurnStarted,
+                    );
+                }
 
                 // 1. Identify tools that need to be run and capture profile context
-                let active_session_id_inner = active_session_id.clone();
                 let composio_profile = {
                     let state = session_state.read();
                     state
                         .sessions
-                        .get(&active_session_id_inner)
+                        .get(&owning_id)
                         .and_then(|s| s.composio_profile.clone())
                 };
 
                 {
                     let state = session_state.read();
-                    if let Some(session) = state.sessions.get(&active_session_id) {
+                    // Claim each call in the same write that collects it: two
+                    // approvals landing for one session both scan for
+                    // `Running` calls, and without a claim the second would
+                    // re-execute calls the first is already running. `insert`
+                    // returning false means someone else owns this one.
+                    let mut claimed = claimed_tool_calls.write();
+                    if let Some(session) = state.sessions.get(&owning_id) {
                         for msg in &session.messages {
                             if let crate::components::shared::MessageContent::ToolCall(tc) =
                                 &msg.content
                             {
-                                if tc.status == crate::components::shared::ToolCallStatus::Running {
+                                if tc.status == crate::components::shared::ToolCallStatus::Running
+                                    && claimed.insert(msg.id)
+                                {
                                     tools_to_run.push((msg.id, tc.clone()));
                                 }
                             }
@@ -338,87 +395,194 @@ pub fn ChatWindow(
                 if tools_to_run.is_empty() {
                     // This could be a Skill continuation (no tools to run).
                     // Reset streaming state since we won't be executing any tools
-                    stream_manager.streaming_sessions.write().remove(&active_session_id);
+                    stream_manager.streaming_sessions.write().remove(&owning_id);
+                    *stream_manager.stream_activity.write() += 1;
                     // Clear this session's in-flight guard before re-triggering
-                    continuation_controller.write().clear_in_flight(&active_session_id);
-                    continuation_controller.write().trigger_continuation(active_session_id.clone());
+                    continuation_controller.write().clear_in_flight(&owning_id);
+                    if !crate::agent_time_runtime::continuation_blocked(
+                        &planner_state.peek(),
+                        &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                        &owning_id,
+                    ) {
+                        continuation_controller
+                            .write()
+                            .trigger_continuation(owning_id.clone());
+                    }
                     return;
                 }
 
                 // 2. Execute tools
                 for (msg_id, tool_call) in tools_to_run {
+                    // The step's clock starts when the approved call actually
+                    // runs, not when the prompt was raised — `created_at` is what
+                    // the activity stream measures a step's offset and duration
+                    // from, and the wait for a human is not work the tool did.
+                    // `restamp_message` clamps to the neighbouring messages, so a
+                    // prompt answered out of order can't reshuffle the vec.
+                    {
+                        let mut state = session_state.write();
+                        if let Some(session) = state.sessions.get_mut(&owning_id) {
+                            session.restamp_message(&msg_id, chrono::Utc::now());
+                        }
+                    }
                     let args_json: serde_json::Value = serde_json::from_str(&tool_call.arguments)
                         .unwrap_or(serde_json::Value::Null);
 
-                    // Intercept HOBBES_PAGE_RESULT and HOBBES_UPDATE_SCRATCHPAD before MCP
-                    // dispatch — these tools require SessionState which McpManager doesn't own.
-                    let (status, response_str) = if tool_call.tool_name == "HOBBES_PAGE_RESULT" {
-                        let page_budget = crate::session::compute_page_budget(
-                            &settings.read(),
-                            session_state.read().sessions.get(&active_session_id),
-                        );
-                        session_state.write().handle_page_result(&args_json, "", page_budget)
-                    } else if tool_call.tool_name == "HOBBES_UPDATE_SCRATCHPAD" {
-                        session_state.write().handle_scratchpad_update(&args_json, &active_session_id, &settings.read())
-                    } else {
-                        // Normal MCP tool dispatch
-                        let manager = mcp_manager.read().clone();
-                        let result_receiver = manager
-                            .use_mcp_tool(
-                                &tool_call.server_name,
-                                &tool_call.tool_name,
-                                args_json,
+                    // Built-in tools run before MCP dispatch, through the same
+                    // dispatcher the streaming path uses so the two can't drift
+                    // apart (see components::builtin_tools).
+                    let builtin_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+                        session_state,
+                        settings,
+                        skill_registry,
+                        permission_manager,
+                        mcp_context: mcp_context_signal,
+                        planner: planner_state,
+                        chat_command,
+                    };
+                    // Agent time: the same scope gate as the streaming path,
+                    // with the user's approval in hand (an approved outside
+                    // effect runs; Deny, no intent, or an ended run refuse).
+                    let builtin = match crate::components::builtin_tools::agent_time_gate(
+                        builtin_ctx,
+                        &tool_call,
+                        &args_json,
+                        &owning_id,
+                        true,
+                    ) {
+                        crate::components::builtin_tools::AgentTimeGate::Refuse(message) => {
+                            Some(crate::components::builtin_tools::BuiltinOutcome {
+                                status: crate::components::shared::ToolCallStatus::Error,
+                                response: message,
+                                persist: true,
+                            })
+                        }
+                        _ => {
+                            crate::components::builtin_tools::dispatch_builtin_tool(
+                                builtin_ctx,
+                                &tool_call,
+                                &args_json,
+                                &owning_id,
+                                composio_profile.as_ref(),
+                                // Only approved calls are `Running` here (see step 1):
+                                // the Approve click already satisfied the skill gate.
                                 true,
-                                composio_profile.clone(),
                             )
-                            .await;
-
-                        let (s, r, _) = match result_receiver {
-                            Ok(receiver) => {
-                                crate::mcp::manager::McpManager::process_tool_output(receiver).await
-                            }
-                            Err(e) => (crate::components::shared::ToolCallStatus::Error, e, false),
-                        };
-                        (s, r)
+                            .await
+                        }
                     };
 
+                    let (status, response_str, persist) = match builtin {
+                        Some(outcome) => (outcome.status, outcome.response, outcome.persist),
+                        None => {
+                            // Normal MCP tool dispatch
+                            let manager = mcp_manager.read().clone();
+                            // Approval resume rebuilds the session context —
+                            // the approving chat owns the tool call. Built
+                            // for every tool (trust gate + decision log).
+                            let session_ctx = {
+                                let state = session_state.peek();
+                                state.sessions.get(&owning_id).map(|s| {
+                                    crate::mcp::terminal_client::TerminalCtx {
+                                        session_id: owning_id.clone(),
+                                        cwd: crate::mcp::terminal_client::resolve_session_cwd(
+                                            s,
+                                            &planner_state.peek(),
+                                            &settings.peek(),
+                                        ),
+                                        project_id: s.project_id.clone(),
+                                    }
+                                })
+                            };
+                            let result_receiver = manager
+                                .use_mcp_tool(
+                                    &tool_call.server_name,
+                                    &tool_call.tool_name,
+                                    args_json,
+                                    true,
+                                    composio_profile.clone(),
+                                    session_ctx,
+                                )
+                                .await;
+
+                            let (s, r, _) = match result_receiver {
+                                Ok(receiver) => {
+                                    crate::mcp::manager::McpManager::process_tool_output(receiver)
+                                        .await
+                                }
+                                Err(e) => {
+                                    (crate::components::shared::ToolCallStatus::Error, e, false)
+                                }
+                            };
+                            (s, r, false)
+                        }
+                    };
 
                     // Update session state with result
                     {
                         let mut state = session_state.write();
 
                         // Update message status
-                        if let Some(msg) = state.get_message_mut(&msg_id) {
+                        let mut result_snapshot: Option<crate::components::chat::Message> = None;
+                        if let Some(msg) = state.get_message_mut_in_session(&owning_id, &msg_id) {
                             if let crate::components::shared::MessageContent::ToolCall(tc) =
                                 &mut msg.content
                             {
                                 tc.status = status;
                                 tc.response = response_str.clone();
+                                tc.completed_at = Some(chrono::Utc::now());
+                                result_snapshot = Some(msg.clone());
                             }
                         }
+                        if let Some(message) = result_snapshot {
+                            log_event(&owning_id, SessionEvent::ToolResult { message });
+                        }
 
-                        // Add to history for context
-                        state
-                            .tool_call_history
-                            .push(crate::components::shared::ToolCallRecord {
-                                call: tool_call.clone(),
-                                result: crate::components::shared::ToolResult {
-                                    status,
-                                    response: response_str,
-                                },
-                                profile_color: {
-                                    let settings_read = settings.read();
-                                    crate::components::shared::resolve_profile_color(
-                                        composio_profile.as_ref(),
-                                        &settings_read,
-                                    )
-                                },
-                            });
+                        // Add to the OWNING session's history for context
+                        let record = crate::components::shared::ToolCallRecord {
+                            call: tool_call.clone(),
+                            result: crate::components::shared::ToolResult {
+                                status,
+                                response: response_str,
+                            },
+                            profile_color: {
+                                let settings_read = settings.read();
+                                crate::components::shared::resolve_profile_color(
+                                    composio_profile.as_ref(),
+                                    &settings_read,
+                                )
+                            },
+                        };
+                        if let Some(session) = state.sessions.get_mut(&owning_id) {
+                            session.tool_call_history.push(record);
+                        }
+                    }
+                    // Result written — the call is no longer in flight.
+                    claimed_tool_calls.write().remove(&msg_id);
+
+                    // Built-ins that mutate durable session state (scratchpad,
+                    // skills, timers) must survive a restart; pagination is
+                    // turn-local and skips the write.
+                    if persist {
+                        crate::session::SessionState::save_async(&session_state.read(), None);
                     }
                 }
 
-                // 3. Trigger continuation to send results back to LLM
-                continuation_controller.write().trigger_continuation(active_session_id.clone());
+                // 3. Trigger continuation to send results back to LLM —
+                // unless agent time ended in this chat meanwhile.
+                if crate::agent_time_runtime::continuation_blocked(
+                    &planner_state.peek(),
+                    &crate::agent_time_runtime::LEASED_CHATS.peek(),
+                    &owning_id,
+                ) {
+                    tracing::info!(session_id = %owning_id, "Continuation skipped: agent time has ended in this chat.");
+                    stream_manager.streaming_sessions.write().remove(&owning_id);
+                    *stream_manager.stream_activity.write() += 1;
+                    return;
+                }
+                continuation_controller
+                    .write()
+                    .trigger_continuation(owning_id.clone());
             });
         }
     });
@@ -440,7 +604,9 @@ pub fn ChatWindow(
                     move || {
                         // Clear the session-scoped continuation guard so the next
                         // trigger_continuation() for THIS session can proceed.
-                        continuation_controller.write().clear_in_flight(&session_id_for_cleanup);
+                        continuation_controller
+                            .write()
+                            .clear_in_flight(&session_id_for_cleanup);
                         let _ = tx.send(());
                     }
                 };
@@ -468,8 +634,10 @@ pub fn ChatWindow(
         }
     };
 
+    // `target_id` is explicit: a queued message can drain into a BACKGROUND
+    // session, so the send path must never infer its target from the active tab.
     let send_message = std::rc::Rc::new(
-        move |(user_message, attachments): (String, Vec<Attachment>)| {
+        move |(user_message, attachments, target_id): (String, Vec<Attachment>, String)| {
             spawn({
                 let mut session_state = session_state;
                 let settings = settings;
@@ -480,26 +648,31 @@ pub fn ChatWindow(
 
                 async move {
                     let settings_read = settings.read().clone();
-                    let target_id = current_target_id.read().clone();
 
                     // Reset the AI turn count every time the user sends a message.
                     if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
                         session.reset_turn_count();
                     }
 
-                    // Clear the tool call history to ensure a fresh start for the new turn.
-                    session_state.write().tool_call_history.clear();
+                    // Clear the target session's tool call history to ensure a
+                    // fresh start for the new turn (never other tabs').
+                    if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
+                        session.tool_call_history.clear();
+                    }
 
                     // Check if the last message was the turn limit warning.
-                    let last_message_was_warning = session_state.read().sessions.get(&target_id)
-                .and_then(|s| s.messages.last())
-                .is_some_and(|m| {
-                    if let MessageContent::Text { content: text, .. } = &m.content {
-                        text.starts_with("Pardon, I have reached the 'Max Turn Limit'")
-                    } else {
-                        false
-                    }
-                });
+                    let last_message_was_warning = session_state
+                        .read()
+                        .sessions
+                        .get(&target_id)
+                        .and_then(|s| s.messages.last())
+                        .is_some_and(|m| {
+                            if let MessageContent::Text { content: text, .. } = &m.content {
+                                text.starts_with("Pardon, I have reached the 'Max Turn Limit'")
+                            } else {
+                                false
+                            }
+                        });
 
                     if last_message_was_warning {
                         if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
@@ -508,8 +681,8 @@ pub fn ChatWindow(
                     }
 
                     if user_message.trim().is_empty() && attachments.is_empty() {
-                        if *has_new_comments.read() {
-                            has_new_comments.set(false);
+                        if has_new_comments.read().contains(&target_id) {
+                            has_new_comments.write().remove(&target_id);
                             let hobbes_message_id = Uuid::new_v4();
                             {
                                 let mut state = session_state.write();
@@ -521,6 +694,7 @@ pub fn ChatWindow(
                                             content: "".to_string(),
                                             thought_signature: None,
                                             thought_summary: None,
+                                            signature_provider: None,
                                         },
                                         attachments: Vec::new(),
                                         comments: Vec::new(),
@@ -536,13 +710,25 @@ pub fn ChatWindow(
                                 fetch_fresh_mcp_context(target_id.clone(), settings_read.clone())
                                     .await;
 
-                            let (prompt_data, pages) = {
+                            let (prompt_data, pages, history_anchor, ledger_entries) = {
                                 let state = session_state.read();
                                 if let Some(session) = state.sessions.get(&target_id) {
-                                    let builder =
-                                        PromptBuilder::new(session, &settings_read, &state);
+                                    let builder = PromptBuilder::new(session, &settings_read)
+                                        .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                                        .with_planner_today(
+                                            crate::todo::handlers::planner_today_context(
+                                                &planner_state.read(),
+                                                &settings_read,
+                                                chrono::Local::now().date_naive(),
+                                            ),
+                                        );
                                     let result = builder.build_prompt("".to_string());
-                                    (result.prompt, result.pages_to_store)
+                                    (
+                                        result.prompt,
+                                        result.pages_to_store,
+                                        result.history_anchor,
+                                        result.ledger_entries,
+                                    )
                                 } else {
                                     return;
                                 }
@@ -550,6 +736,24 @@ pub fn ChatWindow(
                             // Store paginated pages in a separate write scope (clean borrow separation)
                             if !pages.is_empty() {
                                 session_state.write().store_pages(pages);
+                            }
+                            // Persist a moved history trim anchor the same way, so the next build
+                            // starts from the same cut (keeps the prompt-cache prefix stable).
+                            if session_state
+                                .read()
+                                .history_anchor_changed(&target_id, history_anchor)
+                            {
+                                session_state
+                                    .write()
+                                    .set_history_anchor(&target_id, history_anchor);
+                            }
+                            // Persist the turn context ledger entries the build created (boundary
+                            // updates, the request tail, a trim snapshot) so later builds replay
+                            // them unchanged.
+                            if !ledger_entries.is_empty() {
+                                session_state
+                                    .write()
+                                    .append_ledger_entries(&target_id, ledger_entries);
                             }
 
                             let mcp_context = if fresh_mcp_context.servers.is_empty() {
@@ -567,70 +771,99 @@ pub fn ChatWindow(
                         return;
                     }
 
-                    has_new_comments.set(false);
+                    has_new_comments.write().remove(&target_id);
 
-                    let turn_count = session_state.read().sessions.get(&target_id)
-                        .map(|s| s.current_ai_turn_count).unwrap_or(0);
-                    if permission_manager.read().is_turn_limit_reached_for(turn_count) {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&target_id) {
-                            session.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: MessageContent::Text {
-                                    content: user_message.clone(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments,
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            session.messages.push(Message {
-                        id: Uuid::new_v4(),
-                        author: "Hobbes".to_string(),
-                        content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None },
-                        attachments: Vec::new(),
-                        comments: Vec::new(),
-                        created_at: chrono::Utc::now(),
-                        usage: None,
-                    });
+                    let turn_count = session_state
+                        .read()
+                        .sessions
+                        .get(&target_id)
+                        .map(|s| s.current_ai_turn_count)
+                        .unwrap_or(0);
+                    if permission_manager
+                        .read()
+                        .is_turn_limit_reached_for(turn_count)
+                    {
+                        let user_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text {
+                                content: user_message.clone(),
+                                thought_signature: None,
+                                thought_summary: None,
+                                signature_provider: None,
+                            },
+                            attachments,
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        let warning_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "Hobbes".to_string(),
+                            content: MessageContent::Text { content: format!("Pardon, I have reached the 'Max Turn Limit' currently set to {} in settings and need permission to continue.", settings_read.permission_settings.max_ai_turns), thought_signature: None, thought_summary: None, signature_provider: None },
+                            attachments: Vec::new(),
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_id) {
+                                session.messages.push(user_msg.clone());
+                                session.messages.push(warning_msg.clone());
+                            }
                         }
+                        crate::session_events::log_events(
+                            &target_id,
+                            vec![
+                                SessionEvent::UserMessage { message: user_msg },
+                                SessionEvent::AssistantMessage {
+                                    message: warning_msg,
+                                },
+                            ],
+                        );
                         return;
                     }
 
                     let hobbes_message_id = Uuid::new_v4();
                     {
-                        let mut state = session_state.write();
-                        if let Some(session) = state.sessions.get_mut(&target_id) {
-                            session.messages.push(Message {
-                                id: Uuid::new_v4(),
-                                author: "User".to_string(),
-                                content: MessageContent::Text {
-                                    content: user_message.clone(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments,
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
-                            session.messages.push(Message {
-                                id: hobbes_message_id,
-                                author: "Hobbes".to_string(),
-                                content: MessageContent::Text {
-                                    content: "".to_string(),
-                                    thought_signature: None,
-                                    thought_summary: None,
-                                },
-                                attachments: Vec::new(),
-                                comments: Vec::new(),
-                                created_at: chrono::Utc::now(),
-                                usage: None,
-                            });
+                        let user_msg = Message {
+                            id: Uuid::new_v4(),
+                            author: "User".to_string(),
+                            content: MessageContent::Text {
+                                content: user_message.clone(),
+                                thought_signature: None,
+                                thought_summary: None,
+                                signature_provider: None,
+                            },
+                            attachments,
+                            comments: Vec::new(),
+                            created_at: chrono::Utc::now(),
+                            usage: None,
+                        };
+                        {
+                            let mut state = session_state.write();
+                            if let Some(session) = state.sessions.get_mut(&target_id) {
+                                session.messages.push(user_msg.clone());
+                                // Streaming placeholder — finalized (and journaled)
+                                // by stream_manager at end of turn.
+                                session.messages.push(Message {
+                                    id: hobbes_message_id,
+                                    author: "Hobbes".to_string(),
+                                    content: MessageContent::Text {
+                                        content: "".to_string(),
+                                        thought_signature: None,
+                                        thought_summary: None,
+                                        signature_provider: None,
+                                    },
+                                    attachments: Vec::new(),
+                                    comments: Vec::new(),
+                                    created_at: chrono::Utc::now(),
+                                    usage: None,
+                                });
+                            }
                         }
+                        log_event(&target_id, SessionEvent::UserMessage { message: user_msg });
                     }
                     // Scroll to bottom immediately so the new messages are visible
                     // without waiting for the first streaming chunk.
@@ -654,13 +887,27 @@ pub fn ChatWindow(
                         }
                     }
 
-                    let (prompt_data, pages) = {
-                        let user_prompt = user_message.clone();
+                    let (prompt_data, pages, history_anchor, ledger_entries) = {
+                        // The user message was pushed onto the session above
+                        // (with its attachments), so linearisation already
+                        // includes it. Passing it again would send it twice.
+                        let user_prompt = String::new();
                         let state = session_state.read();
                         if let Some(session) = state.sessions.get(&target_id) {
-                            let builder = PromptBuilder::new(session, &settings_read, &state);
+                            let builder = PromptBuilder::new(session, &settings_read)
+                                .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                                .with_planner_today(crate::todo::handlers::planner_today_context(
+                                    &planner_state.read(),
+                                    &settings_read,
+                                    chrono::Local::now().date_naive(),
+                                ));
                             let result = builder.build_prompt(user_prompt);
-                            (result.prompt, result.pages_to_store)
+                            (
+                                result.prompt,
+                                result.pages_to_store,
+                                result.history_anchor,
+                                result.ledger_entries,
+                            )
                         } else {
                             tracing::error!("No active session found when building prompt");
                             return;
@@ -669,6 +916,24 @@ pub fn ChatWindow(
                     // Store paginated pages in a separate write scope (clean borrow separation)
                     if !pages.is_empty() {
                         session_state.write().store_pages(pages);
+                    }
+                    // Persist a moved history trim anchor the same way, so the next build
+                    // starts from the same cut (keeps the prompt-cache prefix stable).
+                    if session_state
+                        .read()
+                        .history_anchor_changed(&target_id, history_anchor)
+                    {
+                        session_state
+                            .write()
+                            .set_history_anchor(&target_id, history_anchor);
+                    }
+                    // Persist the turn context ledger entries the build created (boundary
+                    // updates, the request tail, a trim snapshot) so later builds replay
+                    // them unchanged.
+                    if !ledger_entries.is_empty() {
+                        session_state
+                            .write()
+                            .append_ledger_entries(&target_id, ledger_entries);
                     }
 
                     crate::session::SessionState::save_async(&session_state.read(), None);
@@ -698,7 +963,10 @@ pub fn ChatWindow(
 
     let continue_prompt_flow = {
         Rc::new(move |target_id: String| {
-            tracing::debug!("continue_prompt_flow callback INVOKED for session '{}'", target_id);
+            tracing::debug!(
+                "continue_prompt_flow callback INVOKED for session '{}'",
+                target_id
+            );
             spawn(async move {
                 tracing::debug!(session_id = %target_id, "continue_prompt_flow task SPAWNED.");
                 let mut session_state = session_state;
@@ -715,6 +983,7 @@ pub fn ChatWindow(
                                 content: "".to_string(),
                                 thought_signature: None,
                                 thought_summary: None,
+                                signature_provider: None,
                             },
                             attachments: Vec::new(),
                             comments: Vec::new(),
@@ -729,22 +998,61 @@ pub fn ChatWindow(
                 let fresh_mcp_context =
                     fetch_fresh_mcp_context(target_id.clone(), settings.clone()).await;
 
-                let (prompt_data, pages) = {
+                let (prompt_data, pages, history_anchor, ledger_entries) = {
                     let state = session_state.read();
                     if let Some(session) = state.sessions.get(&target_id) {
-                        let builder = PromptBuilder::new(session, &settings, &state);
+                        let builder = PromptBuilder::new(session, &settings)
+                            .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                            .with_planner_today(crate::todo::handlers::planner_today_context(
+                                &planner_state.read(),
+                                &settings,
+                                chrono::Local::now().date_naive(),
+                            ),
+                        );
                         let result = builder.build_prompt("".to_string());
-                        (result.prompt, result.pages_to_store)
+                        (
+                            result.prompt,
+                            result.pages_to_store,
+                            result.history_anchor,
+                            result.ledger_entries,
+                        )
                     } else {
                         tracing::error!(
                             "Active session lost during continuation flow - aborting prompt build"
                         );
+                        // Clean up stale streaming entry if session was deleted mid-execution
+                        if stream_manager
+                            .streaming_sessions
+                            .read()
+                            .contains(&target_id)
+                        {
+                            stream_manager.streaming_sessions.write().remove(&target_id);
+                            *stream_manager.stream_activity.write() += 1;
+                        }
                         return;
                     }
                 };
                 // Store paginated pages in a separate write scope (clean borrow separation)
                 if !pages.is_empty() {
                     session_state.write().store_pages(pages);
+                }
+                // Persist a moved history trim anchor the same way, so the next build
+                // starts from the same cut (keeps the prompt-cache prefix stable).
+                if session_state
+                    .read()
+                    .history_anchor_changed(&target_id, history_anchor)
+                {
+                    session_state
+                        .write()
+                        .set_history_anchor(&target_id, history_anchor);
+                }
+                // Persist the turn context ledger entries the build created (boundary
+                // updates, the request tail, a trim snapshot) so later builds replay
+                // them unchanged.
+                if !ledger_entries.is_empty() {
+                    session_state
+                        .write()
+                        .append_ledger_entries(&target_id, ledger_entries);
                 }
 
                 crate::session::SessionState::save_async(&session_state.read(), None);
@@ -778,12 +1086,16 @@ pub fn ChatWindow(
         let mut local_cmd = chat_command;
         let (text_content, msg_attachments) = {
             let state = session_state.read();
-            state.sessions.get(&*current_target_id.read())
+            state
+                .sessions
+                .get(&*current_target_id.read())
                 .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
-                .map(|msg| (
-                    msg.content.get_text_content().unwrap_or_default(),
-                    msg.attachments.clone(),
-                ))
+                .map(|msg| {
+                    (
+                        msg.content.get_text_content().unwrap_or_default(),
+                        msg.attachments.clone(),
+                    )
+                })
                 .unwrap_or_default()
         };
         local_cmd.set(Some(super::chat_input::ChatCommand::RestoreToDraft(
@@ -815,15 +1127,121 @@ pub fn ChatWindow(
         } else {
             restore_message_to_draft(message_id);
 
-            // Delete the message and everything after
+            // Delete the message and everything after. Journal-complete
+            // sessions rewind by replay (RewoundTo + project); pre-journal
+            // sessions take the legacy in-place path.
             let message_id_str = message_id.to_string();
             let active_session_id = current_target_id.read().clone();
-            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                session.delete_message_and_after(&message_id_str);
-                // Trigger update
-                stream_update_trigger.set(stream_update_trigger() + 1);
+            {
+                let mut state = session_state.write();
+                crate::session_events::rewind_session_state(
+                    &mut state,
+                    &active_session_id,
+                    &message_id_str,
+                );
             }
+            stream_update_trigger.set(stream_update_trigger() + 1);
             crate::session::SessionState::save_async(&session_state.read(), None);
+        }
+    };
+
+    // Inline edit — Save: mutate the message text in place and journal
+    // MessageEdited. No rewind, no model turn; the projector applies the edit
+    // by id, preserving attachments/comments/usage.
+    let edit_message_save = move |(message_id, new_text): (Uuid, String)| {
+        let session_id = current_target_id.read().clone();
+        let mut applied = false;
+        {
+            let mut state = session_state.write();
+            if let Some(session) = state.sessions.get_mut(&session_id) {
+                if let Some(msg) = session.messages.iter_mut().find(|m| m.id == message_id) {
+                    if let MessageContent::Text { content, .. } = &mut msg.content {
+                        *content = new_text.clone();
+                        applied = true;
+                    }
+                }
+            }
+        }
+        if applied {
+            log_event(
+                &session_id,
+                SessionEvent::MessageEdited {
+                    message_id,
+                    content: new_text,
+                },
+            );
+            stream_update_trigger.set(stream_update_trigger() + 1);
+            crate::session::SessionState::save_async(&session_state.read(), None);
+        }
+    };
+
+    // Inline edit — Save & Resend: journal MessageEdited for provenance
+    // (synchronously, so it lands before the rewind's RewoundTo row), rewind
+    // to just before this message (same machinery as delete: replay for
+    // journal-complete sessions, legacy in-place otherwise), then re-dispatch
+    // the edited text through the normal send path so streaming, context, and
+    // journaling all behave as a fresh send.
+    let edit_message_resend = {
+        let send_message = send_message.clone();
+        move |(message_id, new_text): (Uuid, String)| {
+            let session_id = current_target_id.read().clone();
+            let attachments = session_state
+                .read()
+                .sessions
+                .get(&session_id)
+                .and_then(|s| s.messages.iter().find(|m| m.id == message_id))
+                .map(|m| m.attachments.clone())
+                .unwrap_or_default();
+            crate::session_events::log_event_sync(
+                &session_id,
+                SessionEvent::MessageEdited {
+                    message_id,
+                    content: new_text.clone(),
+                },
+            );
+            {
+                let mut state = session_state.write();
+                crate::session_events::rewind_session_state(
+                    &mut state,
+                    &session_id,
+                    &message_id.to_string(),
+                );
+            }
+            stream_update_trigger.set(stream_update_trigger() + 1);
+            crate::session::SessionState::save_async(&session_state.read(), None);
+            send_message((new_text, attachments, session_id));
+        }
+    };
+
+    // Fork-from-message: copy the journal up to this message's first event
+    // (inclusive) into a new session and open it as a tab. Only offered for
+    // journal-complete sessions — pre-journal history refuses gracefully.
+    let fork_save_error = consume_context::<crate::components::shared::SaveErrorContext>().0;
+    let fork_from_message = move |message_id: Uuid| {
+        let mut fork_save_error = fork_save_error;
+        let session_id = current_target_id.read().clone();
+        let anchor =
+            crate::session_store::first_event_seq_for_message(&session_id, &message_id.to_string());
+        let Some(at_seq) = anchor.filter(|&s| s > 0) else {
+            fork_save_error.set(Some(
+                "This message predates the session journal — fork unavailable.".to_string(),
+            ));
+            return;
+        };
+        let result = session_state
+            .write()
+            .fork_session(&session_id, Some(at_seq));
+        match result {
+            Ok(new_id) => {
+                crate::session::SessionState::save_async(&session_state.read(), None);
+                chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(
+                    new_id,
+                )));
+            }
+            Err(e) => {
+                tracing::warn!("fork_from_message failed: {e}");
+                fork_save_error.set(Some(e));
+            }
         }
     };
 
@@ -840,6 +1258,20 @@ pub fn ChatWindow(
         let routing_target = *optimization_target.read();
         match routing_target {
             OptimizationTarget::Session => {
+                let notice_msg = Message {
+                    id: Uuid::new_v4(),
+                    author: "Hobbes".to_string(),
+                    content: MessageContent::Text {
+                        content: format!("✨ **Memory Optimized**\n\n{}", summary),
+                        thought_signature: None,
+                        thought_summary: None,
+                        signature_provider: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    usage: None,
+                };
                 {
                     let mut state = session_state.write();
                     if let Some(session) = state.sessions.get_mut(&*current_target_id.read()) {
@@ -847,21 +1279,24 @@ pub fn ChatWindow(
                         session.memory_optimization_summary = Some(summary.clone());
 
                         // Insert Internal Turn Message
-                        session.messages.push(Message {
-                            id: Uuid::new_v4(),
-                            author: "Hobbes".to_string(),
-                            content: MessageContent::Text {
-                                content: format!("✨ **Memory Optimized**\n\n{}", summary),
-                                thought_signature: None,
-                                thought_summary: None,
-                            },
-                            attachments: Vec::new(),
-                            comments: Vec::new(),
-                            created_at: chrono::Utc::now(),
-                            usage: None,
-                        });
+                        session.messages.push(notice_msg.clone());
                     }
                 }
+                // MemoryOptimized journals only the summary: the wholesale
+                // active_context replacement is deliberately NOT replayed —
+                // mcp_tools/tools/extra are reactively rebuilt (P-001 sync,
+                // ToolCallSummarizer), so the summary is the durable outcome.
+                crate::session_events::log_events(
+                    &current_target_id.read().clone(),
+                    vec![
+                        SessionEvent::MemoryOptimized {
+                            summary: summary.clone(),
+                        },
+                        SessionEvent::AssistantMessage {
+                            message: notice_msg,
+                        },
+                    ],
+                );
                 crate::session::SessionState::save_async(&session_state.read(), None);
                 // Force refresh messagelist
                 stream_update_trigger.set(stream_update_trigger() + 1);
@@ -889,6 +1324,18 @@ pub fn ChatWindow(
         }
         show_forget_memory_modal.set(false);
     };
+
+    // Mirrors the active session's streaming state. A `use_signal` (not a
+    // `Signal::new` inside `rsx!`) so ChatInput sees one stable signal.
+    let mut is_sending = use_signal(|| false);
+    use_effect(move || {
+        // Belt-and-braces: re-run when stream_activity bumps. Real subscription is is_session_streaming.
+        let _ = stream_manager.stream_activity.read();
+        let streaming = stream_manager.is_session_streaming(&current_target_id.read());
+        if *is_sending.peek() != streaming {
+            is_sending.set(streaming);
+        }
+    });
 
     let session_guard = session.read();
 
@@ -932,15 +1379,22 @@ pub fn ChatWindow(
                     stream_update_trigger: stream_update_trigger,
                     show_scroll_button: show_scroll_button,
                     on_delete: delete_message,
-                    on_comment: move |_| has_new_comments.set(true),
+                    on_fork: fork_from_message,
+                    on_edit_save: edit_message_save,
+                    on_edit_resend: edit_message_resend,
+                    on_comment: move |_| {
+                        let sid = current_target_id.read().clone();
+                        has_new_comments.write().insert(sid);
+                    },
+                    on_stop: move |_| cancel_message(),
                 },
                 ChatInput {
-                    is_sending: Signal::new(stream_manager.is_session_streaming(&current_target_id.read())),
+                    is_sending: is_sending,
                     has_new_comments: has_new_comments,
                     has_pending_approvals: has_pending_approvals,
                     on_send: {
                         let send_message = send_message.clone();
-                        move |(msg, attachments)| send_message((msg, attachments))
+                        move |(msg, attachments, target)| send_message((msg, attachments, target))
                     },
                     on_cancel: move |_| cancel_message(),
                     on_interaction: on_interaction,
@@ -1007,11 +1461,15 @@ pub fn ChatWindow(
                             }
 
                             let active_session_id = current_target_id.read().clone();
-                            if let Some(session) = session_state.write().sessions.get_mut(&active_session_id) {
-                                session.delete_message_and_after(id);
-                                // Trigger update
-                                stream_update_trigger.set(stream_update_trigger() + 1);
+                            {
+                                let mut state = session_state.write();
+                                crate::session_events::rewind_session_state(
+                                    &mut state,
+                                    &active_session_id,
+                                    id,
+                                );
                             }
+                            stream_update_trigger.set(stream_update_trigger() + 1);
                             crate::session::SessionState::save_async(&session_state.read(), None);
                         }
                         show_delete_confirm_modal.set(false);
@@ -1156,13 +1614,32 @@ struct SelectionState {
     left: f64,
 }
 
+/// Whether a Hobbes bubble should copy its text from `session_state` (P-016).
+///
+/// Only a bubble that is actively draining the live stream channel skips the
+/// mirror — it already receives every chunk. Everyone else mirrors, and that
+/// includes the moment the turn stops generating: the stream task writes the
+/// final chunks and clears the generating flag without yielding in between,
+/// so `generating == false` is exactly when the last sync must happen.
+fn should_mirror_session_text(owns_channel: bool, _generating: bool) -> bool {
+    // `_generating` deliberately does not gate the result — see the doc above.
+    !owns_channel
+}
+
 #[component]
 pub fn MessageBubble(
     message: Message,
     on_content_update: EventHandler<()>,
     on_selection: EventHandler<(String, f64, f64)>,
     on_delete: EventHandler<()>,
+    #[props(default)] on_fork: EventHandler<()>,
+    #[props(default)] on_edit_save: EventHandler<String>,
+    #[props(default)] on_edit_resend: EventHandler<String>,
     on_comment: EventHandler<()>,
+    /// Whether the caption carries its time; the list drops it when the
+    /// previous caption shares this author and minute.
+    #[props(default = true)]
+    show_time: bool,
 ) -> Element {
     let is_user = message.author == "User";
 
@@ -1214,11 +1691,34 @@ pub fn MessageBubble(
             let display_mode = ui_state.read().token_display_mode.clone();
             let usage_data = message.usage.clone();
 
+            // User bubbles: an @-mention fleet expansion stays in the stored
+            // text (the model saw it; history is honest) but renders as a
+            // collapsed disclosure instead of cluttering the bubble.
+            let fleet_ref = use_memo(move || {
+                if is_user {
+                    crate::fleet::mention::split_expansion(&content())
+                        .map(|(m, b)| (m.to_string(), b.to_string()))
+                } else {
+                    None
+                }
+            });
+            let mut show_fleet_ref = use_signal(|| false);
+
+            // Inline edit state (user-authored text messages only)
+            let mut editing = use_signal(|| false);
+            let mut edit_draft = use_signal(String::new);
+            let SessionIdContext(bubble_session_id) = use_context::<SessionIdContext>();
+
             // Inline comment state
             let mut selection_mode = use_signal(|| SelectionMode::None);
             let mut selection_data = use_signal(SelectionState::default);
             let mut editing_comment_id = use_signal(|| None::<String>);
             let mut is_mouse_over_toolbar = use_signal(|| false);
+            // Comment draft lives here (not in the popover) so it survives popover
+            // remounts and can be checked before discarding unsaved text.
+            let mut comment_draft = use_signal(String::new);
+            let mut comment_draft_original = use_signal(String::new);
+            let mut show_discard_comment_confirm = use_signal(|| false);
 
             // State tracking for "Thinking" vs "Generating"
             let is_streaming = stream_manager.is_generating(&message.id);
@@ -1331,7 +1831,9 @@ pub fn MessageBubble(
                     while let Ok(msg) = eval.recv().await {
                         if let Ok(data) = serde_json::from_value::<SelectionData>(msg) {
                             if data.hide {
-                                if !*is_mouse_over_toolbar.read() && *selection_mode.read() == SelectionMode::Toolbar {
+                                if !*is_mouse_over_toolbar.read()
+                                    && *selection_mode.read() == SelectionMode::Toolbar
+                                {
                                     selection_mode.set(SelectionMode::None);
                                 }
                             } else if !data.text.trim().is_empty() {
@@ -1352,7 +1854,14 @@ pub fn MessageBubble(
             // If it's a streaming Hobbes message, it takes the stream and updates its local state.
             use_effect(move || {
                 let _stream_activity = stream_manager.stream_activity;
-                if !is_user && stream_manager.is_streaming(&message.id) {
+                // Only a bubble that mounts EMPTY may claim the channel. A live
+                // activity block absorbs the empty placeholder, so this bubble
+                // first mounts once prose is already in session_state — draining
+                // the channel from the top would then duplicate that text. Such a
+                // late mount falls through to the session_state mirror effect
+                // below, exactly like a bubble re-mounted after a tab switch.
+                let mounted_empty = content.peek().trim().is_empty();
+                if !is_user && mounted_empty && stream_manager.is_streaming(&message.id) {
                     // We mounted while the live channel is still available, so we're the
                     // consumer. Claim ownership synchronously (before the async take) so the
                     // session_state-mirror effect never fights this channel loop.
@@ -1366,7 +1875,6 @@ pub fn MessageBubble(
                                     ..
                                 } = stream_msg
                                 {
-                                    tracing::debug!("CHUNK RECEIVED: '{}'", &chunk);
                                     if !chunk.is_empty() {
                                         content.write().push_str(&chunk);
                                     }
@@ -1382,6 +1890,10 @@ pub fn MessageBubble(
                                 }
                             }
                         }
+                        // Channel drained (or never available): hand the bubble back
+                        // to the session_state mirror so it reconciles against the
+                        // persisted text once the turn ends (P-016).
+                        owns_channel.set(false);
                     });
                 }
             });
@@ -1392,35 +1904,43 @@ pub fn MessageBubble(
             // the full accumulated text into session_state on every chunk. Reading
             // session_state here subscribes this effect to those per-chunk writes, so
             // the output keeps painting live instead of freezing at the mount snapshot.
+            //
+            // It also runs the END-OF-TURN reconcile, for every Hobbes bubble. The
+            // stream task can drain its last buffered chunks and finish the turn
+            // without yielding, so this effect may never observe the final chunk
+            // while the turn is still generating. Bailing out once generating ended
+            // froze the bubble short of the persisted text (P-016) — so finishing
+            // is a reason to sync, never a reason to skip.
             use_effect(move || {
                 let _ = stream_manager.stream_activity.read();
+                // Reactive read: when the owner's channel loop ends it clears this
+                // flag, which re-runs the effect to reconcile.
+                let owns = owns_channel();
                 let state = session_state.read();
-                // Skip when we own the live channel (owner drives content directly) or
-                // the turn is no longer generating (nothing left to mirror).
-                if is_user || *owns_channel.peek() || !stream_manager.is_generating(&message.id) {
+                let sid = bubble_session_id.peek().clone();
+                let generating = stream_manager.is_generating(&message.id);
+                if is_user || !should_mirror_session_text(owns, generating) {
                     return;
                 }
-                if let Some((latest, latest_summary)) = state
+                let find = |m: &&Message| m.id == message.id;
+                let persisted = state
                     .sessions
-                    .values()
-                    .flat_map(|s| s.messages.iter())
-                    .find(|m| m.id == message.id)
-                    .and_then(|m| match &m.content {
-                        MessageContent::Text {
-                            content,
-                            thought_summary,
-                            ..
-                        } => Some((content.clone(), thought_summary.clone())),
-                        _ => None,
-                    })
+                    .get(&sid)
+                    .and_then(|s| s.messages.iter().find(find))
+                    .or_else(|| state.sessions.values().flat_map(|s| s.messages.iter()).find(find));
+                if let Some(MessageContent::Text {
+                    content: latest,
+                    thought_summary: latest_summary,
+                    ..
+                }) = persisted.map(|m| &m.content)
                 {
                     let mut changed = false;
-                    if *content.peek() != latest {
-                        content.set(latest);
+                    if *content.peek() != *latest {
+                        content.set(latest.clone());
                         changed = true;
                     }
-                    if *local_thought_summary.peek() != latest_summary {
-                        local_thought_summary.set(latest_summary);
+                    if *local_thought_summary.peek() != *latest_summary {
+                        local_thought_summary.set(latest_summary.clone());
                         changed = true;
                     }
                     if changed {
@@ -1430,6 +1950,11 @@ pub fn MessageBubble(
             });
 
             let is_thinking = is_streaming && !has_content;
+            // Editing is disabled while this session streams: a Save would race
+            // the in-flight turn's journal batch, and a Save & Resend would
+            // rewind under an active stream. (Delete has no such guard today —
+            // it restores to draft — so the guard lives here, on both actions.)
+            let session_streaming = stream_manager.is_session_streaming(&bubble_session_id.read());
 
             let bubble_classes = if is_thinking {
                 "bg-transparent border border-dashed border-faint animate-pulse self-start mr-auto"
@@ -1443,11 +1968,6 @@ pub fn MessageBubble(
             } else {
                 "flex justify-start"
             };
-            let author_classes = format!(
-                "text-xs text-fg-muted mt-1 px-2 {}",
-                if is_user { "text-right" } else { "text-left" }
-            );
-
             let _button_position_classes = if is_user {
                 "absolute bottom-[-10px] left-[-10px]"
             } else {
@@ -1460,11 +1980,19 @@ pub fn MessageBubble(
                 "bottom-[-25px] right-[-25px]"
             };
 
+            // AI bubbles leave room for the hover controls hanging off the
+            // right edge; the 90% cap only kicks in on wide windows.
+            let wrapper_width_class = if is_user {
+                "max-w-full"
+            } else {
+                "max-w-[calc(100%-2.5rem)] lg:max-w-[90%]"
+            };
+
             rsx! {
             div {
                 class: "{container_classes} w-full",
                 div {
-                    class: "flex flex-col max-w-full min-w-0 group",
+                    class: "flex flex-col {wrapper_width_class} min-w-0 group",
                     div {
                         id: "message-bubble-{message.id}",
                         class: "relative rounded-2xl {bubble_classes} max-w-full",
@@ -1504,10 +2032,77 @@ pub fn MessageBubble(
                                         }
                                     }
                                 }
+                            } else if *editing.read() {
+                                // Inline edit mode: textarea prefilled with the
+                                // current text, Save / Save & Resend / Cancel.
+                                div {
+                                    class: "flex flex-col gap-2 w-full min-w-[280px]",
+                                    textarea {
+                                        class: "w-full bg-black/20 text-white text-sm leading-relaxed rounded-lg border border-white/30 focus:border-white/60 focus:outline-none p-2 resize-y",
+                                        rows: "{edit_draft.read().lines().count().clamp(3, 12)}",
+                                        value: "{edit_draft}",
+                                        autofocus: true,
+                                        oninput: move |e| edit_draft.set(e.value()),
+                                        onkeydown: move |e| {
+                                            if e.key() == Key::Escape {
+                                                editing.set(false);
+                                            } else if e.key() == Key::Enter
+                                                && (e.modifiers().contains(Modifiers::SUPER)
+                                                    || e.modifiers().contains(Modifiers::CONTROL))
+                                            {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if !new_text.is_empty() && !session_streaming {
+                                                    editing.set(false);
+                                                    on_edit_resend.call(new_text);
+                                                }
+                                            }
+                                        },
+                                    }
+                                    div {
+                                        class: "flex items-center justify-end gap-2",
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md text-white/70 hover:text-white transition-colors",
+                                            onclick: move |_| editing.set(false),
+                                            "Cancel"
+                                        }
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md bg-white/15 hover:bg-white/25 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                            disabled: session_streaming,
+                                            title: "Save the edit in place (no model turn)",
+                                            onclick: move |_| {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if new_text.is_empty() {
+                                                    return;
+                                                }
+                                                content.set(new_text.clone());
+                                                editing.set(false);
+                                                on_edit_save.call(new_text);
+                                            },
+                                            "Save"
+                                        }
+                                        button {
+                                            class: "px-2 py-1 text-xs rounded-md bg-white/15 hover:bg-white/25 text-white transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                            disabled: session_streaming,
+                                            title: "Rewind to this point and resend the edited message (⌘⏎)",
+                                            onclick: move |_| {
+                                                let new_text = edit_draft.peek().trim().to_string();
+                                                if new_text.is_empty() {
+                                                    return;
+                                                }
+                                                editing.set(false);
+                                                on_edit_resend.call(new_text);
+                                            },
+                                            "Save & Resend"
+                                        }
+                                    }
+                                }
                             } else {
                                 MarkdownRenderer {
                                     id: Some(message.id),
-                                    content: content(),
+                                    content: match fleet_ref() {
+                                        Some((main, _)) => main,
+                                        None => content(),
+                                    },
                                     comments: message.comments.clone(),
                                     pending_highlight: if *selection_mode.read() == SelectionMode::CommentInput {
                                         Some(selection_data.read().text.clone())
@@ -1516,11 +2111,13 @@ pub fn MessageBubble(
                                     },
                                     on_comment_edit: {
                                         let message_comments = message.comments.clone();
-                                        move |comment_id: String| {
+                                        move |(comment_id, top, left): (String, f64, f64)| {
                                             // Find the comment to get its current text
                                             if let Some(comment) = message_comments.iter().find(|c| c.id == comment_id) {
+                                                comment_draft.set(comment.comment.clone());
+                                                comment_draft_original.set(comment.comment.clone());
                                                 editing_comment_id.set(Some(comment_id));
-                                                selection_data.set(SelectionState { text: comment.text_selection.clone(), markdown: comment.text_selection.clone(), top: 100.0, left: 100.0 });
+                                                selection_data.set(SelectionState { text: comment.text_selection.clone(), markdown: comment.text_selection.clone(), top, left });
                                                 selection_mode.set(SelectionMode::CommentEdit);
                                             }
                                         }
@@ -1534,16 +2131,45 @@ pub fn MessageBubble(
                                         move |comment_id: String| {
                                             // Delete the comment from session state
                                             let mut state = session_state.write();
+                                            let session_id = state.active_session_id.clone();
                                             if let Some(msg) = state.get_message_mut(&message_id) {
                                                 msg.comments.retain(|c| c.id != comment_id);
                                             }
                                             drop(state);
+                                            log_event(
+                                                &session_id,
+                                                SessionEvent::CommentRemoved {
+                                                    message_id: message_id.to_string(),
+                                                    comment_id,
+                                                },
+                                            );
                                             crate::session::SessionState::save_signal(&session_state, Some(save_error));
                                         }
                                     }
                                 }
 
-                                if content().starts_with("[Hobbes encountered a persistent error") 
+                                // Collapsed fleet-status attachment (from an
+                                // @-mention expansion): pop open to review.
+                                if let Some((_, block)) = fleet_ref() {
+                                    button {
+                                        class: "mt-1 flex items-center gap-1 text-xs opacity-70 hover:opacity-100 transition-opacity select-none",
+                                        onclick: move |evt| {
+                                            evt.stop_propagation();
+                                            let v = !*show_fleet_ref.peek();
+                                            show_fleet_ref.set(v);
+                                        },
+                                        span { if *show_fleet_ref.read() { "▾" } else { "▸" } }
+                                        span { "fleet status attached…" }
+                                    }
+                                    if *show_fleet_ref.read() {
+                                        pre {
+                                            class: "mt-1 rounded bg-black/20 p-2 text-xs whitespace-pre-wrap break-words",
+                                            "{block}"
+                                        }
+                                    }
+                                }
+
+                                if content().starts_with("[Hobbes encountered a persistent error")
                                     || content().starts_with("⚠️ **Tool Not Available")
                                     || content().starts_with("⚠️ **Tool Connection Issue")
                                     || content().starts_with("⚠️ **Tool Call Error") {
@@ -1607,6 +2233,8 @@ pub fn MessageBubble(
                                     selection_mode.set(SelectionMode::None);
                                 },
                                 on_comment: move |_| {
+                                    comment_draft.set(String::new());
+                                    comment_draft_original.set(String::new());
                                     selection_mode.set(SelectionMode::CommentInput);
                                     on_selection.call((selection_data.read().text.clone(), selection_data.read().top, selection_data.read().left));
                                 }
@@ -1617,6 +2245,7 @@ pub fn MessageBubble(
                             crate::components::inline_comment_popover::InlineCommentPopover {
                                 position_top: selection_data.read().top,
                                 position_left: selection_data.read().left,
+                                draft: comment_draft,
                                 on_save: move |comment_text: String| {
                                     let text = selection_data.read().text.clone();
                                     let new_comment = Comment {
@@ -1629,58 +2258,99 @@ pub fn MessageBubble(
 
                                     // Update session state
                                     let mut state = session_state.write();
+                                    let session_id = state.active_session_id.clone();
                                     if let Some(msg) = state.get_message_mut(&message.id) {
-                                        msg.comments.push(new_comment);
+                                        msg.comments.push(new_comment.clone());
                                     }
                                     drop(state);
+                                    log_event(
+                                        &session_id,
+                                        SessionEvent::CommentAdded {
+                                            message_id: message.id.to_string(),
+                                            comment: new_comment,
+                                        },
+                                    );
                                     crate::session::SessionState::save_signal(&session_state, Some(save_error));
 
                                     on_comment.call(());
 
+                                    comment_draft.set(String::new());
                                     selection_mode.set(SelectionMode::None);
                                 },
                                 on_cancel: move |_| {
-                                    selection_mode.set(SelectionMode::None);
+                                    if comment_draft.peek().trim() != comment_draft_original.peek().trim() {
+                                        show_discard_comment_confirm.set(true);
+                                    } else {
+                                        selection_mode.set(SelectionMode::None);
+                                    }
                                 }
                             }
                         }
 
                         if *selection_mode.read() == SelectionMode::CommentEdit {
-                            // Get the comment being edited
-                            {{
-                                let current_comment_text = editing_comment_id.read().as_ref().and_then(|comment_id| {
-                                    message.comments.iter()
-                                        .find(|c| &c.id == comment_id)
-                                        .map(|c| c.comment.clone())
-                                });
-
-                                rsx! {
-                                    crate::components::inline_comment_popover::InlineCommentPopover {
-                                        position_top: 150.0,
-                                        position_left: 150.0,
-                                        initial_value: current_comment_text,
-                                        on_save: move |new_comment_text: String| {
-                                            if let Some(comment_id) = editing_comment_id.read().clone() {
-                                                // Update the comment in session state
-                                                let mut state = session_state.write();
-                                                if let Some(msg) = state.get_message_mut(&message.id) {
-                                                    if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
-                                                        comment.comment = new_comment_text;
-                                                    }
-                                                }
-                                                drop(state);
-                                                crate::session::SessionState::save_signal(&session_state, Some(save_error));
+                            crate::components::inline_comment_popover::InlineCommentPopover {
+                                position_top: selection_data.read().top,
+                                position_left: selection_data.read().left,
+                                draft: comment_draft,
+                                on_save: move |new_comment_text: String| {
+                                    if let Some(comment_id) = editing_comment_id.read().clone() {
+                                        // Update the comment in session state
+                                        let mut state = session_state.write();
+                                        let session_id = state.active_session_id.clone();
+                                        let mut updated_comment: Option<Comment> = None;
+                                        if let Some(msg) = state.get_message_mut(&message.id) {
+                                            if let Some(comment) = msg.comments.iter_mut().find(|c| c.id == comment_id) {
+                                                comment.comment = new_comment_text;
+                                                updated_comment = Some(comment.clone());
                                             }
-                                            editing_comment_id.set(None);
-                                            selection_mode.set(SelectionMode::None);
-                                        },
-                                        on_cancel: move |_| {
-                                            editing_comment_id.set(None);
-                                            selection_mode.set(SelectionMode::None);
                                         }
+                                        drop(state);
+                                        // Edits journal as CommentAdded — the projector
+                                        // upserts by comment id.
+                                        if let Some(comment) = updated_comment {
+                                            log_event(
+                                                &session_id,
+                                                SessionEvent::CommentAdded {
+                                                    message_id: message.id.to_string(),
+                                                    comment,
+                                                },
+                                            );
+                                        }
+                                        crate::session::SessionState::save_signal(&session_state, Some(save_error));
+                                    }
+                                    comment_draft.set(String::new());
+                                    editing_comment_id.set(None);
+                                    selection_mode.set(SelectionMode::None);
+                                },
+                                on_cancel: move |_| {
+                                    if comment_draft.peek().trim() != comment_draft_original.peek().trim() {
+                                        show_discard_comment_confirm.set(true);
+                                    } else {
+                                        editing_comment_id.set(None);
+                                        selection_mode.set(SelectionMode::None);
                                     }
                                 }
-                            }}
+                            }
+                        }
+
+                        if *show_discard_comment_confirm.read() {
+                            crate::components::confirm_delete_modal::ConfirmDeleteModal {
+                                is_visible: show_discard_comment_confirm,
+                                title: "Discard comment?".to_string(),
+                                message: "You have unsaved changes. Discard them?".to_string(),
+                                confirm_button_text: "Discard".to_string(),
+                                show_dont_ask_again: false,
+                                on_confirm: move |_| {
+                                    show_discard_comment_confirm.set(false);
+                                    comment_draft.set(String::new());
+                                    comment_draft_original.set(String::new());
+                                    editing_comment_id.set(None);
+                                    selection_mode.set(SelectionMode::None);
+                                },
+                                on_cancel: move |_| {
+                                    show_discard_comment_confirm.set(false);
+                                }
+                            }
                         }
 
                         if !is_thinking {
@@ -1709,12 +2379,41 @@ pub fn MessageBubble(
                                     }
                                 }
 
+                                button {
+                                    // Same guard as Edit: forking mid-stream would
+                                    // snapshot a session the in-flight turn is still
+                                    // appending to.
+                                    class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                    disabled: session_streaming,
+                                    onclick: move |_| on_fork.call(()),
+                                    title: "Fork from here",
+                                    Icon { width: 14, height: 14, icon: fi_icons::FiGitBranch }
+                                }
+
                                 if is_user {
+                                    // Inline edit (pencil): swap the bubble body to a
+                                    // textarea. Disabled while this session streams.
                                     button {
-                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors",
-                                        onclick: move |_| on_delete.call(()),
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                        disabled: session_streaming,
+                                        onclick: move |_| {
+                                            edit_draft.set(content.peek().clone());
+                                            editing.set(true);
+                                        },
                                         title: "Edit message",
                                         Icon { width: 14, height: 14, icon: fi_icons::FiEdit2 }
+                                    }
+                                    // Undo from here: restore this message to the
+                                    // draft and rewind the session past it. Same
+                                    // streaming guard as Edit — rewinding under an
+                                    // in-flight turn leaves a ghost reply journaled
+                                    // after the RewoundTo point.
+                                    button {
+                                        class: "p-1.5 text-fg-muted hover:text-accent rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed",
+                                        disabled: session_streaming,
+                                        onclick: move |_| on_delete.call(()),
+                                        title: "Undo from here",
+                                        Icon { width: 14, height: 14, icon: fi_icons::FiRotateCcw }
                                     }
                                 }
                             }
@@ -1847,9 +2546,11 @@ pub fn MessageBubble(
                             }
                         }
                     }
-                    div {
-                        class: "{author_classes}",
-                        "{message.author}"
+                    MessageCaption {
+                        label: message.author.clone(),
+                        created_at: message.created_at,
+                        show_time,
+                        align_right: is_user,
                     }
                 }
             }
@@ -1858,7 +2559,6 @@ pub fn MessageBubble(
         MessageContent::Error { message: error_msg } => {
             let container_classes = "flex justify-start";
             let bubble_classes = "bg-red-900 border border-red-700 text-fg self-start mr-auto";
-            let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
 
             rsx! {
                 div {
@@ -1893,9 +2593,10 @@ pub fn MessageBubble(
                                 }
                             }
                         }
-                        div {
-                            class: "{author_classes}",
-                            "{message.author}"
+                        MessageCaption {
+                            label: message.author.clone(),
+                            created_at: message.created_at,
+                            show_time,
                         }
                     }
                 }
@@ -2007,26 +2708,64 @@ fn extract_bold_blocks(content: &str) -> Option<String> {
 
 #[component]
 pub fn WelcomeMessage() -> Element {
+    // Click-to-pounce, same feel as the app-menu mascot. The idle blink loop
+    // lives inside `AnimatedTiger` and ends when this empty state unmounts.
+    let mut pouncing = use_signal(|| false);
     rsx! {
         div {
             class: "flex flex-col items-center justify-center h-full text-fg-muted",
-            svg {
-                class: "w-24 h-24 mb-4",
-                fill: "none",
-                stroke: "currentColor",
-                view_box: "0 0 24 24",
-                xmlns: "http://www.w3.org/2000/svg",
-                path {
-                    stroke_linecap: "round",
-                    stroke_linejoin: "round",
-                    stroke_width: "2",
-                    d: "M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z"
+            // The mascot beside a pixel speech bubble, tops aligned, both on
+            // the same 6px/5px pixel scale as the mockup (option B).
+            div {
+                class: "flex items-start gap-1.5 mb-6",
+                div {
+                    class: "cursor-pointer",
+                    onclick: move |_| {
+                        pouncing.set(true);
+                        spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                            pouncing.set(false);
+                        });
+                    },
+                    crate::components::pixel_icons::AnimatedTiger {
+                        pouncing,
+                        width: 96,
+                        height: 96,
+                    }
                 }
+                crate::components::pixel_icons::PixelChatBubble { width: 80, height: 75 }
             }
             p {
                 class: "text-lg",
                 "Start a new conversation"
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod bubble_sync_tests {
+    use super::should_mirror_session_text;
+
+    #[test]
+    fn finished_turn_still_reconciles_from_session_state() {
+        // Regression (P-016): a bubble that mounted after its activity block
+        // mirrors session_state. When the last chunks and the end of the turn
+        // land in one poll, the mirror's first look is with generating=false;
+        // skipping then froze the bubble short of the persisted reply.
+        assert!(should_mirror_session_text(false, false));
+    }
+
+    #[test]
+    fn non_owner_mirrors_while_generating() {
+        assert!(should_mirror_session_text(false, true));
+    }
+
+    #[test]
+    fn channel_owner_never_mirrors_until_its_channel_is_drained() {
+        // Mirroring while the owner still has buffered chunks would double
+        // the tail when the channel loop appends them afterwards.
+        assert!(!should_mirror_session_text(true, true));
+        assert!(!should_mirror_session_text(true, false));
     }
 }

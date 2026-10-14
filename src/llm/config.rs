@@ -37,10 +37,10 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             api_key: None,
-            chat_model: GeminiModel::Gemini3_5Flash
+            chat_model: GeminiModel::Gemini3_7Flash
                 .canonical_slug()
                 .to_string(),
-            summary_model: GeminiModel::Gemini3_5Flash
+            summary_model: GeminiModel::Gemini3_7Flash
                 .canonical_slug()
                 .to_string(),
             thinking_enabled: false,
@@ -64,20 +64,22 @@ pub fn default_cache_ttl() -> u32 {
 
 pub fn default_model_slots() -> Vec<String> {
     vec![
+        GeminiModel::Gemini3_7Flash
+            .canonical_slug()
+            .to_string(),
+        GeminiModel::Gemini3_6Flash
+            .canonical_slug()
+            .to_string(),
         GeminiModel::Gemini3_5Flash
             .canonical_slug()
             .to_string(),
         GeminiModel::Gemini3_1ProPreview
             .canonical_slug()
             .to_string(),
-        GeminiModel::Gemini3_1FlashLitePreview
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini3_0FlashPreview
+        GeminiModel::Gemini3_5FlashLite
             .canonical_slug()
             .to_string(),
         GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
-        "".to_string(), // Slot 6
         "".to_string(), // Slot 7
         "".to_string(), // Slot 8
         "".to_string(), // Slot 9
@@ -89,13 +91,17 @@ fn default_empty_model_slots() -> Vec<String> {
     vec!["".to_string(); 10]
 }
 
-/// Default Claude quick-switch slots: current models first, remaining slots empty.
+/// Default Claude quick-switch slots: current models first, remaining slots
+/// empty. Slot 0 mirrors `ClaudeModel::DEFAULT_CHAT_SLUG` rather than naming
+/// a model directly, so the two can't drift out of sync the way they did
+/// when the Claude 5 family shipped and this stayed pinned to the old 4.x
+/// flagship (`claude-opus-4-8`) after `DEFAULT_CHAT_SLUG` moved on.
 pub fn default_claude_model_slots() -> Vec<String> {
     let mut slots: Vec<String> = vec![
-        ClaudeModel::Opus4_8.canonical_slug().to_string(),
-        ClaudeModel::Sonnet4_6.canonical_slug().to_string(),
-        ClaudeModel::Haiku4_5.canonical_slug().to_string(),
-        ClaudeModel::Opus4_7.canonical_slug().to_string(),
+        ClaudeModel::DEFAULT_CHAT_SLUG.to_string(),
+        ClaudeModel::Sonnet5_5.canonical_slug().to_string(),
+        ClaudeModel::Haiku5_5.canonical_slug().to_string(),
+        ClaudeModel::Fable5_1.canonical_slug().to_string(),
     ];
     slots.resize(10, String::new());
     slots
@@ -294,6 +300,39 @@ impl Default for OpenAiCompatConfig {
     }
 }
 
+/// How long Anthropic keeps a prompt-cache entry alive after its last read.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClaudeCacheTtl {
+    /// 5 minutes (default). Cache writes bill at 1.25x the input price.
+    #[default]
+    FiveMinutes,
+    /// 1 hour. Cache writes bill at 2x the input price.
+    OneHour,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+pub fn default_keepalive_max_idle_minutes() -> u32 {
+    30
+}
+
+pub fn default_keepalive_daily_cap_usd() -> f64 {
+    1.0
+}
+
+pub fn default_keepalive_min_prefix_tokens() -> u32 {
+    8_000
+}
+
+/// 4m15s: fires well inside the 5-minute TTL even with timer and clock
+/// jitter (the TTL counts from the start of the previous request).
+pub fn default_keepalive_refresh_secs() -> u32 {
+    255
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ClaudeConfig {
     #[serde(skip)]
@@ -304,6 +343,34 @@ pub struct ClaudeConfig {
     pub max_tokens: Option<u32>, // Claude requires explicit max_tokens
     #[serde(default)]
     pub extended_thinking: bool,
+    /// Anthropic prompt caching (`cache_control` markers). On by default,
+    /// including for settings.json files written before the field existed.
+    #[serde(default = "default_true")]
+    pub prompt_caching_enabled: bool,
+    #[serde(default)]
+    pub cache_ttl: ClaudeCacheTtl,
+    /// Debug flag (settings.json only, no UI): opt into Anthropic's cache
+    /// diagnostics beta so the API names where a cache miss diverged.
+    #[serde(default)]
+    pub cache_diagnostics: bool,
+    /// Keep an idle tab's 5-minute cache entry alive with cheap
+    /// `max_tokens: 0` refresh requests (see `llm::claude::keepalive`).
+    #[serde(default = "default_true")]
+    pub keepalive_enabled: bool,
+    /// Stop refreshing once the tab has been idle this long.
+    #[serde(default = "default_keepalive_max_idle_minutes")]
+    pub keepalive_max_idle_minutes: u32,
+    /// Daily ceiling on keep-alive spend (USD, local day, all tabs).
+    #[serde(default = "default_keepalive_daily_cap_usd")]
+    pub keepalive_daily_cap_usd: f64,
+    /// Cached prefixes smaller than this aren't worth refreshing
+    /// (settings.json only, no UI).
+    #[serde(default = "default_keepalive_min_prefix_tokens")]
+    pub keepalive_min_prefix_tokens: u32,
+    /// Seconds after a request starts before it is refreshed. Clamped below
+    /// the 5-minute TTL (settings.json only, no UI).
+    #[serde(default = "default_keepalive_refresh_secs")]
+    pub keepalive_refresh_secs: u32,
     #[serde(default = "default_claude_model_slots")]
     pub model_slots: Vec<String>, // Provider-scoped quick-switch slots
     /// Per-provider context tuning overrides (None = use global defaults)
@@ -317,9 +384,17 @@ impl Default for ClaudeConfig {
             api_key: None,
             model: ClaudeModel::DEFAULT_CHAT_SLUG.to_string(),
             // Default summaries to a cheaper model; falls back to `model` if unset.
-            summary_model: Some(ClaudeModel::Haiku4_5.canonical_slug().to_string()),
+            summary_model: Some(ClaudeModel::Haiku5_5.canonical_slug().to_string()),
             max_tokens: default_claude_max_tokens(),
             extended_thinking: false,
+            prompt_caching_enabled: true,
+            cache_ttl: ClaudeCacheTtl::default(),
+            cache_diagnostics: false,
+            keepalive_enabled: true,
+            keepalive_max_idle_minutes: default_keepalive_max_idle_minutes(),
+            keepalive_daily_cap_usd: default_keepalive_daily_cap_usd(),
+            keepalive_min_prefix_tokens: default_keepalive_min_prefix_tokens(),
+            keepalive_refresh_secs: default_keepalive_refresh_secs(),
             model_slots: default_claude_model_slots(),
             context_tuning: ContextTuningPreset::default(),
         }
@@ -407,11 +482,13 @@ mod tests {
     fn test_default_model_slots_has_gemini_slugs() {
         let slots = default_model_slots();
         assert_eq!(slots.len(), 10);
-        // First 5 should be non-empty Gemini slugs
-        assert!(!slots[0].is_empty(), "Slot 0 should have a Gemini model slug");
-        assert!(slots[0].contains("gemini"), "Slot 0 should be a Gemini model");
-        // Last 5 should be empty
-        for i in 5..10 {
+        // First 6 should be non-empty Gemini slugs, latest-gen Flash first
+        assert_eq!(slots[0], "gemini-3.7-flash");
+        for i in 0..6 {
+            assert!(slots[i].contains("gemini"), "Slot {} should be a Gemini model", i);
+        }
+        // Last 4 should be empty
+        for i in 6..10 {
             assert!(slots[i].is_empty(), "Slot {} should be empty", i);
         }
     }
@@ -448,14 +525,14 @@ mod tests {
         let config = ClaudeConfig::default();
         assert_eq!(config.model_slots.len(), 10);
         // First slots are pre-filled with current Claude models.
-        assert_eq!(config.model_slots[0], "claude-opus-4-8");
+        assert_eq!(config.model_slots[0], "claude-opus-5-5");
         assert!(config.model_slots[1].contains("claude"));
         // Trailing slots remain empty.
         for i in 4..10 {
             assert!(config.model_slots[i].is_empty(), "Claude slot {} should be empty", i);
         }
         // Sensible non-empty default model + required max_tokens.
-        assert_eq!(config.model, "claude-opus-4-8");
+        assert_eq!(config.model, "claude-opus-5-5");
         assert!(config.max_tokens.is_some());
     }
 

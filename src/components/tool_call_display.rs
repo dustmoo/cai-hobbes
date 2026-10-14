@@ -6,6 +6,67 @@ use crate::settings::UiState;
 use dioxus::prelude::*;
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
+/// A chevron-headed disclosure. Extracted from `ToolCallDisplay`'s
+/// Arguments/Response sections so the activity stream's inline row expansion
+/// shows arguments with exactly the same affordance instead of a lookalike.
+#[derive(Props, Clone, PartialEq)]
+pub struct CollapsibleProps {
+    pub label: String,
+    /// Initial state only — the disclosure owns its open/closed signal after
+    /// the first render, matching the old per-card behaviour.
+    #[props(default)]
+    pub open_default: bool,
+    pub children: Element,
+}
+
+#[component]
+pub fn Collapsible(props: CollapsibleProps) -> Element {
+    let mut open = use_signal(|| props.open_default);
+    rsx! {
+        div {
+            class: "flex flex-col",
+            button {
+                class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
+                onclick: move |_| open.toggle(),
+                if *open.read() {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiChevronDown }
+                } else {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiChevronRight }
+                }
+                "{props.label}"
+            }
+            if *open.read() {
+                {props.children}
+            }
+        }
+    }
+}
+
+/// The "connect your account" panel shown when a tool comes back
+/// `AuthRequired`. Shared so the activity stream can surface the same call to
+/// action without re-deriving the yellow idiom.
+#[component]
+pub fn AuthRequiredPanel(url: String) -> Element {
+    rsx! {
+        div {
+            class: "flex flex-col gap-3 p-3 bg-app rounded mt-2 border border-yellow-700/50",
+            div {
+                class: "flex items-center gap-2 text-yellow-500",
+                Icon { width: 18, height: 18, icon: fi_icons::FiLock }
+                span { class: "font-medium", "Authentication Required" }
+            }
+            p { class: "text-sm text-fg-muted", "Please connect your account to proceed with this tool." }
+            a {
+                class: "px-4 py-2 bg-yellow-600 text-fg rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
+                href: "{url}",
+                target: "_blank",
+                "Connect Account"
+                Icon { width: 14, height: 14, icon: fi_icons::FiExternalLink }
+            }
+        }
+    }
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct ToolCallDisplayProps {
     pub tool_call: ToolCall,
@@ -21,9 +82,9 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     let ui_state = consume_context::<Signal<UiState>>();
 
     // Local signals initialized from global defaults - these are NOT synced back
-    let mut show_arguments = use_signal(|| ui_state.read().default_tool_arguments_open);
+    let show_arguments = use_signal(|| ui_state.read().default_tool_arguments_open);
     // Auto-expand response section for auth-required tools so user sees the connect button
-    let mut show_response = use_signal(|| {
+    let show_response = use_signal(|| {
         if props.tool_call.status == ToolCallStatus::AuthRequired {
             true
         } else {
@@ -112,91 +173,30 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
                 }
 
                 // Arguments collapsible section
-                div {
-                    class: "flex flex-col",
-                    button {
-                        class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
-                        onclick: move |_| show_arguments.toggle(),
-                        if *show_arguments.read() {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronDown
-                            }
-                        } else {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronRight
-                            }
-                        }
-                        "Arguments"
-                    }
-                    if *show_arguments.read() {
-                        div {
-                            class: "overflow-x-auto max-w-full", // Prevent horizontal overflow
-                            CodeBlock {
-                                code: props.tool_call.arguments.clone(),
-                                lang: "json".to_string()
-                            }
+                Collapsible {
+                    label: "Arguments".to_string(),
+                    open_default: *show_arguments.read(),
+                    div {
+                        class: "overflow-x-auto max-w-full", // Prevent horizontal overflow
+                        CodeBlock {
+                            code: props.tool_call.arguments.clone(),
+                            lang: "json".to_string()
                         }
                     }
                 }
 
                 // Response collapsible section
-                div {
-                    class: "flex flex-col",
-                    button {
-                        class: "flex items-center gap-1 text-sm font-semibold text-fg-muted hover:text-fg",
-                        onclick: move |_| show_response.toggle(),
-                        if *show_response.read() {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronDown
-                            }
-                        } else {
-                            Icon {
-                                width: 16,
-                                height: 16,
-                                icon: fi_icons::FiChevronRight
-                            }
-                        }
-                        "Response"
-                    }
-                    if *show_response.read() {
-                         if status == ToolCallStatus::AuthRequired {
-                            div {
-                                class: "flex flex-col gap-3 p-3 bg-app rounded mt-2 border border-yellow-700/50",
-                                div {
-                                    class: "flex items-center gap-2 text-yellow-500",
-                                    Icon {
-                                        width: 18,
-                                        height: 18,
-                                        icon: fi_icons::FiLock
-                                    }
-                                    span { class: "font-medium", "Authentication Required" }
-                                }
-                                p { class: "text-sm text-fg-muted", "Please connect your account to proceed with this tool." }
-                                a {
-                                    class: "px-4 py-2 bg-yellow-600 text-fg rounded hover:bg-yellow-500 text-center text-sm font-medium transition-colors w-fit flex items-center gap-2",
-                                    href: "{response}",
-                                    target: "_blank",
-                                    "Connect Account"
-                                    Icon {
-                                        width: 14,
-                                        height: 14,
-                                        icon: fi_icons::FiExternalLink
-                                    }
-                                }
-                            }
-                        } else if !response.is_empty() {
-                            div {
-                                class: "overflow-x-auto max-w-full",
-                                CodeBlock {
-                                    code: response,
-                                    lang: "json".to_string()
-                                }
+                Collapsible {
+                    label: "Response".to_string(),
+                    open_default: *show_response.read(),
+                    if status == ToolCallStatus::AuthRequired {
+                        AuthRequiredPanel { url: response.clone() }
+                    } else if !response.is_empty() {
+                        div {
+                            class: "overflow-x-auto max-w-full",
+                            CodeBlock {
+                                code: response.clone(),
+                                lang: "json".to_string()
                             }
                         }
                     }
@@ -206,17 +206,254 @@ pub fn ToolCallDisplay(props: ToolCallDisplayProps) -> Element {
     }
 }
 
+/// Session ids whose approved tool calls are ready to run. The approval-resume
+/// effect in `ChatWindow` (chat.rs) drains it and runs every `Running` call
+/// in those sessions with `user_approved = true`.
+///
+/// A global (not a `ChatWindow` context signal) so approvals given outside
+/// the chat — the Agent time panel and the decision queue, which are mounted
+/// beside `ChatWindow`, not under it — reach the same resume path. Every
+/// approval, wherever it is clicked, goes through [`approve_held_call`].
+pub static APPROVED_SESSIONS: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// How a held call (a `PermissionRequest` message) is resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeldResolution {
+    /// Turn it back into a `Running` ToolCall for the resume path to execute.
+    Approve,
+    /// Record it as an error result with this text; it never runs.
+    Deny(String),
+}
+
+/// The response written into a call the user denied.
+pub const DENIED_BY_USER: &str = "Denied by user.";
+
+/// **Pure.** Resolve the held call `execution_id` in `session_id`. Returns the
+/// resolved message, or `None` when the session or a still-held call with
+/// that id isn't there (already answered, or never held).
+pub fn resolve_held_call(
+    state: &mut crate::session::SessionState,
+    session_id: &str,
+    execution_id: &str,
+    resolution: &HeldResolution,
+) -> Option<crate::components::chat::Message> {
+    let session = state.sessions.get_mut(session_id)?;
+    let msg = message_mut_by_execution_id(session, execution_id)?;
+    let super::shared::MessageContent::PermissionRequest(tc) = &msg.content else {
+        return None;
+    };
+    let mut resolved = tc.clone();
+    match resolution {
+        HeldResolution::Approve => resolved.status = ToolCallStatus::Running,
+        HeldResolution::Deny(text) => {
+            resolved.status = ToolCallStatus::Error;
+            resolved.response = text.clone();
+        }
+    }
+    msg.content = super::shared::MessageContent::ToolCall(resolved);
+    Some(msg.clone())
+}
+
+/// **The approve path** every Approve button uses (the chat's permission and
+/// skill prompts, the Agent time panel, the decision queue): flip the held
+/// call to `Running` and hand its session to the approval-resume effect in
+/// chat.rs, which runs it through `agent_time_gate(.., user_approved = true)`
+/// and `dispatch_builtin_tool` / `use_mcp_tool` exactly as for any approval.
+/// Returns whether a held call was found.
+pub fn approve_held_call(
+    mut session_state: Signal<crate::session::SessionState>,
+    session_id: &str,
+    execution_id: &str,
+) -> bool {
+    let found = resolve_held_call(
+        &mut session_state.write(),
+        session_id,
+        execution_id,
+        &HeldResolution::Approve,
+    )
+    .is_some();
+    if found {
+        APPROVED_SESSIONS.write().insert(session_id.to_string());
+    } else {
+        tracing::warn!(
+            "approve: no held call {execution_id} in session {session_id}; nothing to run"
+        );
+    }
+    found
+}
+
+/// **The deny path** every Deny button uses: record the held call as an
+/// error result (`text`, normally [`DENIED_BY_USER`]) without running it.
+/// Like a chat Deny, it does not resume the model. Returns whether a held
+/// call was found.
+pub fn deny_held_call(
+    mut session_state: Signal<crate::session::SessionState>,
+    session_id: &str,
+    execution_id: &str,
+    text: &str,
+) -> bool {
+    let found = resolve_held_call(
+        &mut session_state.write(),
+        session_id,
+        execution_id,
+        &HeldResolution::Deny(text.to_string()),
+    )
+    .is_some();
+    if found {
+        crate::session::SessionState::save_signal(&session_state, None);
+    } else {
+        tracing::warn!("deny: no held call {execution_id} in session {session_id}");
+    }
+    found
+}
+
+/// The message carrying this execution id, within one session.
+fn message_mut_by_execution_id<'a>(
+    session: &'a mut crate::session::Session,
+    execution_id: &str,
+) -> Option<&'a mut crate::components::chat::Message> {
+    session.messages.iter_mut().find(|m| match &m.content {
+        super::shared::MessageContent::ToolCall(tc) => tc.execution_id == execution_id,
+        super::shared::MessageContent::PermissionRequest(tc) => tc.execution_id == execution_id,
+        _ => false,
+    })
+}
+
 #[derive(Props, Clone, PartialEq)]
 pub struct PermissionPromptProps {
     pub tool_call: ToolCall,
+    /// The session id of the tab this prompt is rendered in. MessageList only
+    /// ever renders a PermissionPrompt for the active session's own messages
+    /// (via SessionIdContext), so a click on this prompt can only ever be a
+    /// click on the tab it's displayed in — that visible tab is the owner.
+    /// Captured from context at click time, so the result still routes
+    /// correctly even if the user switches tabs before clicking.
+    pub session_id: String,
 }
 
 #[component]
 pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let session_state = consume_context::<Signal<crate::session::SessionState>>();
-    let has_pending_approvals = consume_context::<Signal<bool>>();
+    let mut settings = consume_context::<Signal<crate::settings::Settings>>();
+    let settings_manager = consume_context::<Signal<crate::settings::SettingsManager>>();
+    let planner = consume_context::<Signal<crate::todo::PlannerState>>();
     let tool_call = props.tool_call.clone();
     let tool_call_deny = tool_call.clone();
+    // Captured from the visible tab's context at click time (see doc comment
+    // on PermissionPromptProps::session_id) — this IS the owning session.
+    let owning_session_id_deny = props.session_id.clone();
+    let owning_session_id_approve = props.session_id.clone();
+
+    // Trust-rule authoring context: what a rule created from THIS prompt
+    // would cover. Terminal execs get a command-prefix rule (first two
+    // tokens); everything else a server+tool rule; both optionally scoped
+    // to the active session's project.
+    let parsed_args: Option<serde_json::Value> =
+        serde_json::from_str(&tool_call.arguments).ok();
+    let command_prefix: Option<String> = parsed_args
+        .as_ref()
+        .filter(|_| {
+            tool_call.server_name == crate::mcp::manager::HOBBES_TERMINAL_SERVER
+                || tool_call.server_name == "local-on-demand"
+        })
+        .and_then(|a| a.get("command").and_then(|c| c.as_str()))
+        .map(|cmd| {
+            cmd.split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|p| !p.is_empty());
+    let session_project: Option<(String, String)> = {
+        let state = session_state.read();
+        state
+            .sessions
+            .get(&state.active_session_id)
+            .and_then(|s| s.project_id.clone())
+            .and_then(|pid| {
+                crate::services::project_tagger::project_title(&planner.read().projects, &pid)
+                    .map(|t| (pid.clone(), t.to_string()))
+            })
+    };
+    let allow_label = match &command_prefix {
+        Some(p) => format!("Always allow `{p}`"),
+        None => format!(
+            "Always allow {} on {}",
+            tool_call.tool_name, tool_call.server_name
+        ),
+    };
+    let mut make_rule = use_signal(|| false);
+    let mut scope_to_project = use_signal(|| false);
+
+    // Built-ins that always ask can't be pre-approved: no trust-rule option.
+    let always_asks = crate::components::builtin_tools::always_asks(&tool_call.tool_name);
+    // HOBBES_PROJECT_MERGE states what moves. Titles and to-dos are in
+    // memory; the chat count is an index lookup run off the UI thread
+    // (P-017), filled in when it lands.
+    let mut merge_chats = use_signal(|| None::<usize>);
+    let merge_args: Option<(String, Vec<String>)> = (tool_call.tool_name == "HOBBES_PROJECT_MERGE")
+        .then(|| {
+            parsed_args.as_ref().and_then(|a| {
+                crate::todo::handlers::validate_project_merge(&planner.read(), a).ok()
+            })
+        })
+        .flatten();
+    use_hook({
+        let ids = merge_args.as_ref().map(|(_, m)| m.clone());
+        move || {
+            if let Some(ids) = ids {
+                spawn(async move {
+                    let n = crate::services::project_tagger::count_sessions_tagged(session_state, ids).await;
+                    merge_chats.set(Some(n));
+                });
+            }
+        }
+    });
+    let merge_description: Option<String> = if tool_call.tool_name == "HOBBES_PROJECT_MERGE" {
+        Some(match &merge_args {
+            Some((keep, merge)) => crate::todo::handlers::project_merge_preview(
+                &planner.read(),
+                keep,
+                merge,
+                *merge_chats.read(),
+            ),
+            None => {
+                let why = parsed_args
+                    .as_ref()
+                    .map(|a| crate::todo::handlers::validate_project_merge(&planner.read(), a))
+                    .and_then(|r| r.err())
+                    .unwrap_or_else(|| "its arguments couldn't be read".to_string());
+                format!("This merge can't run as asked: {why}. Approving it changes nothing.")
+            }
+        })
+    } else {
+        None
+    };
+
+    // Shared decision logger with this prompt's identity.
+    let decision_base = {
+        let tc = tool_call.clone();
+        let args = parsed_args.clone().unwrap_or(serde_json::Value::Null);
+        let session_id = session_state.peek().active_session_id.clone();
+        let project_id = session_project.as_ref().map(|(id, _)| id.clone());
+        move |kind: crate::context::trust_store::DecisionKind,
+              rule_id: Option<String>| {
+            crate::context::trust_store::log_decision(
+                crate::context::trust_store::TrustDecision::new(
+                    kind,
+                    &tc.server_name,
+                    &tc.tool_name,
+                    crate::context::trust_store::arg_summary(&args),
+                    Some(session_id.clone()),
+                    project_id.clone(),
+                    rule_id,
+                ),
+            );
+        }
+    };
+    let log_on_deny = decision_base.clone();
+    let log_on_approve = decision_base;
 
     rsx! {
         div {
@@ -239,62 +476,377 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     span { class: "font-mono text-sm", "{tool_call.server_name}" }
                     "."
                 }
+                // What is actually being approved. For the terminal that's
+                // the command itself — approving a shell command you can't
+                // read is not an approval.
+                {
+                    let detail: Option<(&'static str, String)> = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+                        .ok()
+                        .and_then(|args| {
+                            if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
+                                let mut line = cmd.to_string();
+                                if let Some(cwd) = args.get("cwd").and_then(|c| c.as_str()) {
+                                    line = format!("cd {cwd} && {line}");
+                                }
+                                Some(("Command", line))
+                            } else if args.as_object().is_some_and(|o| !o.is_empty()) {
+                                serde_json::to_string_pretty(&args)
+                                    .ok()
+                                    .map(|p| ("Arguments", p))
+                            } else {
+                                None
+                            }
+                        });
+                    rsx! {
+                        if let Some((label, mut text)) = detail {
+                            {
+                                if text.chars().count() > 1200 {
+                                    text = format!("{}…", text.chars().take(1200).collect::<String>());
+                                }
+                                rsx! {
+                                    div {
+                                        p { class: "text-xs uppercase tracking-wider text-yellow-400 mb-1", "{label}" }
+                                        pre {
+                                            class: "rounded bg-black/40 p-3 text-sm font-mono text-yellow-100 whitespace-pre-wrap break-all max-h-48 overflow-y-auto",
+                                            "{text}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(desc) = merge_description {
+                    p { class: "font-semibold text-yellow-100", "{desc}" }
+                }
                 p { "Do you want to allow this?" }
+                if always_asks {
+                    p { class: "text-xs text-yellow-200/70", "Hobbes asks every time for this one; it can't be set to always allow." }
+                }
+                // Trust-rule authoring at the moment of decision (the skill
+                // prompt's remember-choice idiom).
+                if !always_asks {
+                div {
+                    class: "flex flex-col gap-1 pt-1",
+                    div {
+                        class: "flex items-center gap-2 text-yellow-200/80",
+                        input {
+                            r#type: "checkbox",
+                            id: "trust-rule-make",
+                            class: "w-4 h-4 accent-white/50 cursor-pointer",
+                            checked: *make_rule.read(),
+                            onchange: move |_| {
+                                let v = !*make_rule.peek();
+                                make_rule.set(v);
+                            }
+                        }
+                        label {
+                            r#for: "trust-rule-make",
+                            class: "text-xs cursor-pointer select-none font-mono",
+                            "{allow_label}"
+                        }
+                    }
+                    if let Some((_, title)) = &session_project {
+                        div {
+                            class: "flex items-center gap-2 ml-6 text-yellow-200/60",
+                            input {
+                                r#type: "checkbox",
+                                id: "trust-rule-project",
+                                class: "w-3.5 h-3.5 accent-white/50 cursor-pointer",
+                                disabled: !*make_rule.read(),
+                                checked: *scope_to_project.read(),
+                                onchange: move |_| {
+                                    let v = !*scope_to_project.peek();
+                                    scope_to_project.set(v);
+                                }
+                            }
+                            label {
+                                r#for: "trust-rule-project",
+                                class: "text-xs cursor-pointer select-none",
+                                "only in {title}"
+                            }
+                        }
+                    }
+                }
+                }
             }
             div {
                 class: "mt-4 flex justify-end gap-4",
                 button {
                     class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
                     onclick: move |_| {
-                        // Deny: Convert to error/skipped state so UI can clean up
-                        spawn({
-                            let tool_call_deny = tool_call_deny.clone();
-                            let mut session_state = session_state;
-                            async move {
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call_deny.execution_id) {
-                                        if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                            let mut denied_tc = tc.clone();
-                                            denied_tc.status = ToolCallStatus::Error;
-                                            denied_tc.response = "Denied by user.".to_string();
-                                            msg.content = super::shared::MessageContent::ToolCall(denied_tc);
-                                        }
-                                    }
-                                }
-                            }
-                        });
+                        log_on_deny(crate::context::trust_store::DecisionKind::Denied, None);
+                        // Deny: the shared deny path (also used by the
+                        // Agent time panel and the decision queue).
+                        deny_held_call(
+                            session_state,
+                            &owning_session_id_deny,
+                            &tool_call_deny.execution_id,
+                            DENIED_BY_USER,
+                        );
                     },
                     "Deny"
                 }
                 button {
                     class: "px-4 py-2 rounded-md bg-green-600 text-fg hover:bg-green-500",
                     onclick: move |_| {
-                        // Approve: Mark as ready for execution, signal pending approvals
-                        // The lifecycle (Submit button) will handle actual execution
-                        spawn({
-                            let tool_call = tool_call.clone();
-                            let mut session_state = session_state;
-                            let mut has_pending_approvals = has_pending_approvals;
-                            async move {
-                                {
-                                    let mut state = session_state.write();
-                                    if let Some(msg) = state.get_message_mut_by_execution_id(&tool_call.execution_id) {
-                                        if let super::shared::MessageContent::PermissionRequest(tc) = &mut msg.content {
-                                            let mut approved_tc = tc.clone();
-                                            approved_tc.status = ToolCallStatus::Running;
-                                            msg.content = super::shared::MessageContent::ToolCall(approved_tc);
-                                        }
-                                    }
-                                }
-                                // Signal that there are approved tools ready for execution
-                                has_pending_approvals.set(true);
+                        let owning_session_id = owning_session_id_approve.clone();
+                        // Author the rule first (when asked), then approve.
+                        if *make_rule.peek() {
+                            let rule = crate::context::permissions::TrustRule {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                server: tool_call.server_name.clone(),
+                                tool: Some(tool_call.tool_name.clone()),
+                                command_prefix: command_prefix.clone(),
+                                project_id: (*scope_to_project.peek())
+                                    .then(|| session_project.as_ref().map(|(id, _)| id.clone()))
+                                    .flatten(),
+                                created_at: chrono::Utc::now(),
+                            };
+                            let rule_id = settings.write().add_trust_rule(rule);
+                            let snapshot = settings.peek().clone();
+                            if let Err(e) = settings_manager.read().save(&snapshot) {
+                                tracing::error!("trust rule save failed: {e}");
                             }
-                        });
+                            log_on_approve(
+                                crate::context::trust_store::DecisionKind::ApprovedRuleCreated,
+                                Some(rule_id),
+                            );
+                        } else {
+                            log_on_approve(
+                                crate::context::trust_store::DecisionKind::Approved,
+                                None,
+                            );
+                        }
+                        // Approve: the shared approve path — flips the call
+                        // to Running and signals the resume effect in chat.rs.
+                        // The owning session is the tab this prompt is
+                        // rendered in (captured from context at click time,
+                        // see PermissionPromptProps::session_id) — the
+                        // executor may run after the user has switched tabs,
+                        // so this must not be re-derived from the active tab.
+                        approve_held_call(session_state, &owning_session_id, &tool_call.execution_id);
                     },
                     "Approve"
                 }
             }
         }
+    }
+}
+
+/// Whether a held permission request is the model asking to load a skill —
+/// those render as the skill approval bubble (`SkillPermissionPrompt`, the same
+/// one `/slash` raises) instead of the generic tool prompt.
+pub fn is_skill_invoke_request(tool_call: &ToolCall) -> bool {
+    tool_call.tool_name == "HOBBES_INVOKE_SKILL"
+}
+
+/// The `SkillCall` the skill bubble displays for a held `HOBBES_INVOKE_SKILL`.
+/// Only the name, arguments and execution id are shown by the prompt.
+fn skill_call_from_invoke(tool_call: &ToolCall) -> super::shared::SkillCall {
+    let args: serde_json::Value =
+        serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+    let field = |key: &str| {
+        args.get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    super::shared::SkillCall {
+        execution_id: tool_call.execution_id.clone(),
+        skill_name: field("name"),
+        arguments: field("arguments"),
+        status: super::shared::SkillCallStatus::Pending,
+        ..Default::default()
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+pub struct SkillToolPermissionPromptProps {
+    pub tool_call: ToolCall,
+    /// Owning session — same contract as `PermissionPromptProps::session_id`.
+    pub session_id: String,
+    pub profile_color: String,
+}
+
+/// Approval bubble for a model-initiated skill load. Wraps the shared
+/// `SkillPermissionPrompt` (Approve / Deny + "Always allow this skill") and
+/// resolves the held tool call the way `PermissionPrompt` does: Approve turns it
+/// back into a `Running` ToolCall and signals the resume path in chat.rs, which
+/// loads the skill and continues the turn; Deny records an error result.
+#[component]
+pub fn SkillToolPermissionPrompt(props: SkillToolPermissionPromptProps) -> Element {
+    let session_state = consume_context::<Signal<crate::session::SessionState>>();
+    let skill_call = skill_call_from_invoke(&props.tool_call);
+
+    rsx! {
+        div {
+            class: format!("relative group rounded-2xl {} shadow-md overflow-hidden", props.profile_color),
+            div {
+                class: "px-4 pt-3 pb-1 text-[10px] font-bold opacity-60 uppercase tracking-[0.2em]",
+                "> SKILL COMMAND"
+            }
+            crate::components::skill_call_display::SkillPermissionPrompt {
+                skill_call: skill_call,
+                on_approve: {
+                    let session_id = props.session_id.clone();
+                    move |execution_id: String| {
+                        approve_held_call(session_state, &session_id, &execution_id);
+                    }
+                },
+                on_deny: {
+                    let session_id = props.session_id.clone();
+                    move |execution_id: String| {
+                        deny_held_call(session_state, &session_id, &execution_id, DENIED_BY_USER);
+                    }
+                },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::message_mut_by_execution_id;
+    use super::{is_skill_invoke_request, skill_call_from_invoke};
+
+    #[test]
+    fn skill_invoke_request_maps_to_skill_bubble() {
+        let tc = crate::components::shared::ToolCall {
+            execution_id: "e1".into(),
+            server_name: "hobbes-core".into(),
+            tool_name: "HOBBES_INVOKE_SKILL".into(),
+            arguments: r#"{"name":"news","arguments":"tech"}"#.into(),
+            ..Default::default()
+        };
+        assert!(is_skill_invoke_request(&tc));
+        let sc = skill_call_from_invoke(&tc);
+        assert_eq!(sc.execution_id, "e1");
+        assert_eq!(sc.skill_name, "news");
+        assert_eq!(sc.arguments, "tech");
+
+        let other = crate::components::shared::ToolCall {
+            tool_name: "HOBBES_SET_TIMER".into(),
+            ..Default::default()
+        };
+        assert!(!is_skill_invoke_request(&other));
+    }
+    use crate::components::chat::Message;
+    use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+    use crate::session::{Session, SessionState};
+
+    fn new_session() -> (SessionState, String) {
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        (state, id)
+    }
+
+    fn tool_call_message(execution_id: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::ToolCall(ToolCall {
+                execution_id: execution_id.to_string(),
+                server_name: "test-server".to_string(),
+                tool_name: "test-tool".to_string(),
+                status: ToolCallStatus::Completed,
+                ..Default::default()
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn permission_request_message(execution_id: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".to_string(),
+            content: MessageContent::PermissionRequest(ToolCall {
+                execution_id: execution_id.to_string(),
+                server_name: "test-server".to_string(),
+                tool_name: "test-tool".to_string(),
+                status: ToolCallStatus::Running,
+                ..Default::default()
+            }),
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn text_message(text: &str) -> Message {
+        Message {
+            id: uuid::Uuid::new_v4(),
+            author: "User".to_string(),
+            content: MessageContent::Text {
+                content: text.to_string(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: vec![],
+            comments: vec![],
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn session_with_messages(messages: Vec<Message>) -> (SessionState, String) {
+        let (mut state, id) = new_session();
+        {
+            let session: &mut Session = state.sessions.get_mut(&id).unwrap();
+            session.messages = messages;
+        }
+        (state, id)
+    }
+
+    #[test]
+    fn finds_tool_call_by_execution_id() {
+        let (mut state, id) = session_with_messages(vec![
+            text_message("hello"),
+            tool_call_message("exec-1"),
+        ]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        let found = message_mut_by_execution_id(session, "exec-1");
+        assert!(found.is_some());
+        match &found.unwrap().content {
+            MessageContent::ToolCall(tc) => assert_eq!(tc.execution_id, "exec-1"),
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finds_permission_request_by_execution_id() {
+        let (mut state, id) = session_with_messages(vec![
+            text_message("hello"),
+            permission_request_message("exec-2"),
+        ]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        let found = message_mut_by_execution_id(session, "exec-2");
+        assert!(found.is_some());
+        match &found.unwrap().content {
+            MessageContent::PermissionRequest(tc) => assert_eq!(tc.execution_id, "exec-2"),
+            other => panic!("expected PermissionRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn returns_none_for_text_message() {
+        let (mut state, id) = session_with_messages(vec![text_message("just text")]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        assert!(message_mut_by_execution_id(session, "exec-3").is_none());
+    }
+
+    #[test]
+    fn returns_none_for_unknown_execution_id() {
+        let (mut state, id) = session_with_messages(vec![
+            tool_call_message("exec-known"),
+            permission_request_message("exec-known-2"),
+        ]);
+        let session = state.sessions.get_mut(&id).unwrap();
+        assert!(message_mut_by_execution_id(session, "exec-unknown").is_none());
     }
 }

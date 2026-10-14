@@ -57,8 +57,9 @@ impl std::fmt::Display for SkillExecutionError {
 pub fn check_permission(
     permission_manager: &PermissionManager,
     skill_name: &str,
+    invoker: crate::context::permissions::SkillInvoker,
 ) -> PermissionStatus {
-    permission_manager.check_skill_permission(skill_name)
+    permission_manager.check_skill_permission(skill_name, invoker)
 }
 
 /// Helper to extract all available tool names from the MCP context, indexed by:
@@ -143,9 +144,10 @@ pub async fn execute_skill(
     let tool_map = mcp_context.map(extract_tool_map).unwrap_or_default();
     let available_keys: Vec<String> = tool_map.keys().cloned().collect();
 
-    tracing::info!(
-        "Available Capability Keys for Resolution: {:?}",
-        available_keys
+    tracing::debug!(
+        "Available Capability Keys for Resolution ({}): {}",
+        available_keys.len(),
+        crate::log_utils::cap_list(&available_keys, 5)
     );
     let mut resolved_tools = HashMap::new();
     let mut warnings = Vec::new();

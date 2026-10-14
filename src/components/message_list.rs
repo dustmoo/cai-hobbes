@@ -4,19 +4,89 @@ use std::time::Duration;
 use tokio::time::sleep;
 use uuid::Uuid;
 
+use crate::components::activity_stream::{
+    absorb_live_placeholder, group_turn_runs, run_header_provenance, ActivityStream,
+};
 use crate::components::tool_call_display::{PermissionPrompt, ToolCallDisplay};
 
 use super::chat::{MessageBubble, WelcomeMessage};
-use super::shared::{MessageContent, SessionIdContext};
+use super::shared::{
+    caption_shows_time_utc, day_divider_utc, DayDivider, MessageCaption, MessageContent,
+    SessionIdContext,
+};
 
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
+
+/// What occupies one slot in the rendered list: either a plain message, or a
+/// whole turn's worth of tool calls / permission prompts / thinking collapsed
+/// into a single [`ActivityStream`] block rendered where its first message sat.
+enum RenderItem {
+    Single(usize),
+    Run(std::ops::Range<usize>),
+}
+
+/// The key for one rendered list slot: the id of the first message in a
+/// `Run`, or the id of the single message. Every iteration of the keyed
+/// list wraps its content in one plain `div` carrying this key, so the
+/// list diff always sees the same root shape (see the `for item in items`
+/// loop in `MessageList`).
+fn item_key(item: &RenderItem, sorted_messages: &[crate::components::chat::Message]) -> String {
+    match item {
+        RenderItem::Run(run) => sorted_messages[run.start].id.to_string(),
+        RenderItem::Single(idx) => sorted_messages[*idx].id.to_string(),
+    }
+}
+
+/// The caption an item renders under itself — `(label, created_at)` — or
+/// `None` when the item renders nothing (an empty text message whose thinking
+/// was absorbed into an activity block). Mirrors the labels each arm of the
+/// `MessageList` match paints, so the repeat and day-divider rules see exactly
+/// the captions on screen.
+fn item_caption<'a>(
+    item: &RenderItem,
+    sorted_messages: &'a [crate::components::chat::Message],
+    is_generating: impl Fn(&Uuid) -> bool,
+) -> Option<(&'a str, chrono::DateTime<chrono::Utc>)> {
+    let message = match item {
+        RenderItem::Run(run) => return Some(("Hobbes", sorted_messages[run.start].created_at)),
+        RenderItem::Single(idx) => &sorted_messages[*idx],
+    };
+    let label = match &message.content {
+        MessageContent::Text { content, .. } => {
+            let renders = !content.trim().is_empty()
+                || is_generating(&message.id)
+                || !message.attachments.is_empty();
+            if !renders {
+                return None;
+            }
+            message.author.as_str()
+        }
+        MessageContent::ToolCall(_) | MessageContent::Error { .. } => message.author.as_str(),
+        MessageContent::PermissionRequest(_) => "System",
+        MessageContent::SkillCall(_) | MessageContent::SkillPermissionRequest(_) => "User",
+    };
+    Some((label, message.created_at))
+}
+
+/// Per-item timestamp chrome: the day divider to draw above it, and whether
+/// its caption carries a time.
+struct ItemTimestamp {
+    divider: Option<String>,
+    show_time: bool,
+}
 
 #[component]
 pub fn MessageList(
     stream_update_trigger: Signal<i32>,
     show_scroll_button: Signal<bool>,
     on_delete: EventHandler<Uuid>,
+    on_fork: EventHandler<Uuid>,
+    on_edit_save: EventHandler<(Uuid, String)>,
+    on_edit_resend: EventHandler<(Uuid, String)>,
     on_comment: EventHandler<()>,
+    /// Stops the in-flight turn. Routed through to the activity block's header
+    /// Stop button; ChatWindow owns the actual cancel path (`cancel_message`).
+    on_stop: EventHandler<()>,
 ) -> Element {
     let mut session_state = consume_context::<Signal<crate::session::SessionState>>();
     let ui_state = consume_context::<Signal<crate::settings::UiState>>();
@@ -24,6 +94,20 @@ pub fn MessageList(
     let mcp_manager = use_context::<Signal<crate::mcp::manager::McpManager>>();
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    // Session-scoped, not the bare `ChatCommand::TriggerAiAnalysis` signal —
+    // that command carries no session id and routes to whichever tab happens
+    // to be ACTIVE when it's processed. A skill's permission approval runs an
+    // async execution (skills/execute_skill) that can outlive the click: if
+    // the user switches tabs before it resolves, TriggerAiAnalysis would
+    // trigger a continuation on the now-active tab instead of the one that
+    // actually ran the skill — an empty-user-message continuation against a
+    // session whose last message is already a finished assistant reply,
+    // which Claude rejects ("conversation must end with a user message").
+    // Writing directly into the owning session's slot in this set (the same
+    // primitive the tool-call approval path already uses) makes the
+    // continuation land on the right tab regardless of what's active later.
+    let mut has_pending_approvals =
+        use_context::<Signal<std::collections::HashSet<String>>>();
     let mut visible_message_count = use_signal(|| INITIAL_MESSAGES_TO_SHOW);
     let _ = stream_update_trigger.read();
 
@@ -41,6 +125,37 @@ pub fn MessageList(
         crate::components::shared::resolve_profile_color(session_profile, &settings_read)
             .unwrap_or_default()
     };
+
+    // Fallback header provenance for activity blocks: the session's CURRENT
+    // pins. Used only for legacy runs whose messages predate turn-time
+    // stamping (see `run_header_provenance`, which prefers each run's own
+    // stamped tool calls so a later profile/connector switch doesn't
+    // relabel finished turns).
+    let (profile_name, connector_label) = {
+        let state = session_state.read();
+        let settings_read = settings.read();
+        match state.sessions.get(&*session_id.read()) {
+            Some(session) => {
+                let profile_name = session
+                    .composio_profile
+                    .as_ref()
+                    .and_then(|id| settings_read.composio_profiles.iter().find(|p| &p.id == id))
+                    .or_else(|| settings_read.get_active_profile())
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "default".to_string());
+                let connector = settings_read
+                    .connector_for_session(session)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "no connector".to_string());
+                let model = settings_read.chat_model_for_session(session);
+                (profile_name, format!("{connector} {model}"))
+            }
+            None => ("default".to_string(), String::new()),
+        }
+    };
+
+    let stream_manager =
+        consume_context::<crate::components::stream_manager::StreamManagerContext>();
 
     use_effect(move || {
         if let Some(cmd) = chat_command.read().clone() {
@@ -138,7 +253,70 @@ pub fn MessageList(
                         let mut sorted_messages = session.messages.clone();
                         sorted_messages.sort_by_key(|m| m.created_at);
 
-                        let messages_to_render = sorted_messages.iter().skip(total_messages.saturating_sub(*visible_message_count.read())).collect::<Vec<_>>();
+                        // Group each turn's machinery into one activity block, then
+                        // apply the visible-window skip at slot level so a block is
+                        // never half-rendered.
+                        let mut runs = group_turn_runs(&sorted_messages);
+                        let is_streaming = stream_manager.is_session_streaming(&session_id.read());
+                        // While the turn is live the dashed "Considering…"
+                        // placeholder is part of the block, not a bubble under it.
+                        if is_streaming {
+                            absorb_live_placeholder(&sorted_messages, &mut runs);
+                        }
+                        let skip = total_messages.saturating_sub(*visible_message_count.read());
+                        let items: Vec<(RenderItem, ItemTimestamp)> = {
+                            let mut items = Vec::new();
+                            let mut i = 0usize;
+                            while i < total_messages {
+                                match runs.iter().find(|r| r.start == i) {
+                                    Some(r) => {
+                                        items.push(RenderItem::Run(r.clone()));
+                                        i = r.end;
+                                    }
+                                    None => {
+                                        items.push(RenderItem::Single(i));
+                                        i += 1;
+                                    }
+                                }
+                            }
+                            // Walk every item (not just the visible window) so the
+                            // first visible caption still compares against the one
+                            // above it; the oldest visible day always gets a divider.
+                            let mut prev: Option<(&str, chrono::DateTime<chrono::Utc>)> = None;
+                            let mut first_visible = true;
+                            items
+                                .into_iter()
+                                .filter_map(|it| {
+                                    let visible = match &it {
+                                        RenderItem::Single(i) => *i >= skip,
+                                        RenderItem::Run(r) => r.end > skip,
+                                    };
+                                    let caption = item_caption(&it, &sorted_messages, |id| {
+                                        stream_manager.is_generating(id)
+                                    });
+                                    let stamp = match caption {
+                                        Some(cur) => {
+                                            let prev_ts = if visible && first_visible { None } else { prev.map(|p| p.1) };
+                                            let stamp = ItemTimestamp {
+                                                divider: day_divider_utc(prev_ts, cur.1),
+                                                show_time: caption_shows_time_utc(prev, cur),
+                                            };
+                                            prev = Some(cur);
+                                            stamp
+                                        }
+                                        None => ItemTimestamp { divider: None, show_time: true },
+                                    };
+                                    if !visible {
+                                        return None;
+                                    }
+                                    if caption.is_some() {
+                                        first_visible = false;
+                                    }
+                                    Some((it, stamp))
+                                })
+                                .collect::<Vec<(RenderItem, ItemTimestamp)>>()
+                        };
+                        let last_run_start = runs.last().map(|r| r.start);
 
                         if session.messages.is_empty() {
                             rsx! { WelcomeMessage {} }
@@ -157,12 +335,52 @@ pub fn MessageList(
                                         }
                                     }
                                 }
-                                for message in messages_to_render {
-                                    {
+                                for (item, stamp) in items {
+                                    div {
+                                        key: "{item_key(&item, &sorted_messages)}",
+                                        if let Some(label) = stamp.divider.clone() {
+                                            div { class: "pb-4", DayDivider { label } }
+                                        }
+                                        {
                                         let session_id = session_id.read().clone();
+                                        match &item {
+                                        RenderItem::Run(run) => {
+                                            let run_msgs = sorted_messages[run.clone()].to_vec();
+                                            // Live only while this session streams, for the
+                                            // newest run, and only until the assistant's prose
+                                            // reply lands after it.
+                                            let is_live = is_streaming
+                                                && last_run_start == Some(run.start)
+                                                && !sorted_messages[run.end..].iter().any(|m| matches!(
+                                                    &m.content,
+                                                    MessageContent::Text { content, .. } if !content.trim().is_empty()
+                                                ));
+                                            let (run_profile_name, run_profile_color, run_connector_label) =
+                                                run_header_provenance(
+                                                    &run_msgs,
+                                                    &settings.read(),
+                                                    &profile_name,
+                                                    &profile_color,
+                                                    &connector_label,
+                                                );
+                                            rsx! {
+                                                ActivityStream {
+                                                    messages: run_msgs,
+                                                    session_id: session_id.clone(),
+                                                    is_live: is_live,
+                                                    profile_color: run_profile_color,
+                                                    profile_name: run_profile_name,
+                                                    connector_label: run_connector_label,
+                                                    on_stop: move |_| on_stop.call(()),
+                                                    show_time: stamp.show_time,
+                                                }
+                                            }
+                                        }
+                                        RenderItem::Single(idx) => {
+                                        let message = &sorted_messages[*idx];
                                         rsx! {
                                             match &message.content {
-                                                MessageContent::Text { content: text, thought_signature: _, thought_summary: _ } => {
+                                                MessageContent::Text { content: text, thought_signature: _, thought_summary: _, signature_provider: _ } => {
                                                     let stream_manager = consume_context::<crate::components::stream_manager::StreamManagerContext>();
                                                     let is_generating = stream_manager.is_generating(&message.id);
                                                     // Don't render empty bubbles — thinking data (thought_signature/thought_summary)
@@ -173,7 +391,6 @@ pub fn MessageList(
                                                     if should_render {
                                                         rsx! {
                                                             MessageBubble {
-                                                                key: "{message.id}",
                                                                 message: message.clone(),
                                                                 on_content_update: move |_| stream_update_trigger += 1,
                                                                 on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
@@ -181,23 +398,36 @@ pub fn MessageList(
                                                                     let msg_id = message.id;
                                                                     move |_| on_delete.call(msg_id)
                                                                 },
+                                                                on_fork: {
+                                                                    let msg_id = message.id;
+                                                                    move |_| on_fork.call(msg_id)
+                                                                },
+                                                                on_edit_save: {
+                                                                    let msg_id = message.id;
+                                                                    move |text: String| on_edit_save.call((msg_id, text))
+                                                                },
+                                                                on_edit_resend: {
+                                                                    let msg_id = message.id;
+                                                                    move |text: String| on_edit_resend.call((msg_id, text))
+                                                                },
                                                                 on_comment: move |_| on_comment.call(()),
+                                                                show_time: stamp.show_time,
                                                             }
                                                         }
                                                     } else {
+                                                        // The list key now lives on the wrapper `div`
+                                                        // this whole match is rendered inside of (see
+                                                        // the `for item in items` loop), so every
+                                                        // iteration's root shape is identical and this
+                                                        // arm doesn't need its own key.
                                                         rsx! {}
                                                     }
                                                 },
                                                 MessageContent::ToolCall(tool_call) => {
                                                     let bubble_classes = "bg-input text-fg self-start mr-auto";
                                                     let container_classes = "flex justify-start";
-                                                    let author_classes = format!(
-                                                        "text-xs text-fg-muted mt-1 px-2 {}",
-                                                        "text-left"
-                                                    );
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -209,9 +439,10 @@ pub fn MessageList(
                                                                         token_display_mode: ui_state.read().token_display_mode.clone()
                                                                     }
                                                                 }
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "{message.author}"
+                                                                MessageCaption {
+                                                                    label: message.author.clone(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
                                                                 }
                                                             }
                                                         }
@@ -219,17 +450,27 @@ pub fn MessageList(
                                                 }
                                                 MessageContent::PermissionRequest(tool_call) => {
                                                     let container_classes = "flex justify-start";
-                                                    let author_classes = "text-xs text-fg-muted mt-1 px-2 text-left";
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
-                                                                PermissionPrompt { tool_call: tool_call.clone() },
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "System"
+                                                                if crate::components::tool_call_display::is_skill_invoke_request(tool_call) {
+                                                                    crate::components::tool_call_display::SkillToolPermissionPrompt {
+                                                                        tool_call: tool_call.clone(),
+                                                                        session_id: session_id.clone(),
+                                                                        profile_color: profile_color.clone(),
+                                                                    }
+                                                                } else {
+                                                                    PermissionPrompt {
+                                                                        tool_call: tool_call.clone(),
+                                                                        session_id: session_id.clone(),
+                                                                    }
+                                                                }
+                                                                MessageCaption {
+                                                                    label: "System".to_string(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
                                                                 }
                                                             }
                                                         }
@@ -238,7 +479,6 @@ pub fn MessageList(
                                                 MessageContent::Error { .. } => {
                                                     rsx! {
                                                         MessageBubble {
-                                                            key: "{message.id}",
                                                             message: message.clone(),
                                                             on_content_update: move |_| stream_update_trigger += 1,
                                                             on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
@@ -246,16 +486,19 @@ pub fn MessageList(
                                                                 let msg_id = message.id;
                                                                 move |_| on_delete.call(msg_id)
                                                             },
+                                                            on_fork: {
+                                                                let msg_id = message.id;
+                                                                move |_| on_fork.call(msg_id)
+                                                            },
                                                             on_comment: move |_| on_comment.call(()),
+                                                            show_time: stamp.show_time,
                                                         }
                                                     }
                                                 }
                                                 MessageContent::SkillCall(skill_call) => {
                                                     let container_classes = "flex justify-end text-fg";
-                                                    let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -276,9 +519,11 @@ pub fn MessageList(
                                                                         },
                                                                     }
                                                                 }
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "User"
+                                                                MessageCaption {
+                                                                    label: "User".to_string(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
+                                                                    align_right: true,
                                                                 }
                                                             }
                                                         }
@@ -286,12 +531,10 @@ pub fn MessageList(
                                                 }
                                                 MessageContent::SkillPermissionRequest(skill_call) => {
                                                     let container_classes = "flex justify-end text-fg";
-                                                    let author_classes = "text-xs text-fg-muted mt-1 px-2 text-right";
                                                     let execution_id = skill_call.execution_id.clone();
                                                     let message_id = message.id;
                                                     rsx! {
                                                         div {
-                                                            key: "{message.id}",
                                                             class: "{container_classes} w-full",
                                                             div {
                                                                 class: "flex flex-col max-w-full min-w-0",
@@ -348,9 +591,11 @@ pub fn MessageList(
                                                                                                 tracing::info!("Skill executed: {:?}", result.status);
                                                                                                 // Update message with completed SkillCall
                                                                                                 let mut state = session_state.write();
+                                                                                                let mut skill_events: Vec<crate::session_events::SessionEvent> = Vec::new();
                                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                                         msg.content = MessageContent::SkillCall(sc.clone());
+                                                                                                        skill_events.push(crate::session_events::SessionEvent::ToolResult { message: msg.clone() });
                                                                                                     }
                                                                                                     // Persist skill into session.loaded_skills
                                                                                                     if sc.status == crate::components::shared::SkillCallStatus::Completed {
@@ -358,22 +603,35 @@ pub fn MessageList(
                                                                                                             sc.skill_name.clone(),
                                                                                                             sc.response.clone(),
                                                                                                         );
+                                                                                                        skill_events.push(crate::session_events::SessionEvent::SkillLoaded {
+                                                                                                            name: sc.skill_name.clone(),
+                                                                                                            payload: sc.response.clone(),
+                                                                                                        });
                                                                                                         tracing::info!("Persisted skill '{}' into session.loaded_skills (permission path)", sc.skill_name);
                                                                                                     }
                                                                                                 }
                                                                                                 drop(state);
-                                                                                                // Trigger continuation so LLM responds to skill output
-                                                                                                chat_command.set(Some(crate::components::chat_input::ChatCommand::TriggerAiAnalysis));
+                                                                                                crate::session_events::log_events(&session_id, skill_events);
+                                                                                                // Trigger continuation on the session that actually ran the
+                                                                                                // skill, not whichever tab is active right now (see the
+                                                                                                // has_pending_approvals doc comment above).
+                                                                                                has_pending_approvals.write().insert(session_id.clone());
                                                                                             }
                                                                                             Err(e) => {
                                                                                                 tracing::error!("Skill execution failed: {}", e);
                                                                                                 sc.status = crate::components::shared::SkillCallStatus::Error;
                                                                                                 sc.response = e.to_string();
                                                                                                 let mut state = session_state.write();
+                                                                                                let mut error_snapshot: Option<crate::components::chat::Message> = None;
                                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                                         msg.content = MessageContent::SkillCall(sc);
+                                                                                                        error_snapshot = Some(msg.clone());
                                                                                                     }
+                                                                                                }
+                                                                                                drop(state);
+                                                                                                if let Some(message) = error_snapshot {
+                                                                                                    crate::session_events::log_event(&session_id, crate::session_events::SessionEvent::ToolResult { message });
                                                                                                 }
                                                                                             }
                                                                                         }
@@ -388,6 +646,7 @@ pub fn MessageList(
                                                                                 let session_id = session_id.clone();
                                                                                 // Mark skill as denied
                                                                                 let mut state = session_state.write();
+                                                                                let mut denied_snapshot: Option<crate::components::chat::Message> = None;
                                                                                 if let Some(session) = state.sessions.get_mut(&session_id) {
                                                                                     if let Some(msg) = session.messages.iter_mut().find(|m| m.id == msg_id) {
                                                                                         if let MessageContent::SkillPermissionRequest(sc) = &msg.content {
@@ -395,17 +654,27 @@ pub fn MessageList(
                                                                                             denied_sc.status = crate::components::shared::SkillCallStatus::Error;
                                                                                             denied_sc.response = "Permission denied by user.".to_string();
                                                                                             msg.content = MessageContent::SkillCall(denied_sc);
+                                                                                            denied_snapshot = Some(msg.clone());
                                                                                         }
                                                                                     }
+                                                                                }
+                                                                                drop(state);
+                                                                                // Denials journal as ToolResult — consistent with the
+                                                                                // approval path: the deny mutates the same message in
+                                                                                // place, and the projector upserts by message id.
+                                                                                if let Some(message) = denied_snapshot {
+                                                                                    crate::session_events::log_event(&session_id, crate::session_events::SessionEvent::ToolResult { message });
                                                                                 }
                                                                                 tracing::info!("Skill permission denied for execution_id: {}", execution_id);
                                                                             }
                                                                         }
                                                                     }
                                                                 }
-                                                                div {
-                                                                    class: "{author_classes}",
-                                                                    "User"
+                                                                MessageCaption {
+                                                                    label: "User".to_string(),
+                                                                    created_at: message.created_at,
+                                                                    show_time: stamp.show_time,
+                                                                    align_right: true,
                                                                 }
                                                             }
                                                         }
@@ -413,9 +682,12 @@ pub fn MessageList(
                                                 }
                                             }
                                         }
+                                        }
+                                        }
                                     }
                                 }
                             }
+                        }
                         }
                     } else {
                         rsx! { WelcomeMessage {} }

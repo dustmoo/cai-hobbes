@@ -1,4 +1,5 @@
 mod context_compression;
+mod ledger;
 mod message_history;
 mod system_context;
 pub(crate) mod types;
@@ -15,24 +16,59 @@ use crate::session::Session;
 use crate::settings::Settings;
 
 
+/// Stands in for the user's silence when a continuation would otherwise leave
+/// the request ending on an assistant turn. See `ensure_ends_with_user_turn`.
+const CONTINUATION_NUDGE: &str = "[Continue. The user has not replied yet.]";
+
 /// Builds a structured `LlmPrompt` object for the LLM.
 pub struct PromptBuilder<'a> {
     pub(crate) session: &'a Session,
     pub(crate) settings: &'a Settings,
-    pub(crate) session_state: &'a crate::session::SessionState,
+    /// Prebuilt `planner_today` system-context block
+    /// (`todo::handlers::planner_today_context`). Computed at the call site so
+    /// the builder stays free of planner state; `None` (the default) when the
+    /// planner or its context injection is disabled.
+    pub(crate) planner_today: Option<serde_json::Value>,
+    /// Clock for a new request tail; `None` (the default) reads the local
+    /// clock. Tests pin it so a build is a pure function of its inputs.
+    pub(crate) now: Option<chrono::DateTime<chrono::Local>>,
+    /// Offer `HOBBES_AGENT_TIME` (`PlannerClient::agent_time_tools`). True
+    /// only for the leased agent-time session
+    /// (`builtin_tools::agent_time_tool_visible`); every other prompt has
+    /// the tool stripped, whatever its MCP context says.
+    pub(crate) agent_time_tools: bool,
 }
 
 impl<'a> PromptBuilder<'a> {
-    pub fn new(
-        session: &'a Session,
-        settings: &'a Settings,
-        session_state: &'a crate::session::SessionState,
-    ) -> Self {
+    pub fn new(session: &'a Session, settings: &'a Settings) -> Self {
         Self {
             session,
             settings,
-            session_state,
+            planner_today: None,
+            now: None,
+            agent_time_tools: false,
         }
+    }
+
+    /// Offer the agent-time tool. Pass
+    /// `builtin_tools::agent_time_tool_visible(&planner, session_id)`.
+    pub fn with_agent_time_tools(mut self, visible: bool) -> Self {
+        self.agent_time_tools = visible;
+        self
+    }
+
+    /// Attach the `planner_today` block built by
+    /// `todo::handlers::planner_today_context`.
+    pub fn with_planner_today(mut self, planner_today: Option<serde_json::Value>) -> Self {
+        self.planner_today = planner_today;
+        self
+    }
+
+    /// Pin the clock a new request tail records (tests).
+    #[cfg(test)]
+    pub fn with_now(mut self, now: chrono::DateTime<chrono::Local>) -> Self {
+        self.now = Some(now);
+        self
     }
 
     /// Effective LLM provider for this prompt: session override → global settings.
@@ -77,24 +113,17 @@ impl<'a> PromptBuilder<'a> {
         // Phase 1: Build system context (persona, tools, skills, scratchpad, etc.)
         let ctx = self.build_system_context();
 
-        // Phase 2: Linearise message history (Pass 1)
-        let last_message = self.session.messages.last();
-        let mut linearised = self.linearise_messages(
-            &ctx.system,
-            &ctx.tools,
-            ctx.provider_context,
-            &ctx.tuning,
-            ctx.is_continuation_placeholder,
-            last_message,
-        );
+        // Phase 2: Linearise message history (Pass 1), with the turn context
+        // ledger spliced in and the request tail at the end.
+        let mut linearised = self.linearise_messages(&ctx, user_message);
 
-        // 3. Add current user message
-        if !user_message.is_empty() {
-            linearised.messages.push(ChatMessage {
-                role: ChatRole::User,
-                content: vec![ContentBlock::Text { text: user_message }],
-            });
-        }
+        // 3b. A request asking for a new completion must not end on an
+        // assistant turn. Appending here (at the tail) keeps every
+        // `tool_result_positions` and `turn_scoped` index from Pass 1 valid.
+        // The request tail (a System message carrying the CONTINUATION /
+        // TOOL COMPLETION instruction) is always last, so this only fires
+        // when no tail rendered.
+        Self::ensure_ends_with_user_turn(&mut linearised.messages);
 
         // Phase 3: Apply Pass 2 budget & pagination
         self.apply_pass2_budget(
@@ -109,7 +138,7 @@ impl<'a> PromptBuilder<'a> {
 
         // Log page queue availability
         if !linearised.pages_to_store.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 "HOBBES_PAGE_RESULT available via hobbes-core — {} paginated result(s) queued",
                 linearised.pages_to_store.len()
             );
@@ -122,39 +151,102 @@ impl<'a> PromptBuilder<'a> {
 
         PromptBuildResult {
             prompt: NeutralLlmPrompt {
+                // Stable for the whole session: the live context and the
+                // per-request tail are messages now.
                 system: Some(ctx.system),
+                system_volatile_offset: None,
+                turn_scoped: linearised.turn_scoped,
+                history_rewritten: linearised.history_rewritten,
                 messages: linearised.messages,
                 tools: ctx.tools,
             },
             pages_to_store: linearised.pages_to_store,
+            history_anchor: linearised.history_anchor,
+            ledger_entries: linearised.ledger_entries,
         }
     }
 
-    /// Strip `ContentBlock::Thinking` blocks from all assistant messages except
-    /// the most recent one. This dramatically reduces context usage for models
-    /// with finite context windows — thinking content from historical turns is
-    /// the single largest contributor to context exhaustion on small models.
+    /// Guarantee the outgoing message list never ends on an assistant turn.
     ///
-    /// Walks messages in reverse: the first `ChatRole::Assistant` message encountered
-    /// keeps its thinking blocks; all earlier assistant messages have them removed.
+    /// Claude refuses such a request outright on models without prefill
+    /// support — "This model does not support assistant message prefill. The
+    /// conversation must end with a user message" — and every other provider
+    /// needs a user turn to answer as well.
+    ///
+    /// This used to hold by accident. A turn's last stored message was its
+    /// tool call, and a tool call always linearises into an assistant
+    /// `tool_use` *plus* its `tool_result`, which rides on a user turn. Once a
+    /// finished reply started being ordered after the tool calls it follows
+    /// (so the transcript reads thinking → commands → answer), the assistant's
+    /// own prose became the last message of the turn and the invariant broke:
+    /// a continuation — which carries no new user text — then built a request
+    /// ending on that prose.
+    ///
+    /// A continuation has nothing from the conversation left to append, so the
+    /// nudge below stands in for the user's silence. It exists only in the
+    /// outgoing request: it is never stored on the session, journaled, or
+    /// shown in the transcript. The system prompt already carries the fuller
+    /// instruction for this case (see `build_system_context`'s
+    /// TOOL COMPLETION / CONTINUATION instructions), so this stays terse.
+    fn ensure_ends_with_user_turn(messages: &mut Vec<ChatMessage>) {
+        if messages
+            .last()
+            .is_some_and(|m| m.role == ChatRole::Assistant)
+        {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text {
+                    text: CONTINUATION_NUDGE.to_string(),
+                }],
+            });
+        }
+    }
+
+    /// Strip `ContentBlock::Thinking` blocks from every assistant message
+    /// before the current turn. This dramatically reduces context usage for
+    /// models with finite context windows — thinking content from historical
+    /// turns is the single largest contributor to context exhaustion on small
+    /// models.
+    ///
+    /// The current turn starts at the last `ChatRole::User` message (tool
+    /// results are `ChatRole::Tool`, ledger entries and tails
+    /// `ChatRole::System`), not counting a trailing continuation nudge, which
+    /// stands in for silence rather than starting a turn. Every assistant
+    /// message after it keeps its thinking — Claude Opus 5.5 and Fable 5.1
+    /// reject a tool loop whose thinking blocks were partially dropped — and
+    /// every one before it is stripped.
+    ///
+    /// The rule depends only on where the turn starts, so within a turn each
+    /// request renders the messages it shares with the previous one
+    /// identically, and the prompt cache carries across the tool loop. (It
+    /// used to also keep thinking on the most recent assistant message even
+    /// when it belonged to an earlier turn: a boundary build then sent the
+    /// previous turn's final reply *with* its thinking and the next request
+    /// sent it without, so the first continuation of every turn missed the
+    /// cache from that reply on — the whole history right after a trim.)
+    /// What is stripped is always a leading run of the thinking blocks the
+    /// previous request carried, which preserved thinking allows.
     fn strip_historical_thinking(messages: &mut [ChatMessage]) {
-        let mut found_latest = false;
-        for msg in messages.iter_mut().rev() {
-            if msg.role == ChatRole::Assistant {
-                if found_latest {
-                    // Strip thinking from older assistant messages
-                    let before = msg.content.len();
-                    msg.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
-                    if msg.content.len() < before {
-                        tracing::debug!(
-                            "Stripped {} thinking block(s) from historical assistant message",
-                            before - msg.content.len()
-                        );
-                    }
-                } else {
-                    found_latest = true;
-                    // Keep thinking on the most recent assistant message
-                }
+        let is_nudge = |m: &ChatMessage| {
+            matches!(&m.content[..], [ContentBlock::Text { text }] if text == CONTINUATION_NUDGE)
+        };
+        let Some(turn_start) = messages
+            .iter()
+            .rposition(|m| m.role == ChatRole::User && !is_nudge(m))
+        else {
+            return;
+        };
+        for msg in messages[..turn_start]
+            .iter_mut()
+            .filter(|m| m.role == ChatRole::Assistant)
+        {
+            let before = msg.content.len();
+            msg.content.retain(|block| !matches!(block, ContentBlock::Thinking { .. }));
+            if msg.content.len() < before {
+                tracing::debug!(
+                    "Stripped {} thinking block(s) from historical assistant message",
+                    before - msg.content.len()
+                );
             }
         }
     }

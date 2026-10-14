@@ -30,12 +30,15 @@ use crate::mcp::manager::McpContext;
 
 // ── Routing ──────────────────────────────────────────────────────────────────
 
-/// True if the model belongs to OpenAI's Responses-first family (gpt-5 / o-series).
-/// The Responses API works for *all* current OpenAI models, but only this family
-/// *requires* it (Chat Completions rejects them), so Auto routes the family here.
+/// True if the model belongs to OpenAI's Responses-first family (gpt-6 / gpt-5 /
+/// o-series). The Responses API works for *all* current OpenAI models, but only
+/// this family *requires* it (Chat Completions rejects them), so Auto routes the
+/// family here. `gpt-5.6-*` and `gpt-5.5-*` already match the `gpt-5` prefix;
+/// `gpt-6-astra` needs its own prefix since it doesn't start with `gpt-5`.
 pub fn is_responses_family(model: &str) -> bool {
     let m = model.trim();
-    m.starts_with("gpt-5")
+    m.starts_with("gpt-6")
+        || m.starts_with("gpt-5")
         || m.starts_with("o1")
         || m.starts_with("o3")
         || m.starts_with("o4")
@@ -109,7 +112,10 @@ impl OpenAiResponsesConnector {
                     // Reasoning is hidden server-side; never re-inject it into history.
                     ContentBlock::Thinking { .. } => {}
                     ContentBlock::ToolCall {
-                        id, name, arguments, ..
+                        id,
+                        name,
+                        arguments,
+                        ..
                     } => {
                         let args = if arguments.is_string() {
                             arguments.as_str().unwrap_or("{}").to_string()
@@ -141,6 +147,19 @@ impl OpenAiResponsesConnector {
                 ChatRole::Tool => "user",
             };
             let joined = text_parts.join("\n");
+
+            // Mid-conversation system message: OpenAI's Responses API takes
+            // system items anywhere; other servers implementing /responses
+            // may not, so they get user-role context text.
+            if msg.role == ChatRole::System
+                && !items.is_empty()
+                && !endpoint_is_openai(&self.config.endpoint)
+            {
+                if !joined.is_empty() {
+                    crate::llm::convert::push_context_as_user(&mut items, &joined, "input_text");
+                }
+                continue;
+            }
 
             if let Some((call_id, output)) = tool_result {
                 // Tool results are standalone items correlated by call_id.
@@ -188,33 +207,30 @@ impl OpenAiResponsesConnector {
     fn to_responses_request(&self, prompt: &LlmPrompt, streaming: bool) -> Value {
         let input = self.build_input_items(prompt);
 
-        let tools: Option<Vec<Value>> =
-            if !self.config.tools_enabled || prompt.tools.is_empty() {
-                None
-            } else {
-                Some(
-                    prompt
-                        .tools
-                        .iter()
-                        .map(|t| {
-                            let name = crate::gemini::convert::get_prefixed_tool_name(
-                                &t.server_name,
-                                &t.name,
-                            );
-                            // Responses flattens the function shape (no nested
-                            // `function` object). `strict: false` avoids strict
-                            // JSON-schema validation our MCP tools may not satisfy.
-                            json!({
-                                "type": "function",
-                                "name": name,
-                                "description": t.description,
-                                "parameters": t.parameters,
-                                "strict": false,
-                            })
+        let tools: Option<Vec<Value>> = if !self.config.tools_enabled || prompt.tools.is_empty() {
+            None
+        } else {
+            Some(
+                prompt
+                    .tools
+                    .iter()
+                    .map(|t| {
+                        let name =
+                            crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
+                        // Responses flattens the function shape (no nested
+                        // `function` object). `strict: false` avoids strict
+                        // JSON-schema validation our MCP tools may not satisfy.
+                        json!({
+                            "type": "function",
+                            "name": name,
+                            "description": t.description,
+                            "parameters": t.parameters,
+                            "strict": false,
                         })
-                        .collect(),
-                )
-            };
+                    })
+                    .collect(),
+            )
+        };
 
         let mut request = json!({
             "model": self.config.model,
@@ -250,8 +266,7 @@ impl OpenAiResponsesConnector {
     ) -> std::collections::HashMap<String, (String, String)> {
         let mut map = std::collections::HashMap::new();
         for t in &prompt.tools {
-            let prefixed =
-                crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
+            let prefixed = crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
             map.insert(prefixed, (t.server_name.clone(), t.name.clone()));
         }
         map
@@ -314,7 +329,10 @@ enum RespEvent {
 
 fn parse_usage(response: &Value) -> Option<UsageData> {
     let usage = response.get("usage")?;
-    let input = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as i32;
+    let input = usage
+        .get("input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as i32;
     let output = usage
         .get("output_tokens")
         .and_then(|v| v.as_u64())
@@ -328,6 +346,7 @@ fn parse_usage(response: &Value) -> Option<UsageData> {
         completion_tokens: output,
         total_tokens: total,
         cached_content_tokens: None,
+        cache_creation_tokens: None,
         thoughts_tokens: None,
         cost: Some(0.0),
     })
@@ -336,23 +355,37 @@ fn parse_usage(response: &Value) -> Option<UsageData> {
 /// Classify a single parsed SSE `data:` JSON object into a [`RespEvent`].
 fn classify_event(v: &Value) -> RespEvent {
     match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "response.output_text.delta" => {
-            RespEvent::TextDelta(v.get("delta").and_then(|d| d.as_str()).unwrap_or("").to_string())
-        }
+        "response.output_text.delta" => RespEvent::TextDelta(
+            v.get("delta")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ),
         "response.reasoning_summary_text.delta" => RespEvent::ReasoningDelta(
-            v.get("delta").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+            v.get("delta")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string(),
         ),
         "response.output_item.added" | "response.output_item.done" => {
             let item = v.get("item").cloned().unwrap_or(Value::Null);
             if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
                 RespEvent::FunctionCallAdded {
-                    item_id: item.get("id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    item_id: item
+                        .get("id")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     call_id: item
                         .get("call_id")
                         .and_then(|s| s.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    name: item.get("name").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                    name: item
+                        .get("name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     initial_args: item
                         .get("arguments")
                         .and_then(|s| s.as_str())
@@ -364,11 +397,23 @@ fn classify_event(v: &Value) -> RespEvent {
             }
         }
         "response.function_call_arguments.delta" => RespEvent::FunctionCallArgsDelta {
-            item_id: v.get("item_id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
-            delta: v.get("delta").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            item_id: v
+                .get("item_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
+            delta: v
+                .get("delta")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
         },
         "response.function_call_arguments.done" => RespEvent::FunctionCallArgsDone {
-            item_id: v.get("item_id").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+            item_id: v
+                .get("item_id")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string(),
             arguments: v
                 .get("arguments")
                 .and_then(|s| s.as_str())
@@ -396,7 +441,11 @@ fn classify_event(v: &Value) -> RespEvent {
             let msg = v
                 .get("message")
                 .and_then(|m| m.as_str())
-                .or_else(|| v.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()))
+                .or_else(|| {
+                    v.get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                })
                 .unwrap_or("Stream error")
                 .to_string();
             RespEvent::Failed(msg)
@@ -423,11 +472,20 @@ impl LlmConnector for OpenAiResponsesConnector {
                 .unwrap_or(crate::context::token_estimator::DEFAULT_CHARS_PER_TOKEN);
             let dropped = prompt_data.enforce_context_budget(max_tokens, 6, chars_per_token);
             if dropped > 0 {
-                tracing::warn!(
-                    "OpenAI Responses: trimmed {} oldest messages to fit {} token window",
-                    dropped,
-                    max_tokens
-                );
+                if crate::log_utils::first_time(&format!("oai_responses_trim:{}", self.config.model)) {
+                    tracing::info!(
+                        "OpenAI Responses: trimmed {} oldest messages to fit {} token window (model '{}'; further trims logged at DEBUG)",
+                        dropped,
+                        max_tokens,
+                        self.config.model
+                    );
+                } else {
+                    tracing::debug!(
+                        "OpenAI Responses: trimmed {} oldest messages to fit {} token window",
+                        dropped,
+                        max_tokens
+                    );
+                }
             }
         }
 
@@ -456,9 +514,12 @@ impl LlmConnector for OpenAiResponsesConnector {
             .header("Content-Type", "application/json")
             .body(body_str);
         if let Some(api_key) = &self.config.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", api_key));
         } else {
-            tracing::warn!("OpenAI Responses: no API key configured — request will be unauthenticated");
+            tracing::warn!(
+                "OpenAI Responses: no API key configured — request will be unauthenticated"
+            );
         }
 
         let response = match request_builder.send().await {
@@ -495,18 +556,16 @@ impl LlmConnector for OpenAiResponsesConnector {
         // Flush all assembled function calls as ToolCall messages. Preserves the
         // OpenAI call_id as the ToolCall execution_id so the function_call_output
         // we send on the next turn correlates exactly.
-        let flush =
-            |pending: &mut Vec<PendingCall>, tx: &mpsc::UnboundedSender<StreamMessage>| {
-                for pc in pending.drain(..) {
-                    let args: Value =
-                        serde_json::from_str(&pc.arguments).unwrap_or_else(|_| json!({}));
-                    let mut call = ToolCall::new(pc.server_name, pc.tool_name, args, None, None);
-                    if !pc.call_id.is_empty() {
-                        call.execution_id = pc.call_id;
-                    }
-                    let _ = tx.send(StreamMessage::ToolCall(call));
+        let flush = |pending: &mut Vec<PendingCall>, tx: &mpsc::UnboundedSender<StreamMessage>| {
+            for pc in pending.drain(..) {
+                let args: Value = serde_json::from_str(&pc.arguments).unwrap_or_else(|_| json!({}));
+                let mut call = ToolCall::new(pc.server_name, pc.tool_name, args, None, None);
+                if !pc.call_id.is_empty() {
+                    call.execution_id = pc.call_id;
                 }
-            };
+                let _ = tx.send(StreamMessage::ToolCall(Box::new(call)));
+            }
+        };
 
         while let Some(item) = stream.next().await {
             let bytes = match item {
@@ -655,7 +714,9 @@ You MUST respond with valid JSON containing exactly these fields:
 - "summary": A concise, updated summary of the entire conversation so far.
 - "sentiment": A brief string describing the user's current mood.
 - "current_task": A one-sentence description of the task the user is CURRENTLY working on (empty string if none).
-- "entities": An object with "user_name", "project_name", "key_topics" (array), "key_decisions" (array), "active_profile", "blockers" (array)."#;
+- "entities": An object with "user_name", "project_name", "key_topics" (array), "key_decisions" (array), "active_profile", "blockers" (array).
+- "tab_title": A 2-4 word topic for this chat's browser-tab-style label. Empty string if unclear.
+- "tab_emoji": A single emoji that specifically captures this chat's topic — reach for the most precise, least-generic match to the actual subject matter (a tool, domain, object, or action mentioned), not a default like 💬, 🤖, 📝, ✅, or 🚀. Vary your choice across different chats rather than reusing a small favorite set. Examples of specific picks: "🐛" for a bug hunt, "🧮" for a math problem, "🗺️" for trip planning, "🔐" for auth work, "🍞" for a baking recipe."#;
 
         let user_message = format!(
             "Previous Summary:\n---\n{}\n---\n\nRecent Messages:\n---\n{}\n---",
@@ -680,7 +741,8 @@ You MUST respond with valid JSON containing exactly these fields:
             .header("Content-Type", "application/json")
             .body(serde_json::to_string(&request_body).unwrap_or_default());
         if let Some(api_key) = &self.config.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
         let response = request_builder
@@ -704,13 +766,8 @@ You MUST respond with valid JSON containing exactly these fields:
 
         let content = extract_output_text(&response_json);
         if !content.is_empty() {
-            if let Ok(json_value) = serde_json::from_str::<Value>(&content) {
+            if let Some(json_value) = super::extract_json_object(&content) {
                 return Ok(json_value);
-            }
-            if let (Some(start), Some(end)) = (content.find('{'), content.rfind('}')) {
-                if let Ok(json_value) = serde_json::from_str::<Value>(&content[start..=end]) {
-                    return Ok(json_value);
-                }
             }
             tracing::warn!("OpenAI Responses: summary not valid JSON, using raw text.");
             return Ok(json!({ "summary": content, "entities": {}, "sentiment": "neutral" }));
@@ -762,7 +819,8 @@ You MUST respond with valid JSON containing exactly these fields:
             .header("Content-Type", "application/json")
             .body(serde_json::to_string(&request_body).unwrap_or_default());
         if let Some(api_key) = &self.config.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", api_key));
+            request_builder =
+                request_builder.header("Authorization", format!("Bearer {}", api_key));
         }
 
         let response = request_builder.send().await.map_err(|e| e.to_string())?;
@@ -829,7 +887,10 @@ mod tests {
     fn auto_routes_gpt5_and_o_series_on_openai_to_responses() {
         let c = cfg("https://api.openai.com/v1", "gpt-5-pro", ApiStyle::Auto);
         assert!(should_use_responses(&c, "gpt-5-pro"));
-        assert!(should_use_responses(&cfg("https://api.openai.com/v1", "o3-pro", ApiStyle::Auto), "o3-pro"));
+        assert!(should_use_responses(
+            &cfg("https://api.openai.com/v1", "o3-pro", ApiStyle::Auto),
+            "o3-pro"
+        ));
     }
 
     #[test]
@@ -849,14 +910,34 @@ mod tests {
     fn explicit_overrides_win_regardless_of_endpoint() {
         let forced_on = cfg("http://localhost:1234/v1", "llama3", ApiStyle::Responses);
         assert!(should_use_responses(&forced_on, "llama3"));
-        let forced_off = cfg("https://api.openai.com/v1", "gpt-5-pro", ApiStyle::ChatCompletions);
+        let forced_off = cfg(
+            "https://api.openai.com/v1",
+            "gpt-5-pro",
+            ApiStyle::ChatCompletions,
+        );
         assert!(!should_use_responses(&forced_off, "gpt-5-pro"));
     }
 
     #[test]
     fn family_detection_matches_expected_prefixes() {
-        for m in ["gpt-5", "gpt-5-mini", "o1", "o1-pro", "o3", "o3-mini", "o4-mini"] {
-            assert!(is_responses_family(m), "{m} should be in the Responses family");
+        for m in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.5",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-6-astra",
+            "o1",
+            "o1-pro",
+            "o3",
+            "o3-mini",
+            "o4-mini",
+        ] {
+            assert!(
+                is_responses_family(m),
+                "{m} should be in the Responses family"
+            );
         }
         for m in ["gpt-4o", "gpt-4.1", "chatgpt-4o-latest", "llama3"] {
             assert!(!is_responses_family(m), "{m} should NOT be in the family");
@@ -873,9 +954,14 @@ mod tests {
     fn system_prompt_maps_to_instructions_not_a_message() {
         let prompt = LlmPrompt {
             system: Some("be terse".to_string()),
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![ChatMessage {
                 role: ChatRole::User,
-                content: vec![ContentBlock::Text { text: "hi".to_string() }],
+                content: vec![ContentBlock::Text {
+                    text: "hi".to_string(),
+                }],
             }],
             tools: vec![],
         };
@@ -893,6 +979,9 @@ mod tests {
     fn tools_are_flattened_no_nested_function_object() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![],
             tools: vec![ToolDefinition {
                 name: "send".to_string(),
@@ -905,7 +994,10 @@ mod tests {
         let tool = &req["tools"][0];
         assert_eq!(tool["type"], json!("function"));
         assert!(tool["name"].is_string(), "name is top-level, not nested");
-        assert!(tool.get("function").is_none(), "must not nest under `function`");
+        assert!(
+            tool.get("function").is_none(),
+            "must not nest under `function`"
+        );
         assert_eq!(tool["parameters"], json!({ "type": "object" }));
     }
 
@@ -913,6 +1005,9 @@ mod tests {
     fn tool_call_and_result_become_correlated_items() {
         let prompt = LlmPrompt {
             system: None,
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
             messages: vec![
                 ChatMessage {
                     role: ChatRole::Assistant,
@@ -937,20 +1032,33 @@ mod tests {
         let req = connector().to_responses_request(&prompt, true);
         let input = req["input"].as_array().unwrap();
         // function_call item
-        let fc = input.iter().find(|i| i["type"] == json!("function_call")).unwrap();
+        let fc = input
+            .iter()
+            .find(|i| i["type"] == json!("function_call"))
+            .unwrap();
         assert_eq!(fc["call_id"], json!("call_42"));
         assert_eq!(fc["name"], json!("gmail_send"));
         // Arguments serialized as a JSON string.
         assert_eq!(fc["arguments"], json!(r#"{"to":"a@b.c"}"#));
         // function_call_output correlated by the same call_id
-        let out = input.iter().find(|i| i["type"] == json!("function_call_output")).unwrap();
+        let out = input
+            .iter()
+            .find(|i| i["type"] == json!("function_call_output"))
+            .unwrap();
         assert_eq!(out["call_id"], json!("call_42"));
         assert_eq!(out["output"], json!("sent"));
     }
 
     #[test]
     fn reasoning_requested_only_when_thinking_enabled() {
-        let prompt = LlmPrompt { system: None, messages: vec![], tools: vec![] };
+        let prompt = LlmPrompt {
+            system: None,
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
+            messages: vec![],
+            tools: vec![],
+        };
         let off = connector().to_responses_request(&prompt, true);
         assert!(off.get("reasoning").is_none());
 
@@ -969,7 +1077,9 @@ mod tests {
             RespEvent::TextDelta("hello".to_string())
         );
         assert_eq!(
-            classify_event(&json!({ "type": "response.reasoning_summary_text.delta", "delta": "thinking" })),
+            classify_event(
+                &json!({ "type": "response.reasoning_summary_text.delta", "delta": "thinking" })
+            ),
             RespEvent::ReasoningDelta("thinking".to_string())
         );
     }
@@ -990,12 +1100,22 @@ mod tests {
             }
         );
         assert_eq!(
-            classify_event(&json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"to\":" })),
-            RespEvent::FunctionCallArgsDelta { item_id: "fc_1".to_string(), delta: "{\"to\":".to_string() }
+            classify_event(
+                &json!({ "type": "response.function_call_arguments.delta", "item_id": "fc_1", "delta": "{\"to\":" })
+            ),
+            RespEvent::FunctionCallArgsDelta {
+                item_id: "fc_1".to_string(),
+                delta: "{\"to\":".to_string()
+            }
         );
         assert_eq!(
-            classify_event(&json!({ "type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": "{\"to\":\"x\"}" })),
-            RespEvent::FunctionCallArgsDone { item_id: "fc_1".to_string(), arguments: "{\"to\":\"x\"}".to_string() }
+            classify_event(
+                &json!({ "type": "response.function_call_arguments.done", "item_id": "fc_1", "arguments": "{\"to\":\"x\"}" })
+            ),
+            RespEvent::FunctionCallArgsDone {
+                item_id: "fc_1".to_string(),
+                arguments: "{\"to\":\"x\"}".to_string()
+            }
         );
     }
 
@@ -1058,5 +1178,40 @@ mod tests {
             ]
         });
         assert_eq!(extract_output_text(&resp), r#"{"summary":"done"}"#);
+    }
+
+    #[test]
+    fn mid_conversation_system_items_by_endpoint() {
+        let msgs = vec![
+            ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            },
+            ChatMessage {
+                role: ChatRole::System,
+                content: vec![ContentBlock::Text { text: "T1".into() }],
+            },
+        ];
+        let prompt = LlmPrompt {
+            system: Some("persona".into()),
+            system_volatile_offset: None,
+            turn_scoped: vec![1],
+            history_rewritten: false,
+            messages: msgs,
+            tools: vec![],
+        };
+        // OpenAI accepts system items anywhere.
+        let req = connector().to_responses_request(&prompt, true);
+        assert_eq!(req["input"][1], json!({ "role": "system", "content": "T1" }));
+        // Another server behind /responses: user-role context text.
+        let local = OpenAiResponsesConnector::new(cfg(
+            "http://localhost:1234/v1",
+            "llama3",
+            ApiStyle::Responses,
+        ));
+        let req = local.to_responses_request(&prompt, true);
+        let input = req["input"].as_array().unwrap();
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0], json!({ "role": "user", "content": "hi\n\n[Context]\nT1" }));
     }
 }

@@ -87,6 +87,29 @@ impl ToolDefinition {
 pub struct LlmPrompt {
     /// System instruction (separate from messages per Gemini/Claude convention)
     pub system: Option<String>,
+    /// Byte offset into `system` where per-turn (volatile) content begins.
+    /// Everything before it is stable across turns of a session and safe to
+    /// prompt-cache; everything from it on changes turn to turn. `None` means
+    /// the whole system string is treated as stable. Connectors that don't
+    /// cache ignore it — `system` always carries the full text. Consumers must
+    /// clamp it to `system.len()` and to a char boundary before slicing.
+    #[serde(default)]
+    pub system_volatile_offset: Option<usize>,
+    /// Indices into `messages` of turn-scoped context messages (the per-request
+    /// tail: clock + turn instructions). Each is a `ChatRole::System` message
+    /// persisted with the turn and replayed unchanged on later requests, so the
+    /// history stays append-only. Claude sends these with
+    /// `clear_at: "next_user_message"` where supported; other connectors send
+    /// them like any other system message. Empty = none.
+    #[serde(default)]
+    pub turn_scoped: Vec<usize>,
+    /// True when the prompt builder deliberately rewrote earlier history for
+    /// this request (a history trim). Informational: Claude asks the API to
+    /// drop mismatched thinking blocks on every request of a model that binds
+    /// them (`ClaudeModel::binds_thinking_to_conversation`), not only on this
+    /// one, so the `thinking` parameter — part of the cache key — never flips.
+    #[serde(default)]
+    pub history_rewritten: bool,
     /// Conversation history + current user message
     pub messages: Vec<ChatMessage>,
     /// Available tools
@@ -181,10 +204,21 @@ impl LlmPrompt {
                 let total_available = self.tools.len();
                 let kept_count = total_available - to_remove.len();
 
-                tracing::warn!(
-                    "Tool budget exceeded: {} tool tokens vs {} available. Dropping {} of {} tool definitions: {:?}",
-                    tool_cost, target_tool_budget, to_remove.len(), total_available, dropped_tool_names
-                );
+                // Fires every turn while the condition holds: INFO once per
+                // context-window size, DEBUG after that.
+                if crate::log_utils::first_time(&format!("tool_budget_exceeded:{}", max_context_tokens)) {
+                    tracing::info!(
+                        "Tool budget exceeded: {} tool tokens vs {} available. Dropping {} of {} tool definitions: {}",
+                        tool_cost, target_tool_budget, to_remove.len(), total_available,
+                        crate::log_utils::cap_list(&dropped_tool_names, 5)
+                    );
+                } else {
+                    tracing::debug!(
+                        "Tool budget exceeded: dropping {} of {} tool definitions: {}",
+                        to_remove.len(), total_available,
+                        crate::log_utils::cap_list(&dropped_tool_names, 5)
+                    );
+                }
 
                 let to_remove_count = to_remove.len();
 
@@ -225,16 +259,35 @@ impl LlmPrompt {
         let (drop_count, _estimated_tokens) = messages_to_drop(self, budget, protected_window, chars_per_token);
 
         if drop_count > 0 {
-            tracing::warn!(
-                "Context budget exceeded: estimated {} tokens, budget {} (max {} - safety margin). Dropping {} oldest messages.",
-                crate::context::token_estimator::estimate_prompt_tokens_with_ratio(self, chars_per_token),
-                budget,
-                max_context_tokens,
-                drop_count
-            );
+            if crate::log_utils::first_time(&format!("context_budget_exceeded:{}", max_context_tokens)) {
+                tracing::info!(
+                    "Context budget exceeded: estimated {} tokens, budget {} (max {} - safety margin). Dropping {} oldest messages.",
+                    crate::context::token_estimator::estimate_prompt_tokens_with_ratio(self, chars_per_token),
+                    budget,
+                    max_context_tokens,
+                    drop_count
+                );
+            } else {
+                tracing::debug!(
+                    "Context budget exceeded (budget {}): dropping {} oldest messages.",
+                    budget,
+                    drop_count
+                );
+            }
 
             // Remove oldest messages
             self.messages.drain(..drop_count);
+            // Keep `turn_scoped` pointing at the same messages: indices of
+            // dropped messages go, the rest shift down by the drop and up by
+            // one for the marker inserted below.
+            self.turn_scoped = self
+                .turn_scoped
+                .iter()
+                .filter(|&&i| i >= drop_count)
+                .map(|&i| i - drop_count + 1)
+                .collect();
+            // Dropping from the front rewrites earlier history.
+            self.history_rewritten = true;
 
             // Inject a context-trimmed marker as the first message.
             // Framed explicitly as a system annotation so the model does not

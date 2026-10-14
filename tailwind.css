@@ -1,3 +1,120 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+/* ==========================================================================
+   Column divider (src/components/column_divider.rs)
+   A 1px hairline in an invisible 8px grab area that takes no layout width.
+   ========================================================================== */
+.col-divider {
+  position: relative;
+  flex: 0 0 8px;
+  width: 8px;
+  margin: 0 -4px;
+  align-self: stretch;
+  z-index: 30;
+  cursor: col-resize;
+  user-select: none;
+}
+.col-divider-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 1px;
+  transform: translateX(-50%);
+  background: rgba(35, 53, 92, 0.8);
+  pointer-events: none;
+  transition: background-color 120ms ease;
+}
+.col-divider-grip {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  box-sizing: border-box;
+  width: 7px;
+  height: 32px;
+  transform: translate(-50%, -50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  border-radius: 999px;
+  background: var(--color-bg-card);
+  border: 1px solid #5B86C1;
+  opacity: 0;
+  outline: none;
+  transition: opacity 120ms ease;
+}
+.col-divider-grip span {
+  display: block;
+  width: 2px;
+  height: 2px;
+  background: #84A4D1;
+}
+.col-divider:hover .col-divider-line,
+.col-divider:focus-within .col-divider-line {
+  background: #5B86C1;
+  transition-delay: 120ms;
+}
+.col-divider:hover .col-divider-grip {
+  opacity: 1;
+  transition-delay: 120ms;
+}
+.col-divider-grip:focus-visible {
+  opacity: 1;
+  box-shadow: 0 0 0 2px var(--color-bg-app), 0 0 0 4px #84A4D1;
+}
+.col-divider[data-state="dragging"] .col-divider-line {
+  width: 2px;
+  background: #84A4D1;
+  transition: none;
+}
+.col-divider[data-state="dragging"] .col-divider-grip {
+  opacity: 1;
+  background: #3B5998;
+  border-color: #3B5998;
+  transition: none;
+}
+.col-divider[data-state="dragging"] .col-divider-grip span {
+  background: #FFFFFF;
+}
+.col-divider-readout {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--color-bg-card);
+  border: 1px solid #23355C;
+  color: var(--color-text-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.col-divider-readout[data-side="right"] { left: calc(50% + 9px); }
+.col-divider-readout[data-side="left"] { right: calc(50% + 9px); }
+.col-divider-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  cursor: col-resize;
+  user-select: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .col-divider-line,
+  .col-divider-grip {
+    transition: none !important;
+  }
+}
+
+/* Tab sidebar header: the sort pill's popover is right-anchored in the
+   shared ListOrderControl; this far left that hangs off the window, so
+   anchor it to the pill's left edge and let it overhang the chat column. */
+.tab-sidebar-order .absolute.right-0 {
+  right: auto;
+  left: 0;
+}

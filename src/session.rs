@@ -18,7 +18,11 @@ where
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummaryEntities {
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub user_name: String,
     #[serde(flatten)]
     pub other_entities: HashMap<String, Value>,
@@ -26,18 +30,40 @@ pub struct ConversationSummaryEntities {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
 pub struct ConversationSummary {
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub summary: String,
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub sentiment: String,
     /// The active task or goal the user is currently pursuing.
     /// Populated automatically by the summarizer on each turn — no model tool call needed.
     /// Injected as part of `conversation_summary` in the system context (Tier 3).
     /// For small-context models this acts as a goal anchor so the task survives history scrolling.
-    #[serde(default, skip_serializing_if = "String::is_empty", deserialize_with = "null_to_empty")]
+    #[serde(
+        default,
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "null_to_empty"
+    )]
     pub current_task: String,
     #[serde(default)]
     pub entities: ConversationSummaryEntities,
+    /// AI-proposed 2-4 word tab topic, alongside the rolling summary.
+    /// Validated/normalized (`normalize_tab_title`) before being applied to
+    /// `Session.tab_title` — never applied raw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_title: Option<String>,
+    /// AI-proposed single-emoji tab icon, alongside the rolling summary.
+    /// Validated/normalized (`normalize_tab_emoji`) before being applied to
+    /// `Session.tab_emoji` — never applied raw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_emoji: Option<String>,
 }
 
 impl ConversationSummary {
@@ -52,6 +78,144 @@ impl ConversationSummary {
             self.summary.push_str("... [truncated]");
         }
     }
+}
+
+/// Fallback tab emoji used whenever the summarizer's proposal is missing or
+/// fails validation.
+pub const FALLBACK_TAB_EMOJI: &str = "⭐";
+
+/// Validate an AI-proposed tab emoji: exactly one extended grapheme cluster
+/// (so multi-codepoint sequences like `🏗️` — base + variation selector —
+/// still count as one "emoji"), short, and not plain ASCII text. Falls back
+/// to [`FALLBACK_TAB_EMOJI`] on anything else (missing, empty, multiple
+/// clusters, or ASCII).
+pub fn normalize_tab_emoji(raw: Option<&str>) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return FALLBACK_TAB_EMOJI.to_string();
+    };
+    let mut graphemes = raw.graphemes(true);
+    let Some(first) = graphemes.next() else {
+        return FALLBACK_TAB_EMOJI.to_string();
+    };
+    if graphemes.next().is_some() {
+        return FALLBACK_TAB_EMOJI.to_string(); // more than one grapheme cluster
+    }
+    if first.len() > 8 || first.is_ascii() {
+        return FALLBACK_TAB_EMOJI.to_string();
+    }
+    first.to_string()
+}
+
+/// Normalize an AI-proposed tab topic: trim, strip wrapping quotes, cap at
+/// 40 chars. Returns `None` for a missing/empty/quotes-only proposal.
+pub fn normalize_tab_title(raw: Option<&str>) -> Option<String> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let stripped = raw
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '\u{201c}' | '\u{201d}'))
+        .trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    let truncated: String = stripped.chars().take(40).collect();
+    let truncated = truncated.trim_end().to_string();
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
+}
+
+/// User messages a tab needs before its title stops being provisional. The
+/// first title lands early (after the first real exchange) so every tab —
+/// including background/dispatched ones — gets an identity quickly; the first
+/// summary once the conversation reaches this many user messages may replace
+/// it once, and then the title locks for good.
+pub const TAB_TITLE_MATURE_USER_MESSAGES: usize = 3;
+
+/// Applies an AI-proposed tab emoji/topic from a freshly computed
+/// [`ConversationSummary`] to `session.tab_title`/`tab_emoji`, normalizing
+/// both first (never applied raw) and honoring the `name_user_set` guard — a
+/// user rename always wins, forever.
+///
+/// Nothing is written until the tab has at least one user message: a summary
+/// of an empty tab (e.g. the profile-switch `ForceRefresh`, which sees only a
+/// "current Composio profile" system note) otherwise names the tab after that
+/// note ("Profile Setup") before the user has said anything.
+///
+/// The TITLE is written at most twice per tab:
+/// 1. A provisional title from the first summary that proposes one
+///    (`tab_title_provisional = true` while the tab is still short).
+/// 2. One retitle from the first summary after the tab reaches
+///    [`TAB_TITLE_MATURE_USER_MESSAGES`] user messages — an opening exchange
+///    is often too thin to name the conversation it turns into. The title
+///    then locks (`tab_title_provisional = false`).
+///
+/// After that, later summaries (each idle pause, each tool-call turn) are a
+/// no-op. Without the lock the tab would keep re-proposing a title as the
+/// conversation's topic drifts — a tab you'd already learned to recognize
+/// would relabel itself out from under you while switching between a
+/// handful of tabs, which is more disorienting than a picked title going
+/// slightly stale.
+///
+/// The lock is keyed on `tab_title` specifically, NOT `tab_emoji` —
+/// `normalize_tab_emoji` always returns a fallback glyph even when the raw
+/// proposal was empty/invalid (it never produces `None`), so an early,
+/// low-quality summary reliably writes SOME emoji while leaving `tab_title`
+/// empty. Locking on emoji too would freeze that tab on a bare fallback
+/// emoji + date forever. Emoji may keep refreshing until a real title
+/// arrives; on the mature retitle, emoji is only replaced together with a
+/// title so the pair stays consistent.
+///
+/// Every caller that computes a `ConversationSummary` (the proactive
+/// tool-call-turn summarizer in `stream_manager.rs`, and the idle-inactivity
+/// scheduler in `summarization_scheduler.rs`) must call this, or a tab's
+/// emoji/topic silently never gets set — this was missed on the scheduler's
+/// two call sites when the feature first shipped (2026-09-16): they wrote
+/// `session.active_context.conversation_summary` but never read
+/// `summary.tab_title`/`tab_emoji` off of it, so ordinary new tabs (no tool
+/// calls, first summarized via the idle path) never got titled at all.
+///
+/// Returns `Some((emoji, title))` when it actually wrote something, for the
+/// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
+/// carried no proposal, the tab's identity is locked (user-set or a final AI
+/// title), the tab is still too short to retitle, or it has no user message.
+pub fn apply_tab_identity_from_summary(
+    session: &mut Session,
+    summary: &ConversationSummary,
+) -> Option<(Option<String>, Option<String>)> {
+    if session.name_user_set {
+        return None;
+    }
+    let user_messages = session.user_message_count();
+    if user_messages == 0 {
+        return None;
+    }
+    let mature = user_messages >= TAB_TITLE_MATURE_USER_MESSAGES;
+    let retitling = session.tab_title.is_some();
+    if retitling && !(session.tab_title_provisional && mature) {
+        return None;
+    }
+    let raw_title = summary.tab_title.as_deref();
+    let raw_emoji = summary.tab_emoji.as_deref();
+    if raw_title.is_none() && raw_emoji.is_none() {
+        return None;
+    }
+    let title = normalize_tab_title(raw_title);
+    if retitling && title.is_none() {
+        // Keep the provisional title; a later summary gets another try.
+        return None;
+    }
+    let emoji = normalize_tab_emoji(raw_emoji);
+    if let Some(title) = &title {
+        session.tab_title = Some(title.clone());
+        session.tab_title_provisional = !mature;
+    }
+    session.tab_emoji = Some(emoji.clone());
+    Some((Some(emoji), title))
 }
 
 impl ConversationSummaryEntities {
@@ -126,6 +290,14 @@ pub struct Session {
     /// Per-session chat model override. None → the effective provider's configured model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_model: Option<String>,
+    /// Planner project this chat belongs to (auto-tagged by the AI from
+    /// conversation content, or set by the user via the chat-bar chip).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// True after any manual set/clear of the project tag — the auto-tagger
+    /// never touches a session the user has decided about.
+    #[serde(default)]
+    pub project_tag_user_set: bool,
     /// Skills actively loaded into this session's context.
     /// Maps skill_name → CapabilityContextPayload JSON (the response from execute_skill).
     /// Skills persist here until explicitly unloaded via /unload.
@@ -150,9 +322,230 @@ pub struct Session {
     /// Persisted so pending timers survive a restart and can be re-scheduled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled_timers: Vec<crate::timers::ScheduledTimer>,
+    /// Tool calls executed during the current turn of THIS session.
+    /// Per-session (never global): two tabs streaming concurrently must not
+    /// see each other's tool calls, and cancelling one tab must not wipe the
+    /// other's in-flight history. Cleared on send and on cancel; drained by
+    /// `ToolCallSummarizer` at turn end.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
+    /// AI-derived one-emoji "icon" for this chat's tab, set by the rolling
+    /// summarizer (or programmatically for dispatch review tabs). `None`
+    /// until the first summary lands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_emoji: Option<String>,
+    /// AI-derived 2-4 word topic for this chat's tab. Overridden forever by
+    /// a user rename (see `name_user_set`); `None` until the first summary
+    /// lands (or set programmatically for dispatch review tabs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_title: Option<String>,
+    /// True once the user has explicitly renamed this tab (from the tab bar
+    /// or History). A user rename wins forever: the summarizer never
+    /// overwrites `name`/`tab_title` again once this is set.
+    #[serde(default)]
+    pub name_user_set: bool,
+    /// True while `tab_title` is an early AI guess that the first summary
+    /// after [`TAB_TITLE_MATURE_USER_MESSAGES`] user messages may replace
+    /// once. False for locked titles, programmatic titles, and every tab
+    /// saved before this field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tab_title_provisional: bool,
+    /// Forward-only history trim anchor: the id of the first non-pinned
+    /// message the prompt builder sends (everything before it, except the
+    /// pinned first user message, is left out). It only ever moves forward,
+    /// in whole chunks, to a user text message (a turn boundary), so the
+    /// outgoing message prefix stays byte-stable between requests and a
+    /// provider prompt cache keeps hitting. Set from
+    /// `PromptBuildResult::history_anchor` after each build; `None` (or an id
+    /// that no longer exists) means "recompute from the start of the chat".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_anchor: Option<uuid::Uuid>,
+    /// Turn context ledger: live context (today's plan, scratchpad, loaded
+    /// skills, ...) and each request's turn-scoped tail, recorded as entries
+    /// anchored after the message they follow. The prompt builder splices
+    /// them into the outgoing history as `ChatRole::System` messages, so that
+    /// state reaches the model as an append-only part of the conversation
+    /// instead of a per-request system block. Written only from
+    /// `PromptBuildResult::ledger_entries`; entries whose anchor message is
+    /// gone are dropped by `prune_orphaned_ledger`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_ledger: Vec<LedgerEntry>,
+}
+
+/// What a [`LedgerEntry`] records.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LedgerKind {
+    /// A context value that changed at a user-turn boundary (empty body =
+    /// the value was cleared).
+    Ledger,
+    /// One request's turn-scoped tail: the clock plus turn instructions.
+    Tail,
+    /// Part of the snapshot written when the history window was trimmed;
+    /// rendered after the pinned first message while `trim_anchor` is the
+    /// session's history anchor.
+    Trim,
+}
+
+/// One entry of `Session.context_ledger`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LedgerEntry {
+    pub id: uuid::Uuid,
+    /// The message this entry renders after.
+    pub after_message_id: uuid::Uuid,
+    pub kind: LedgerKind,
+    /// Context key (`planner_today`, `scratchpad`, ...); `tail` for tails.
+    pub key: String,
+    /// Canonical body. Empty on a `Ledger` entry means "cleared".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    /// `Trim` entries only: the history anchor whose window they belong to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trim_anchor: Option<uuid::Uuid>,
+}
+
+/// Stamp `created_at` on a message that is already in `messages`, without
+/// breaking the vec's `created_at`-monotonic ordering.
+///
+/// Ordering is load-bearing in two places that must agree: the prompt builder
+/// walks `session.messages` in vec order, while the journal projector reinserts
+/// messages at their `created_at`-sorted position
+/// (`session_events::upsert_message`). A vec whose order disagrees with its
+/// own timestamps therefore renders and replays differently — so a restamp is
+/// clamped into the window its neighbours leave open, and skipped entirely
+/// when they leave none (legacy rows that are already out of order).
+///
+/// Returns the stamp actually applied, or `None` when the message isn't there.
+pub fn restamp_message(
+    messages: &mut [crate::components::chat::Message],
+    message_id: &uuid::Uuid,
+    ts: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let idx = messages.iter().position(|m| m.id == *message_id)?;
+    let lower = idx.checked_sub(1).map(|i| messages[i].created_at);
+    let upper = messages.get(idx + 1).map(|m| m.created_at);
+    if let (Some(lo), Some(hi)) = (lower, upper) {
+        if lo > hi {
+            return Some(messages[idx].created_at);
+        }
+    }
+    let mut ts = ts;
+    if let Some(lo) = lower {
+        ts = ts.max(lo);
+    }
+    if let Some(hi) = upper {
+        ts = ts.min(hi);
+    }
+    messages[idx].created_at = ts;
+    Some(ts)
+}
+
+/// Move a message to the end of `messages` and stamp it at `ts` (never earlier
+/// than the message it now follows), returning the moved message.
+///
+/// Used when a turn's prose reply is finalized *after* the tool calls it
+/// follows: the reply's placeholder is pushed at turn start, so leaving it in
+/// place renders the turn's work BELOW the answer that work produced. Moving
+/// the message rather than only restamping it keeps the vec order and the
+/// timestamps in agreement, which is what makes `session_events::project`
+/// replay the same layout the live session renders.
+pub fn move_message_to_end(
+    messages: &mut Vec<crate::components::chat::Message>,
+    message_id: &uuid::Uuid,
+    ts: DateTime<Utc>,
+) -> Option<crate::components::chat::Message> {
+    let idx = messages.iter().position(|m| m.id == *message_id)?;
+    if idx + 1 == messages.len() {
+        restamp_message(messages, message_id, ts);
+        return messages.last().cloned();
+    }
+    let mut msg = messages.remove(idx);
+    msg.created_at = match messages.last() {
+        Some(last) => ts.max(last.created_at),
+        None => ts,
+    };
+    messages.push(msg.clone());
+    Some(msg)
 }
 
 impl Session {
+    /// Number of messages the user wrote in this tab.
+    pub fn user_message_count(&self) -> usize {
+        self.messages.iter().filter(|m| m.author == "User").count()
+    }
+
+    /// True when a summary could still set or refine this tab's title: it has
+    /// a user message, no user rename, and either no title yet or a
+    /// provisional one that is now old enough to be replaced. The turn-end
+    /// summarizer uses this to summarize tabs the idle scheduler never
+    /// reaches (e.g. background tabs from HOBBES_DISPATCH).
+    pub fn wants_tab_identity(&self) -> bool {
+        if self.name_user_set {
+            return false;
+        }
+        let user_messages = self.user_message_count();
+        if user_messages == 0 {
+            return false;
+        }
+        self.tab_title.is_none()
+            || (self.tab_title_provisional
+                && user_messages >= TAB_TITLE_MATURE_USER_MESSAGES)
+    }
+
+    /// The tab's headline label: the user's own name wins forever, then the
+    /// AI-derived topic, then the creation-date placeholder (`name`, before
+    /// any rename or summary).
+    pub fn display_title(&self) -> String {
+        if self.name_user_set {
+            self.name.clone()
+        } else if let Some(title) = &self.tab_title {
+            title.clone()
+        } else {
+            self.name.clone()
+        }
+    }
+
+    /// The AI-derived topic layer for the tab strip — `None` until the first
+    /// summary lands. A user rename replaces it forever (keeping the emoji).
+    pub fn tab_topic(&self) -> Option<String> {
+        if self.name_user_set {
+            Some(self.name.clone())
+        } else {
+            self.tab_title.clone()
+        }
+    }
+
+    /// Short creation date ("Sep 16") for the tab strip. `Session` has no
+    /// dedicated `created_at` field, so this parses it out of `name`, which
+    /// is stamped as `"%b %d - %I:%M %p"` at creation (`create_session_raw`)
+    /// and is never touched again except by a user rename. Once renamed,
+    /// that original stamp is gone, so this falls back to `last_updated`
+    /// (the closest thing to a creation date this struct still carries).
+    pub fn short_date(&self) -> String {
+        match self.name.split_once(" - ") {
+            Some((date_part, _)) => date_part.to_string(),
+            None => self.last_updated.format("%b %d").to_string(),
+        }
+    }
+
+    /// See [`restamp_message`].
+    pub fn restamp_message(
+        &mut self,
+        message_id: &uuid::Uuid,
+        ts: DateTime<Utc>,
+    ) -> Option<DateTime<Utc>> {
+        restamp_message(&mut self.messages, message_id, ts)
+    }
+
+    /// See [`move_message_to_end`].
+    pub fn move_message_to_end(
+        &mut self,
+        message_id: &uuid::Uuid,
+        ts: DateTime<Utc>,
+    ) -> Option<crate::components::chat::Message> {
+        move_message_to_end(&mut self.messages, message_id, ts)
+    }
+
     pub fn increment_turn_count(&mut self) {
         self.current_ai_turn_count += 1;
     }
@@ -162,63 +555,124 @@ impl Session {
         self.watch_word_recovery_count = 0;
     }
 
-    pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
-        if let Ok(uuid) = uuid::Uuid::parse_str(message_id) {
-            if let Some(index) = self.messages.iter().position(|m| m.id == uuid) {
-                let count = self.messages.len() - index;
-                // Harvest cost/token data from the messages being deleted
-                // so the session totals never drop when messages are pruned.
-                // Also collect execution_ids from ToolCall messages so we can
-                // remove their stale tool_snapshot entries from active_context.
-                let mut deleted_execution_ids: Vec<String> = Vec::new();
-                for msg in &self.messages[index..] {
-                    if let Some(usage) = &msg.usage {
-                        if let Some(cost) = usage.cost {
-                            self.accumulated_cost += cost;
-                        }
-                        self.accumulated_tokens += usage.total_tokens;
-                    }
-                    if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
-                        deleted_execution_ids.push(tc.execution_id.clone());
-                    }
+    /// Truncate history from `message_id` (inclusive) to the end, applying the
+    /// derived undo effects. This is the single home of the rewind rules —
+    /// shared by the legacy in-place undo (`delete_message_and_after`) and by
+    /// the journal projector (`session_events::project` on `RewoundTo`):
+    ///
+    /// - Harvest cost/token usage from the deleted messages into
+    ///   `accumulated_cost`/`accumulated_tokens` so session totals never drop.
+    /// - Remove `tool_snapshot_*` extras for deleted tool calls (inserted by
+    ///   ToolCallSummarizer, serialized into SYSTEM_CONTEXT via flatten —
+    ///   without this the LLM sees phantom results and loops on stale context).
+    /// - Reset `conversation_summary` so stale context from deleted turns
+    ///   can't leak into future prompts (re-populated on the next turn).
+    ///
+    /// Pure with respect to clocks and the journal: no `Utc::now()`, no event
+    /// logging — callers own those side effects.
+    pub fn truncate_from_message(&mut self, message_id: &str) -> usize {
+        let Ok(uuid) = uuid::Uuid::parse_str(message_id) else {
+            return 0;
+        };
+        let Some(index) = self.messages.iter().position(|m| m.id == uuid) else {
+            return 0;
+        };
+        let count = self.messages.len() - index;
+        let mut deleted_execution_ids: Vec<String> = Vec::new();
+        for msg in &self.messages[index..] {
+            if let Some(usage) = &msg.usage {
+                if let Some(cost) = usage.cost {
+                    self.accumulated_cost += cost;
                 }
-                self.messages.truncate(index);
-
-                // Remove tool_snapshot_* entries for deleted tool calls.
-                // These are inserted by ToolCallSummarizer at end-of-turn and
-                // serialized into SYSTEM_CONTEXT via #[serde(flatten)]. Without
-                // this cleanup, the LLM sees phantom tool results from undone
-                // turns, causing it to loop on stale context.
-                for exec_id in &deleted_execution_ids {
-                    let key = format!("tool_snapshot_{}", exec_id);
-                    if self.active_context.extra.remove(&key).is_some() {
-                        tracing::debug!("Removed stale tool snapshot after undo: {}", key);
-                    }
-                }
-
-                // Reset conversation_summary to prevent stale context from
-                // deleted turns leaking into future prompts. The summarizer
-                // will re-populate it on the next turn's completion.
-                if count > 0 {
-                    self.active_context.conversation_summary = Default::default();
-                    tracing::debug!("Reset conversation_summary after undo ({} messages removed)", count);
-                }
-
-                self.last_updated = Utc::now();
-                count
-            } else {
-                0
+                self.accumulated_tokens += usage.total_tokens;
             }
-        } else {
-            0
+            if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
+                deleted_execution_ids.push(tc.execution_id.clone());
+            }
         }
+        self.messages.truncate(index);
+        self.prune_orphaned_ledger();
+
+        for exec_id in &deleted_execution_ids {
+            let key = format!("tool_snapshot_{}", exec_id);
+            if self.active_context.extra.remove(&key).is_some() {
+                tracing::debug!("Removed stale tool snapshot after undo: {}", key);
+            }
+        }
+
+        if count > 0 {
+            self.active_context.conversation_summary = Default::default();
+            tracing::debug!(
+                "Reset conversation_summary after undo ({} messages removed)",
+                count
+            );
+        }
+        count
+    }
+
+    /// End every tool call still `Running` in this session with `reason`
+    /// ([`ToolCall::mark_cancelled`](crate::components::shared::ToolCall::mark_cancelled)).
+    /// Calls held for approval are `PermissionRequest`s and stay held.
+    /// Returns the changed messages, for the caller to journal as
+    /// `ToolResult`s.
+    pub fn cancel_running_calls(&mut self, reason: &str, now: DateTime<Utc>) -> Vec<crate::components::chat::Message> {
+        use crate::components::shared::{MessageContent, ToolCallStatus};
+        let mut changed = Vec::new();
+        for m in &mut self.messages {
+            if let MessageContent::ToolCall(tc) = &mut m.content {
+                if tc.status == ToolCallStatus::Running {
+                    tc.mark_cancelled(reason, now);
+                    changed.push(m.clone());
+                }
+            }
+        }
+        changed
+    }
+
+    /// Drop ledger entries whose anchor message is gone (rewind, cancel,
+    /// message removal), and trim snapshots whose window anchor is gone.
+    pub fn prune_orphaned_ledger(&mut self) {
+        if self.context_ledger.is_empty() {
+            return;
+        }
+        let ids: std::collections::HashSet<uuid::Uuid> =
+            self.messages.iter().map(|m| m.id).collect();
+        self.context_ledger.retain(|e| {
+            ids.contains(&e.after_message_id)
+                && e.trim_anchor.is_none_or(|a| ids.contains(&a))
+        });
+    }
+
+    /// Legacy in-place undo. Journal-complete sessions should go through
+    /// `session_events::rewind_session_state` instead (rewind-as-replay);
+    /// this path remains for pre-journal sessions and journals its own
+    /// `RewoundTo` so the history is recorded either way.
+    pub fn delete_message_and_after(&mut self, message_id: &str) -> usize {
+        let count = self.truncate_from_message(message_id);
+        if count > 0 {
+            // The anchor is the seq of the first journaled event referencing
+            // the deleted message; 0 when it predates the journal.
+            let rewind_seq =
+                crate::session_store::first_event_seq_for_message(&self.id, message_id)
+                    .unwrap_or(0);
+            crate::session_events::log_event(
+                &self.id,
+                crate::session_events::SessionEvent::RewoundTo {
+                    seq: rewind_seq,
+                    message_id: message_id.to_string(),
+                },
+            );
+            self.last_updated = Utc::now();
+        }
+        count
     }
 
     /// Calculate total cost for all messages in this session.
     /// Includes `accumulated_cost` from deleted messages so the counter
     /// never drops when the user prunes conversation history.
     pub fn total_cost(&self) -> f64 {
-        let message_cost: f64 = self.messages
+        let message_cost: f64 = self
+            .messages
             .iter()
             .filter_map(|m| m.usage.as_ref())
             .filter_map(|u| u.cost)
@@ -230,7 +684,8 @@ impl Session {
     /// Includes `accumulated_tokens` from deleted messages so the counter
     /// never drops when the user prunes conversation history.
     pub fn total_tokens(&self) -> i32 {
-        let message_tokens: i32 = self.messages
+        let message_tokens: i32 = self
+            .messages
             .iter()
             .filter_map(|m| m.usage.as_ref())
             .map(|u| u.total_tokens)
@@ -253,11 +708,7 @@ impl Session {
             .filter(|m| m.author == "Hobbes")
             .count() as f64;
 
-        if turns > 0.0 {
-            tokens / turns
-        } else {
-            0.0
-        }
+        if turns > 0.0 { tokens / turns } else { 0.0 }
     }
 }
 
@@ -323,9 +774,6 @@ pub fn compute_page_budget(
 /// Existing files without this field default to 0 via `#[serde(default)]`.
 pub const CURRENT_SESSION_SCHEMA_VERSION: u32 = 2;
 
-/// Fingerprint-map key for the tool-call-history meta blob (see `collect_meta_kv`).
-const TCH_FP_KEY: &str = "\0meta:tool_call_history";
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     /// Schema version for forward-compatible migrations.
@@ -336,8 +784,6 @@ pub struct SessionState {
     pub active_session_id: String,
     pub window_width: f64,
     pub window_height: f64,
-    #[serde(default)]
-    pub tool_call_history: Vec<crate::components::shared::ToolCallRecord>,
     /// All-time cumulative cost in USD across all sessions (including deleted ones).
     #[serde(default)]
     pub lifetime_cost: f64,
@@ -405,8 +851,7 @@ impl SessionState {
 
         // Re-insert if there's remaining content
         if !entry.remaining_content.is_empty() {
-            self.page_queue
-                .insert(tool_call_id.to_string(), entry);
+            self.page_queue.insert(tool_call_id.to_string(), entry);
         }
 
         Some((page, tool_name, remaining_estimate))
@@ -457,7 +902,9 @@ impl SessionState {
                 };
                 tracing::info!(
                     "HOBBES_PAGE_RESULT: Delivered page for '{}' (tool_call_id={}, remaining=~{})",
-                    tool_name, tool_call_id, remaining
+                    tool_name,
+                    tool_call_id,
+                    remaining
                 );
                 (
                     crate::components::shared::ToolCallStatus::Completed,
@@ -530,17 +977,28 @@ impl SessionState {
         }
 
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.scratchpad = content;
+            session.scratchpad = content.clone();
+            crate::session_events::log_event(
+                session_id,
+                crate::session_events::SessionEvent::ScratchpadSet { content },
+            );
             tracing::info!(
                 "HOBBES_UPDATE_SCRATCHPAD: Scratchpad updated ({} chars, limit {})",
-                char_count, max_scratchpad_chars
+                char_count,
+                max_scratchpad_chars
             );
             (
                 crate::components::shared::ToolCallStatus::Completed,
-                format!("Scratchpad updated ({} chars). Content is now persistent for this session.", char_count),
+                format!(
+                    "Scratchpad updated ({} chars). Content is now persistent for this session.",
+                    char_count
+                ),
             )
         } else {
-            tracing::warn!("HOBBES_UPDATE_SCRATCHPAD: Session '{}' not found", session_id);
+            tracing::warn!(
+                "HOBBES_UPDATE_SCRATCHPAD: Session '{}' not found",
+                session_id
+            );
             (
                 crate::components::shared::ToolCallStatus::Error,
                 format!("Session '{}' not found", session_id),
@@ -556,8 +1014,8 @@ impl SessionState {
     ) -> (crate::components::shared::ToolCallStatus, String) {
         use crate::components::shared::ToolCallStatus;
         use crate::timers::{
-            parse_duration_secs, ScheduledTimer, TimerMode, TimerStatus, MAX_DELAY_SECS,
-            MIN_DELAY_SECS,
+            MAX_DELAY_SECS, MIN_DELAY_SECS, ScheduledTimer, TimerMode, TimerStatus,
+            parse_duration_secs,
         };
 
         // Delay accepts either `delay_secs` (integer) or `delay` ("10m", "1h30m").
@@ -570,16 +1028,15 @@ impl SessionState {
                     .and_then(|v| v.as_str())
                     .and_then(parse_duration_secs)
             });
-        let delay_secs = match delay_secs {
-            Some(n) => n,
-            None => {
-                return (
+        let delay_secs =
+            match delay_secs {
+                Some(n) => n,
+                None => return (
                     ToolCallStatus::Error,
                     "Provide 'delay_secs' (integer seconds) or 'delay' (e.g. \"10m\", \"1h30m\")."
                         .to_string(),
-                )
-            }
-        };
+                ),
+            };
         if delay_secs < MIN_DELAY_SECS {
             return (
                 ToolCallStatus::Error,
@@ -600,7 +1057,7 @@ impl SessionState {
                 return (
                     ToolCallStatus::Error,
                     format!("Unknown mode '{}'. Use 'notify' or 'prompt'.", other),
-                )
+                );
             }
         };
         let prompt = args_json
@@ -612,9 +1069,7 @@ impl SessionState {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        if mode == TimerMode::Prompt
-            && prompt.as_deref().map(str::trim).unwrap_or("").is_empty()
-        {
+        if mode == TimerMode::Prompt && prompt.as_deref().map(str::trim).unwrap_or("").is_empty() {
             return (
                 ToolCallStatus::Error,
                 "mode 'prompt' requires a non-empty 'prompt' to run when the timer fires."
@@ -642,8 +1097,12 @@ impl SessionState {
                     format!("Session '{}' not found", session_id),
                 );
             };
-            session.scheduled_timers.push(timer);
+            session.scheduled_timers.push(timer.clone());
         }
+        crate::session_events::log_event(
+            session_id,
+            crate::session_events::SessionEvent::TimerCreated { timer },
+        );
         Self::save_async(self, None);
 
         let human = {
@@ -707,7 +1166,8 @@ impl SessionState {
         if timer_id.is_empty() {
             return (
                 ToolCallStatus::Error,
-                "Missing 'timer_id' (from the timer's confirmation or HOBBES_LIST_TIMERS).".to_string(),
+                "Missing 'timer_id' (from the timer's confirmation or HOBBES_LIST_TIMERS)."
+                    .to_string(),
             );
         }
 
@@ -727,6 +1187,12 @@ impl SessionState {
         };
 
         if cancelled {
+            crate::session_events::log_event(
+                session_id,
+                crate::session_events::SessionEvent::TimerCancelled {
+                    timer_id: timer_id.clone(),
+                },
+            );
             Self::save_async(self, None);
             (
                 ToolCallStatus::Completed,
@@ -740,6 +1206,56 @@ impl SessionState {
         }
     }
 
+    /// Persist the history trim anchor a prompt build resolved
+    /// (`PromptBuildResult::history_anchor`) onto `session_id`.
+    /// Call this after `PromptBuilder::build_prompt` in a separate write scope,
+    /// like `store_pages`. Returns true when the stored anchor changed.
+    pub fn set_history_anchor(&mut self, session_id: &str, anchor: Option<uuid::Uuid>) -> bool {
+        match self.sessions.get_mut(session_id) {
+            Some(session) if session.history_anchor != anchor => {
+                session.history_anchor = anchor;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// True when `anchor` differs from the one stored on `session_id`, so a
+    /// caller can skip taking a write guard (and re-rendering) when nothing
+    /// moved.
+    pub fn history_anchor_changed(&self, session_id: &str, anchor: Option<uuid::Uuid>) -> bool {
+        self.sessions
+            .get(session_id)
+            .is_some_and(|s| s.history_anchor != anchor)
+    }
+
+    /// Append the ledger entries a prompt build produced
+    /// (`PromptBuildResult::ledger_entries`) to `session_id` and journal each
+    /// one. Call after `PromptBuilder::build_prompt` in a separate write
+    /// scope, like `set_history_anchor`. Entries already present (same id)
+    /// are skipped. Returns true when anything was appended.
+    pub fn append_ledger_entries(&mut self, session_id: &str, entries: Vec<LedgerEntry>) -> bool {
+        let Some(session) = self.sessions.get_mut(session_id) else {
+            return false;
+        };
+        let fresh: Vec<LedgerEntry> = entries
+            .into_iter()
+            .filter(|e| !session.context_ledger.iter().any(|x| x.id == e.id))
+            .collect();
+        if fresh.is_empty() {
+            return false;
+        }
+        session.context_ledger.extend(fresh.iter().cloned());
+        crate::session_events::log_events(
+            session_id,
+            fresh
+                .into_iter()
+                .map(|entry| crate::session_events::SessionEvent::LedgerEntryAdded { entry })
+                .collect(),
+        );
+        true
+    }
+
     /// Store newly-generated paginated pages into the queue.
     /// Call this after `PromptBuilder::build_prompt` in a separate write scope.
     ///
@@ -750,13 +1266,15 @@ impl SessionState {
     /// always see page 1 again instead of the next page.
     pub fn store_pages(&mut self, pages: Vec<(String, PagedResult)>) {
         let mut inserted_ids = std::collections::HashSet::new();
-        
+
         for (id, paged) in pages {
             if self.page_queue.contains_key(&id) {
                 tracing::debug!(
                     "Skipping page queue entry (already exists): id={} (remaining={} bytes)",
                     id,
-                    self.page_queue.get(&id).map_or(0, |p| p.remaining_content.len())
+                    self.page_queue
+                        .get(&id)
+                        .map_or(0, |p| p.remaining_content.len())
                 );
             } else {
                 tracing::debug!("Storing page queue entry: id={}", id);
@@ -769,14 +1287,16 @@ impl SessionState {
         const MAX_PAGE_QUEUE_SIZE: usize = 50;
         if self.page_queue.len() > MAX_PAGE_QUEUE_SIZE {
             let excess = self.page_queue.len() - MAX_PAGE_QUEUE_SIZE;
-            
+
             // Collect oldest/random keys EXCEPT those we just inserted
-            let keys_to_remove: Vec<String> = self.page_queue.keys()
+            let keys_to_remove: Vec<String> = self
+                .page_queue
+                .keys()
                 .filter(|k| !inserted_ids.contains(*k))
                 .take(excess)
                 .cloned()
                 .collect();
-                
+
             for key in keys_to_remove {
                 self.page_queue.remove(&key);
                 tracing::debug!("Pruned expired page queue entry to save memory: {}", key);
@@ -806,8 +1326,7 @@ impl SessionState {
         let schema_version = store::meta_get(store::META_SCHEMA_VERSION)
             .and_then(|v| v.parse().ok())
             .unwrap_or(CURRENT_SESSION_SCHEMA_VERSION);
-        let mut active_session_id =
-            store::meta_get(store::META_ACTIVE_SESSION).unwrap_or_default();
+        let mut active_session_id = store::meta_get(store::META_ACTIVE_SESSION).unwrap_or_default();
         let default = SessionState::default();
         let window_width = store::meta_get(store::META_WINDOW_WIDTH)
             .and_then(|v| v.parse().ok())
@@ -821,9 +1340,11 @@ impl SessionState {
         let lifetime_tokens = store::meta_get(store::META_LIFETIME_TOKENS)
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let tool_call_history = store::meta_get(store::META_TOOL_CALL_HISTORY)
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default();
+        // Legacy: tool-call history used to live in a single global meta
+        // blob. It is now per-session (`Session.tool_call_history`), so the
+        // old key is discarded on load and never written again; the stale
+        // row is removed once, here.
+        store::meta_delete(store::META_TOOL_CALL_HISTORY);
 
         // Hydration set: open tabs, the active session, sessions with timers.
         let mut ids: Vec<String> = open_tab_ids.to_vec();
@@ -862,7 +1383,6 @@ impl SessionState {
             active_session_id,
             window_width,
             window_height,
-            tool_call_history,
             lifetime_cost,
             lifetime_tokens,
             save_disabled: false,
@@ -1082,11 +1602,8 @@ impl SessionState {
             if let Some(height) = value.get("window_height").and_then(|v| v.as_f64()) {
                 state.window_height = height;
             }
-            if let Some(history_val) = value.get("tool_call_history") {
-                if let Ok(history) = serde_json::from_value(history_val.clone()) {
-                    state.tool_call_history = history;
-                }
-            }
+            // Legacy global "tool_call_history" is intentionally dropped:
+            // history is per-session now and is turn-local anyway.
         }
         Ok(state)
     }
@@ -1106,40 +1623,50 @@ impl SessionState {
         use crate::session_store as store;
         let rows = store::collect_dirty_rows(&self.sessions)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        let (meta, tch_mark) = self.collect_meta_kv();
-        store::write_rows_and_meta(&rows, &meta)
-            .map_err(std::io::Error::other)?;
+        let meta = self.collect_meta_kv();
+        store::write_rows_and_meta(&rows, &meta).map_err(std::io::Error::other)?;
         store::mark_rows_saved(&rows);
-        if let Some(tch) = tch_mark {
-            store::mark_blob_saved(TCH_FP_KEY, &tch);
-        }
         Ok(())
     }
 
-    /// Meta key/value pairs to persist alongside session rows. The
-    /// tool-call history blob is fingerprinted and only included when it
-    /// changed; the second return value is the blob to mark saved on success.
+    /// Meta key/value pairs to persist alongside session rows.
     /// Seqs are drawn here, at collect time on the calling thread — not at
     /// write time on the blocking pool — so overlapping saves whose writes
     /// land out of order cannot overwrite newer meta with an older snapshot.
-    fn collect_meta_kv(&self) -> (Vec<(String, String, i64)>, Option<String>) {
+    fn collect_meta_kv(&self) -> Vec<(String, String, i64)> {
         use crate::session_store as store;
-        let mut kv = vec![
-            (store::META_SCHEMA_VERSION.to_string(), self.schema_version.to_string(), store::next_seq()),
-            (store::META_ACTIVE_SESSION.to_string(), self.active_session_id.clone(), store::next_seq()),
-            (store::META_WINDOW_WIDTH.to_string(), self.window_width.to_string(), store::next_seq()),
-            (store::META_WINDOW_HEIGHT.to_string(), self.window_height.to_string(), store::next_seq()),
-            (store::META_LIFETIME_COST.to_string(), self.lifetime_cost.to_string(), store::next_seq()),
-            (store::META_LIFETIME_TOKENS.to_string(), self.lifetime_tokens.to_string(), store::next_seq()),
-        ];
-        let tch = serde_json::to_string(&self.tool_call_history).unwrap_or_else(|_| "[]".into());
-        let mark = if store::blob_changed(TCH_FP_KEY, &tch) {
-            kv.push((store::META_TOOL_CALL_HISTORY.to_string(), tch.clone(), store::next_seq()));
-            Some(tch)
-        } else {
-            None
-        };
-        (kv, mark)
+        vec![
+            (
+                store::META_SCHEMA_VERSION.to_string(),
+                self.schema_version.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_ACTIVE_SESSION.to_string(),
+                self.active_session_id.clone(),
+                store::next_seq(),
+            ),
+            (
+                store::META_WINDOW_WIDTH.to_string(),
+                self.window_width.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_WINDOW_HEIGHT.to_string(),
+                self.window_height.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_LIFETIME_COST.to_string(),
+                self.lifetime_cost.to_string(),
+                store::next_seq(),
+            ),
+            (
+                store::META_LIFETIME_TOKENS.to_string(),
+                self.lifetime_tokens.to_string(),
+                store::next_seq(),
+            ),
+        ]
     }
 
     pub fn create_session_raw(&mut self, initial_profile: Option<String>) -> String {
@@ -1159,15 +1686,67 @@ impl SessionState {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            tool_call_history: Vec::new(),
+            tab_emoji: None,
+            tab_title: None,
+            name_user_set: false,
+            tab_title_provisional: false,
+            history_anchor: None,
+            context_ledger: Vec::new(),
         };
+        // Birth event: a journal that starts with SessionCreated is
+        // "journal-complete" and can be rebuilt from nothing via project().
+        // The initial profile binding is journaled alongside so replay
+        // reproduces it (create_session_raw is its assignment site).
+        let mut birth_events = vec![crate::session_events::SessionEvent::SessionCreated {
+            id: new_id.clone(),
+            name: new_session.name.clone(),
+        }];
+        if let Some(profile) = &new_session.composio_profile {
+            birth_events.push(crate::session_events::SessionEvent::ComposioProfileSet {
+                profile: Some(profile.clone()),
+            });
+        }
+        crate::session_events::log_events(&new_id, birth_events);
+
         self.sessions.insert(new_id.clone(), new_session);
         self.active_session_id = new_id.clone();
         new_id
+    }
+
+    /// Fork a journal-complete session: copy its journal up to `at_seq`
+    /// (inclusive; `None` = whole journal) into a fresh session id, rebuild
+    /// the hydrated `Session` via `project()`, and insert it into state as the
+    /// active session. The caller persists (`save_async`) and opens the tab.
+    ///
+    /// Only journal-complete sources (journal starts with `SessionCreated`)
+    /// can be forked — pre-journal sessions return a clear error.
+    pub fn fork_session(&mut self, source_id: &str, at_seq: Option<i64>) -> Result<String, String> {
+        let source_name = self
+            .sessions
+            .get(source_id)
+            .map(|s| s.name.clone())
+            .or_else(|| {
+                crate::session_store::metadata_by_ids(&[source_id.to_string()])
+                    .pop()
+                    .map(|m| m.name)
+            })
+            .ok_or_else(|| format!("Session '{source_id}' not found"))?;
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_name = format!("Fork of {source_name}");
+        let events = crate::session_store::fork_events(source_id, at_seq, &new_id, &new_name)?;
+        let session = crate::session_events::project(None, &events);
+        self.sessions.insert(new_id.clone(), session);
+        self.active_session_id = new_id.clone();
+        Ok(new_id)
     }
 
     pub fn create_session(&mut self, initial_profile: Option<String>) -> String {
@@ -1177,6 +1756,7 @@ impl SessionState {
     }
 
     pub fn delete_session_raw(&mut self, id: &str) {
+        crate::llm::claude::keepalive::cancel_session(id);
         // Harvest cost/token data before destruction so lifetime counters survive deletion
         if let Some(session) = self.sessions.get(id) {
             self.lifetime_cost += session.total_cost();
@@ -1252,6 +1832,7 @@ impl SessionState {
         if let Some(session) = self.sessions.get_mut(session_id) {
             if let Some(index) = session.messages.iter().position(|m| m.id == *message_id) {
                 session.messages.remove(index);
+                session.prune_orphaned_ledger();
                 tracing::info!(message_id = %message_id, session_id = %session_id, "Removed message from target session.");
             }
         }
@@ -1301,22 +1882,19 @@ impl SessionState {
                 return;
             }
         };
-        let (meta, tch_mark) = state.collect_meta_kv();
+        let meta = state.collect_meta_kv();
 
         // Move only the prepared row/meta buffers to the background thread
         dioxus::prelude::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                store::write_rows_and_meta(&rows, &meta).map(|_| (rows, tch_mark))
+                store::write_rows_and_meta(&rows, &meta).map(|_| rows)
             })
             .await;
 
             // Back on the Dioxus runtime — safe to touch Signals
             match result {
-                Ok(Ok((rows, tch_mark))) => {
+                Ok(Ok(rows)) => {
                     store::mark_rows_saved(&rows);
-                    if let Some(tch) = tch_mark {
-                        store::mark_blob_saved(TCH_FP_KEY, &tch);
-                    }
                 }
                 Ok(Err(e)) => {
                     tracing::error!("Failed to save session state: {}", e);
@@ -1343,9 +1921,19 @@ impl SessionState {
         Self::save_async(&signal.read(), error_signal);
     }
 
+    /// A rename from the tab bar or History — a user act. Wins forever: sets
+    /// `name_user_set` so the summarizer never overwrites `name`/`tab_title`
+    /// for this session again.
     pub fn update_session_name_raw(&mut self, id: &str, new_name: String) {
+        crate::session_events::log_event(
+            id,
+            crate::session_events::SessionEvent::SessionRenamed {
+                name: new_name.clone(),
+            },
+        );
         if let Some(session) = self.sessions.get_mut(id) {
             session.name = new_name;
+            session.name_user_set = true;
         } else {
             // Not hydrated (renamed from History) — update the stored row directly.
             crate::session_store::rename_session(id, &new_name);
@@ -1356,29 +1944,38 @@ impl SessionState {
         self.update_session_name_raw(id, new_name);
         Self::save_async(self, None);
     }
+
+    /// Programmatic tab naming (e.g. a dispatch review tab: 🐯 + the todo
+    /// title) — NOT a user act, so `name_user_set` is left untouched and the
+    /// summarizer may still overwrite this later.
+    pub fn set_session_title_programmatic(
+        &mut self,
+        id: &str,
+        title: Option<String>,
+        emoji: Option<String>,
+    ) {
+        crate::session_events::log_event(
+            id,
+            crate::session_events::SessionEvent::TabTitled {
+                emoji: emoji.clone(),
+                title: title.clone(),
+            },
+        );
+        if let Some(session) = self.sessions.get_mut(id) {
+            if emoji.is_some() {
+                session.tab_emoji = emoji;
+            }
+            if title.is_some() {
+                session.tab_title = title;
+            }
+        }
+    }
     pub fn get_message_mut(
         &mut self,
         message_id: &uuid::Uuid,
     ) -> Option<&mut super::components::chat::Message> {
         self.get_active_session_mut()
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
-    }
-
-    pub fn get_message_mut_by_execution_id(
-        &mut self,
-        execution_id: &str,
-    ) -> Option<&mut super::components::chat::Message> {
-        self.get_active_session_mut().and_then(|session| {
-            session.messages.iter_mut().find(|m| match &m.content {
-                super::components::shared::MessageContent::ToolCall(tc) => {
-                    tc.execution_id == execution_id
-                }
-                super::components::shared::MessageContent::PermissionRequest(tc) => {
-                    tc.execution_id == execution_id
-                }
-                _ => false,
-            })
-        })
     }
 
     /// Migrate session composio_profile from name-based to ID-based.
@@ -1420,7 +2017,6 @@ impl Default for SessionState {
             active_session_id: String::new(),
             window_width: 1440.0, // 16:9 ratio default
             window_height: 810.0,
-            tool_call_history: Vec::new(),
             lifetime_cost: 0.0,
             lifetime_tokens: 0,
             save_disabled: false,
@@ -1432,7 +2028,459 @@ impl Default for SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+
+    #[test]
+    fn cancel_running_calls_ends_only_calls_in_flight() {
+        use crate::components::chat::Message;
+        use crate::components::shared::{MessageContent, ToolCall, ToolCallStatus};
+        let mut state = SessionState { save_disabled: true, ..Default::default() };
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        let call = |status| {
+            let mut tc = ToolCall::new("hobbes-terminal".into(), "HOBBES_TERMINAL_EXEC".into(), serde_json::json!({}), None, None);
+            tc.status = status;
+            Message {
+                id: uuid::Uuid::new_v4(),
+                author: "Hobbes".into(),
+                content: MessageContent::ToolCall(tc),
+                attachments: Vec::new(),
+                comments: Vec::new(),
+                created_at: Utc::now(),
+                usage: None,
+            }
+        };
+        s.messages.push(call(ToolCallStatus::Completed));
+        s.messages.push(call(ToolCallStatus::Running));
+        let now = Utc::now();
+        let changed = s.cancel_running_calls(crate::components::shared::CANCELLED_BY_RESTART, now);
+        assert_eq!(changed.len(), 1);
+        let statuses: Vec<_> = s
+            .messages
+            .iter()
+            .filter_map(|m| match &m.content {
+                MessageContent::ToolCall(tc) => Some((tc.status, tc.cancelled.clone(), tc.completed_at)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(statuses[0], (ToolCallStatus::Completed, None, None), "finished calls untouched");
+        assert_eq!(statuses[1], (ToolCallStatus::Error, Some("Hobbes closed while it ran".to_string()), Some(now)));
+        assert!(s.cancel_running_calls("again", now).is_empty(), "nothing left running");
+    }
+
+    mod tab_identity {
+        use super::*;
+
+        fn session_with(name: &str, name_user_set: bool, tab_title: Option<&str>) -> Session {
+            let mut s = create_test_session();
+            s.name = name.to_string();
+            s.name_user_set = name_user_set;
+            s.tab_title = tab_title.map(str::to_string);
+            add_user_messages(&mut s, 1);
+            s
+        }
+
+        fn add_user_messages(s: &mut Session, n: usize) {
+            for _ in 0..n {
+                s.messages.push(crate::components::chat::Message {
+                    id: uuid::Uuid::new_v4(),
+                    author: "User".to_string(),
+                    content: crate::components::shared::MessageContent::Text {
+                        content: "hi".to_string(),
+                        thought_signature: None,
+                        thought_summary: None,
+                        signature_provider: None,
+                    },
+                    attachments: Vec::new(),
+                    comments: Vec::new(),
+                    created_at: Utc::now(),
+                    usage: None,
+                });
+            }
+        }
+
+        fn proposal(title: &str, emoji: &str) -> ConversationSummary {
+            ConversationSummary {
+                tab_title: Some(title.to_string()),
+                tab_emoji: Some(emoji.to_string()),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn an_empty_tab_is_never_titled() {
+            // A profile switch's ForceRefresh summarizes a fresh tab that
+            // only carries a system note; that must not name the tab.
+            let mut session = create_test_session();
+            let result =
+                apply_tab_identity_from_summary(&mut session, &proposal("Profile Setup", "🆔"));
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, None);
+            assert!(!session.wants_tab_identity());
+        }
+
+        #[test]
+        fn an_early_title_is_provisional_and_replaced_once_the_tab_matures() {
+            let mut session = session_with("Sep 30 - 09:00 AM", false, None);
+            assert!(session.wants_tab_identity());
+            apply_tab_identity_from_summary(&mut session, &proposal("Quick question", "❓"))
+                .expect("first title lands");
+            assert!(session.tab_title_provisional);
+            assert!(!session.wants_tab_identity());
+
+            // Still short: later summaries don't touch the provisional title.
+            add_user_messages(&mut session, 1);
+            assert_eq!(
+                apply_tab_identity_from_summary(&mut session, &proposal("Other", "🐛")),
+                None
+            );
+            assert_eq!(session.tab_title.as_deref(), Some("Quick question"));
+
+            // Mature: one retitle, then locked.
+            add_user_messages(&mut session, TAB_TITLE_MATURE_USER_MESSAGES - 2);
+            assert!(session.wants_tab_identity());
+            apply_tab_identity_from_summary(&mut session, &proposal("Trust dispatch", "🎯"))
+                .expect("mature retitle lands");
+            assert_eq!(session.tab_title.as_deref(), Some("Trust dispatch"));
+            assert_eq!(session.tab_emoji.as_deref(), Some("🎯"));
+            assert!(!session.tab_title_provisional);
+            assert!(!session.wants_tab_identity());
+
+            add_user_messages(&mut session, 5);
+            assert_eq!(
+                apply_tab_identity_from_summary(&mut session, &proposal("Drifted", "🐛")),
+                None
+            );
+            assert_eq!(session.tab_title.as_deref(), Some("Trust dispatch"));
+        }
+
+        #[test]
+        fn a_mature_summary_without_a_title_keeps_the_provisional_one_open() {
+            let mut session = session_with("Sep 30 - 09:00 AM", false, None);
+            apply_tab_identity_from_summary(&mut session, &proposal("Quick question", "❓"));
+            add_user_messages(&mut session, TAB_TITLE_MATURE_USER_MESSAGES);
+            assert_eq!(
+                apply_tab_identity_from_summary(&mut session, &proposal("", "🐛")),
+                None
+            );
+            assert_eq!(session.tab_title.as_deref(), Some("Quick question"));
+            assert_eq!(session.tab_emoji.as_deref(), Some("❓"));
+            assert!(session.tab_title_provisional);
+        }
+
+        #[test]
+        fn a_title_first_set_on_a_mature_tab_locks_immediately() {
+            let mut session = session_with("Sep 30 - 09:00 AM", false, None);
+            add_user_messages(&mut session, TAB_TITLE_MATURE_USER_MESSAGES);
+            apply_tab_identity_from_summary(&mut session, &proposal("Trust dispatch", "🎯"));
+            assert!(!session.tab_title_provisional);
+            assert!(!session.wants_tab_identity());
+        }
+
+        #[test]
+        fn a_user_renamed_tab_never_wants_identity() {
+            let mut session = session_with("Mine", true, None);
+            add_user_messages(&mut session, 5);
+            assert!(!session.wants_tab_identity());
+        }
+
+        fn create_test_session() -> Session {
+            Session {
+                id: "s1".to_string(),
+                name: "Sep 16 - 03:45 PM".to_string(),
+                messages: Vec::new(),
+                active_context: ActiveContext::default(),
+                last_updated: Utc::now(),
+                accumulated_cost: 0.0,
+                accumulated_tokens: 0,
+                accumulated_turns: 0,
+                memory_optimization_summary: None,
+                composio_profile: None,
+                llm_connector_id: None,
+                llm_provider: None,
+                chat_model: None,
+                project_id: None,
+                project_tag_user_set: false,
+                loaded_skills: HashMap::new(),
+                scratchpad: String::new(),
+                current_ai_turn_count: 0,
+                watch_word_recovery_count: 0,
+                scheduled_timers: Vec::new(),
+                tool_call_history: Vec::new(),
+                tab_emoji: None,
+                tab_title: None,
+                name_user_set: false,
+            tab_title_provisional: false,
+            history_anchor: None,
+            context_ledger: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn display_title_prefers_user_name_over_tab_title_over_date() {
+            let user_named = session_with("My Renamed Chat", true, Some("AI Topic"));
+            assert_eq!(user_named.display_title(), "My Renamed Chat");
+
+            let ai_titled = session_with("Sep 16 - 03:45 PM", false, Some("AI Topic"));
+            assert_eq!(ai_titled.display_title(), "AI Topic");
+
+            let bare = session_with("Sep 16 - 03:45 PM", false, None);
+            assert_eq!(bare.display_title(), "Sep 16 - 03:45 PM");
+        }
+
+        #[test]
+        fn tab_topic_user_rename_replaces_ai_topic_forever() {
+            let renamed = session_with("Renamed", true, Some("Old AI Topic"));
+            assert_eq!(renamed.tab_topic().as_deref(), Some("Renamed"));
+
+            let untouched = session_with("Sep 16 - 03:45 PM", false, Some("AI Topic"));
+            assert_eq!(untouched.tab_topic().as_deref(), Some("AI Topic"));
+
+            let no_summary_yet = session_with("Sep 16 - 03:45 PM", false, None);
+            assert_eq!(no_summary_yet.tab_topic(), None);
+        }
+
+        #[test]
+        fn short_date_parses_the_creation_stamp() {
+            let s = session_with("Sep 16 - 03:45 PM", false, None);
+            assert_eq!(s.short_date(), "Sep 16");
+        }
+
+        #[test]
+        fn short_date_falls_back_to_last_updated_once_renamed() {
+            let mut s = session_with("My Renamed Chat", true, None);
+            s.last_updated =
+                chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc);
+            assert_eq!(s.short_date(), "Mar 01");
+        }
+
+        #[test]
+        fn emoji_validation_accepts_single_emoji_clusters() {
+            assert_eq!(normalize_tab_emoji(Some("✅")), "✅");
+            assert_eq!(normalize_tab_emoji(Some("🏗️")), "🏗️"); // base + VS16
+            assert_eq!(normalize_tab_emoji(Some("🐯")), "🐯");
+        }
+
+        #[test]
+        fn emoji_validation_falls_back_on_invalid_input() {
+            assert_eq!(normalize_tab_emoji(Some("ab")), FALLBACK_TAB_EMOJI);
+            assert_eq!(normalize_tab_emoji(Some("")), FALLBACK_TAB_EMOJI);
+            assert_eq!(normalize_tab_emoji(None), FALLBACK_TAB_EMOJI);
+            assert_eq!(normalize_tab_emoji(Some("😀😁")), FALLBACK_TAB_EMOJI);
+        }
+
+        #[test]
+        fn title_normalization_trims_quotes_and_caps_length() {
+            assert_eq!(
+                normalize_tab_title(Some("  \"Ship the release\"  ")),
+                Some("Ship the release".to_string())
+            );
+            let long = "a".repeat(60);
+            assert_eq!(
+                normalize_tab_title(Some(&long)).map(|s| s.len()),
+                Some(40)
+            );
+            assert_eq!(normalize_tab_title(Some("   ")), None);
+            assert_eq!(normalize_tab_title(None), None);
+        }
+
+        #[test]
+        fn apply_tab_identity_writes_normalized_title_and_emoji() {
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let summary = ConversationSummary {
+                tab_title: Some("  \"Trust dispatch\"  ".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &summary);
+            assert_eq!(
+                result,
+                Some((Some("🎯".to_string()), Some("Trust dispatch".to_string())))
+            );
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+        }
+
+        #[test]
+        fn apply_tab_identity_never_overwrites_a_user_rename() {
+            let mut session = session_with("My renamed tab", true, None);
+            let summary = ConversationSummary {
+                tab_title: Some("Trust dispatch".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &summary);
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, None);
+        }
+
+        #[test]
+        fn apply_tab_identity_is_a_noop_when_summary_carries_no_proposal() {
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let summary = ConversationSummary::default();
+            let result = apply_tab_identity_from_summary(&mut session, &summary);
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, None);
+        }
+
+        #[test]
+        fn apply_tab_identity_locks_after_the_first_write_and_never_relabels_again() {
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let first = ConversationSummary {
+                tab_title: Some("Trust dispatch".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &first);
+            assert!(result.is_some());
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+
+            // A later summary reflecting where the conversation drifted to
+            // must NOT relabel a tab the user has already learned to
+            // recognize.
+            let later = ConversationSummary {
+                tab_title: Some("Totally different topic".to_string()),
+                tab_emoji: Some("🐛".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &later);
+            assert_eq!(result, None);
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+        }
+
+        #[test]
+        fn an_emoji_only_proposal_does_not_lock_out_a_later_real_title() {
+            // normalize_tab_emoji always falls back to SOME emoji even for
+            // empty/invalid input — it never produces None — so an early,
+            // low-quality summary (e.g. seconds after a brand new tab opens)
+            // reliably sets tab_emoji while leaving no title. That must not
+            // permanently block the real title a later, more mature summary
+            // proposes; only a title landing should lock the tab.
+            let mut session = session_with("Sep 16 - 03:45 PM", false, None);
+            let early = ConversationSummary {
+                tab_title: Some("".to_string()),
+                tab_emoji: Some("".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &early);
+            assert!(result.is_some());
+            assert_eq!(session.tab_title, None);
+            assert_eq!(session.tab_emoji, Some(FALLBACK_TAB_EMOJI.to_string()));
+
+            let later = ConversationSummary {
+                tab_title: Some("Trust dispatch".to_string()),
+                tab_emoji: Some("🎯".to_string()),
+                ..Default::default()
+            };
+            let result = apply_tab_identity_from_summary(&mut session, &later);
+            assert!(result.is_some());
+            assert_eq!(session.tab_title, Some("Trust dispatch".to_string()));
+            assert_eq!(session.tab_emoji, Some("🎯".to_string()));
+        }
+    }
+
+    /// Both ordering helpers exist to keep one invariant: the vec's order and
+    /// its `created_at` stamps agree, because the journal projector reinserts
+    /// by timestamp while the prompt builder walks the vec.
+    mod message_order {
+        use super::*;
+
+        fn msg(at_secs: i64) -> crate::components::chat::Message {
+            crate::components::chat::Message {
+                id: uuid::Uuid::new_v4(),
+                author: "Hobbes".to_string(),
+                content: crate::components::shared::MessageContent::Text {
+                    content: String::new(),
+                    thought_signature: None,
+                    thought_summary: None,
+                    signature_provider: None,
+                },
+                attachments: Vec::new(),
+                comments: Vec::new(),
+                created_at: Utc::now() + chrono::Duration::seconds(at_secs),
+                usage: None,
+            }
+        }
+
+        #[test]
+        fn restamp_of_the_tail_takes_the_new_stamp() {
+            let mut messages = vec![msg(0), msg(1)];
+            let id = messages[1].id;
+            let ts = messages[1].created_at + chrono::Duration::seconds(10);
+            assert_eq!(restamp_message(&mut messages, &id, ts), Some(ts));
+            assert_eq!(messages[1].created_at, ts);
+        }
+
+        #[test]
+        fn restamp_is_clamped_by_its_neighbours() {
+            let mut messages = vec![msg(0), msg(5), msg(6)];
+            let id = messages[1].id;
+            let upper = messages[2].created_at;
+            // Way past the next message: clamped, so the vec stays sorted.
+            let ts = upper + chrono::Duration::seconds(60);
+            assert_eq!(restamp_message(&mut messages, &id, ts), Some(upper));
+            let stamps: Vec<_> = messages.iter().map(|m| m.created_at).collect();
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        #[test]
+        fn restamp_leaves_already_unordered_neighbours_alone() {
+            let mut messages = vec![msg(9), msg(5), msg(0)];
+            let id = messages[1].id;
+            let before = messages[1].created_at;
+            let ts = Utc::now();
+            assert_eq!(restamp_message(&mut messages, &id, ts), Some(before));
+            assert_eq!(messages[1].created_at, before);
+        }
+
+        #[test]
+        fn restamp_of_a_missing_message_is_none() {
+            let mut messages = vec![msg(0)];
+            assert!(restamp_message(&mut messages, &uuid::Uuid::new_v4(), Utc::now()).is_none());
+        }
+
+        #[test]
+        fn move_to_end_reorders_and_stamps_last() {
+            let mut messages = vec![msg(0), msg(1), msg(2)];
+            let id = messages[1].id;
+            let ts = messages[2].created_at + chrono::Duration::seconds(1);
+            let moved = move_message_to_end(&mut messages, &id, ts).expect("present");
+            assert_eq!(moved.id, id);
+            assert_eq!(messages.last().unwrap().id, id);
+            assert_eq!(messages.len(), 3);
+            let stamps: Vec<_> = messages.iter().map(|m| m.created_at).collect();
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        #[test]
+        fn move_to_end_never_stamps_before_the_message_it_follows() {
+            let mut messages = vec![msg(0), msg(60)];
+            let id = messages[0].id;
+            // A stamp earlier than the tail would break the invariant.
+            let moved = move_message_to_end(&mut messages, &id, Utc::now()).expect("present");
+            assert_eq!(moved.created_at, messages[0].created_at);
+            assert_eq!(messages.last().unwrap().id, id);
+            let stamps: Vec<_> = messages.iter().map(|m| m.created_at).collect();
+            assert!(stamps.windows(2).all(|w| w[0] <= w[1]));
+        }
+
+        #[test]
+        fn move_to_end_of_the_tail_only_restamps() {
+            let mut messages = vec![msg(0), msg(1)];
+            let id = messages[1].id;
+            let ts = messages[1].created_at + chrono::Duration::seconds(5);
+            let moved = move_message_to_end(&mut messages, &id, ts).expect("present");
+            assert_eq!(moved.created_at, ts);
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[1].id, id);
+        }
+    }
 
     // === Migration Tests ===
 
@@ -1485,10 +2533,12 @@ mod tests {
                 content,
                 thought_signature,
                 thought_summary,
+                signature_provider,
             } => {
                 assert_eq!(content, "Hello world");
                 assert!(thought_signature.is_none());
                 assert!(thought_summary.is_none());
+                assert!(signature_provider.is_none());
             }
             other => panic!("Expected Text variant, got {:?}", other),
         }
@@ -1762,6 +2812,7 @@ mod tests {
                     content: "Hello".to_string(),
                     thought_signature: None,
                     thought_summary: None,
+                    signature_provider: None,
                 },
                 attachments: Vec::new(),
                 comments: Vec::new(),
@@ -1772,15 +2823,14 @@ mod tests {
                     total_tokens: 150,
                     thoughts_tokens: None,
                     cached_content_tokens: None,
+                    cache_creation_tokens: None,
                     cost: Some(0.0042),
                 }),
             });
         }
 
         // Verify session cost before deletion
-        assert!(
-            (state.sessions.get(&session_id).unwrap().total_cost() - 0.0042).abs() < 0.00001
-        );
+        assert!((state.sessions.get(&session_id).unwrap().total_cost() - 0.0042).abs() < 0.00001);
         assert_eq!(state.lifetime_cost, 0.0);
         assert_eq!(state.lifetime_tokens, 0);
 
@@ -1808,6 +2858,7 @@ mod tests {
                         content: "test".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: Vec::new(),
                     comments: Vec::new(),
@@ -1818,6 +2869,7 @@ mod tests {
                         total_tokens: 150,
                         thoughts_tokens: None,
                         cached_content_tokens: None,
+                        cache_creation_tokens: None,
                         cost: Some(cost),
                     }),
                 });
@@ -1870,16 +2922,22 @@ mod tests {
         let mut state = SessionState::default();
 
         // Store initial content: ID "page-A" with ~45 chars of remaining content
-        let initial_pages = vec![
-            ("page-A".to_string(), PagedResult {
+        let initial_pages = vec![(
+            "page-A".to_string(),
+            PagedResult {
                 remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
-            }),
-        ];
+            },
+        )];
         state.store_pages(initial_pages);
         assert_eq!(
-            state.page_queue.get("page-A").unwrap().remaining_content.len(),
-            45 - 1  // "Page 1 content\nPage 2 content\nPage 3 content" = 44 chars
+            state
+                .page_queue
+                .get("page-A")
+                .unwrap()
+                .remaining_content
+                .len(),
+            45 - 1 // "Page 1 content\nPage 2 content\nPage 3 content" = 44 chars
         );
 
         // Consume one page via fetch_next_page with a 15-char budget
@@ -1890,23 +2948,31 @@ mod tests {
         assert!(remaining > 0, "Should have remaining pages");
 
         // Record how much content remains after consuming one page
-        let remaining_after_first = state.page_queue.get("page-A")
+        let remaining_after_first = state
+            .page_queue
+            .get("page-A")
             .unwrap()
             .remaining_content
             .len();
 
         // Simulate continuation turn: store_pages called again with same ID but fresh content
-        let re_generated = vec![
-            ("page-A".to_string(), PagedResult {
+        let re_generated = vec![(
+            "page-A".to_string(),
+            PagedResult {
                 remaining_content: "Page 1 content\nPage 2 content\nPage 3 content".to_string(),
                 tool_name: "test_tool".to_string(),
-            }),
-        ];
+            },
+        )];
         state.store_pages(re_generated);
 
         // CRITICAL: the queue should still have the partially-consumed content (not reset)
         assert_eq!(
-            state.page_queue.get("page-A").unwrap().remaining_content.len(),
+            state
+                .page_queue
+                .get("page-A")
+                .unwrap()
+                .remaining_content
+                .len(),
             remaining_after_first,
             "store_pages must NOT overwrite partially-consumed entries"
         );
@@ -1914,7 +2980,10 @@ mod tests {
         // Verify we get the next portion of content (not starting over)
         let (content2, _, _remaining2) = state.fetch_next_page("page-A", 15).unwrap();
         assert!(!content2.is_empty(), "Should return next page content");
-        assert!(content2.len() <= 15, "Second page should also respect budget");
+        assert!(
+            content2.len() <= 15,
+            "Second page should also respect budget"
+        );
     }
 
     /// Test: fetch_next_page dynamically sizes pages based on page_budget.
@@ -1926,22 +2995,33 @@ mod tests {
 
         // Store content (~100 chars)
         let content = "Line one of the result.\nLine two of the result.\nLine three of the result.\nLine four of the result.";
-        state.store_pages(vec![
-            ("page-dynamic".to_string(), PagedResult {
+        state.store_pages(vec![(
+            "page-dynamic".to_string(),
+            PagedResult {
                 remaining_content: content.to_string(),
                 tool_name: "dynamic_tool".to_string(),
-            }),
-        ]);
+            },
+        )]);
 
         // Fetch with a small budget (30 chars)
         let (page1, _, remaining1) = state.fetch_next_page("page-dynamic", 30).unwrap();
-        assert!(page1.len() <= 30, "Small budget: page should be ≤30 chars, got {}", page1.len());
+        assert!(
+            page1.len() <= 30,
+            "Small budget: page should be ≤30 chars, got {}",
+            page1.len()
+        );
         assert!(remaining1 > 0, "Should have remaining content");
 
         // Fetch with a large budget (remaining content should fit in one page)
         let (page2, _, remaining2) = state.fetch_next_page("page-dynamic", 10000).unwrap();
-        assert!(page2.len() > 30, "Large budget: page should be larger than small-budget page");
-        assert_eq!(remaining2, 0, "Large budget should consume all remaining content");
+        assert!(
+            page2.len() > 30,
+            "Large budget: page should be larger than small-budget page"
+        );
+        assert_eq!(
+            remaining2, 0,
+            "Large budget should consume all remaining content"
+        );
 
         // All content consumed — entry should be cleaned up
         assert!(
@@ -1951,7 +3031,10 @@ mod tests {
 
         // Concatenated pages should reproduce original content
         let reconstructed = format!("{}{}", page1, page2);
-        assert_eq!(reconstructed, content, "Pages must reconstruct original content");
+        assert_eq!(
+            reconstructed, content,
+            "Pages must reconstruct original content"
+        );
     }
 
     /// Test that delete_message_and_after cleans up stale tool_snapshot entries
@@ -1971,6 +3054,12 @@ mod tests {
         let mut session = Session {
             id: "test-session".to_string(),
             name: "Test".to_string(),
+            tab_emoji: None,
+            tab_title: None,
+            name_user_set: false,
+            tab_title_provisional: false,
+            history_anchor: None,
+            context_ledger: Vec::new(),
             messages: vec![
                 Message {
                     id: msg1_id,
@@ -1979,6 +3068,7 @@ mod tests {
                         content: "Hello".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: vec![],
                     comments: vec![],
@@ -1992,6 +3082,7 @@ mod tests {
                         content: "Do something".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                     },
                     attachments: vec![],
                     comments: vec![],
@@ -2010,8 +3101,15 @@ mod tests {
                         response: "file contents".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                         cached_image_path: None,
                         result_summary: None,
+                        completed_at: None,
+                        profile_id: None,
+                        connector_name: None,
+                        model: None,
+                        round_id: None,
+                        cancelled: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -2030,8 +3128,15 @@ mod tests {
                         response: "ok".to_string(),
                         thought_signature: None,
                         thought_summary: None,
+                        signature_provider: None,
                         cached_image_path: None,
                         result_summary: None,
+                        completed_at: None,
+                        profile_id: None,
+                        connector_name: None,
+                        model: None,
+                        round_id: None,
+                        cancelled: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -2045,6 +3150,8 @@ mod tests {
                     sentiment: "neutral".to_string(),
                     current_task: String::new(),
                     entities: ConversationSummaryEntities::default(),
+                    tab_title: None,
+                    tab_emoji: None,
                 },
                 ..Default::default()
             },
@@ -2057,11 +3164,14 @@ mod tests {
             llm_connector_id: None,
             llm_provider: None,
             chat_model: None,
+            project_id: None,
+            project_tag_user_set: false,
             loaded_skills: HashMap::new(),
             scratchpad: String::new(),
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            tool_call_history: Vec::new(),
         };
 
         // Simulate ToolCallSummarizer having inserted snapshots
@@ -2080,20 +3190,36 @@ mod tests {
         );
 
         assert_eq!(session.active_context.extra.len(), 3);
-        assert!(!session.active_context.conversation_summary.summary.is_empty());
+        assert!(
+            !session
+                .active_context
+                .conversation_summary
+                .summary
+                .is_empty()
+        );
 
         // Undo: delete msg2 and everything after (msg2, msg3, msg4)
         let deleted = session.delete_message_and_after(&msg2_id.to_string());
         assert_eq!(deleted, 3, "Should have deleted 3 messages");
-        assert_eq!(session.messages.len(), 1, "Only first message should remain");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "Only first message should remain"
+        );
 
         // Tool snapshots for the deleted tool calls should be gone
         assert!(
-            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_1)),
+            !session
+                .active_context
+                .extra
+                .contains_key(&format!("tool_snapshot_{}", exec_id_1)),
             "tool_snapshot for exec_id_1 should be removed"
         );
         assert!(
-            !session.active_context.extra.contains_key(&format!("tool_snapshot_{}", exec_id_2)),
+            !session
+                .active_context
+                .extra
+                .contains_key(&format!("tool_snapshot_{}", exec_id_2)),
             "tool_snapshot for exec_id_2 should be removed"
         );
 
@@ -2105,7 +3231,11 @@ mod tests {
 
         // Conversation summary should be reset
         assert!(
-            session.active_context.conversation_summary.summary.is_empty(),
+            session
+                .active_context
+                .conversation_summary
+                .summary
+                .is_empty(),
             "Conversation summary should be cleared after undo"
         );
     }
@@ -2248,8 +3378,12 @@ mod tests {
     #[ignore]
     fn real_data_import() {
         use crate::session_store::test_support as ts;
-        let json = std::env::var("HOBBES_IMPORT_TEST_JSON").ok().map(std::path::PathBuf::from);
-        let archive = std::env::var("HOBBES_IMPORT_TEST_ARCHIVE").ok().map(std::path::PathBuf::from);
+        let json = std::env::var("HOBBES_IMPORT_TEST_JSON")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let archive = std::env::var("HOBBES_IMPORT_TEST_ARCHIVE")
+            .ok()
+            .map(std::path::PathBuf::from);
         if json.is_none() && archive.is_none() {
             eprintln!("real_data_import: no env vars set, skipping");
             return;
@@ -2273,14 +3407,16 @@ mod tests {
     /// raw-JSON migration fallback.
     #[test]
     fn test_legacy_session_import_fallback() {
-        let old_format = make_old_session_json(r#"{
+        let old_format = make_old_session_json(
+            r#"{
             "id": "0b0e9e2e-49e2-4a4d-bd58-9d1b4a55b573",
             "author": "User",
             "content": { "Text": "hello from the past" },
             "attachments": [],
             "comments": [],
             "created_at": "2026-01-01T00:00:00Z"
-        }"#);
+        }"#,
+        );
         let state = SessionState::migrate_from_raw_json(&old_format).unwrap();
         let session = state.sessions.get("test-session-1").unwrap();
         assert_eq!(session.messages.len(), 1);

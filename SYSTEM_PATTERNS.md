@@ -165,6 +165,9 @@ mod secret_manager_generic; // keyring crate
 | AP-006 | Direct Keychain Save Bypass | Duplicated fallback logic, inconsistent behavior | Use `save_secret_to_keychain()` or `SecretManager::set()` |
 | AP-007 | Reversed MCP Lock Order | App deadlock (hangs forever) | Always lock `servers` before `dynamic_local_tools` |
 | AP-008 | `use_memo` Over a Prop | Streaming code/markdown freezes at first chunk | Compute inline; reserve `use_memo` for Signals (P-012) |
+| AP-009 | Built-in Tool Intercepted at One Call Site | Tool works normally, fails only after a permission approval | Add it to `dispatch_builtin_tool`, never to a call site (P-015) |
+| AP-010 | Stream Mirror Skips Once Generating Ends | Finished reply cut off mid-sentence until a tab switch; DB has the full text | Reconcile from `session_state` at turn end; only a channel owner may skip (P-016) |
+| AP-011 | Store Scan in a Click Handler | Beach ball on a click; opening a chat stalls meanwhile | Indexed query, run in `spawn_blocking` from a spawned task, in-progress state in the UI (P-017) |
 
 ---
 
@@ -179,6 +182,61 @@ For deeper documentation on specific subsystems:
 | Security & Credentials | [SECURITY.md](SECURITY.md) |
 | macOS Signing | [GUIDE_TO_APPLE_SIGNING.md](GUIDE_TO_APPLE_SIGNING.md) |
 | Contributing | [CONTRIBUTING.md](CONTRIBUTING.md) |
+
+### Module map: components/settings_panel/
+
+| File | Owns |
+|------|------|
+| `mod.rs` | `SettingsPanel` (the only public item): every hook, the draft/sync effects, model-fetch effects, save + keychain-mode + conflict modals, the tab bar, the footer Save button, and a short `match` dispatching to tab components. Also defines `SettingsCtx`. |
+| `shared.rs` | `INPUT` class string, `Toggle` switch, connector draft helpers (`load_instance_into_draft`, `selected_kind`, `flush_draft_into_instance`, `comparable`). |
+| `calendar.rs` | Planner-tab calendar subscriptions: palette, ICS URL validation, `CalendarSubscriptionRow`, `CalendarSubscriptionsSection` (+ its unit tests). |
+| `license.rs` | `LicenseSection` (About tab). |
+| `trust_rules.rs` | `TrustRulesSection` (Permissions tab). |
+| `terminal.rs` | `TerminalSection` (Behavior tab). |
+| `fleet.rs` | `FleetSection` (Behavior tab). |
+| `tabs/mod.rs` | Declares and re-exports the tab components. |
+| `tabs/general.rs` … `tabs/about.rs` | One component per tab: `GeneralTab`, `McpTab`, `BehaviorTab`, `PlannerTab`, `DataTab`, `PermissionsTab`, `HotkeysTab`, `SkillsTab`, `AboutTab`. Credentials renders `ToolCredentials` directly; ImageGen is a one-line placeholder in the match. |
+
+`SettingsCtx` is a `#[derive(Clone, Copy, PartialEq)]` bundle of the signals most tabs share (`settings`, `settings_manager`, `local_settings`, `ui_state`, `ui_state_manager`, `session_state`, `secret_manager`, `save_error`, `selected_connector_id`, `skill_registry`). Tab-specific signals are passed as individual `Signal<T>` props.
+
+**Rule:** new settings tabs go in `tabs/<name>.rs` and receive shared state via `SettingsCtx` props, not new hooks. Any state that must survive switching tabs (drafts, collapse flags, modal state) is a hook in `SettingsPanel` passed down; calling `use_signal` inside a tab component resets it on every tab switch.
+
+### Module map: mcp/manager/
+
+`McpManager` is one type with several `impl McpManager` blocks, one per concern, in child modules (children can see the parent's private fields). Public paths are unchanged: everything is still `crate::mcp::manager::X`.
+
+| File | Owns |
+|------|------|
+| `mod.rs` | Types only, plus `new` and the small state accessors: consts (`COMPOSIO_NATIVE_PREFIX`, `HOBBES_*_SERVER`), `is_composio_native`, `is_builtin_virtual_server`, `McpServerConfig`, `McpContext`, `McpServerContext`, `ServerStatus`, `McpServerStatus`, `McpClientType`, `ActiveMcpClient`, `AuthRequiredInfo`, the `McpManager` struct; `new`, `inject_custom_credentials`, `set_initial_*`, `set_server_on_demand`/`set_server_loaded`, `is_server_loaded`, `get_client`. Re-exports the `pub(crate)` Composio key helpers. |
+| `lifecycle.rs` | Server start/stop: `launch_servers`, `retry_server`, `reconnect_stdio_server`, `install_mcp_server`, `load_server`, `unload_server`, `reload_config`, `clear_dynamic_tools_for`, terminal reaping/shutdown, `get_sane_path`, `get_critical_env_vars`, `is_auth_error`, `is_needs_setup_error`. |
+| `tool_call.rs` | Tool execution: `use_mcp_tool`, `process_tool_output`, `try_auth_recovery`, `get_local_meta_tools`, `score_tool_relevance`, `GEMINI_TOOL_LIMIT`. |
+| `composio.rs` | Composio key resolution and purge helpers (`composio_server_key`, `resolve_composio_key`, `ComposioKeyLookup`, `purge_composio_profile_state`, + their tests) and the profile/client methods: native client init/reinit, `find_composio_client`, `composio_client_for_profile`, `get_composio_toolkits`, `recreate_composio_server`, `initiate_composio_auth`. |
+| `composio_toolkits.rs` | Per-toolkit tool operations: `connect_toolkit`, `remove_toolkit`, `reload_composio_tools`, `set_composio_toolkit_tools`, `rollback_partial_connect`, `clear_dynamic_tools_for_toolkit`, `get_composio_toolkit_tool_state`. |
+| `config.rs` | `mcp_servers.json` persistence: `load_configs`, `save_configs`, `add_or_update_mcp_server`. |
+| `oauth.rs` | `start_oauth_flow`, `complete_oauth_flow`. |
+| `status.rs` | `get_mcp_context`, `get_all_server_statuses`, `invalidate_status_cache(_async)`. |
+
+**Rule:** new `McpManager` methods go in the module for their concern as a separate `impl McpManager` block; `mod.rs` holds types only. A private method called from a sibling module is `pub(super)` — no wider.
+
+### Module map: components/planner_rows/
+
+The Things-style planner list surfaces (centre column, quick-add, list, row). Public paths are unchanged: everything is still `crate::components::planner_rows::X`; `mod.rs` re-exports (with the same `pub(crate)` visibility) only what other components import.
+
+| File | Owns |
+|------|------|
+| `mod.rs` | Module docs, `mod` declarations, the `pub(crate)` re-exports, and the shared style consts (`DEFAULT_PROFILE_COLOR`, `PILL`, `META`, `BTN_*`, `POPOVER`, `MENU_*`, `SECTION_HEADER`, `KEY_RING`). Child modules read the consts via `use super::{…}`; they stay private. |
+| `centre.rs` | `CentreColumn` (entry point, used by `planner_view.rs`), `ListOrderControl`, `GroupHeader`. |
+| `quick_add.rs` | The quick-add flow: `QuickAdd`, `QuickAddField`, `QuickAddPreview`, `QuickAddDraft`, `Inherited`/`InheritedFrom`, `BirthProject`/`Birth`, `resolve_birth`, `commit_quick_add`, `apply_project_pick`, `create_project`, title/highlight helpers (+ birth tests). Also consumed by `quick_capture.rs`. |
+| `list.rs` | `Section`, `TodoList` (grouping, drag wiring, adopt-undo), `ProjectPicker`. |
+| `row.rs` | `TodoRow` (the WHO / WHAT / WHEN grid and its popovers) and the `RowMenu` state enum. |
+| `reorder.rs` | Manual-order math (`Reorder`, `reorder_target`, `moved`, `drag_over_index`, `flatten_with`), drag/undo plumbing (`ListDrag`, `ListDragContext`, `AdoptUndo`, `UNDO_GENERATION`), FLIP helpers (`bump_flip`, `flip_snap`), `apply_move`. |
+| `schedule.rs` | `ScheduleChoice`, `apply_schedule_choice`, `current_schedule_choice`, `set_schedule` (also used by `todo_detail.rs`), `DueTone`/`due_tone`/`due_tone_class`, `date_pill_label`. |
+| `helpers.rs` | Pure display and selection helpers: `WhoState`/`who_state`, `cycle_estimate`, `activation_seed`, profile swatch classes, `working_minutes`, `view_title`, `empty_state_line`, `todos_for_selection`, `first_block_on_day`, `block_slots`, `priority_tone_class`, `order_hint`. |
+| `test_support.rs` | `#[cfg(test)]` helper shared by more than one file's tests (`d`, a date parser). Other test helpers live beside their tests. |
+
+Tests sit in a `#[cfg(test)] mod tests` at the bottom of the file that owns the code under test.
+
+**Rule:** new planner row/list UI goes in the file for its concern; shared style consts live in `mod.rs`. A private item used from a sibling module is `pub(super)` — no wider. `TodoRow` is deliberately one ~1,000-line component: splitting it means moving hooks, so don't do it as a drive-by.
 
 ---
 
@@ -214,7 +272,7 @@ After successful re-auth, `try_auth_recovery()` returns `is_error: Some(false)` 
 > - **Fallthrough after proactive reconnect**: Same issue — executes tool before token syncs → 401 → `try_auth_recovery` fires second reconnect
 > - **Case-sensitive cache keys**: `toolkit_account_map` keys must be **lowercase**. API slug casing varies between endpoints.
 
-**Location**: `src/mcp/composio_client/mod.rs` → `reconnect_toolkit()`, `src/mcp/manager.rs` → `try_auth_recovery()`
+**Location**: `src/mcp/composio_client/mod.rs` → `reconnect_toolkit()`, `src/mcp/manager/tool_call.rs` → `try_auth_recovery()`
 
 ---
 
@@ -239,7 +297,7 @@ All auth error detection is centralized in `ToolExecuteResponse::is_auth_error()
 
 `COMPOSIO_CLEAR_TOOLS` flushes the cache. `build_mcp_context()` includes dynamic cache as a virtual server.
 
-**Location**: `src/mcp/manager.rs`
+**Location**: `src/mcp/manager/tool_call.rs` (`use_mcp_tool`, `GEMINI_TOOL_LIMIT`)
 
 ---
 
@@ -348,9 +406,9 @@ against the official pricing pages.
 |----------|-------|--------------|
 | OpenAI | `src/llm/openai_pricing.rs` → `PRICES` | developers.openai.com/api/docs/pricing |
 | Gemini | `src/llm/gemini.rs` → `GeminiModel::get_rates` | ai.google.dev/gemini-api/docs/pricing |
-| Claude | `src/llm/claude_models.rs` → `input_price_per_mtok` / `output_price_per_mtok` | platform.claude.com/docs/en/about-claude/pricing |
+| Claude | `src/llm/claude_models.rs` → `input_price_per_mtok` / `output_price_per_mtok` / `cache_read_price_per_mtok` / `price_multiplier` (prompt-length tiers) | platform.claude.com/docs/en/about-claude/pricing |
 
-> **Last verified**: 2026-06-17 (all three confirmed against published rates).
+> **Last verified**: Claude 2026-10-07 (added Haiku 5.5 and its >100k-token price tier via `price_multiplier`); OpenAI and Gemini 2026-06-17.
 
 **Rules**:
 - Match models by **family with a version/dash boundary**, never a bare
@@ -399,9 +457,156 @@ the dropped ids → drop its on-demand tools (profile-keyed bucket) + settings
 - **Recreate to recover** — `recreate_composio_server` resolves auth for the kept
   toolkits, provisions a fresh server **seeded with the first** toolkit
   (`create_fresh_mcp_server` — Composio rejects an empty server, error 1153), then
-  binds the rest, repoints `base_url` + the servers map. This is the **only**
-  recovery for an already-wedged server. There is **no delete-server endpoint**;
-  the old server is abandoned.
+  binds the rest (re-applying the locally persisted per-toolkit `enabled_tools`
+  curation), repoints `base_url` + the servers map, then soft-deletes the old
+  server (`delete_mcp_server`, `DELETE /api/v3/mcp/{id}`) so abandoned servers
+  don't accumulate and can't be mis-targeted later. This is the **only**
+  recovery for an already-wedged server.
 
 **If broken**: connects fail with 400s on the shared server; removals also fail;
 the only escape is Recreate.
+
+---
+
+### 15. Built-in Tools Have Exactly One Dispatch Point
+
+> **Pattern ID**: P-015
+> **Anti-Pattern**: Intercepting a `HOBBES_*` tool at one call site but not the other (AP-009)
+
+Built-in ("virtual server") tools are intercepted **before** MCP dispatch because
+they operate on `SessionState`, the skill registry, and the permission manager —
+state `McpManager` does not own. `McpClientType::NativeCore` therefore has no
+executor: reaching it means interception was missed, and it returns an explicit
+*"was not intercepted before MCP dispatch. This is a Hobbes bug"* error.
+
+There are **two** paths that execute tool calls:
+
+| Path | Location | When |
+|------|----------|------|
+| Streaming | `src/components/stream_manager.rs` | Normal turn |
+| Approval resume | `src/components/chat.rs` | Re-runs calls left `Running` after the user approves them |
+
+Both route through `dispatch_builtin_tool` in
+`src/components/builtin_tools.rs`, which returns `Some(BuiltinOutcome)` for a
+built-in and `None` to fall through to MCP.
+
+**Rules**:
+- **Add new built-ins to `dispatch_builtin_tool` only** — never inline at a call
+  site. That is how the two paths drifted before: `HOBBES_SET_TIMER` and
+  `HOBBES_INVOKE_SKILL` were handled only on the streaming path, so they worked
+  normally and hit the NativeCore bug error whenever the turn happened to resume
+  from an approval. Intermittent by nature, and invisible in any test that
+  doesn't involve a permission prompt.
+- **`BuiltinOutcome.persist`** carries whether the caller must
+  `SessionState::save_async` afterwards. Pagination is turn-local (`false`); the
+  scratchpad, skills, and timers must survive a restart (`true`).
+- **The dispatcher only computes the result.** Writing it back into the message,
+  persisting, and recording tool-call history stay with each caller, because the
+  two sites genuinely differ there.
+- `BUILTIN_TOOLS` is documentation plus a test fixture — it is deliberately
+  **not** consulted as an early-out in the dispatcher. A guard would mean a new
+  match arm whose name was omitted from the list silently fell through to MCP,
+  trading a loud failure for a quiet one.
+
+**Test**: `every_core_client_tool_is_dispatchable` asserts every tool advertised
+by `CoreClient::list_tools` is listed in `BUILTIN_TOOLS`, so a tool added to the
+schema but not the dispatcher fails the build rather than the user's next
+approval.
+
+**If broken**: the tool works in most turns and errors only after a permission
+prompt — the hardest possible failure to reproduce from a bug report.
+
+---
+
+### 16. A Finished Turn Is a Reason to Sync, Never a Reason to Skip
+
+> **Pattern ID**: P-016
+> **Anti-Pattern**: Gating a streaming bubble's `session_state` mirror on "still generating" (AP-010)
+
+`MessageBubble` renders a local `content` signal seeded at mount. It is fed one
+of two ways: the bubble that mounted empty owns the single-consumer stream
+channel and appends chunks; every other bubble (re-mounted after a tab switch,
+or mounted late because a live activity block absorbed the empty placeholder —
+i.e. every reply that follows tool calls) mirrors the text the stream task
+writes into `session_state` on each chunk.
+
+The stream task does not yield between chunks that are already buffered, and
+the final leg's cleanup (`summarize_and_cleanup`, the closed tool-results
+channel) is synchronous. So when rendering a long reply falls behind, the last
+chunks, the persisted final text **and** the removal of the generating flag all
+land in one poll. The mirror effect's next run sees `is_generating == false`;
+if it bails out there, the bubble stays frozen at an earlier chunk forever.
+
+**Symptom**: a long reply after tool calls stops mid-table or mid-sentence;
+the footer shows final tokens and cost; `sessions.db` holds the full text; a
+tab switch (remount re-seeds `content` from the prop) fixes it.
+
+**Rules**:
+- The mirror skips **only** while this bubble owns a still-open channel.
+  Everyone else mirrors, generating or not (`should_mirror_session_text`).
+- The channel owner clears `owns_channel` when its loop ends, and the mirror
+  reads that flag reactively, so the owner gets the same end-of-turn
+  reconcile. Never reconcile an owner before its channel drains — the loop
+  would then append the buffered tail a second time.
+- Don't "optimise" by early-returning on a stream state flag before comparing
+  against `session_state`; the compare is the cheap part.
+
+**Location**: `src/components/chat.rs` → `MessageBubble` (mirror effect,
+`should_mirror_session_text`)
+
+**Test**: `finished_turn_still_reconciles_from_session_state`.
+
+**If broken**: the end of long replies silently goes missing on screen while
+persistence, cost and history all look correct.
+
+---
+
+### 17. No Store or File I/O on the UI Thread
+
+> **Pattern ID**: P-017
+> **Anti-Pattern**: Running a row-scanning `session_store` query from a Dioxus handler (AP-011)
+
+Dioxus event handlers, render, and tasks started with `spawn` all run on the
+main thread. Any `session_store` query that can scan rows, or any disk I/O
+beyond a single-row upsert, goes through `tokio::task::spawn_blocking` from a
+spawned task, with an in-progress state in the UI. The store also sits behind
+one global `with_conn` mutex, so a slow query on the UI thread blocks every
+other store user too (opening a chat from History, saves, the journal).
+
+**The bug that set this rule**: Manage projects' "Merge into…" counted the
+chats tagged to the merging projects in the click handler, and the confirm
+retagged them there too. Both ran `SELECT id, data FROM sessions WHERE
+instr(data, ?)` and parsed the JSON of each hit — on a 1.18 GB `sessions.db`
+a multi-second full scan, twice, on the main thread, holding the connection.
+The app beach-balled.
+
+**Rules**:
+- Make the query cheap first: anything selected by a session field gets a
+  derived, indexed column written by `build_row`/`upsert_row` (like
+  `project_id`, `has_timers`, `search_text`), backfilled once behind a
+  `meta` key in `init()`. Never `instr`/`LIKE` over `data` to find rows.
+- Then move it off the main thread anyway: open the UI at once with an
+  in-progress state ("Counting chats…", "retagging N chats…"), run the store
+  work in `spawn_blocking` inside `spawn(async move { … })`, and write the
+  result back to signals on the UI side when it lands.
+- Never move a `Signal` write into `spawn_blocking`: compute there, write
+  back after the `.await`. Snapshot what the blocking side needs (rows,
+  ids, seqs) on the UI thread first, P-009 style.
+- Multi-row planner writes go through `todo::store::PlannerRows` with seqs
+  allocated at snapshot time, so an edit made while the batch is in flight
+  still wins.
+- A single-row upsert from a handler (renaming one project) is fine.
+
+**Location**: `src/session_store.rs` (`project_id` column,
+`backfill_project_id_column`, `tagged_ids_conn`),
+`src/services/project_tagger.rs` (`count_sessions_tagged`,
+`retag_stored_sessions_blocking`),
+`src/components/planner_view/manage_projects.rs` (`finish_merge`,
+`write_rows_async`).
+
+**Tests**: `project_id_column_migration_adds_backfills_once_and_indexes`
+(asserts the lookup's query plan uses the index),
+`upsert_writes_the_project_id_column_and_tool_args_never_match`.
+
+**If broken**: the app freezes on a click whose cost grows with the size of
+the chat history — invisible on a test database, minutes on a real one.

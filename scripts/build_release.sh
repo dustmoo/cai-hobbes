@@ -3,6 +3,22 @@
 # This script ensures proper Info.plist configuration and code signing for biometric keychain access.
 set -e
 
+# Pinned Dioxus CLI. Hobbes is on dioxus 0.6.3; the global 'dx' is 0.7.x and must not be used.
+# Install once: cargo install dioxus-cli --version 0.6.3 --locked --root ~/.dx-0.6.3
+DX="${HOBBES_DX:-$HOME/.dx-0.6.3/bin/dx}"
+DX_REQUIRED="0.6.3"
+if [ ! -x "$DX" ]; then
+    echo "❌ dx $DX_REQUIRED not found at $DX"
+    echo "   Install with: cargo install dioxus-cli --version $DX_REQUIRED --locked --root ~/.dx-0.6.3"
+    exit 1
+fi
+DX_FOUND=$("$DX" --version 2>/dev/null | awk '{print $2}')
+if [ "$DX_FOUND" != "$DX_REQUIRED" ]; then
+    echo "❌ $DX reports version '$DX_FOUND', expected $DX_REQUIRED"
+    exit 1
+fi
+echo "✅ Using dx $DX_FOUND ($DX)"
+
 APP_PATH="target/dx/Hobbes/release/macos/Hobbes.app"
 BINARY="$APP_PATH/Contents/MacOS/Hobbes"
 PLIST="$APP_PATH/Contents/Info.plist"
@@ -22,7 +38,7 @@ if [ -n "$RESOLVED_FINGERPRINT" ]; then
 fi
 
 echo "=== Building Release App Package ==="
-dx build --release
+"$DX" build --release
 
 # Fail-safe: Ensure binary exists in bundle
 if [ ! -f "$BINARY" ]; then
