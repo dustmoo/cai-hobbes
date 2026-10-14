@@ -338,9 +338,38 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 }
 
 /// Formats a fixed-width RFC3339 `last_updated` timestamp as a short
-/// human date for the row's right-aligned meta column (e.g. "Sep 16").
+/// human date for the row's right-aligned meta column (e.g. "Sep 16"),
+/// in local time: the stored timestamp is UTC, so an evening chat would
+/// otherwise show tomorrow's date.
 fn format_session_date(last_updated: &str) -> String {
+    format_session_date_in(last_updated, &chrono::Local)
+}
+
+fn format_session_date_in<Tz: chrono::TimeZone>(last_updated: &str, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
     chrono::DateTime::parse_from_rfc3339(last_updated)
-        .map(|dt| dt.format("%b %-d").to_string())
+        .map(|dt| dt.with_timezone(tz).format("%b %-d").to_string())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_session_date_in;
+    use chrono::FixedOffset;
+
+    #[test]
+    fn session_date_is_the_local_day_not_the_utc_day() {
+        // 17:55 on Oct 13 in UTC-7 is already Oct 14 in UTC.
+        let stored = "2026-10-14T00:55:00Z";
+        let pacific = FixedOffset::west_opt(7 * 3600).unwrap();
+        assert_eq!(format_session_date_in(stored, &pacific), "Oct 13");
+        assert_eq!(format_session_date_in(stored, &FixedOffset::east_opt(0).unwrap()), "Oct 14");
+    }
+
+    #[test]
+    fn unparseable_session_date_is_blank() {
+        assert_eq!(format_session_date_in("not a date", &chrono::Local), "");
+    }
 }
