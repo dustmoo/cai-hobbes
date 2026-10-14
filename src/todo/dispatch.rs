@@ -25,8 +25,14 @@ fn mark_dispatched(t: &mut Todo, worker_session: &str) {
 }
 
 /// The extra line a Hobbes chat worker gets: how to raise a decision so it
-/// lands in the person's decision queue.
-fn chat_worker_note(todo_id: &str) -> String {
+/// lands in the person's decision queue. With the decision queue hidden
+/// (`Settings::agent_time_enabled` off) the worker asks in its own chat.
+fn chat_worker_note(todo_id: &str, decisions_on: bool) -> String {
+    if !decisions_on {
+        return "\nIf you need a decision from the user, ask it here in this chat as a one-line \
+                question with the options, then stop; the user will answer here."
+            .to_string();
+    }
     format!(
         "\nIf you need a decision from the user, call HOBBES_DECISIONS with action 'ask' \
          (todo_id: {todo_id}) giving a one-line question, the options, and an estimate, then stop; \
@@ -277,7 +283,8 @@ pub fn dispatch_to_chat(
             t.worker_model = Some(model.clone()).filter(|m| !m.trim().is_empty());
         }
     }
-    prompt.push_str(&chat_worker_note(todo_id));
+    let decisions_on = deps.settings.peek().agent_time_enabled();
+    prompt.push_str(&chat_worker_note(todo_id, decisions_on));
     if let Some(t) = deps.planner.peek().todo(todo_id) {
         let _ = crate::todo::store::save_todo(t);
     }
@@ -757,6 +764,15 @@ pub(crate) mod tests {
             dioxus::prelude::rsx! { div {} }
         });
         crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
+    fn chat_worker_note_names_the_decision_queue_only_when_it_is_on() {
+        let hidden = chat_worker_note("t1", false);
+        assert!(!hidden.contains("HOBBES_DECISIONS"), "{hidden}");
+        assert!(hidden.contains("ask it here in this chat"), "{hidden}");
+        let on = chat_worker_note("t1", true);
+        assert!(on.contains("HOBBES_DECISIONS") && on.contains("todo_id: t1"), "{on}");
     }
 
     #[test]

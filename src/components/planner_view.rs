@@ -491,7 +491,10 @@ pub fn PlannerView(
     } else {
         None
     };
-    let decisions_open = *decisions_drawer.read();
+    // Release gate (`Settings::agent_time_enabled`): Agent time and the
+    // decision queue are hidden unless the experimental switch is on.
+    let agent_time_on = settings.read().agent_time_enabled();
+    let decisions_open = *decisions_drawer.read() && agent_time_on;
 
     rsx! {
         div {
@@ -535,7 +538,8 @@ pub fn PlannerView(
                     }
                 }
                 match panel {
-                    Some(PlannerPanel::AgentTime) => rsx! { agent_time::AgentTimeView {} },
+                    Some(PlannerPanel::AgentTime) if agent_time_on => rsx! { agent_time::AgentTimeView {} },
+                    Some(PlannerPanel::AgentTime) => rsx! { CentreColumn { selection } },
                     Some(PlannerPanel::WeeklyReview) => rsx! { review::WeeklyReview {} },
                     Some(PlannerPanel::ManageProjects) => rsx! { manage_projects::ManageProjects {} },
                     None => rsx! { CentreColumn { selection } },
@@ -629,6 +633,9 @@ fn RailItemTagged<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + '
     warn: bool,
     selected: bool,
     onclick: EventHandler<MouseEvent>,
+    /// Show the "Experimental" pill after the label.
+    #[props(default)]
+    experimental: bool,
 ) -> Element {
     rsx! {
         button {
@@ -640,6 +647,9 @@ fn RailItemTagged<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + '
             onclick: move |evt| onclick.call(evt),
             Icon { width: 16, height: 16, icon }
             span { class: "flex-1 truncate text-left", "{label}" }
+            if experimental {
+                ExperimentalPill {}
+            }
             if let Some(t) = tag {
                 if warn {
                     span { class: "rounded-full bg-yellow-800 px-1.5 text-[10px] font-bold leading-4 text-yellow-300", "{t}" }
@@ -654,6 +664,10 @@ fn RailItemTagged<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + '
 #[component]
 fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
+    let settings = use_context::<Signal<Settings>>();
+    // Release gate: "Decisions" and "Agent time" only when the experimental
+    // switch is on (`Settings::agent_time_enabled`).
+    let agent_time_on = settings.read().agent_time_enabled();
     // Rail mode's projects popover (hook declared before the rail early-return).
     let mut projects_open = use_signal(|| false);
     // Calls the agent-time run is waiting on the user for (a memo, so chat
@@ -807,23 +821,25 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                     selected: is_view(smart[5].0),
                     onclick: move |_| selection.set(PlannerSelection::View(smart[5].0)),
                 }
-                RailIconButton {
-                    icon: fi_icons::FiGitMerge,
-                    label: rail_label("Decisions", decisions_count),
-                    badge: decisions_count,
-                    selected: *drawer.read(),
-                    onclick: move |_| open_decisions(),
-                }
-                RailIconButton {
-                    icon: fi_icons::FiClock,
-                    label: "Agent time".to_string(),
-                    badge: 0usize,
-                    selected: is_panel(PlannerPanel::AgentTime),
-                    onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
+                if agent_time_on {
+                    RailIconButton {
+                        icon: fi_icons::FiGitMerge,
+                        label: rail_label("Decisions", decisions_count),
+                        badge: decisions_count,
+                        selected: *drawer.read(),
+                        onclick: move |_| open_decisions(),
+                    }
+                    RailIconButton {
+                        icon: fi_icons::FiClock,
+                        label: "Agent time".to_string(),
+                        badge: 0usize,
+                        selected: is_panel(PlannerPanel::AgentTime),
+                        onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
+                    }
                 }
                 RailIconButton {
                     icon: fi_icons::FiBarChart2,
-                    label: "Weekly review".to_string(),
+                    label: "Weekly review (experimental)".to_string(),
                     badge: 0usize,
                     selected: is_panel(PlannerPanel::WeeklyReview),
                     onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::WeeklyReview)),
@@ -900,21 +916,23 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                 selected: is_view(TodoView::Logbook),
                 onclick: move |_| selection.set(PlannerSelection::View(TodoView::Logbook)),
             }
-            RailItemTagged {
-                icon: fi_icons::FiGitMerge,
-                label: "Decisions",
-                tag: badge_text(decisions_count),
-                warn: true,
-                selected: *drawer.read(),
-                onclick: move |_| open_decisions(),
-            }
-            RailItemTagged {
-                icon: fi_icons::FiClock,
-                label: "Agent time",
-                tag: agent_time_label,
-                warn: held_count > 0,
-                selected: is_panel(PlannerPanel::AgentTime),
-                onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
+            if agent_time_on {
+                RailItemTagged {
+                    icon: fi_icons::FiGitMerge,
+                    label: "Decisions",
+                    tag: badge_text(decisions_count),
+                    warn: true,
+                    selected: *drawer.read(),
+                    onclick: move |_| open_decisions(),
+                }
+                RailItemTagged {
+                    icon: fi_icons::FiClock,
+                    label: "Agent time",
+                    tag: agent_time_label,
+                    warn: held_count > 0,
+                    selected: is_panel(PlannerPanel::AgentTime),
+                    onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::AgentTime)),
+                }
             }
             RailItemTagged {
                 icon: fi_icons::FiBarChart2,
@@ -923,6 +941,7 @@ fn LeftRail(mut selection: Signal<PlannerSelection>, railed: bool) -> Element {
                 warn: false,
                 selected: is_panel(PlannerPanel::WeeklyReview),
                 onclick: move |_| selection.set(PlannerSelection::Panel(PlannerPanel::WeeklyReview)),
+                experimental: true,
             }
 
             if has_projects {
@@ -1002,6 +1021,20 @@ type RailAreaRows = (String, Vec<RailProjectRow>);
 
 /// One icon button in the railed nav: tooltip + aria-label carry the list
 /// name and count, a 10px badge shows the count (hidden at zero).
+/// The small "Experimental" pill for surfaces that ship but aren't settled
+/// (the weekly review). Same outline-pill vocabulary as the review's
+/// "Correction" chip.
+#[component]
+pub(crate) fn ExperimentalPill() -> Element {
+    rsx! {
+        span {
+            class: "shrink-0 rounded-full border border-yellow-600 px-1.5 text-[10px] uppercase leading-4 tracking-[0.08em] text-yellow-200",
+            title: "Experimental: still taking shape, and may change",
+            "Experimental"
+        }
+    }
+}
+
 #[component]
 fn RailIconButton<I: dioxus_free_icons::IconShape + Copy + Clone + PartialEq + 'static>(
     icon: I,

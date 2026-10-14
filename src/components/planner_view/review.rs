@@ -419,6 +419,9 @@ pub(crate) fn WeeklyReview() -> Element {
     });
 
     let style = settings.read().planner_review_style;
+    // Release gate: the decision-queue and agent-time cards only show with
+    // the experimental switch on (`Settings::agent_time_enabled`).
+    let agent_time_on = settings.read().agent_time_enabled();
     let start = week_of();
     let state = planner.read();
     let review = measures::week_review(&state, style, start, *leverage.read(), &trust.read());
@@ -551,6 +554,7 @@ pub(crate) fn WeeklyReview() -> Element {
                 div {
                     class: "flex flex-wrap items-baseline gap-2.5",
                     h1 { class: "text-xl font-semibold", "Weekly review" }
+                    span { class: "self-center", super::ExperimentalPill {} }
                     span { class: "text-sm text-fg-muted", "{week_label(start)}" }
                     div { class: "flex-1" }
                     button {
@@ -865,60 +869,64 @@ pub(crate) fn WeeklyReview() -> Element {
                                 span { class: "text-xl font-semibold tabular-nums", "{review.ground_covered.outcomes_reached}" }
                                 span { class: "{SUB}", "outcomes reached" }
                             }
-                            div { class: "flex flex-col",
-                                span { class: "text-xl font-semibold tabular-nums", "{review.ground_covered.decisions_cleared}" }
-                                span { class: "{SUB}", "decisions cleared" }
+                            if agent_time_on {
+                                div { class: "flex flex-col",
+                                    span { class: "text-xl font-semibold tabular-nums", "{review.ground_covered.decisions_cleared}" }
+                                    span { class: "{SUB}", "decisions cleared" }
+                                }
                             }
                         }
                     }
-                    // ── Judgment vs routing ────────────────────────────
-                    div {
-                        class: "{PANEL}",
-                        span { class: "{EYEBROW}", "Judgment vs routing" }
+                    if agent_time_on {
+                        // ── Judgment vs routing ────────────────────────────
                         div {
-                            class: "flex flex-wrap items-baseline gap-2.5",
-                            match routing_now {
-                                Some(r) => rsx! {
-                                    span { class: "{BIG}", "{r.routing}" }
-                                    span { class: "{SUB}",
-                                        "routing calls reached you"
-                                        if let Some(f) = routing_first.filter(|f| f.routing > r.routing) {
-                                            " \u{b7} down from {f.routing}"
+                            class: "{PANEL}",
+                            span { class: "{EYEBROW}", "Judgment vs routing" }
+                            div {
+                                class: "flex flex-wrap items-baseline gap-2.5",
+                                match routing_now {
+                                    Some(r) => rsx! {
+                                        span { class: "{BIG}", "{r.routing}" }
+                                        span { class: "{SUB}",
+                                            "routing calls reached you"
+                                            if let Some(f) = routing_first.filter(|f| f.routing > r.routing) {
+                                                " \u{b7} down from {f.routing}"
+                                            }
                                         }
-                                    }
-                                },
-                                None => rsx! {
-                                    span { class: "{BIG} text-fg-muted", "\u{2014}" }
-                                    span { class: "{SUB}", "nothing measured this week" }
-                                },
+                                    },
+                                    None => rsx! {
+                                        span { class: "{BIG} text-fg-muted", "\u{2014}" }
+                                        span { class: "{SUB}", "nothing measured this week" }
+                                    },
+                                }
                             }
-                        }
-                        div { class: "flex gap-3 text-[10.5px] text-fg-muted",
-                            span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-primary-400" } "judgment" }
-                            span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-gray-400" } "routing" }
-                        }
-                        div {
-                            class: "flex h-[120px] items-end gap-2",
-                            for (i, r) in routing.iter().enumerate() {
-                                div {
-                                    key: "{i}",
-                                    class: "flex flex-1 flex-col items-center justify-end gap-1",
-                                    span { class: "font-mono text-[10px] text-fg-muted",
-                                        match r { Some(r) => r.routing.to_string(), None => "\u{2014}".to_string() }
-                                    }
+                            div { class: "flex gap-3 text-[10.5px] text-fg-muted",
+                                span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-primary-400" } "judgment" }
+                                span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-gray-400" } "routing" }
+                            }
+                            div {
+                                class: "flex h-[120px] items-end gap-2",
+                                for (i, r) in routing.iter().enumerate() {
                                     div {
-                                        class: "flex w-full max-w-[30px] flex-col",
-                                        if let Some(r) = r {
-                                            span { class: "rounded-t-sm bg-gray-400", style: "height: {(r.routing as f64 / routing_scale as f64 * 90.0).round()}px;" }
-                                            span { class: "bg-primary-400", style: "height: {(r.judgment as f64 / routing_scale as f64 * 90.0).round()}px;" }
+                                        key: "{i}",
+                                        class: "flex flex-1 flex-col items-center justify-end gap-1",
+                                        span { class: "font-mono text-[10px] text-fg-muted",
+                                            match r { Some(r) => r.routing.to_string(), None => "\u{2014}".to_string() }
+                                        }
+                                        div {
+                                            class: "flex w-full max-w-[30px] flex-col",
+                                            if let Some(r) = r {
+                                                span { class: "rounded-t-sm bg-gray-400", style: "height: {(r.routing as f64 / routing_scale as f64 * 90.0).round()}px;" }
+                                                span { class: "bg-primary-400", style: "height: {(r.judgment as f64 / routing_scale as f64 * 90.0).round()}px;" }
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        div { class: "flex gap-2 font-mono text-[10px] text-fg-muted",
-                            for (i, w) in week_labels.iter().enumerate() {
-                                span { key: "{i}", class: "flex-1 text-center", "{w}" }
+                            div { class: "flex gap-2 font-mono text-[10px] text-fg-muted",
+                                for (i, w) in week_labels.iter().enumerate() {
+                                    span { key: "{i}", class: "flex-1 text-center", "{w}" }
+                                }
                             }
                         }
                     }
@@ -968,52 +976,54 @@ pub(crate) fn WeeklyReview() -> Element {
                             }
                         }
                     }
-                    // ── Agent-time proposals ───────────────────────────
-                    div {
-                        class: "{PANEL}",
-                        span { class: "{EYEBROW}", "Agent-time proposals" }
-                        if prop_total == 0 {
-                            div {
-                                class: "flex items-baseline gap-2.5",
-                                span { class: "{BIG} text-fg-muted", "\u{2014}" }
-                                span { class: "{SUB}", "none decided this week" }
-                            }
-                        } else {
-                            div {
-                                class: "flex items-baseline gap-2.5",
-                                span { class: "{BIG}", "{prop_acc} of {prop_total}" }
-                                span { class: "{SUB}", "accepted this week" }
-                            }
-                            div { class: "flex gap-3 text-[10.5px] text-fg-muted",
-                                span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-primary-400" } "accepted" }
-                                span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-gray-600" } "dismissed" }
-                            }
-                            div {
-                                class: "flex flex-col gap-3",
-                                for (label, a, d) in prop_rows.iter().copied() {
-                                    div {
-                                        key: "{label}",
-                                        class: "flex flex-col gap-1",
-                                        div { class: "flex text-xs text-fg",
-                                            span { "{label}" }
-                                            div { class: "flex-1" }
-                                            span { class: "font-mono text-[11px] text-fg-muted", "{a} of {a + d}" }
-                                        }
-                                        div { class: "flex h-2.5 overflow-hidden rounded-full bg-input",
-                                            span { class: "bg-primary-400", style: "width: {pct_of(a, prop_scale)}%;" }
-                                            span { class: "bg-gray-600", style: "width: {pct_of(d, prop_scale)}%;" }
+                    if agent_time_on {
+                        // ── Agent-time proposals ───────────────────────────
+                        div {
+                            class: "{PANEL}",
+                            span { class: "{EYEBROW}", "Agent-time proposals" }
+                            if prop_total == 0 {
+                                div {
+                                    class: "flex items-baseline gap-2.5",
+                                    span { class: "{BIG} text-fg-muted", "\u{2014}" }
+                                    span { class: "{SUB}", "none decided this week" }
+                                }
+                            } else {
+                                div {
+                                    class: "flex items-baseline gap-2.5",
+                                    span { class: "{BIG}", "{prop_acc} of {prop_total}" }
+                                    span { class: "{SUB}", "accepted this week" }
+                                }
+                                div { class: "flex gap-3 text-[10.5px] text-fg-muted",
+                                    span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-primary-400" } "accepted" }
+                                    span { class: "inline-flex items-center gap-1", span { class: "h-2 w-2 rounded-full bg-gray-600" } "dismissed" }
+                                }
+                                div {
+                                    class: "flex flex-col gap-3",
+                                    for (label, a, d) in prop_rows.iter().copied() {
+                                        div {
+                                            key: "{label}",
+                                            class: "flex flex-col gap-1",
+                                            div { class: "flex text-xs text-fg",
+                                                span { "{label}" }
+                                                div { class: "flex-1" }
+                                                span { class: "font-mono text-[11px] text-fg-muted", "{a} of {a + d}" }
+                                            }
+                                            div { class: "flex h-2.5 overflow-hidden rounded-full bg-input",
+                                                span { class: "bg-primary-400", style: "width: {pct_of(a, prop_scale)}%;" }
+                                                span { class: "bg-gray-600", style: "width: {pct_of(d, prop_scale)}%;" }
+                                            }
                                         }
                                     }
                                 }
                             }
-                        }
-                        div { class: "mt-auto flex items-center gap-1.5 text-[11px] text-fg-muted",
-                            Icon { width: 11, height: 11, icon: fi_icons::FiShield }
-                            {
-                                let l = review.trust;
-                                match l.acceptance_rate() {
-                                    Some(r) => format!("All time: {:.0}% accepted", r * 100.0),
-                                    None => "No proposals decided yet".to_string(),
+                            div { class: "mt-auto flex items-center gap-1.5 text-[11px] text-fg-muted",
+                                Icon { width: 11, height: 11, icon: fi_icons::FiShield }
+                                {
+                                    let l = review.trust;
+                                    match l.acceptance_rate() {
+                                        Some(r) => format!("All time: {:.0}% accepted", r * 100.0),
+                                        None => "No proposals decided yet".to_string(),
+                                    }
                                 }
                             }
                         }

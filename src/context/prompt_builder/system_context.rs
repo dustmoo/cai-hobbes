@@ -147,7 +147,15 @@ impl<'a> PromptBuilder<'a> {
         tools.retain(|t: &ToolDefinition| {
             !crate::components::builtin_tools::is_agent_time_tool(&t.name)
         });
-        if self.agent_time_tools {
+        // Release gate: with Agent time / Decisions hidden, neither tool is
+        // offered anywhere — not even to a (stale) leased session.
+        let agent_time_on = self.settings.agent_time_enabled();
+        if !agent_time_on {
+            tools.retain(|t: &ToolDefinition| {
+                !crate::components::builtin_tools::is_experimental_agent_tool(&t.name)
+            });
+        }
+        if self.agent_time_tools && agent_time_on {
             tools.extend(
                 crate::mcp::planner_client::PlannerClient::agent_time_tools()
                     .iter()

@@ -202,6 +202,9 @@ pub(crate) fn card_open(linked: Option<&str>, in_memory: bool, fleet_origin: Opt
 pub(crate) fn AgentsReadout() -> Element {
     let planner = use_context::<Signal<PlannerState>>();
     let mut drawer = use_context::<DecisionsDrawerContext>().0;
+    // Release gate: without the decision queue, "needs you" is a count only
+    // (each card opens its worker instead).
+    let decisions_on = use_context::<Signal<crate::settings::Settings>>().read().agent_time_enabled();
     let (working, needs, done, minutes) = {
         let state = planner.read();
         let lane = lanes::agent_lane(&state.todos, today());
@@ -230,13 +233,15 @@ pub(crate) fn AgentsReadout() -> Element {
                 }
                 span { class: "text-fg-muted", "{done} done" }
             }
-            if needs > 0 {
+            if needs > 0 && decisions_on {
                 button {
                     class: "self-start font-mono text-[10px] text-primary-300 hover:text-fg",
                     title: "Open the decision queue",
                     onclick: move |_| drawer.set(true),
                     "Open decisions \u{b7} about {minutes} min to clear"
                 }
+            } else if needs > 0 {
+                span { class: "font-mono text-[10px] text-fg-muted", "about {minutes} min to clear" }
             } else {
                 span { class: "font-mono text-[10px] text-fg-muted", "no decisions waiting" }
             }
@@ -260,6 +265,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let fleet_state = use_context::<Signal<FleetState>>();
     let session_state = use_context::<Signal<SessionState>>();
     let mut drawer = use_context::<DecisionsDrawerContext>().0;
+    let decisions_on = use_context::<Signal<crate::settings::Settings>>().read().agent_time_enabled();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut detail = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
     let mut collapsed = use_signal(|| None::<bool>);
@@ -402,10 +408,12 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         span { class: "text-fg", "Needs you" }
                         span { class: "font-mono normal-case tracking-normal", "\u{b7} about {minutes} min" }
                         div { class: "flex-1" }
-                        button {
-                            class: "text-[11px] normal-case tracking-normal rounded px-2 py-0.5 bg-btn-primary text-fg hover:bg-btn-primary-hover",
-                            onclick: move |_| drawer.set(true),
-                            "Open decisions"
+                        if decisions_on {
+                            button {
+                                class: "text-[11px] normal-case tracking-normal rounded px-2 py-0.5 bg-btn-primary text-fg hover:bg-btn-primary-hover",
+                                onclick: move |_| drawer.set(true),
+                                "Open decisions"
+                            }
                         }
                     }
                     for c in needs {

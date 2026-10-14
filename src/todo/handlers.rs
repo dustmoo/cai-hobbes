@@ -1126,7 +1126,9 @@ fn agent_lane_section(state: &PlannerState, today: NaiveDate) -> Option<String> 
                     .unwrap_or_else(|| format!("[{}] {} — waiting on the user", t.id, truncate_title(&t.title)))
             })
             .collect();
-        out.push_str(&format!("\nNeeds you (HOBBES_DECISIONS): {}", lines.join("; ")));
+        // Tool-neutral: the decision queue may be hidden (the release gate,
+        // `Settings::agent_time_enabled`), and this handler has no settings.
+        out.push_str(&format!("\nNeeds you (waiting on the user): {}", lines.join("; ")));
     }
     list("Stuck", &lane.stuck, &mut out);
     Some(out)
@@ -3405,11 +3407,15 @@ pub fn planner_today_context_with_events(
     if let Some(v) = your_time_context(planner, today, step) {
         ctx["your_time"] = v;
     }
-    if let Some(v) = agent_lane_context(planner, today) {
+    let agent_time_on = settings.agent_time_enabled();
+    if let Some(v) = agent_lane_context(planner, today, agent_time_on) {
         ctx["agents"] = v;
     }
-    if let Some(v) = agent_time_context(planner, today, now, step) {
-        ctx["agent_time"] = v;
+    // Agent time is behind the release gate: no line about it while hidden.
+    if agent_time_on {
+        if let Some(v) = agent_time_context(planner, today, now, step) {
+            ctx["agent_time"] = v;
+        }
     }
     Some(ctx)
 }
@@ -3459,7 +3465,7 @@ fn your_time_context(planner: &PlannerState, today: NaiveDate, step: u32) -> Opt
 
 /// `{"summary": "2 working · 1 needs you", "needs_you": [...]}` — `None`
 /// when the agent lane is empty.
-fn agent_lane_context(planner: &PlannerState, today: NaiveDate) -> Option<Value> {
+fn agent_lane_context(planner: &PlannerState, today: NaiveDate, decisions_on: bool) -> Option<Value> {
     let lane = super::lanes::agent_lane(&planner.todos, today);
     if lane.is_empty() {
         return None;
@@ -3474,9 +3480,11 @@ fn agent_lane_context(planner: &PlannerState, today: NaiveDate) -> Option<Value>
         .collect();
     if !needs.is_empty() {
         v["needs_you"] = serde_json::json!(needs);
-        v["instruction"] = serde_json::json!(
+        v["instruction"] = serde_json::json!(if decisions_on {
             "Agent work waiting on the user's judgment — HOBBES_DECISIONS lists and resolves it."
-        );
+        } else {
+            "Agent work waiting on the user's judgment — the user unblocks it in that worker's chat or in the Fleet."
+        });
     }
     Some(v)
 }
@@ -5830,7 +5838,11 @@ mod tests {
         agent_todo(&mut state, "Queued one");
         state.agent_time_grant = model::AgentTimeGrant { enabled: true, daily_minutes: 45, ..Default::default() };
 
-        let ctx = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        // Agent time is behind the release gate (`experimental_agent_time`).
+        let gated_on = crate::settings::Settings { experimental_agent_time: true, ..ctx_settings(true, true) };
+        let hidden = planner_today_context(&state, &ctx_settings(true, true), today()).unwrap();
+        assert!(hidden.get("agent_time").is_none(), "no agent-time line while hidden");
+        let ctx = planner_today_context(&state, &gated_on, today()).unwrap();
         assert_eq!(ctx["your_time"]["today"], "1h protected (Reading 19:00–20:00) — plan around it, never over it");
         assert_eq!(ctx["your_time"]["week"], "Outside 0m/4h · Reading 1h/3h");
         assert_eq!(ctx["agents"]["summary"], "1 needs you · 1 to dispatch");

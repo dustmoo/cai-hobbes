@@ -124,6 +124,18 @@ pub fn is_planner_tool(name: &str) -> bool {
         )
 }
 
+/// The tools behind the `experimental_agent_time` release gate
+/// ([`Settings::agent_time_enabled`]): withheld from every prompt
+/// (system_context.rs) and refused at dispatch while it is off.
+pub fn is_experimental_agent_tool(name: &str) -> bool {
+    matches!(name, "HOBBES_AGENT_TIME" | "HOBBES_DECISIONS")
+}
+
+/// The refusal a gated tool gets while Agent time / Decisions are hidden.
+pub const EXPERIMENTAL_AGENT_TOOL_REFUSAL: &str =
+    "Agent time and the decision queue aren't available in this version of Hobbes. \
+     If you need the user's decision, ask them directly in this chat.";
+
 /// The agent-time tool family. Never offered to an ordinary chat: it is not
 /// in `PlannerClient::list_tools`, and the agent-time runtime adds
 /// `PlannerClient::agent_time_tools()` only to a session for which
@@ -586,6 +598,9 @@ fn run_planner_tool(
             ToolCallStatus::Error,
             "The planner is disabled in Settings.".to_string(),
         );
+    }
+    if is_experimental_agent_tool(tool_name) && !deps.settings.read().agent_time_enabled() {
+        return (ToolCallStatus::Error, EXPERIMENTAL_AGENT_TOOL_REFUSAL.to_string());
     }
 
     use crate::todo::handlers;
@@ -1194,6 +1209,50 @@ mod tests {
             assert!(!builtin_needs_approval(off, &tc, &args, "chat"));
             let (status, _) = handle.block_on(project_merge_tool(off, &args, true));
             assert_eq!(status, ToolCallStatus::Error);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    /// The release gate (`Settings::agent_time_enabled`, off by default):
+    /// dispatch refuses HOBBES_DECISIONS and HOBBES_AGENT_TIME outright, and
+    /// the decision queue answers again once the switch is on.
+    #[test]
+    fn hidden_agent_time_and_decisions_are_refused_at_dispatch() {
+        assert!(is_experimental_agent_tool("HOBBES_AGENT_TIME"));
+        assert!(is_experimental_agent_tool("HOBBES_DECISIONS"));
+        assert!(!is_experimental_agent_tool("HOBBES_DISPATCH"));
+        assert!(!is_experimental_agent_tool("HOBBES_TODO_LIST"));
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let hidden = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                Settings::default(),
+            );
+            let list = serde_json::json!({ "action": "list" });
+            for tool in ["HOBBES_DECISIONS", "HOBBES_AGENT_TIME"] {
+                let (status, msg) = run_planner_tool(hidden, tool, &list, "chat");
+                assert_eq!(status, ToolCallStatus::Error, "{tool}: {msg}");
+                assert_eq!(msg, EXPERIMENTAL_AGENT_TOOL_REFUSAL, "{tool}");
+            }
+            // The rest of the planner is untouched.
+            let (status, msg) = run_planner_tool(hidden, "HOBBES_TODO_LIST", &serde_json::json!({}), "chat");
+            assert_eq!(status, ToolCallStatus::Completed, "{msg}");
+
+            let on = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                Settings { experimental_agent_time: true, ..Default::default() },
+            );
+            let (status, msg) = run_planner_tool(on, "HOBBES_DECISIONS", &list, "chat");
+            assert_eq!(status, ToolCallStatus::Completed, "{msg}");
+            assert!(msg.starts_with("No decisions waiting."), "{msg}");
+            // HOBBES_AGENT_TIME still has its own lease check behind the gate.
+            let (status, msg) =
+                run_planner_tool(on, "HOBBES_AGENT_TIME", &serde_json::json!({"action": "start", "intent": "x"}), "chat");
+            assert_eq!(status, ToolCallStatus::Error);
+            assert_ne!(msg, EXPERIMENTAL_AGENT_TOOL_REFUSAL);
             rsx! { div {} }
         });
         crate::test_support::rebuild_or_fail(&mut dom);
