@@ -242,8 +242,10 @@ pub(crate) fn AgentsReadout() -> Element {
                 }
             } else if needs > 0 {
                 span { class: "font-mono text-[10px] text-fg-muted", "about {minutes} min to clear" }
-            } else {
+            } else if decisions_on {
                 span { class: "font-mono text-[10px] text-fg-muted", "no decisions waiting" }
+            } else {
+                span { class: "font-mono text-[10px] text-fg-muted", "nothing waiting on you" }
             }
         }
     }
