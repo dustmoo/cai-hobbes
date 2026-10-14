@@ -431,6 +431,18 @@ pub struct Settings {
     /// (`todo::measures::suggest_review_style`) but never switches silently.
     #[serde(default)]
     pub planner_review_style: crate::todo::model::ReviewStyle,
+    /// **Release gate for Agent time and Decisions** (SYMBIOTIC_PLANNER.md).
+    /// Off by default and deliberately not shown in Settings: both features
+    /// are hidden for release while they mature. When off, the Planner nav
+    /// hides "Decisions" and "Agent time", the agent-time scheduler never
+    /// starts a window, "Prep this" is hidden, the weekly review drops its
+    /// agent-time / judgment cards, and `HOBBES_AGENT_TIME` /
+    /// `HOBBES_DECISIONS` are withheld from every prompt and refused at
+    /// dispatch. To re-enable, set `"experimental_agent_time": true` in
+    /// settings.json and restart. Read it through
+    /// [`Settings::agent_time_enabled`], never directly.
+    #[serde(default)]
+    pub experimental_agent_time: bool,
 
     // ── Fleet (Pro) ─────────────────────────────────────────────────────────
     /// Master switch for fleet observation: when on (and Pro is active), the
@@ -464,6 +476,13 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// Whether Agent time and the Decisions queue are on: the planner is
+    /// enabled AND the hidden `experimental_agent_time` release gate is set.
+    /// The one switch every Agent-time / Decisions surface consults.
+    pub fn agent_time_enabled(&self) -> bool {
+        self.planner_enabled && self.experimental_agent_time
+    }
+
     /// Add a trust rule, deduplicating on the full (server, tool,
     /// command_prefix, project_id) tuple — returns the surviving rule's id.
     pub fn add_trust_rule(
@@ -962,6 +981,7 @@ impl Default for Settings {
             planner_calendar_subscriptions: Vec::new(),
             planner_calendar_counts_against_capacity: true,
             planner_default_estimate_minutes: 0,
+            experimental_agent_time: false,
             planner_default_block_minutes: default_planner_block_minutes(),
             planner_priority: Default::default(),
             planner_review_style: Default::default(),
@@ -2410,8 +2430,17 @@ pub struct UiState {
     pub fleet_active: bool,
     /// Show open tabs as a vertical list in a left sidebar instead of the
     /// top strip (which then keeps only the app chrome). Off = the strip.
-    #[serde(default)]
+    /// On by default since v0.12.2 (see `tabs_sidebar_default_applied`).
+    #[serde(default = "default_true")]
     pub tabs_as_sidebar: bool,
+    /// One-time marker for the v0.12.2 switch to side tabs by default.
+    /// `tabs_as_sidebar` always serialises, so a saved `false` can't tell
+    /// "chose the top strip" from "never touched it" (pre-release builds
+    /// saved the old default). A file without this marker is flipped to the
+    /// sidebar once on load ([`UiState::apply_tab_layout_default`]); from
+    /// then on the saved choice is the user's and is kept.
+    #[serde(default)]
+    pub tabs_sidebar_default_applied: bool,
     /// The tab sidebar's display order (sort lens + grouping). A view
     /// preference, never written to `open_tabs`. Missing = open order.
     #[serde(default)]
@@ -2454,6 +2483,19 @@ fn default_planner_today_width() -> f64 {
 }
 
 impl UiState {
+    /// The one-time v0.12.2 migration to side tabs by default: a state saved
+    /// before the marker existed moves to the sidebar and gets the marker.
+    /// Returns whether anything changed (the caller saves). A user who picks
+    /// the top strip afterwards keeps it — the marker is already set.
+    pub fn apply_tab_layout_default(&mut self) -> bool {
+        if self.tabs_sidebar_default_applied {
+            return false;
+        }
+        self.tabs_as_sidebar = true;
+        self.tabs_sidebar_default_applied = true;
+        true
+    }
+
     /// Drop saved list orders for projects that no longer exist. Leftover
     /// keys are harmless; this just keeps ui_state.json from accreting them.
     pub fn prune_planner_list_orders(&mut self, live_project_ids: &[&str]) {
@@ -2488,7 +2530,8 @@ impl Default for UiState {
             planner_active: false,
             fleet_tab_open: false,
             fleet_active: false,
-            tabs_as_sidebar: false,
+            tabs_as_sidebar: true,
+            tabs_sidebar_default_applied: true,
             tab_sidebar_order: crate::tab_list::TabListOrder::default(),
             tab_sidebar_width: default_tab_sidebar_width(),
             tab_sidebar_railed: false,
@@ -2536,10 +2579,17 @@ impl UiStateManager {
             Err(_) => return UiState::default(),
         };
 
-        serde_json::from_str(&content).unwrap_or_else(|e| {
+        let mut state: UiState = serde_json::from_str(&content).unwrap_or_else(|e| {
             tracing::error!("Failed to deserialize UI state, using default: {}", e);
             UiState::default()
-        })
+        });
+        if state.apply_tab_layout_default() {
+            tracing::info!("UI state: switched to side tabs (the new default), once");
+            if let Err(e) = self.save(&state) {
+                tracing::warn!("Failed to save migrated UI state: {}", e);
+            }
+        }
+        state
     }
 
     pub fn save(&self, state: &UiState) -> Result<(), std::io::Error> {
@@ -2719,9 +2769,9 @@ mod tests {
     }
 
     #[test]
-    fn ui_state_without_tab_sidebar_fields_keeps_the_top_strip() {
+    fn ui_state_without_tab_sidebar_fields_gets_side_tabs() {
         let state: UiState = serde_json::from_str(r#"{"settings_panel_width": 400.0}"#).unwrap();
-        assert!(!state.tabs_as_sidebar, "missing field = today's top tab strip");
+        assert!(state.tabs_as_sidebar, "missing field = side tabs, the v0.12.2 default");
         assert!(state.tab_sidebar_order.is_manual());
 
         use crate::tab_list::{TabGroupBy, TabListOrder, TabSortKey};
@@ -2736,6 +2786,62 @@ mod tests {
         let back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert!(back.tabs_as_sidebar);
         assert_eq!(back.tab_sidebar_order, state.tab_sidebar_order);
+    }
+
+    #[test]
+    fn fresh_installs_default_to_side_tabs_and_need_no_migration() {
+        let mut fresh = UiState::default();
+        assert!(fresh.tabs_as_sidebar);
+        assert!(fresh.tabs_sidebar_default_applied);
+        assert!(!fresh.apply_tab_layout_default(), "nothing to migrate");
+    }
+
+    #[test]
+    fn a_pre_marker_top_strip_moves_to_side_tabs_once() {
+        // Pre-release builds always saved the old default `false`.
+        let mut state: UiState =
+            serde_json::from_str(r#"{"settings_panel_width": 400.0, "tabs_as_sidebar": false}"#).unwrap();
+        assert!(!state.tabs_sidebar_default_applied);
+        assert!(state.apply_tab_layout_default());
+        assert!(state.tabs_as_sidebar && state.tabs_sidebar_default_applied);
+
+        // The user then picks the top strip: that choice survives reloads.
+        state.tabs_as_sidebar = false;
+        let mut back: UiState = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(!back.apply_tab_layout_default());
+        assert!(!back.tabs_as_sidebar, "an explicit top-strip choice after the switch is kept");
+    }
+
+    #[test]
+    fn ui_state_manager_load_migrates_and_persists_the_side_tab_default() {
+        let dir = std::env::temp_dir().join(format!("hobbes-ui-state-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ui_state.json");
+        std::fs::write(&path, r#"{"settings_panel_width": 400.0, "tabs_as_sidebar": false}"#).unwrap();
+        let manager = UiStateManager::new(path.clone());
+        let loaded = manager.load();
+        assert!(loaded.tabs_as_sidebar);
+        let on_disk: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["tabs_sidebar_default_applied"], serde_json::json!(true));
+
+        // Choose the top strip, save, reload: kept.
+        let mut chosen = loaded;
+        chosen.tabs_as_sidebar = false;
+        manager.save(&chosen).unwrap();
+        assert!(!manager.load().tabs_as_sidebar);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_time_and_decisions_are_hidden_by_default() {
+        let s = Settings::default();
+        assert!(!s.experimental_agent_time);
+        assert!(!s.agent_time_enabled());
+        // The switch needs the planner as well.
+        let mut on = Settings { experimental_agent_time: true, ..Settings::default() };
+        assert!(on.agent_time_enabled());
+        on.planner_enabled = false;
+        assert!(!on.agent_time_enabled());
     }
 
     /// Every Claude model slug used to fall through `get_default_model_icon`'s

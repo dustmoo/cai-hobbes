@@ -515,7 +515,7 @@ pub(super) fn TodoRow(
                     }
                 }
 
-                if todo.prep_requested {
+                if todo.prep_requested && settings.read().agent_time_enabled() {
                     span {
                         class: "shrink-0 text-fg-muted",
                         title: "Hobbes will prep this",

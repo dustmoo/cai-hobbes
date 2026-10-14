@@ -581,6 +581,13 @@ pub fn start_now(
             "The planner is disabled in Settings; agent time runs through it.".into(),
         ));
     }
+    // Release gate (`Settings::agent_time_enabled`): hidden features never
+    // open a window, whatever the saved grant says.
+    if !settings.peek().agent_time_enabled() {
+        return Err(AgentTimeRefusal::Invalid(
+            "Agent time isn't available in this version of Hobbes.".into(),
+        ));
+    }
     let budget = start_check(&planner.peek(), today, now)?;
     // The grant's model, validated before anything opens: a stale choice is
     // refused with what is allowed, never swapped for another model.

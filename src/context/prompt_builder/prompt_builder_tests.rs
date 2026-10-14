@@ -809,7 +809,8 @@ fn planner_tools_are_withheld_when_the_planner_is_disabled() {
 /// agent-time session only.
 #[test]
 fn agent_time_tool_only_in_the_leased_agent_time_session() {
-    let settings = Settings::default();
+    // Behind the release gate: this exercises the enabled path.
+    let settings = Settings { experimental_agent_time: true, ..Settings::default() };
     let mut session = session_with_planner_tools();
     let has_it = |p: &crate::context::prompt_builder::PromptBuildResult| {
         p.prompt.tools.iter().any(|t| t.name == "HOBBES_AGENT_TIME")
@@ -857,6 +858,79 @@ fn agent_time_tool_only_in_the_leased_agent_time_session() {
             .count(),
         1
     );
+}
+
+/// The release gate (`Settings::agent_time_enabled`, off by default):
+/// neither HOBBES_AGENT_TIME nor HOBBES_DECISIONS reaches any prompt — not
+/// a normal chat, not even a leased agent-time session — while the rest of
+/// the planner (HOBBES_DISPATCH included) stays.
+#[test]
+fn hidden_agent_time_and_decisions_are_withheld_from_every_prompt() {
+    let hidden = Settings::default();
+    assert!(!hidden.agent_time_enabled());
+    let mut session = session_with_planner_tools();
+    if let Some(ctx) = session.active_context.mcp_tools.as_mut() {
+        ctx.servers[0]
+            .tools
+            .extend(crate::mcp::planner_client::PlannerClient::agent_time_tools());
+    }
+    let names = |p: &crate::context::prompt_builder::PromptBuildResult| -> Vec<String> {
+        p.prompt.tools.iter().map(|t| t.name.clone()).collect()
+    };
+    for leased in [false, true] {
+        let prompt = PromptBuilder::new(&session, &hidden)
+            .with_agent_time_tools(leased)
+            .build_prompt("Hi".to_string());
+        let tools = names(&prompt);
+        assert!(!tools.iter().any(|t| t == "HOBBES_AGENT_TIME"), "leased={leased}: {tools:?}");
+        assert!(!tools.iter().any(|t| t == "HOBBES_DECISIONS"), "leased={leased}: {tools:?}");
+        assert!(tools.iter().any(|t| t == "HOBBES_DISPATCH"), "dispatch stays: {tools:?}");
+        assert!(tools.iter().any(|t| t == "HOBBES_TODO_CREATE"));
+    }
+
+    // Switched on, the decision queue is offered again.
+    let on = Settings { experimental_agent_time: true, ..Settings::default() };
+    let prompt = PromptBuilder::new(&session, &on).build_prompt("Hi".to_string());
+    assert!(names(&prompt).iter().any(|t| t == "HOBBES_DECISIONS"));
+}
+
+/// With the gate off, planner_today says nothing about agent time and
+/// points "needs you" at the worker instead of HOBBES_DECISIONS.
+#[test]
+fn hidden_planner_today_has_no_agent_time_or_decision_tool_lines() {
+    use crate::todo::handlers::{handle_decisions, handle_todo_create};
+    let today = chrono::Local::now().date_naive();
+    let mut planner = crate::todo::PlannerState::default();
+    planner.agent_time_grant =
+        crate::todo::model::AgentTimeGrant { enabled: true, daily_minutes: 45, ..Default::default() };
+    handle_todo_create(
+        &mut planner,
+        &serde_json::json!({"todos": [{"title": "Pick a vendor", "lane": "agent", "scheduled_for": "today"}]}),
+        "s",
+        today,
+        false,
+    );
+    let id = planner.todos.last().unwrap().id.clone();
+    let asked = handle_decisions(
+        &mut planner,
+        &serde_json::json!({"action": "ask", "todo_id": id, "question": "Vendor A or B?", "options": ["A", "B"], "est_minutes": 2}),
+        None,
+        None,
+        false,
+    );
+    assert_eq!(asked.status, crate::components::shared::ToolCallStatus::Completed, "{}", asked.response);
+
+    let hidden = Settings::default();
+    let ctx = crate::todo::handlers::planner_today_context_with_events(&planner, &hidden, today, &[])
+        .expect("planner context on");
+    let text = ctx.to_string();
+    assert!(ctx.get("agent_time").is_none(), "{text}");
+    assert!(!text.contains("HOBBES_DECISIONS"), "{text}");
+    assert!(ctx.get("agents").is_some_and(|a| a.get("needs_you").is_some()), "needs-you still shown: {text}");
+
+    let on = Settings { experimental_agent_time: true, ..Settings::default() };
+    let ctx = crate::todo::handlers::planner_today_context_with_events(&planner, &on, today, &[]).unwrap();
+    assert!(ctx.to_string().contains("HOBBES_DECISIONS"));
 }
 
 // =========================================================================

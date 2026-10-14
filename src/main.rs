@@ -1987,6 +1987,12 @@ fn app() -> Element {
                     agent_time_runtime::TICK_SECS,
                 ))
                 .await;
+                // Release gate: with Agent time hidden nothing here runs —
+                // no budget enforcement (no lease can exist) and, above
+                // all, no scheduled window.
+                if !settings.peek().agent_time_enabled() {
+                    continue;
+                }
                 let streaming = STREAMING_SESSIONS.peek().clone();
                 agent_time_runtime::tick(planner_state, session_state, &streaming);
                 let planner_enabled = settings.peek().planner_enabled;

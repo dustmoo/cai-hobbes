@@ -317,10 +317,12 @@ fn DetailCardInner(todo_id: String) -> Element {
     sessions.sort_by(|a, b| b.started_at.cmp(&a.started_at));
 
     let label_class = "pb-1 text-xs font-medium text-fg-muted";
-    let priority_display = use_context::<Signal<crate::settings::Settings>>()
-        .read()
-        .planner_priority
-        .clone();
+    let (priority_display, agent_time_on) = {
+        let settings = use_context::<Signal<crate::settings::Settings>>();
+        let s = settings.read();
+        // "Prep this" is an Agent-time job: hidden with it (release gate).
+        (s.planner_priority.clone(), s.agent_time_enabled())
+    };
     let input_class = "w-full rounded border border-subtle bg-input px-2 py-1.5 text-sm text-fg placeholder:text-fg-muted focus:outline-none focus:border-faint";
     let clear_class = "shrink-0 rounded px-2 py-1 text-xs text-fg-muted hover:bg-input hover:text-fg";
     let tod_options: [(&str, TimeOfDay); 3] = [
@@ -402,7 +404,7 @@ fn DetailCardInner(todo_id: String) -> Element {
                 }
 
                 // Prep this: the person's own open to-dos only.
-                if todo.lane == crate::todo::model::Lane::Human && !todo.status.is_closed() {
+                if agent_time_on && todo.lane == crate::todo::model::Lane::Human && !todo.status.is_closed() {
                     label {
                         class: "flex cursor-pointer items-start gap-2",
                         input {
