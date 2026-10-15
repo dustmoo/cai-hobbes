@@ -408,7 +408,7 @@ against the official pricing pages.
 | Gemini | `src/llm/gemini.rs` → `GeminiModel::get_rates` | ai.google.dev/gemini-api/docs/pricing |
 | Claude | `src/llm/claude_models.rs` → `input_price_per_mtok` / `output_price_per_mtok` / `cache_read_price_per_mtok` / `price_multiplier` (prompt-length tiers) | platform.claude.com/docs/en/about-claude/pricing |
 
-> **Last verified**: Claude 2026-10-07 (added Haiku 5.5 and its >100k-token price tier via `price_multiplier`); OpenAI and Gemini 2026-06-17.
+> **Last verified**: Claude 2026-10-07 (added Haiku 5.5 and its >100k-token price tier via `price_multiplier`); Gemini 2026-10-15 (added 4 Argon: dated intro pricing through 2026-11-30, 5% cached-input rate via `cached_input_multiplier`); OpenAI 2026-06-17.
 
 **Rules**:
 - Match models by **family with a version/dash boundary**, never a bare

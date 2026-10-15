@@ -1014,6 +1014,8 @@ pub fn get_default_model_icon(model_slug: &str) -> String {
     // --- Gemini family ---
     } else if slug.contains("experimental") {
         "🧪".to_string()
+    } else if slug.contains("gemini-4") {
+        "💎".to_string()
     } else if slug.contains("gemini-3.8")
         || slug.contains("gemini-3.7")
         || slug.contains("gemini-3.6")
