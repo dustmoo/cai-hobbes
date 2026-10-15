@@ -327,7 +327,6 @@ impl GeminiModel {
                 }
             }
 
-
             // Gemini 3.8 (GA 2026-09-02), 3.7 (GA 2026-08-13) & 3.6
             // (GA 2026-07-21) Flash: intro $0.75/$3.75 through 2026-12-31,
             // then $1.50/$7.50
