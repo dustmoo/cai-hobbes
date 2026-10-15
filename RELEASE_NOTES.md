@@ -1,3 +1,15 @@
+# Hobbes v0.12.3 — Gemini 4 Argon
+
+## ✨ New Features
+- **Gemini 4 Argon.** Google's newest model is now supported, with a 1M-token context and low / medium / high thinking levels. Hobbes tracks its introductory pricing ($2 / $10 per million input / output tokens through November 30, then $4 / $20) and its lower 5% rate for cached input, so turn costs stay accurate. Argon needs a paid Gemini API key; add `gemini-4-argon` to a model slot to try it.
+
+## 🐛 Fixes
+- **Chat dates use your local time.** History and renamed tabs showed chats from the evening under the next day's date. They now use your local day.
+- **No wasted cache requests on Argon.** Argon only supports Google's automatic caching, so Hobbes no longer tries to create an explicit context cache for it on every turn.
+
+## 🛡️ Security
+- Updated `openssl` (0.10.81), `rand` (0.8.8 / 0.9.5) and `rustls` (0.23.46) for recent RustSec advisories.
+
 # Hobbes v0.12.2 — The Planner, the Fleet, and Side Tabs
 
 ## ✨ New Features

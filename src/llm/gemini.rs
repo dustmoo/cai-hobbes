@@ -178,6 +178,7 @@ pub struct UsageMetadata {
 /// Supported Gemini Models for Pricing
 #[derive(Debug, PartialEq, Clone)]
 pub enum GeminiModel {
+    Gemini4Argon,
     Gemini3_8Flash,
     Gemini3_7Flash,
     Gemini3_6Flash,
@@ -209,7 +210,10 @@ impl GeminiModel {
         let s = slug.strip_prefix("models/").unwrap_or(slug);
 
         match s {
-            // Gemini 3.8 Series - HIGHEST PRIORITY (GA 2026-09-02)
+            // Gemini 4 Series - HIGHEST PRIORITY (Argon GA 2026-10-13)
+            _ if s.starts_with("gemini-4-argon") => GeminiModel::Gemini4Argon,
+
+            // Gemini 3.8 Series (GA 2026-09-02)
             _ if s.starts_with("gemini-3.8-flash") => GeminiModel::Gemini3_8Flash,
 
             // Gemini 3.7 Series (GA 2026-08-13)
@@ -299,18 +303,30 @@ impl GeminiModel {
 
     /// Per-1M-token (input, output) USD rates. Manually maintained and subject
     /// to drift — re-verify against ai.google.dev/gemini-api/docs/pricing
-    /// (see SYSTEM_PATTERNS P-013). Last verified: 2026-09-17 — added Gemini
-    /// 3.8 Flash (GA 2026-09-02, same intro/standard tiering as 3.7/3.6
-    /// Flash); confirmed 3.7 Flash, 3.6 Flash, 3.1 Pro, and 3.1 Flash-Lite
-    /// pricing unchanged from prior verification.
+    /// (see SYSTEM_PATTERNS P-013). Last verified: 2026-10-15 — added Gemini
+    /// 4 Argon (GA 2026-10-13, intro pricing through 2026-11-30, doubling
+    /// 2026-12-01; paid tier only); confirmed 3.8 Flash and 3.1 Pro pricing
+    /// unchanged from prior verification.
     pub fn get_rates(&self, prompt_tokens: i32) -> (f64, f64) {
         self.get_rates_at(prompt_tokens, chrono::Utc::now().date_naive())
     }
 
-    /// Date-aware rate lookup: 3.8/3.7/3.6 Flash carry introductory pricing
-    /// through 2026-12-31 that doubles on 2027-01-01.
+    /// Date-aware rate lookup: 4 Argon carries introductory pricing through
+    /// 2026-11-30 that doubles on 2026-12-01; 3.8/3.7/3.6 Flash carry
+    /// introductory pricing through 2026-12-31 that doubles on 2027-01-01.
     fn get_rates_at(&self, prompt_tokens: i32, today: chrono::NaiveDate) -> (f64, f64) {
         match self {
+            // Gemini 4 Argon (GA 2026-10-13): intro $2.00/$10.00 through
+            // 2026-11-30, then $4.00/$20.00. No >200K prompt tier.
+            GeminiModel::Gemini4Argon => {
+                let promo_end = chrono::NaiveDate::from_ymd_opt(2026, 11, 30).expect("valid date");
+                if today <= promo_end {
+                    (2.00, 10.00)
+                } else {
+                    (4.00, 20.00)
+                }
+            }
+
             // Gemini 3.8 (GA 2026-09-02), 3.7 (GA 2026-08-13) & 3.6
             // (GA 2026-07-21) Flash: intro $0.75/$3.75 through 2026-12-31,
             // then $1.50/$7.50
@@ -378,6 +394,22 @@ impl GeminiModel {
             }
         }
     }
+
+    /// Cached input is billed as a fraction of the standard input rate:
+    /// 5% on 4 Argon ($0.10 vs $2.00), 10% elsewhere (e.g. 3.6 Flash: $0.15
+    /// vs $1.50; 3.1 Pro: $0.20 vs $2.00; 2.5 Pro: $0.125 vs $1.25).
+    pub fn cached_input_multiplier(&self) -> f64 {
+        match self {
+            GeminiModel::Gemini4Argon => 0.05,
+            _ => 0.10,
+        }
+    }
+
+    /// Whether the model accepts explicit `cachedContents`. 4 Argon only does
+    /// implicit caching, so creating a cache for it would fail every turn.
+    pub fn supports_explicit_caching(&self) -> bool {
+        !matches!(self, GeminiModel::Gemini4Argon)
+    }
 }
 
 /// Clear `thoughtSignature` from every `FunctionCall` part of an already-built
@@ -414,9 +446,7 @@ pub fn calculate_cost(model: &str, usage: &UsageMetadata) -> f64 {
     // prompt_token_count includes cached tokens, so we determine standard input tokens by subtracting
     let standard_input_tokens = (usage.prompt_token_count - cached_tokens).max(0);
 
-    // Cached content is billed at 10% of the standard input rate
-    // (e.g. 3.6 Flash: $0.15 vs $1.50; 3.1 Pro: $0.20 vs $2.00; 2.5 Pro: $0.125 vs $1.25)
-    let cached_rate = input_rate * 0.10;
+    let cached_rate = input_rate * gemini_model.cached_input_multiplier();
 
     let input_cost = (standard_input_tokens as f64 / 1_000_000.0) * input_rate;
     let cached_cost = (cached_tokens as f64 / 1_000_000.0) * cached_rate;
@@ -902,7 +932,9 @@ impl GeminiModel {
     /// Returns the thinking config style for this model
     pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
         match self {
-            GeminiModel::Gemini3_5Pro
+            // 4 Argon: thinkingLevel low|medium|high, same as the Pro line
+            GeminiModel::Gemini4Argon
+            | GeminiModel::Gemini3_5Pro
             | GeminiModel::Gemini3_1ProPreview
             | GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
             GeminiModel::Gemini3_8Flash
@@ -925,6 +957,7 @@ impl GeminiModel {
     /// Returns the official human-readable name for this model
     pub fn display_name(&self) -> String {
         match self {
+            GeminiModel::Gemini4Argon => "Gemini 4 Argon".to_string(),
             GeminiModel::Gemini3_8Flash => "Gemini 3.8 Flash".to_string(),
             GeminiModel::Gemini3_7Flash => "Gemini 3.7 Flash".to_string(),
             GeminiModel::Gemini3_6Flash => "Gemini 3.6 Flash".to_string(),
@@ -982,6 +1015,7 @@ impl GeminiModel {
     /// This is the authoritative source for model identifiers sent to the API.
     pub fn canonical_slug(&self) -> &str {
         match self {
+            GeminiModel::Gemini4Argon => "gemini-4-argon",
             GeminiModel::Gemini3_8Flash => "gemini-3.8-flash",
             GeminiModel::Gemini3_7Flash => "gemini-3.7-flash",
             GeminiModel::Gemini3_6Flash => "gemini-3.6-flash",
@@ -1011,8 +1045,9 @@ impl GeminiModel {
     /// Source: https://ai.google.dev/gemini-api/docs/models
     pub fn context_window_tokens(&self) -> usize {
         match self {
-            // Gemini 3.5/3.6/3.7/3.8: 1M context
-            GeminiModel::Gemini3_8Flash
+            // Gemini 3.5/3.6/3.7/3.8 and 4 Argon: 1M context
+            GeminiModel::Gemini4Argon
+            | GeminiModel::Gemini3_8Flash
             | GeminiModel::Gemini3_7Flash
             | GeminiModel::Gemini3_6Flash
             | GeminiModel::Gemini3_5Pro
@@ -1325,7 +1360,9 @@ impl LlmConnector for GeminiConnector {
 
         // Explicit Context Caching check/create
         let mut cache_entry_opt = None;
-        if self.config.context_caching_enabled {
+        if self.config.context_caching_enabled
+            && GeminiModel::from_slug(&model).supports_explicit_caching()
+        {
             if let Some(ref sess_id) = session_id {
                 if request_body.contents.len() > 1 {
                     let prefix_contents =
@@ -2858,6 +2895,64 @@ mod tests {
     }
 
     #[test]
+    fn test_gemini_4_argon_model() {
+        assert_eq!(
+            GeminiModel::from_slug("gemini-4-argon"),
+            GeminiModel::Gemini4Argon
+        );
+        assert_eq!(
+            GeminiModel::from_slug("models/gemini-4-argon"),
+            GeminiModel::Gemini4Argon
+        );
+
+        let model = GeminiModel::Gemini4Argon;
+        assert_eq!(model.canonical_slug(), "gemini-4-argon");
+        assert_eq!(model.display_name(), "Gemini 4 Argon");
+        assert_eq!(model.context_window_tokens(), 1_000_000);
+        assert_eq!(model.thinking_config_style(), ThinkingConfigStyle::LevelPro);
+        assert_eq!(model.valid_thinking_levels(), &["low", "medium", "high"]);
+        // Implicit caching only; explicit cachedContents is unsupported.
+        assert!(!model.supports_explicit_caching());
+        assert!(GeminiModel::Gemini3_8Flash.supports_explicit_caching());
+    }
+
+    #[test]
+    fn test_gemini_4_argon_pricing() {
+        // Intro $2.00/$10.00 through 2026-11-30, then $4.00/$20.00 from
+        // 2026-12-01. No prompt-length tier.
+        let last_promo_day = chrono::NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let first_standard_day = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        let model = GeminiModel::Gemini4Argon;
+
+        assert_eq!(model.get_rates_at(0, last_promo_day), (2.00, 10.00));
+        assert_eq!(model.get_rates_at(500_000, last_promo_day), (2.00, 10.00));
+        assert_eq!(model.get_rates_at(0, first_standard_day), (4.00, 20.00));
+
+        // Cached input is 5% of input: $0.10 intro, $0.20 standard.
+        let (input_rate, _) = model.get_rates_at(0, last_promo_day);
+        assert!((input_rate * model.cached_input_multiplier() - 0.10).abs() < 1e-9);
+        let (input_rate, _) = model.get_rates_at(0, first_standard_day);
+        assert!((input_rate * model.cached_input_multiplier() - 0.20).abs() < 1e-9);
+
+        let usage = UsageMetadata {
+            prompt_token_count: 1_000_000,
+            candidates_token_count: Some(1_000_000),
+            total_token_count: 2_000_000,
+            thoughts_token_count: None,
+            cached_content_token_count: Some(500_000),
+        };
+        let cost = calculate_cost("gemini-4-argon", &usage);
+        let (in_rate, out_rate) = model.get_rates(0);
+        let expected = 0.5 * in_rate + 0.5 * in_rate * 0.05 + out_rate;
+        assert!(
+            (cost - expected).abs() < 1e-6,
+            "Gemini 4 Argon: Expected ${}, got {}",
+            expected,
+            cost
+        );
+    }
+
+    #[test]
     fn test_gemini_3_1_pro_context_length_tiering() {
         // Gemini 3.1 Pro: $2.00/$12.00 <= 200K tokens, $4.00/$18.00 above.
         assert_eq!(
@@ -2882,6 +2977,7 @@ mod tests {
     fn test_canonical_slug_round_trip() {
         // Ensure canonical slugs resolve back to the correct model
         let models = [
+            GeminiModel::Gemini4Argon,
             GeminiModel::Gemini3_8Flash,
             GeminiModel::Gemini3_7Flash,
             GeminiModel::Gemini3_6Flash,
