@@ -53,6 +53,8 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
     // Unsorted tabs the person ticked to close (opt-in: nothing suggests
     // closing them). Filing is the project chip, independent of closing.
     let mut unsorted_close = use_signal(HashSet::<String>::new);
+    // Other open tabs the person ticked to close (opt-in, like unsorted).
+    let mut other_close = use_signal(HashSet::<String>::new);
     let mut menu_for = use_signal(|| None::<String>);
     // Where the open project menu sits: the click point, in viewport px.
     // The menu is `position: fixed` so the scrolling list can't clip it.
@@ -88,6 +90,14 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
     let all_idle_on = idle_ids.iter().all(|id| !deselected.read().contains(id));
     let unsorted_ids: Vec<String> = sug.unsorted.iter().map(|u| u.session_id.clone()).collect();
     let all_unsorted_closing = !unsorted_ids.is_empty() && sug.unsorted.iter().all(&closes_unsorted);
+    let other_ids: Vec<String> = sug.other.iter().map(|o| o.session_id.clone()).collect();
+    let all_other_closing = !other_ids.is_empty() && other_ids.iter().all(|id| other_close.read().contains(id));
+    let project_of = |id: &str| {
+        tab_of(id)
+            .and_then(|t| t.project_id.clone())
+            .map(|pid| project_title(&pid))
+            .filter(|t| !t.is_empty())
+    };
 
     // Filed: every unsorted tab whose chip names a project (a suggestion,
     // or the person's pick). A tab both filed and closed is filed first, so
@@ -104,6 +114,7 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
         .filter(|id| !deselected.read().contains(*id))
         .cloned()
         .chain(sug.unsorted.iter().filter(|u| closes_unsorted(u)).map(|u| u.session_id.clone()))
+        .chain(other_ids.iter().filter(|id| other_close.read().contains(*id)).cloned())
         .collect();
     let close_count = close.len();
     let suggestion_count = sug.finished.len() + sug.idle.len() + sug.unsorted.len();
@@ -169,7 +180,7 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                             menu_for.set(None);
                         }
                     },
-                    if suggestion_count == 0 {
+                    if suggestion_count == 0 && sug.other.is_empty() {
                         p { class: "text-sm text-fg-muted py-6 text-center", "Nothing to tidy. Every open tab is in use or already filed." }
                     }
 
@@ -385,6 +396,74 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if !sug.other.is_empty() {
+                        div {
+                            class: "{SECTION}",
+                            input {
+                                r#type: "checkbox",
+                                class: "{CB}",
+                                "aria-label": "Close all other open tabs",
+                                checked: all_other_closing,
+                                onchange: {
+                                    let ids = other_ids.clone();
+                                    move |evt: FormEvent| {
+                                        let mut c = other_close.write();
+                                        for id in ids.iter() {
+                                            if evt.checked() {
+                                                c.insert(id.clone());
+                                            } else {
+                                                c.remove(id);
+                                            }
+                                        }
+                                    }
+                                },
+                            }
+                            span { "Other open tabs" }
+                            span { class: "{WHY}", "tick to close · least recently active first" }
+                        }
+                        div {
+                            class: "flex flex-col",
+                            for o in sug.other.iter() {
+                                {
+                                    let id = o.session_id.clone();
+                                    let checked = other_close.read().contains(&id);
+                                    let label = label_of(&id);
+                                    let emoji = emoji_of(&id);
+                                    let why = match project_of(&id) {
+                                        Some(project) => format!("{project} \u{b7} active {}", short_date(o.last_updated)),
+                                        None => format!("active {}", short_date(o.last_updated)),
+                                    };
+                                    rsx! {
+                                        div {
+                                            key: "{id}",
+                                            class: "{ITEM}",
+                                            input {
+                                                r#type: "checkbox",
+                                                class: "{CB}",
+                                                "aria-label": "Close {label}",
+                                                checked,
+                                                onchange: {
+                                                    let id = id.clone();
+                                                    move |evt: FormEvent| {
+                                                        let mut c = other_close.write();
+                                                        if evt.checked() {
+                                                            c.insert(id.clone());
+                                                        } else {
+                                                            c.remove(&id);
+                                                        }
+                                                    }
+                                                },
+                                            }
+                                            span { class: "w-4 text-center", "{emoji}" }
+                                            span { class: "flex-1 min-w-0 truncate", "{label}" }
+                                            span { class: "{WHY} max-w-[220px] truncate", "{why}" }
                                         }
                                     }
                                 }
