@@ -120,6 +120,11 @@ pub enum FleetStatus {
     /// The main turn ended (the user may type) but background subagents are
     /// still running — idle for input, still doing work.
     WorkingBackground,
+    /// A Hobbes chat between turns with a timer pending: nothing is running,
+    /// but the session will pick itself back up at `FleetSession::wake_at`.
+    /// Not working time (no span is open) and never stale or retired before
+    /// the timer is due.
+    Waiting,
     Idle,
     NeedsAttention(AttentionKind),
 }
@@ -127,6 +132,15 @@ pub enum FleetStatus {
 impl FleetStatus {
     pub fn needs_attention(&self) -> bool {
         matches!(self, FleetStatus::NeedsAttention(_))
+    }
+
+    /// Still on the job: running a turn, running background work, or
+    /// waiting on its own timer.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self,
+            FleetStatus::Working | FleetStatus::WorkingBackground | FleetStatus::Waiting
+        )
     }
 }
 
@@ -243,6 +257,9 @@ pub struct FleetSession {
     /// Persisted, so a restart mid-run never double-fires the continuation.
     #[serde(default)]
     pub continuation_sent: bool,
+    /// When a `Waiting` session's next timer is due.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_at: Option<DateTime<Utc>>,
 }
 
 impl FleetSession {
@@ -270,6 +287,7 @@ impl FleetSession {
             dispatched_todo: None,
             dispatched_from: None,
             continuation_sent: false,
+            wake_at: None,
         }
     }
 
@@ -793,11 +811,24 @@ pub fn resolve_gate_in_state(
 /// Staleness sweep: Working sessions silent for over [`STALENESS_MINUTES`]
 /// show as Idle; `WorkingBackground` sessions get
 /// [`BACKGROUND_STALENESS_MINUTES`] — background jobs are silent by design.
+/// `Waiting` sessions idle once their timer is [`STALENESS_MINUTES`] overdue
+/// (it should have fired and started a turn; the app was likely closed).
 /// The open span is deliberately kept (module docs) — display math caps it,
 /// and a later `Stop` restores full credit.
 pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
     let mut changed = Vec::new();
     for session in state.sessions.values_mut() {
+        if session.status == FleetStatus::Waiting {
+            let overdue = session
+                .wake_at
+                .is_none_or(|w| w < now - chrono::Duration::minutes(STALENESS_MINUTES));
+            if overdue {
+                session.status = FleetStatus::Idle;
+                session.wake_at = None;
+                changed.push(session.clone());
+            }
+            continue;
+        }
         let window = match session.status {
             FleetStatus::Working => STALENESS_MINUTES,
             FleetStatus::WorkingBackground => BACKGROUND_STALENESS_MINUTES,
@@ -2861,5 +2892,27 @@ mod tests {
         // Resolving an unknown gate is a no-op.
         shared.resolve_gate("g2", false);
         assert!(shared.take_gate("g1").is_none());
+    }
+
+    #[test]
+    fn a_timer_wait_holds_until_overdue_and_never_retires() {
+        let now = Utc::now();
+        let mut state = FleetState::default();
+        let mut s = FleetSession::new("tab1", "", now - chrono::Duration::hours(6));
+        s.status = FleetStatus::Waiting;
+        s.wake_at = Some(now + chrono::Duration::hours(2));
+        state.sessions.insert("tab1".into(), s);
+        // Hours of silence before the timer is due: still waiting, still on
+        // the board.
+        assert!(sweep_stale(&mut state, now).is_empty());
+        assert!(sweep_retired_after(&mut state, now, 60).is_empty());
+        assert_eq!(state.sessions["tab1"].status, FleetStatus::Waiting);
+        // Past due by more than the staleness window (it never fired, e.g.
+        // the app was closed): idle.
+        let late = now + chrono::Duration::hours(2) + chrono::Duration::minutes(STALENESS_MINUTES + 1);
+        let changed = sweep_stale(&mut state, late);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(state.sessions["tab1"].status, FleetStatus::Idle);
+        assert_eq!(state.sessions["tab1"].wake_at, None);
     }
 }

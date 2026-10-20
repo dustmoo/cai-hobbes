@@ -55,7 +55,7 @@ impl StreamManagerContext {
         if !crate::fleet::bridge::enabled() {
             return;
         }
-        let (name, summary_json) = {
+        let (name, summary_json, next_timer) = {
             let state = self.session_state.peek();
             match state.sessions.get(session_id) {
                 Some(s) => {
@@ -64,15 +64,24 @@ impl StreamManagerContext {
                         || !cs.current_task.trim().is_empty())
                     .then(|| serde_json::to_value(cs).ok())
                     .flatten();
-                    (s.name.clone(), json)
+                    (s.name.clone(), json, s.next_pending_timer())
                 }
-                None => (String::new(), None),
+                None => (String::new(), None, None),
             }
+        };
+        // A turn that ends with a timer pending leaves the tab waiting on
+        // itself, not idle.
+        let signal = match signal {
+            crate::fleet::bridge::HobbesSignal::TurnCompleted => {
+                crate::fleet::bridge::turn_end_signal(next_timer)
+            }
+            other => other,
         };
         let brief_source = summary_json.clone();
         let is_turn_end = matches!(
             signal,
             crate::fleet::bridge::HobbesSignal::TurnCompleted
+                | crate::fleet::bridge::HobbesSignal::TimerWaiting { .. }
                 | crate::fleet::bridge::HobbesSignal::Closed
         );
         crate::fleet::bridge::report_with_brief(session_id, &name, signal, summary_json);

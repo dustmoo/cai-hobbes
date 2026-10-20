@@ -133,6 +133,10 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
             .collect::<std::collections::HashSet<String>>()
     });
 
+    // Tabs between turns with a timer pending: a hollow, still dot, so a tab
+    // waiting on itself doesn't read as idle (or as streaming).
+    let timer_waits = use_memo(move || session_state.read().timer_waits());
+
     // ── Display order (a lens: never written to open_tabs) ─────────────────
     let group_options = move || {
         let s = settings.read();
@@ -273,6 +277,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                 && !props.fleet_active;
                             let is_streaming = streaming.read().contains(&tab.session_id);
                             let waits_on_you = needs_you.read().contains(&tab.session_id);
+                            let timer_at = timer_waits.read().get(&tab.session_id).copied();
                             let label = tab.topic.clone().unwrap_or_else(|| tab.title.clone());
                             let glyph = rail_glyph(tab.emoji.as_deref(), tab.topic.as_deref());
                             let on_select = props.on_select_tab;
@@ -309,6 +314,11 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                         }
                                     } else if is_streaming {
                                         div { class: "absolute bottom-1 right-1.5 w-1.5 h-1.5 rounded-full bg-primary-400 animate-pulse" }
+                                    } else if let Some(at) = timer_at {
+                                        span {
+                                            class: "absolute bottom-1 right-1.5 w-1.5 h-1.5 rounded-full border border-primary-400",
+                                            title: "{crate::timers::waiting_title(at)}",
+                                        }
                                     }
                                     button {
                                         class: "{RAIL_CLOSE}",
@@ -484,6 +494,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     && !props.fleet_active;
                                 let is_streaming = streaming.read().contains(&tab.session_id);
                                 let waits_on_you = needs_you.read().contains(&tab.session_id);
+                                let timer_at = timer_waits.read().get(&tab.session_id).copied();
                                 let is_editing = editing_tab_id.read().as_deref() == Some(tab.session_id.as_str());
                                 // Same identity layers as the strip's tooltip.
                                 let tooltip = {
@@ -551,6 +562,11 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                         } else {
                                             if is_streaming {
                                                 div { class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse shrink-0" }
+                                            } else if let Some(at) = timer_at {
+                                                span {
+                                                    class: "w-2 h-2 rounded-full border border-primary-400 shrink-0",
+                                                    title: "{crate::timers::waiting_title(at)}",
+                                                }
                                             }
                                             if let Some(e) = &tab.emoji {
                                                 span { class: "text-[13px] leading-none shrink-0", "{e}" }

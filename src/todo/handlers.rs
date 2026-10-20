@@ -2501,7 +2501,10 @@ pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession) -> super::lane
     use super::lanes::{GateSignal, WorkerSignal, WorkerStatus};
     use crate::fleet::{AttentionKind, FleetStatus};
     let (status, attention_message) = match &row.status {
-        FleetStatus::Working | FleetStatus::WorkingBackground => (WorkerStatus::Working, None),
+        // Waiting on its own timer is still on the job, not idle.
+        FleetStatus::Working | FleetStatus::WorkingBackground | FleetStatus::Waiting => {
+            (WorkerStatus::Working, None)
+        }
         FleetStatus::Idle => (WorkerStatus::Idle, None),
         FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) => {
             (WorkerStatus::WaitingOnUser, Some(message.clone()).filter(|m| !m.trim().is_empty()))
@@ -2984,13 +2987,7 @@ pub fn handle_agent_time(
 /// Whether a fleet session is running now (a live worker on a to-do).
 pub fn fleet_worker_live(snapshot: &crate::fleet::FleetState, session_id: &str) -> bool {
     snapshot.sessions.get(session_id).is_some_and(|r| {
-        r.ended_at.is_none()
-            && matches!(
-                r.status,
-                crate::fleet::FleetStatus::Working
-                    | crate::fleet::FleetStatus::WorkingBackground
-                    | crate::fleet::FleetStatus::NeedsAttention(_)
-            )
+        r.ended_at.is_none() && (r.status.is_active() || r.status.needs_attention())
     })
 }
 

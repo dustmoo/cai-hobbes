@@ -93,6 +93,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
         states
     });
 
+    // Tabs between turns with a timer pending (see TabSidebar).
+    let timer_waits = use_memo(move || session_state.read().timer_waits());
+
     rsx! {
         div {
             class: "flex items-center bg-section border-b border-primary-700/50 h-10 shrink-0 overflow-hidden",
@@ -154,6 +157,7 @@ pub fn TabBar(props: TabBarProps) -> Element {
                         parts.join(" · ")
                     };
                     let is_streaming = streaming_states.read().get(idx).cloned().unwrap_or(false);
+                    let timer_at = timer_waits.read().get(session_id.as_str()).copied();
                     let session_id_key = session_id.clone();
                     let id_edit = session_id.clone();
                     let id_save_keydown = session_id.clone();
@@ -266,6 +270,11 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                 if is_streaming {
                                     div {
                                         class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse mr-1.5 shrink-0",
+                                    }
+                                } else if let Some(at) = timer_at {
+                                    span {
+                                        class: "w-2 h-2 rounded-full border border-primary-400 mr-1.5 shrink-0",
+                                        title: "{crate::timers::waiting_title(at)}",
                                     }
                                 }
                                 div {

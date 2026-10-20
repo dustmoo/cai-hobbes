@@ -46,6 +46,9 @@ pub enum HobbesSignal {
     GateWaiting { tool_name: String },
     /// The turn finished (or was cancelled) — idle.
     TurnCompleted,
+    /// The turn finished (or a timer fired) with a timer still pending: the
+    /// tab is waiting on itself until `wake_at`, not idle.
+    TimerWaiting { wake_at: chrono::DateTime<Utc> },
     /// The tab was closed.
     Closed,
 }
@@ -68,7 +71,9 @@ fn to_event(session_id: &str, signal: &HobbesSignal) -> FleetEvent {
             kind: "permission_prompt".to_string(),
             message: format!("Waiting for tool approval: {tool_name}"),
         },
-        HobbesSignal::TurnCompleted => FleetEvent::Stop {
+        // A Stop as far as the fleet core knows (span banked, turn over);
+        // `report_with_brief` then marks the row Waiting.
+        HobbesSignal::TurnCompleted | HobbesSignal::TimerWaiting { .. } => FleetEvent::Stop {
             session_id,
             cwd,
             background_tasks: 0,
@@ -117,7 +122,12 @@ pub fn report_with_brief(
     }
     let is_final = matches!(signal, HobbesSignal::Closed);
     let brief = summary_json
-        .filter(|_| matches!(signal, HobbesSignal::TurnCompleted | HobbesSignal::Closed))
+        .filter(|_| {
+            matches!(
+                signal,
+                HobbesSignal::TurnCompleted | HobbesSignal::TimerWaiting { .. } | HobbesSignal::Closed
+            )
+        })
         .and_then(|v| super::briefs::brief_from_summary_value(&v, now, is_final));
     let shared = super::shared();
     let changed = {
@@ -135,15 +145,7 @@ pub fn report_with_brief(
         // Patch identity on the live entry and the persisted clones: origin
         // marker plus the human tab title (created rows start "(unknown)"),
         // and the summary-derived brief when one rode along.
-        let patch = |s: &mut super::FleetSession| {
-            s.origin = FleetOrigin::Hobbes;
-            if !name.is_empty() && s.name != name {
-                s.name = name.to_string();
-            }
-            if let Some(b) = &brief {
-                s.brief = Some(b.clone());
-            }
-        };
+        let patch = |s: &mut super::FleetSession| patch_row(s, name, brief.as_ref(), &signal);
         if let Some(s) = state.sessions.get_mut(ev.session_id()) {
             patch(s);
         }
@@ -155,6 +157,50 @@ pub fn report_with_brief(
     };
     store::persist_sessions(&changed);
     shared.poke();
+}
+
+/// What the fleet core's reduce can't know about a Hobbes row: its origin,
+/// the tab title, the summary-derived brief, and the Waiting state (the core
+/// folds `TimerWaiting` as a plain Stop).
+fn patch_row(
+    s: &mut super::FleetSession,
+    name: &str,
+    brief: Option<&super::SessionBrief>,
+    signal: &HobbesSignal,
+) {
+    s.origin = FleetOrigin::Hobbes;
+    if !name.is_empty() && s.name != name {
+        s.name = name.to_string();
+    }
+    if let Some(b) = brief {
+        s.brief = Some(b.clone());
+    }
+    match signal {
+        HobbesSignal::TimerWaiting { wake_at } => {
+            s.status = super::FleetStatus::Waiting;
+            s.wake_at = Some(*wake_at);
+        }
+        _ if s.status != super::FleetStatus::Waiting => s.wake_at = None,
+        _ => {}
+    }
+}
+
+/// The signal for a Hobbes tab whose turn just ended (or whose timer just
+/// fired): Waiting until the next pending timer, else idle.
+pub fn turn_end_signal(next_timer: Option<chrono::DateTime<Utc>>) -> HobbesSignal {
+    match next_timer {
+        Some(wake_at) => HobbesSignal::TimerWaiting { wake_at },
+        None => HobbesSignal::TurnCompleted,
+    }
+}
+
+/// Whether the fleet shows this Hobbes tab as Waiting on a timer.
+pub fn is_waiting(session_id: &str) -> bool {
+    super::shared()
+        .state
+        .lock()
+        .map(|s| s.sessions.get(session_id).is_some_and(|r| r.status == super::FleetStatus::Waiting))
+        .unwrap_or(false)
 }
 
 /// Pre-create a fleet row for a headless run HOBBES_DISPATCH is about to
@@ -206,12 +252,7 @@ mod tests {
         let ev = to_event(id, &sig);
         let now = Utc::now();
         let mut changed = crate::fleet::reduce(state, &ev, now);
-        let patch = |s: &mut crate::fleet::FleetSession| {
-            s.origin = FleetOrigin::Hobbes;
-            if !name.is_empty() && s.name != name {
-                s.name = name.to_string();
-            }
-        };
+        let patch = |s: &mut crate::fleet::FleetSession| patch_row(s, name, None, &sig);
         if let Some(s) = state.sessions.get_mut(ev.session_id()) {
             patch(s);
         }
@@ -260,6 +301,29 @@ mod tests {
 
         fold(&mut state, "tab1", "Case Study Metrics", HobbesSignal::Closed);
         assert!(state.sessions.is_empty(), "closed tabs leave the live map");
+    }
+
+    #[test]
+    fn a_turn_ending_with_a_pending_timer_waits_until_it() {
+        let mut state = crate::fleet::FleetState::default();
+        let wake_at = Utc::now() + chrono::Duration::minutes(45);
+        fold(&mut state, "tab1", "Deploy watch", HobbesSignal::TurnStarted);
+        fold(&mut state, "tab1", "Deploy watch", turn_end_signal(Some(wake_at)));
+        {
+            let s = &state.sessions["tab1"];
+            assert_eq!(s.status, FleetStatus::Waiting);
+            assert_eq!(s.wake_at, Some(wake_at));
+            assert!(s.status.is_active(), "the tab and its to-do read as active");
+            assert!(s.working_since.is_none(), "waiting isn't banked as working time");
+        }
+        // The timer fires and its follow-up runs: working again, wait over.
+        fold(&mut state, "tab1", "Deploy watch", HobbesSignal::TurnStarted);
+        assert_eq!(state.sessions["tab1"].status, FleetStatus::Working);
+        assert_eq!(state.sessions["tab1"].wake_at, None);
+        // Last timer gone: an ordinary idle tab.
+        fold(&mut state, "tab1", "Deploy watch", turn_end_signal(None));
+        assert_eq!(state.sessions["tab1"].status, FleetStatus::Idle);
+        assert_eq!(state.sessions["tab1"].wake_at, None);
     }
 
     #[test]

@@ -275,13 +275,7 @@ fn FocusBar() -> Element {
         let working = fleet
             .sessions
             .values()
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    crate::fleet::FleetStatus::Working
-                        | crate::fleet::FleetStatus::WorkingBackground
-                )
-            })
+            .filter(|s| s.status.is_active())
             .count();
         (working > 0).then(|| {
             format!(
