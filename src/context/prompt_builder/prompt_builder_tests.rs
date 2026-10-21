@@ -2915,3 +2915,229 @@ fn history_is_byte_identical_across_a_tool_round_with_many_results() {
     }
     assert!(!tool_result_text(&req2).contains("HOBBES_PAGE_RESULT"));
 }
+
+// =========================================================================
+// Turn briefing (Heartbeat Phase 1)
+// =========================================================================
+
+use super::briefing::{turn_briefing, BRIEFING_HEADER};
+
+/// A timer built from JSON, so fields added later take their serde defaults.
+fn briefing_timer(
+    id: &str,
+    status: &str,
+    fired_at: Option<chrono::DateTime<Utc>>,
+    label: Option<&str>,
+    reason: Option<&str>,
+    cause: Option<&str>,
+) -> crate::timers::ScheduledTimer {
+    let at = fired_at.unwrap_or_else(|| fixed_clock(0).with_timezone(&Utc));
+    let mut v = serde_json::json!({
+        "id": id,
+        "session_id": "test_session",
+        "created_at": at - chrono::Duration::minutes(30),
+        "fire_at": at,
+        "mode": "notify",
+        "status": status,
+    });
+    if let Some(f) = fired_at {
+        v["fired_at"] = serde_json::json!(f);
+    }
+    for (k, val) in [("label", label), ("reason", reason), ("fire_cause", cause)] {
+        if let Some(val) = val {
+            v[k] = serde_json::json!(val);
+        }
+    }
+    serde_json::from_value(v).unwrap()
+}
+
+fn note_at(at: chrono::DateTime<Utc>, change: Option<&str>) -> crate::handoff::HandoffNote {
+    crate::handoff::HandoffNote {
+        doing: "watching the release build".to_string(),
+        expect_next: "CI goes green, then tag v0.12.4".to_string(),
+        would_change_mind: change.map(str::to_string),
+        written_at: at,
+    }
+}
+
+/// Messages of one finished turn, all stamped `at`.
+fn finished_turn_at(at: chrono::DateTime<Utc>) -> Vec<Message> {
+    let mut msgs = vec![
+        user_text_msg("start the build"),
+        tool_call_msg("RUN", "{}".to_string(), None),
+        assistant_text_msg("Started."),
+    ];
+    for m in &mut msgs {
+        m.created_at = at;
+    }
+    msgs
+}
+
+fn utc(n: i64) -> chrono::DateTime<Utc> {
+    fixed_clock(n).with_timezone(&Utc)
+}
+
+fn hhmm(at: chrono::DateTime<Utc>) -> String {
+    at.with_timezone(&chrono::Local).format("%H:%M").to_string()
+}
+
+#[test]
+fn briefing_parts_appear_only_when_they_have_something_to_say() {
+    let mut session = create_test_session();
+    let prior = finished_turn_at(utc(0));
+    let gap = 47 * 60;
+
+    // First turn: nothing came before.
+    assert_eq!(turn_briefing(&session, &[], fixed_clock(gap)), "");
+
+    // Long gap only: the elapsed line, nothing else.
+    let b = turn_briefing(&session, &prior, fixed_clock(gap));
+    assert_eq!(
+        b,
+        format!("{BRIEFING_HEADER}\n47 min since your last turn here ({}).", hhmm(utc(0)))
+    );
+
+    // Short gap with a handoff note and no fired timer: a live conversation,
+    // nothing to say.
+    session.handoff = Some(note_at(utc(-60), None));
+    assert_eq!(turn_briefing(&session, &prior, fixed_clock(120)), "");
+
+    // Short gap, a bare fired timer: the timer line (no cause, no reason)
+    // and the note, but no elapsed line.
+    session.scheduled_timers = vec![briefing_timer("t1", "fired", Some(utc(60)), None, None, None)];
+    let b = turn_briefing(&session, &prior, fixed_clock(120));
+    assert!(!b.contains("since your last turn here ("), "{b}");
+    assert!(b.contains(&format!("Timer fired at {}: \"(no label)\".", hhmm(utc(60)))), "{b}");
+    assert!(!b.contains("Why you set it"), "{b}");
+    assert!(b.contains("Your handoff note, written 3 min ago:"), "{b}");
+    assert!(!b.contains("Would change plan if"), "{b}");
+    assert!(!b.contains("out of date"), "{b}");
+
+    // Timers that fired before the previous turn, are pending or were
+    // cancelled are not news.
+    session.scheduled_timers = vec![
+        briefing_timer("old", "fired", Some(utc(-30)), Some("old"), None, None),
+        briefing_timer("pending", "pending", None, Some("pending"), None, None),
+        briefing_timer("cancelled", "cancelled", None, Some("cancelled"), None, None),
+    ];
+    session.handoff = None;
+    assert_eq!(turn_briefing(&session, &prior, fixed_clock(120)), "");
+
+    // A note older than a day is flagged.
+    session.handoff = Some(note_at(utc(-30 * 3600), Some("the build fails twice")));
+    let b = turn_briefing(&session, &prior, fixed_clock(gap));
+    assert!(b.contains("Your handoff note, written 30 h 47 min ago (possibly out of date):"), "{b}");
+    assert!(b.contains("Would change plan if: the build fails twice"), "{b}");
+}
+
+/// A sim whose session offers HOBBES_WRITE_HANDOFF (so the stable guidance
+/// renders), with one finished turn stamped at the sim's clock.
+fn briefing_sim(provider: LlmProvider) -> ChatSim {
+    let mut sim = ChatSim::new(provider, 75);
+    sim.session.active_context.mcp_tools = Some(crate::mcp::manager::McpContext {
+        servers: vec![mcp_server("hobbes-core", &["HOBBES_UPDATE_SCRATCHPAD", "HOBBES_WRITE_HANDOFF"])],
+        connected_toolkit_slugs: vec![],
+    });
+    sim.turn(0, 1);
+    let at = utc(sim.clock);
+    for m in &mut sim.session.messages {
+        m.created_at = at;
+    }
+    sim
+}
+
+#[test]
+fn boundary_tail_carries_the_briefing_and_replays_unchanged() {
+    for provider in [LlmProvider::Claude, LlmProvider::Gemini] {
+        let mut sim = briefing_sim(provider);
+        let first_system = {
+            let r = PromptBuilder::new(&sim.session, &sim.settings)
+                .with_planner_today(Some(sim.planner.clone()))
+                .with_now(fixed_clock(sim.clock))
+                .build_prompt(String::new());
+            r.prompt.system.unwrap()
+        };
+        assert!(first_system.contains("handoff_guidance"));
+        assert!(first_system.contains("HOBBES_WRITE_HANDOFF after meaningful work"));
+
+        // Away 47 minutes: a timer fired and a handoff note is waiting.
+        let last = utc(sim.clock);
+        sim.session.handoff = Some(note_at(last, Some("the suite fails")));
+        sim.session.scheduled_timers.push(briefing_timer(
+            "tmr_ci",
+            "fired",
+            Some(last + chrono::Duration::minutes(30)),
+            Some("Check CI"),
+            Some("waiting for the release suite"),
+            Some("deadline reached"),
+        ));
+        sim.clock += 47 * 60 - 7; // build() adds 7s
+        sim.session.messages.push(user_text_msg("any news?"));
+        sim.session.messages.push(placeholder_msg());
+        let boundary = sim.build();
+        let tail = tail_text(&boundary);
+        let expected = format!(
+            "{TAIL_HEADER}\nCurrent time: {} (local)\n{BRIEFING_HEADER}\n\
+             47 min since your last turn here ({}).\n\
+             Timer fired at {}: \"Check CI\" (deadline reached). Why you set it: waiting for the release suite\n\
+             Your handoff note, written 47 min ago:\n\
+             Doing: watching the release build\n\
+             Next: CI goes green, then tag v0.12.4\n\
+             Would change plan if: the suite fails",
+            fixed_clock(sim.clock).to_rfc3339(),
+            hhmm(last),
+            hhmm(last + chrono::Duration::minutes(30)),
+        );
+        assert_eq!(tail, expected, "{provider:?}");
+
+        // The stable system prefix holds no briefing and does not change.
+        let sys = boundary.prompt.system.clone().unwrap();
+        assert_eq!(sys, first_system, "{provider:?}: system changed across turns");
+        assert!(!sys.contains("watching the release build"));
+        assert!(!sys.contains("Check CI"));
+
+        // A retry with a later clock reuses the persisted briefing.
+        let retry = PromptBuilder::new(&sim.session, &sim.settings)
+            .with_planner_today(Some(sim.planner.clone()))
+            .with_now(fixed_clock(sim.clock + 3_600))
+            .build_prompt(String::new());
+        assert!(retry.ledger_entries.is_empty());
+        assert_eq!(retry.prompt.messages, boundary.prompt.messages);
+
+        // Mid-turn: the model rewrites its note; the briefing stays as sent
+        // (every provider keeps it in view), and the new tail carries none.
+        sim.session.handoff = Some(note_at(utc(sim.clock), None));
+        let call = tool_call_msg("CHECK", "{}".to_string(), None);
+        sim.session.messages.last_mut().unwrap().content = call.content;
+        sim.session.messages.push(placeholder_msg());
+        let mid = sim.build();
+        let texts: Vec<String> = mid.prompt.messages.iter().map(text_of).collect();
+        assert!(texts.contains(&expected), "{provider:?}: briefing tail replayed unchanged");
+        assert!(!tail_text(&mid).contains(BRIEFING_HEADER), "{provider:?}: mid-turn tail");
+        assert_eq!(mid.prompt.system.as_deref(), Some(first_system.as_str()));
+
+        // Reply, then an immediate follow-up: no briefing, the earlier one
+        // still replays, the system is still identical.
+        sim.session.messages.last_mut().unwrap().content = assistant_text_msg("CI is green.").content;
+        sim.session.messages.last_mut().unwrap().created_at = utc(sim.clock);
+        sim.session.messages.push(user_text_msg("tag it"));
+        sim.session.messages.push(placeholder_msg());
+        let next = sim.build();
+        assert!(!tail_text(&next).contains(BRIEFING_HEADER), "{provider:?}: live follow-up");
+        let texts: Vec<String> = next.prompt.messages.iter().map(text_of).collect();
+        assert!(texts.contains(&expected), "{provider:?}: earlier briefing replayed");
+        assert_eq!(next.prompt.system.as_deref(), Some(first_system.as_str()));
+    }
+}
+
+/// A live send (the user's message, then the reply placeholder) is not a
+/// continuation: the tail must not tell the model the user hasn't replied.
+#[test]
+fn live_send_with_placeholder_gets_no_continuation_instruction() {
+    let settings = Settings::default();
+    let mut session = create_test_session();
+    session.messages = vec![user_text_msg("hi"), assistant_text_msg("hello"), user_text_msg("more"), placeholder_msg()];
+    let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    assert!(!tail_text(&result).contains("CONTINUATION INSTRUCTION"));
+    assert!(!tail_text(&result).contains("TOOL COMPLETION INSTRUCTION"));
+}

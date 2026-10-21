@@ -13,7 +13,8 @@
 //! - **Tails.** Every request carries a turn-scoped tail (clock + turn
 //!   instructions), persisted anchored after the last message at build time
 //!   and replayed unchanged on later requests. A retry (a tail already exists
-//!   for that anchor) reuses it.
+//!   for that anchor) reuses it. A user-turn boundary's tail may also carry
+//!   the turn briefing (`briefing.rs`), computed once with the tail's clock.
 //! - **Trim snapshots.** When the history window moves (only at a user-turn
 //!   boundary), entries restating the current context are written to render
 //!   right after the pinned first user message.
@@ -98,9 +99,14 @@ pub(crate) fn render_entry(entry: &LedgerEntry) -> String {
     }
 }
 
-/// Body of a request tail: header, clock, then the turn instructions.
-pub(crate) fn tail_body(now_rfc3339: &str, turn_instructions: &str) -> String {
+/// Body of a request tail: header, clock, the turn briefing (boundary tails
+/// only, may be empty), then the turn instructions.
+pub(crate) fn tail_body(now_rfc3339: &str, briefing: &str, turn_instructions: &str) -> String {
     let mut body = format!("{TAIL_HEADER}\nCurrent time: {now_rfc3339} (local)");
+    if !briefing.trim().is_empty() {
+        body.push('\n');
+        body.push_str(briefing.trim());
+    }
     if !turn_instructions.trim().is_empty() {
         body.push('\n');
         body.push_str(turn_instructions.trim());

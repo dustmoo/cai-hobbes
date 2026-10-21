@@ -169,6 +169,19 @@ impl<'a> PromptBuilder<'a> {
         // Derived from settings only (sorted), so the cached prefix holds.
         crate::mcp::planner_client::annotate_dispatch_models(&mut tools, self.settings);
 
+        // Offered whenever the synced MCP context carries the tool (checked
+        // before any per-turn filtering, so the guidance below stays stable).
+        let handoff_tool_offered = self
+            .session
+            .active_context
+            .mcp_tools
+            .as_ref()
+            .is_some_and(|ctx| {
+                ctx.servers
+                    .iter()
+                    .any(|s| s.tools.iter().any(|t| t.name == "HOBBES_WRITE_HANDOFF"))
+            });
+
         // 2. Build the system instruction from the remaining context.
         let mut active_context = self.session.active_context.clone();
 
@@ -210,10 +223,23 @@ impl<'a> PromptBuilder<'a> {
             // A conversation ending on the assistant's own prose is a
             // continuation too (the instruction used to ride on a separate
             // nudge message; the request tail carries it now).
-            is_continuation_placeholder || last_message.is_some_and(|m| {
-                matches!(&m.content, MessageContent::ToolCall(_))
-                    || (m.author == "Hobbes" && matches!(&m.content, MessageContent::Text { .. }))
-            })
+            //
+            // A placeholder right after the user's own text is a live send
+            // (chat.rs pushes the user message and the placeholder, then
+            // builds with an empty `user_message`): the user just spoke.
+            let live_send = is_continuation_placeholder
+                && self
+                    .session
+                    .messages
+                    .len()
+                    .checked_sub(2)
+                    .and_then(|i| self.session.messages.get(i))
+                    .is_some_and(super::ledger::is_user_text);
+            !live_send
+                && (is_continuation_placeholder || last_message.is_some_and(|m| {
+                    matches!(&m.content, MessageContent::ToolCall(_))
+                        || (m.author == "Hobbes" && matches!(&m.content, MessageContent::Text { .. }))
+                }))
         };
 
         if user_message_is_empty {
@@ -316,6 +342,13 @@ impl<'a> PromptBuilder<'a> {
             "context_protocol".to_string(),
             json!(CONTEXT_PROTOCOL_NOTE),
         );
+        // When to write a handoff note (static text, stable part).
+        if handoff_tool_offered {
+            system_context_map.insert(
+                "handoff_guidance".to_string(),
+                json!(HANDOFF_GUIDANCE_NOTE),
+            );
+        }
 
         // Check for fully configured Composio profiles and inject context
         if self
@@ -750,10 +783,14 @@ const STABLE_CONTEXT_KEYS: &[&str] = &[
     "active_skill",
     "available_skills",
     "context_protocol",
+    "handoff_guidance",
 ];
 
 /// Explains the ledger and tail messages to the model (stable).
 const CONTEXT_PROTOCOL_NOTE: &str = "Live state is not in this block. It arrives inside the conversation with the same authority as SYSTEM_CONTEXT: a message starting with [Context update: <key>] gives the current value of that key (working memory, today's plan, loaded skills) and replaces any earlier value of the same key; [History trimmed] marks omitted earlier messages and restates the current values; [Turn context] carries the current time and instructions for that request only.";
+
+/// When to write a handoff note, and where it comes back (stable).
+const HANDOFF_GUIDANCE_NOTE: &str = "You exist only while you generate; between turns, a handoff note is how you pass the thread to your future self in this chat. Call HOBBES_WRITE_HANDOFF after meaningful work, before you wait on a timer, a worker or the user, and whenever your plan changes: what you are doing, what you expect next, and what would change your plan. When you pick the chat back up after a gap, the [Turn context] opens with a [Turn briefing]: time since your last turn here, timers that fired meanwhile and why you set them, and your latest handoff note with its age.";
 
 /// Recursively sort every JSON object's keys. The app's `serde_json` has
 /// `preserve_order` enabled (pulled in transitively), so a `Map` keeps

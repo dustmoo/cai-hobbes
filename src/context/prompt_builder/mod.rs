@@ -1,3 +1,4 @@
+mod briefing;
 mod context_compression;
 mod ledger;
 mod message_history;
