@@ -92,12 +92,7 @@ impl ScheduledTimer {
     }
 
     /// One-line summary for tool responses and the timers list. A condition
-    /// names its to-do by id; use [`Self::summary_with`] to name it by title.
-    pub fn summary(&self) -> String {
-        self.summary_with(|_| None)
-    }
-
-    /// [`Self::summary`], resolving a condition's to-do id to its title.
+    /// names its to-do by the title `todo_title` resolves, else by id.
     pub fn summary_with(&self, todo_title: impl Fn(&str) -> Option<String>) -> String {
         let when = self.fire_at.format("%Y-%m-%d %H:%M:%S UTC");
         let label = self.label.as_deref().unwrap_or("(no label)");
@@ -481,7 +476,7 @@ mod tests {
         t.label = Some("Check the suite".into());
         t.reason = Some("Report whether it passed.".into());
         assert_eq!(
-            t.summary(),
+            t.summary_with(|_| None),
             "[t1] Check the suite — fires 2026-10-21 12:00:00 UTC (notify), \
              or sooner when the worker for to-do tdo_1 finishes — reason: Report whether it passed."
         );
@@ -490,7 +485,7 @@ mod tests {
             .contains("or sooner when the worker for 'Run the suite' finishes"));
         // A plain timer's summary is unchanged.
         assert_eq!(
-            timer(now(), TimerStatus::Pending).summary(),
+            timer(now(), TimerStatus::Pending).summary_with(|_| None),
             "[t1] (no label) — fires 2026-10-21 12:00:00 UTC (notify)"
         );
     }
