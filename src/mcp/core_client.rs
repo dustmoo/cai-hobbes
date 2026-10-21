@@ -50,6 +50,35 @@ impl CoreClient {
                 meta: None,
             },
             Tool {
+                name: "HOBBES_WRITE_HANDOFF".into(),
+                description: Some(
+                    "Write a handoff note to your future self in this chat: what you are doing, \
+                    what you expect to happen next and what you will do then, and what would \
+                    change your plan. It is shown back to you, with its age, at the start of \
+                    later turns. Write one when you finish a meaningful piece of work, before you \
+                    wait on something (a timer, a worker, the user), or when your plan changes. \
+                    Replaces the previous note; not a summary of the conversation."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "doing": { "type": "string", "description": "What you are working on right now, in a sentence." },
+                            "expect_next": { "type": "string", "description": "What you expect to happen next and what you will do about it." },
+                            "would_change_mind": { "type": "string", "description": "Optional: what would change this plan." }
+                        },
+                        "required": ["doing", "expect_next"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Write Handoff".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
                 name: "HOBBES_PAGE_RESULT".into(),
                 description: Some(
                     "Fetch the next page of a paginated tool result. \
@@ -145,7 +174,10 @@ impl CoreClient {
                     front. Choose mode: 'notify' just shows a reminder toast; 'prompt' runs a \
                     follow-up turn using the given prompt (use this to continue work later, e.g. \
                     'check if the build finished'). Specify the delay with EITHER 'delay' \
-                    (\"10m\", \"1h30m\", \"45s\") OR 'delay_secs' (integer seconds)."
+                    (\"10m\", \"1h30m\", \"45s\") OR 'delay_secs' (integer seconds). The delay \
+                    is the deadline: with 'until' it fires as soon as that condition is met, or at \
+                    the deadline, whichever comes first. Always give a 'reason': it is shown back \
+                    to you when the timer fires."
                         .into(),
                 ),
                 input_schema: Arc::new(
@@ -156,7 +188,9 @@ impl CoreClient {
                             "delay_secs": { "type": "integer", "description": "Delay in seconds. Provide this or delay." },
                             "mode": { "type": "string", "enum": ["notify", "prompt"], "description": "'notify' = reminder only; 'prompt' = run the prompt as a new turn. Defaults to notify." },
                             "prompt": { "type": "string", "description": "Required for mode 'prompt': the message to run when the timer fires." },
-                            "label": { "type": "string", "description": "Short label shown in the reminder and the timer list." }
+                            "label": { "type": "string", "description": "Short label shown in the reminder and the timer list." },
+                            "reason": { "type": "string", "description": "Why you are setting it and what you plan to do when it fires, in a sentence or two. Shown back to you on waking." },
+                            "until_worker_done": { "type": "string", "description": "A dispatched to-do's id: fire as soon as its worker stops working (done, needs you or stuck) or the to-do is completed, instead of waiting for the full delay." }
                         }
                     }))
                     .unwrap_or_default(),

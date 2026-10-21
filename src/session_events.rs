@@ -225,6 +225,7 @@ fn blank_session() -> Session {
         current_ai_turn_count: 0,
         watch_word_recovery_count: 0,
         scheduled_timers: Vec::new(),
+        handoff: None,
         tool_call_history: Vec::new(),
         tab_emoji: None,
         tab_title: None,
@@ -708,6 +709,10 @@ mod tests {
             label: Some("tea".to_string()),
             prompt: None,
             status: crate::timers::TimerStatus::Pending,
+            reason: None,
+            until: None,
+            fired_at: None,
+            fire_cause: None,
         };
 
         let tool_done = {

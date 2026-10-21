@@ -58,6 +58,7 @@ mod tab_tidy;
 #[cfg(test)]
 mod test_support;
 mod timers;
+mod handoff;
 mod todo;
 mod usage_log;
 mod settings;

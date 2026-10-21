@@ -50,6 +50,32 @@ pub struct ScheduledTimer {
     pub prompt: Option<String>,
     #[serde(default)]
     pub status: TimerStatus,
+    /// Why the model set it, in its own words: shown back to it in the wake
+    /// briefing when the timer fires, so it acts on its earlier reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Fire early when this condition is met (an intention: "when the worker
+    /// finishes, or at `fire_at`, whichever comes first").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<WakeCondition>,
+    /// When it fired (set with `status = Fired`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fired_at: Option<DateTime<Utc>>,
+    /// Why it fired, for the wake briefing: "deadline reached", or the
+    /// condition that was met ("worker for 'Run the suite' finished: done").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fire_cause: Option<String>,
+}
+
+/// Something the harness can observe that fires an intention before its
+/// deadline. Phase 1 conditions need no perception layer: they read planner
+/// and fleet state Hobbes already holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WakeCondition {
+    /// The to-do's dispatched worker stopped working: done, needs you or
+    /// stuck, or the to-do was completed.
+    WorkerDone { todo_id: String },
 }
 
 impl ScheduledTimer {
@@ -170,6 +196,10 @@ mod tests {
             label: None,
             prompt: None,
             status,
+            reason: None,
+            until: None,
+            fired_at: None,
+            fire_cause: None,
         }
     }
 

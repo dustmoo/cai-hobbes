@@ -44,6 +44,7 @@ use dioxus::prelude::*;
 pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_PAGE_RESULT",
     "HOBBES_UPDATE_SCRATCHPAD",
+    "HOBBES_WRITE_HANDOFF",
     "HOBBES_INVOKE_SKILL",
     "HOBBES_UNLOAD_SKILL",
     "HOBBES_SET_TIMER",
@@ -467,6 +468,16 @@ pub async fn dispatch_builtin_tool(
                 session_id,
                 &deps.settings.read(),
             );
+            Some(BuiltinOutcome {
+                status,
+                response,
+                persist: true,
+            })
+        }
+
+        "HOBBES_WRITE_HANDOFF" => {
+            let (status, response) =
+                crate::handoff::handle_write_handoff(&mut session_state.write(), args_json, session_id);
             Some(BuiltinOutcome {
                 status,
                 response,

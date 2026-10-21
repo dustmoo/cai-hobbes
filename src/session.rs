@@ -322,6 +322,9 @@ pub struct Session {
     /// Persisted so pending timers survive a restart and can be re-scheduled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled_timers: Vec<crate::timers::ScheduledTimer>,
+    /// The model's latest note to its future self (HOBBES_WRITE_HANDOFF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<crate::handoff::HandoffNote>,
     /// Tool calls executed during the current turn of THIS session.
     /// Per-session (never global): two tabs streaming concurrently must not
     /// see each other's tool calls, and cancelling one tab must not wipe the
@@ -1098,6 +1101,10 @@ impl SessionState {
             label,
             prompt,
             status: TimerStatus::Pending,
+            reason: None,
+            until: None,
+            fired_at: None,
+            fire_cause: None,
         };
         let summary = timer.summary();
 
@@ -1712,6 +1719,7 @@ impl SessionState {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            handoff: None,
             tool_call_history: Vec::new(),
             tab_emoji: None,
             tab_title: None,
@@ -2225,6 +2233,7 @@ mod tests {
                 current_ai_turn_count: 0,
                 watch_word_recovery_count: 0,
                 scheduled_timers: Vec::new(),
+                handoff: None,
                 tool_call_history: Vec::new(),
                 tab_emoji: None,
                 tab_title: None,
@@ -3191,6 +3200,7 @@ mod tests {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            handoff: None,
             tool_call_history: Vec::new(),
         };
 

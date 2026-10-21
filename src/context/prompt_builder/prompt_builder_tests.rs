@@ -31,6 +31,7 @@ fn create_test_session() -> Session {
         loaded_skills: std::collections::HashMap::new(),
         scratchpad: String::new(),
         current_ai_turn_count: 0,
+        handoff: None,
         watch_word_recovery_count: 0,
         scheduled_timers: Vec::new(),
         tool_call_history: Vec::new(),
