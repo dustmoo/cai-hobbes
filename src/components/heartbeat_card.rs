@@ -70,8 +70,8 @@ pub fn last_wake_at(trail: &[WakeRecord]) -> Option<DateTime<Utc>> {
 }
 
 /// Newest first, capped.
-pub fn recent_trail(trail: &[WakeRecord], n: usize) -> Vec<&WakeRecord> {
-    let mut v: Vec<&WakeRecord> = trail.iter().collect();
+pub fn recent_trail<'a>(trail: impl IntoIterator<Item = &'a WakeRecord>, n: usize) -> Vec<&'a WakeRecord> {
+    let mut v: Vec<&WakeRecord> = trail.into_iter().collect();
     v.sort_by(|a, b| b.at.cmp(&a.at));
     v.truncate(n);
     v
@@ -177,6 +177,7 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let mut open = use_signal(|| false);
+    let mut confirm_clear = use_signal(|| false);
 
     let persist = move || {
         settings_manager
@@ -204,7 +205,7 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
     let last = last_wake_at(&hb.trail);
     let next_label = crate::heartbeat::wake::next_check_in(&hb, b.wakes_per_hour)
         .map(|t| t.with_timezone(&chrono::Local).format("%-I:%M").to_string());
-    let trail: Vec<WakeRecord> = recent_trail(&hb.trail, TRAIL_ROWS).into_iter().cloned().collect();
+    let trail: Vec<WakeRecord> = recent_trail(hb.visible_trail(), TRAIL_ROWS).into_iter().cloned().collect();
     // Pre-resolve each wake's events (summary, kind) and reactions so the
     // rsx holds no borrow of the global.
     struct EvRow {
@@ -299,6 +300,31 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
                         class: "flex items-center gap-6 flex-wrap text-xs text-fg-muted",
                         span { { format!("Wakes this hour: {} of {}", wakes, b.wakes_per_hour) } }
                         div { class: "flex-1" }
+                        if !rows.is_empty() {
+                            if *confirm_clear.read() {
+                                span { class: "text-xs text-fg-muted", "Clear the trail? Budget counts stay." }
+                                button {
+                                    class: "text-xs px-2 py-1 rounded border border-subtle text-fg hover:bg-card",
+                                    onclick: move |_| {
+                                        crate::heartbeat::HEARTBEAT.write().clear_trail(Utc::now());
+                                        crate::heartbeat::save_signal();
+                                        confirm_clear.set(false);
+                                    },
+                                    "Clear"
+                                }
+                                button {
+                                    class: "text-xs px-2 py-1 rounded text-fg-muted hover:text-fg",
+                                    onclick: move |_| confirm_clear.set(false),
+                                    "Cancel"
+                                }
+                            } else {
+                                button {
+                                    class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
+                                    onclick: move |_| confirm_clear.set(true),
+                                    "Clear trail"
+                                }
+                            }
+                        }
                         if let Some(id) = session_id.clone() {
                             button {
                                 class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",

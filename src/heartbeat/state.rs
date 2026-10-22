@@ -20,6 +20,8 @@ pub const MAX_EVENTS: usize = 500;
 pub const EVENT_MAX_AGE_DAYS: i64 = 7;
 /// Wake records kept.
 pub const MAX_TRAIL: usize = 200;
+/// Wake records older than this are dropped.
+pub const TRAIL_MAX_AGE_DAYS: i64 = 7;
 /// Reactions kept. Labels outlive their events (each carries the event's
 /// kind and summary), so this cap is the only bound.
 pub const MAX_REACTIONS: usize = 1000;
@@ -153,6 +155,11 @@ pub struct HeartbeatState {
     /// created (not an open tab unless the user opens it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// "Clear trail": the card hides wake records at or before this time.
+    /// The records stay for the budget (the hourly cap and today's spend
+    /// count them) until they age out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_cleared_at: Option<DateTime<Utc>>,
 }
 
 impl HeartbeatState {
@@ -359,8 +366,23 @@ impl HeartbeatState {
         let live: HashSet<&str> = self.events.iter().map(|e| e.id.as_str()).collect();
         self.decisions.retain(|d| live.contains(d.event_id.as_str()));
         self.queue.retain(|id| live.contains(id.as_str()));
+        let trail_cutoff = now - Duration::days(TRAIL_MAX_AGE_DAYS);
+        self.trail.retain(|w| w.at >= trail_cutoff);
         cap_front(&mut self.trail, MAX_TRAIL);
         cap_front(&mut self.reactions, MAX_REACTIONS);
+    }
+
+    /// Hide the current wake trail from the card ("Clear trail").
+    pub fn clear_trail(&mut self, now: DateTime<Utc>) {
+        self.trail_cleared_at = Some(now);
+    }
+
+    /// The wake records the card shows: those after the last clear.
+    pub fn visible_trail(&self) -> Vec<&WakeRecord> {
+        self.trail
+            .iter()
+            .filter(|w| self.trail_cleared_at.is_none_or(|c| w.at > c))
+            .collect()
     }
 }
 
@@ -496,6 +518,21 @@ mod tests {
         }
         assert_eq!(s.trail.len(), MAX_TRAIL);
         assert_eq!(s.trail[0].trigger, "w5");
+    }
+
+    #[test]
+    fn clearing_hides_the_trail_but_keeps_it_for_the_budget() {
+        let mut s = HeartbeatState::default();
+        s.record_wake(WakeRecord::fired(now() - Duration::minutes(20), "a", vec![], ""));
+        s.record_wake(WakeRecord::fired(now() - Duration::minutes(10), "b", vec![], ""));
+        s.clear_trail(now());
+        assert!(s.visible_trail().is_empty());
+        assert_eq!(s.trail.len(), 2, "kept for the hourly cap and today's spend");
+        s.record_wake(WakeRecord::fired(now() + Duration::minutes(5), "c", vec![], ""));
+        assert_eq!(s.visible_trail().len(), 1);
+        // Records age out after a week regardless.
+        s.prune(now() + Duration::days(TRAIL_MAX_AGE_DAYS) + Duration::minutes(1));
+        assert_eq!(s.trail.len(), 1);
     }
 
     #[test]
