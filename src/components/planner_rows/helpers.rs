@@ -302,6 +302,7 @@ mod tests {
             dispatched_from: None,
             continuation_sent: false,
             wake_at: None,
+            terminal: None,
         };
         s.working_since = matches!(
             s.status,

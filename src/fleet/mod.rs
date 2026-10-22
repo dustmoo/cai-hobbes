@@ -50,6 +50,7 @@ pub mod replay;
 pub mod hooks_config;
 pub mod server;
 pub mod store;
+pub mod terminal_focus;
 pub mod transcript;
 
 use std::collections::{BTreeMap, HashMap};
@@ -260,6 +261,9 @@ pub struct FleetSession {
     /// When a `Waiting` session's next timer is due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_at: Option<DateTime<Utc>>,
+    /// The terminal a Claude Code session runs in, from hook headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<terminal_focus::TerminalHint>,
 }
 
 impl FleetSession {
@@ -288,6 +292,7 @@ impl FleetSession {
             dispatched_from: None,
             continuation_sent: false,
             wake_at: None,
+            terminal: None,
         }
     }
 
