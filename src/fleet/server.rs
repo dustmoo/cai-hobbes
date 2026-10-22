@@ -280,8 +280,8 @@ async fn handle(
     // process (startup/resume/fork), not `/clear` or a compaction inside an
     // already-running one.
     let hint = hint.map(|mut h| {
-        if let FleetEvent::SessionStart { reason, .. } = &event {
-            if !matches!(reason.as_str(), "clear" | "compact") {
+        if let FleetEvent::SessionStart { source, .. } = &event {
+            if !matches!(source.as_str(), "clear" | "compact") {
                 h.started_at = Some(chrono::Utc::now());
             }
         }
@@ -430,7 +430,7 @@ mod tests {
             "session_id": id,
             "cwd": "/Users/x/dev/hobbes",
             "hook_event_name": "SessionStart",
-            "reason": "startup"
+            "source": "startup"
         })
         .to_string()
     }

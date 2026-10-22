@@ -113,6 +113,58 @@ pub fn extract_json_object(text: &str) -> Option<serde_json::Value> {
     })
 }
 
+/// Whether `text` is (an attempt at) a JSON object or a fenced block of one:
+/// it starts with `{` or a code fence, or carries the summary key.
+pub fn looks_like_json_object(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with('{') || t.starts_with("```") || t.contains("\"summary\"")
+}
+
+/// Pull the `"summary"` string out of JSON text that never parsed because the
+/// model was cut off mid-object (`{"summary":"Active Composio profile is …`)
+/// or wrapped it in something unparseable. Reads the string value up to its
+/// closing quote, or to the end of the text when it was truncated.
+pub fn salvage_summary_text(text: &str) -> Option<String> {
+    let key = text.find("\"summary\"")?;
+    let rest = text[key + "\"summary\"".len()..].trim_start().strip_prefix(':')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => break,
+            '\\' => match chars.next() {
+                Some('n') | Some('t') | Some('r') => out.push(' '),
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        out.push(ch);
+                    }
+                }
+                Some(other) => out.push(other),
+                None => break,
+            },
+            c => out.push(c),
+        }
+    }
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// What a connector returns when a summary reply was not a parseable JSON
+/// object: the text itself as the summary when it is prose; the salvaged
+/// `summary` when it is truncated JSON; `Null` (no summary) when it is JSON
+/// debris with nothing recoverable — never the raw JSON as the summary.
+pub fn summary_fallback_value(text: &str) -> serde_json::Value {
+    if looks_like_json_object(text) {
+        return match salvage_summary_text(text) {
+            Some(s) => serde_json::json!({ "summary": s, "entities": {}, "sentiment": "neutral" }),
+            None => serde_json::Value::Null,
+        };
+    }
+    serde_json::json!({ "summary": text, "entities": {}, "sentiment": "neutral" })
+}
+
 /// Build a connector for a specific connector instance, optionally overriding
 /// the chat model (per-session model pins). Gemini connectors share a
 /// process-wide cache store, so per-request construction does not orphan
@@ -290,6 +342,20 @@ mod tests {
         let odd = StubConnector(serde_json::json!({"summary": "", "other": 1}));
         let out = odd.generate_fleet_rollup("framed".into()).await.unwrap();
         assert!(out.contains("other"));
+    }
+
+    #[test]
+    fn truncated_summary_json_is_salvaged_not_stored_raw() {
+        let cut = r#"{"summary":"Active Composio profile is 'Clearmirror.ai'. Hobbes was asked to \"check\" the calend"#;
+        assert_eq!(extract_json_object(cut), None);
+        assert_eq!(
+            summary_fallback_value(cut)["summary"],
+            "Active Composio profile is 'Clearmirror.ai'. Hobbes was asked to \"check\" the calend"
+        );
+        let fenced = "Here is the summary:\n```json\n{\"summary\": \"Drafted the brief\", \"entities\": {\"key_top";
+        assert_eq!(summary_fallback_value(fenced)["summary"], "Drafted the brief");
+        assert!(summary_fallback_value("{\"entities\": {\"key_topics\": [\"a\"").is_null());
+        assert_eq!(summary_fallback_value("Fixed the bug.")["summary"], "Fixed the bug.");
     }
 
     #[test]

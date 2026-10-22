@@ -31,8 +31,9 @@ const DISPATCH_DESCRIPTION: &str = "Send a todo to a worker. target 'chat' opens
     Code run in the todo's project directory (the project must have a path). Either way the todo \
     joins the agent lane, links to the worker, and its state (working / needs you / stuck / done) \
     and progress flow back onto it automatically; a headless run's permission requests appear in \
-    the Fleet for approval. Set the todo's 'outcome' first so the worker knows what done looks \
-    like. For target 'chat' you may pick the worker's model (connector + model): a cheaper, faster \
+    the Fleet for approval. Keep the todo's title a short name (about 80 characters): put the brief in its \
+    'notes' and any extra guidance in 'instructions', never in the title. Set the todo's \
+    'outcome' first so the worker knows what done looks like. For target 'chat' you may pick the worker's model (connector + model): a cheaper, faster \
     model (e.g. a Haiku) for routine lookups, summaries and formatting; a stronger one for \
     multi-step reasoning or code. The choice must come from the allowed list; anything else is \
     refused.";
@@ -90,8 +91,8 @@ impl PlannerClient {
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "title": { "type": "string", "description": "Short imperative title, e.g. 'Draft the proposal'." },
-                                        "notes": { "type": "string", "description": "Longer free-form notes (markdown)." },
+                                        "title": { "type": "string", "description": "A short name, about 80 characters at most, e.g. 'Draft the proposal'. Never a brief or instructions: put those in 'notes'." },
+                                        "notes": { "type": "string", "description": "Longer free-form notes (markdown). The brief, context and instructions for the work go here." },
                                         "bucket": { "type": "string", "enum": ["inbox", "anytime", "someday"], "description": "List for an unscheduled todo. Defaults to inbox." },
                                         "scheduled_for": { "type": "string", "description": "The day the user intends to do it (YYYY-MM-DD, 'today' or 'tomorrow'). Distinct from deadline." },
                                         "time_of_day": { "type": "string", "enum": ["morning", "afternoon", "evening"], "description": "Rough slot within the scheduled day." },
@@ -142,7 +143,7 @@ impl PlannerClient {
                                     "type": "object",
                                     "properties": {
                                         "id": { "type": "string", "description": "Id of the todo to update (from HOBBES_TODO_LIST or a previous create)." },
-                                        "title": { "type": "string" },
+                                        "title": { "type": "string", "description": "A short name, about 80 characters at most. Brief or instructions go in 'notes'." },
                                         "notes": { "type": "string" },
                                         "status": { "type": "string", "enum": ["open", "in_progress", "completed", "cancelled"], "description": "'completed' finishes it, 'cancelled' abandons it, 'open' reopens it." },
                                         "bucket": { "type": "string", "enum": ["inbox", "anytime", "someday"] },
@@ -342,7 +343,7 @@ impl PlannerClient {
                         "properties": {
                             "todo_id": { "type": "string", "description": "The todo to dispatch." },
                             "target": { "type": "string", "enum": ["chat", "claude_code"], "description": "Where the work runs." },
-                            "instructions": { "type": "string", "description": "Extra guidance appended to the assignment." },
+                            "instructions": { "type": "string", "description": "Extra guidance appended to the assignment. Put it here, not in the todo's title." },
                             "connector": { "type": "string", "description": "chat only: the connector to run the new tab on (a connector name from the allowed list). Omit for the user's default." },
                             "model": { "type": "string", "description": "chat: a model slug from the allowed list (omit for the user's default). claude_code: the Claude Code model (e.g. 'sonnet', 'opus')." }
                         },

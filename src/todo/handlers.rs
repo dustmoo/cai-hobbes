@@ -238,6 +238,41 @@ pub fn handle_todo_create(
     compose_batch_response("Created", &created, &errors)
 }
 
+/// Titles longer than this are treated as a pasted brief.
+const LONG_TITLE_CHARS: usize = 120;
+/// The shortened title's cap.
+const SHORT_TITLE_CHARS: usize = 80;
+
+/// A title that is really a brief (agents paste whole dispatch briefs in)
+/// becomes a short name plus the full text for the notes. `None` when the
+/// title is fine as is. The short title is the first sentence/line when it
+/// fits in 80 characters, else a word-boundary cut ending in "…".
+pub(crate) fn shorten_long_title(title: &str) -> Option<String> {
+    let title = title.trim();
+    if title.chars().count() <= LONG_TITLE_CHARS {
+        return None;
+    }
+    let first = title
+        .split(['\n'])
+        .next()
+        .unwrap_or(title)
+        .split_inclusive(['.', '!', '?', ':', ';'])
+        .next()
+        .unwrap_or(title)
+        .trim()
+        .trim_end_matches([':', ';', '.'])
+        .trim();
+    if !first.is_empty() && first.chars().count() <= SHORT_TITLE_CHARS && first.chars().count() < title.chars().count() {
+        return Some(first.to_string());
+    }
+    let cut: String = title.chars().take(SHORT_TITLE_CHARS - 1).collect();
+    let cut = match cut.rfind(char::is_whitespace) {
+        Some(i) if i > SHORT_TITLE_CHARS / 2 => &cut[..i],
+        _ => cut.as_str(),
+    };
+    Some(format!("{}\u{2026}", cut.trim_end_matches([',', ';', ':', '-', ' '])))
+}
+
 fn build_todo(
     state: &PlannerState,
     item: &Value,
@@ -253,13 +288,22 @@ fn build_todo(
         .filter(|t| !t.is_empty())
         .ok_or("missing required 'title'")?;
 
-    let mut todo = Todo::new(title, state.next_sort_order());
+    let short = shorten_long_title(title);
+    let mut todo = Todo::new(short.as_deref().unwrap_or(title), state.next_sort_order());
     todo.origin = TodoOrigin::Ai {
         session_id: session_id.to_string(),
     };
 
     if let Some(notes) = obj.get("notes").and_then(|v| v.as_str()) {
         todo.notes = notes.to_string();
+    }
+    // The full text stays: it leads the notes.
+    if short.is_some() {
+        todo.notes = if todo.notes.trim().is_empty() {
+            title.to_string()
+        } else {
+            format!("{title}\n\n{}", todo.notes)
+        };
     }
     if let Some(bucket) = obj.get("bucket").and_then(|v| v.as_str()) {
         todo.bucket = parse_bucket(bucket)?;
@@ -2464,8 +2508,17 @@ pub fn apply_brief_progress(
     now: DateTime<Utc>,
 ) -> Vec<String> {
     let mut changed = Vec::new();
+    // A line that is itself a JSON object is never progress: take its
+    // summary, or drop it (the state hook below still runs).
+    let line = if crate::llm::looks_like_json_object(line) {
+        crate::fleet::briefs::clean_headline(line).unwrap_or_default()
+    } else {
+        line.trim().to_string()
+    };
+    let line = line.as_str();
     for todo in state.todos.iter_mut() {
-        if todo.linked_fleet_session.as_deref() == Some(session_id)
+        if !line.is_empty()
+            && todo.linked_fleet_session.as_deref() == Some(session_id)
             && !matches!(todo.status, TodoStatus::Completed | TodoStatus::Cancelled)
             && todo.latest_progress.as_deref() != Some(line)
         {
@@ -3625,6 +3678,16 @@ mod tests {
         // Same line again → no-op (no churn, no updated_at bump).
         assert!(apply_brief_progress(&mut state, "s1", "Did the thing", Utc::now()).is_empty());
 
+        // JSON never lands as progress: unwrapped, or dropped.
+        let raw = r#"{"summary":"Active Composio profile is 'Clearmirror.ai'. Hobbe"#;
+        assert_eq!(apply_brief_progress(&mut state, "s1", raw, Utc::now()), vec![a.clone()]);
+        assert_eq!(
+            state.todo(&a).unwrap().latest_progress.as_deref(),
+            Some("Active Composio profile is 'Clearmirror.ai'. Hobbe")
+        );
+        assert!(apply_brief_progress(&mut state, "s1", r#"{"entities":{}}"#, Utc::now()).is_empty());
+        assert!(!state.todo(&a).unwrap().latest_progress.as_deref().unwrap().contains('{'));
+
         // Pairs feed framing/status: only open linked todos.
         let pairs = linked_session_pairs(&state);
         assert_eq!(pairs, vec![("s1".to_string(), "Linked open".to_string())]);
@@ -4079,6 +4142,31 @@ mod tests {
             TodoOrigin::Ai { session_id: "sess-1".into() },
             "AI-created todos must record the originating session"
         );
+    }
+
+    #[test]
+    fn long_titles_become_short_names_with_the_brief_in_notes() {
+        assert_eq!(shorten_long_title("Draft the proposal"), None);
+        let brief = "Audit the Composio connections for Clearmirror. Check every toolkit, list the stale ones, \
+                     and write the findings into a table with owner and last-used date.";
+        assert_eq!(shorten_long_title(brief).as_deref(), Some("Audit the Composio connections for Clearmirror"));
+        let run_on = "Go through every open pull request in the repository and summarise the state of each one with a recommendation for the owner";
+        let short = shorten_long_title(run_on).unwrap();
+        assert!(short.chars().count() <= 80 && short.ends_with('\u{2026}'), "{short}");
+        assert!(run_on.starts_with(short.trim_end_matches('\u{2026}')));
+        assert!(!short.trim_end_matches('\u{2026}').ends_with(' '));
+
+        let mut state = PlannerState::default();
+        let (status, _) = create(
+            &mut state,
+            json!({"todos": [{"title": brief, "notes": "extra", "lane": "agent"}, {"title": "tiny"}]}),
+        );
+        assert_eq!(status, ToolCallStatus::Completed);
+        let t = state.todos.iter().find(|t| t.title.starts_with("Audit")).unwrap();
+        assert_eq!(t.title, "Audit the Composio connections for Clearmirror");
+        assert!(t.notes.starts_with(brief) && t.notes.ends_with("extra"));
+        let tiny = state.todos.iter().find(|t| t.title == "tiny").unwrap();
+        assert!(tiny.notes.is_empty());
     }
 
     #[test]

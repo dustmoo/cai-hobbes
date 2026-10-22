@@ -16,8 +16,9 @@ pub enum FleetEvent {
     SessionStart {
         session_id: String,
         cwd: String,
-        /// `startup` | `resume` | `clear` | `compact` | `fork`
-        reason: String,
+        /// The payload's `source`: `startup` | `resume` | `clear` | `compact` | `fork`
+        /// (older builds sent it as `reason`; still accepted).
+        source: String,
     },
     SessionEnd {
         session_id: String,
@@ -112,6 +113,13 @@ impl FleetEvent {
     }
 }
 
+/// SessionStart's `source` (startup/resume/clear/compact/fork), falling back
+/// to the older `reason` spelling.
+fn session_start_source(v: &Value) -> String {
+    let s = str_field(v, "source");
+    if s.is_empty() { str_field(v, "reason") } else { s }
+}
+
 fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
@@ -166,7 +174,7 @@ pub fn parse_event(body: &[u8]) -> Result<FleetEvent, String> {
         "SessionStart" => Ok(FleetEvent::SessionStart {
             session_id,
             cwd,
-            reason: str_field(&v, "reason"),
+            source: session_start_source(&v),
         }),
         "SessionEnd" => Ok(FleetEvent::SessionEnd {
             session_id,
@@ -230,7 +238,7 @@ mod tests {
             "cwd": "/Users/x/dev/hobbes",
             "permission_mode": "default",
             "hook_event_name": "SessionStart",
-            "reason": "startup",
+            "source": "startup",
             "model": "claude-fable-5"
         });
         let ev = parse_event(body.to_string().as_bytes()).unwrap();
@@ -239,9 +247,27 @@ mod tests {
             FleetEvent::SessionStart {
                 session_id: "abc123".into(),
                 cwd: "/Users/x/dev/hobbes".into(),
-                reason: "startup".into(),
+                source: "startup".into(),
             }
         );
+    }
+
+    #[test]
+    fn session_start_reads_source_and_falls_back_to_reason() {
+        let src = |v: serde_json::Value| match parse_event(v.to_string().as_bytes()).unwrap() {
+            FleetEvent::SessionStart { source, .. } => source,
+            other => panic!("{other:?}"),
+        };
+        let base = |k: &str, val: &str| {
+            let mut m = serde_json::json!({"session_id": "a", "cwd": "/x", "hook_event_name": "SessionStart"});
+            m[k] = val.into();
+            m
+        };
+        assert_eq!(src(base("source", "compact")), "compact");
+        assert_eq!(src(base("reason", "clear")), "clear");
+        let mut both = base("source", "resume");
+        both["reason"] = "clear".into();
+        assert_eq!(src(both), "resume", "source wins");
     }
 
     #[test]

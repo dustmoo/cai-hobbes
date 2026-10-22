@@ -722,11 +722,7 @@ You MUST respond with valid JSON containing exactly these fields:
             tracing::warn!(
                 "OpenAI Compat: Failed to parse summary response as JSON. Using raw text."
             );
-            return Ok(json!({
-                "summary": content,
-                "entities": {},
-                "sentiment": "neutral"
-            }));
+            return Ok(super::summary_fallback_value(content));
         }
 
         tracing::error!("OpenAI Compat: Summarization response had no content.");

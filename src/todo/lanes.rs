@@ -143,7 +143,7 @@ fn synthesize_decision(signal: &WorkerSignal, now: DateTime<Utc>) -> Option<Deci
     let (question, options, source) = if let Some(g) = &signal.gate {
         (
             format!("Allow {}? {}", g.tool_name, g.input_summary.trim()),
-            vec!["Approve".to_string(), "Deny".to_string()],
+            Vec::new(),
             DecisionSource::Gate {
                 request_id: g.request_id.clone(),
             },
@@ -219,8 +219,8 @@ pub fn ask_decision(
 /// Record the person's answer to an open decision. Returns the log entry;
 /// delivery to the worker happens at the edge, which then calls
 /// [`record_delivery`]. Gate decisions are refused: a permission gate is the
-/// person's own Approve/Deny in the Fleet or decision-queue UI
-/// (`FleetShared::resolve_gate`), never something the model answers.
+/// prompt the person answers in the Claude Code terminal, never something
+/// the model answers.
 pub fn resolve_decision(
     state: &mut PlannerState,
     todo_id: &str,
@@ -239,8 +239,8 @@ pub fn resolve_decision(
         .ok_or_else(|| format!("'{}' has no open decision.", title))?;
     if matches!(decision.source, DecisionSource::Gate { .. }) {
         return Err(format!(
-            "'{}' is waiting on a permission gate. Only the user can approve or deny it, \
-             in the Fleet or the decision queue — it cannot be answered by a tool.",
+            "'{}' is waiting on a permission gate. Only the user can answer it, \
+             in the Claude Code terminal — it cannot be answered by a tool.",
             title
         ));
     }
@@ -431,7 +431,7 @@ pub fn decision_line(t: &Todo) -> Option<String> {
         extras.push(w.clone());
     }
     if matches!(d.source, DecisionSource::Gate { .. }) {
-        extras.push("permission gate — the user approves in the Fleet".into());
+        extras.push("permission prompt — the user answers it in the terminal".into());
     }
     Some(format!("[{}] {} ({})", t.id, d.question, extras.join("; ")))
 }
@@ -520,10 +520,10 @@ mod tests {
         assert_eq!(t.agent_state, Some(AgentState::NeedsYou));
         let d = t.decision.clone().unwrap();
         assert!(d.question.contains("Bash") && d.question.contains("npm publish"));
-        assert_eq!(d.options, vec!["Approve", "Deny"]);
+        assert!(d.options.is_empty(), "answered in the terminal: no Approve/Deny options");
         assert!(matches!(d.source, DecisionSource::Gate { .. }));
 
-        // Approved in the Fleet: the worker resumes; the synthesized
+        // Answered in the terminal: the worker resumes; the synthesized
         // decision clears itself.
         assert!(apply_worker_signal(&mut t, &signal(WorkerStatus::Working), now));
         assert!(t.decision.is_none());
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(t.agent_state, Some(AgentState::Queued));
         assert!(t.latest_progress.as_deref().unwrap().contains("Move to Phase 3"));
 
-        // Gate decisions are the user's own Approve/Deny.
+        // Gate decisions are answered by the user in the terminal.
         let mut g = agent_todo();
         let mut gated = signal(WorkerStatus::WaitingOnUser);
         gated.gate = Some(GateSignal { request_id: "g".into(), tool_name: "Bash".into(), input_summary: "rm".into() });

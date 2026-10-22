@@ -1929,7 +1929,7 @@ You MUST respond with ONLY valid JSON (no prose, no markdown fences) containing 
             return Ok(json_value);
         }
         tracing::warn!("Claude: Failed to parse summary as JSON. Using raw text.");
-        Ok(json!({ "summary": text, "entities": {}, "sentiment": "neutral" }))
+        Ok(super::summary_fallback_value(text))
     }
 
     async fn select_tools_for_toolkit(

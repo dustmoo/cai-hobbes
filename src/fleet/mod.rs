@@ -1417,7 +1417,7 @@ mod tests {
         FleetEvent::SessionStart {
             session_id: id.into(),
             cwd: "/Users/x/dev/hobbes".into(),
-            reason: "startup".into(),
+            source: "startup".into(),
         }
     }
 
@@ -1659,7 +1659,7 @@ mod tests {
             &FleetEvent::SessionStart {
                 session_id: "s2".into(),
                 cwd: "/Users/x/dev/hobbes".into(), // same name as s1
-                reason: "startup".into(),
+                source: "startup".into(),
             },
             t0,
         );
@@ -1668,7 +1668,7 @@ mod tests {
             &FleetEvent::SessionStart {
                 session_id: "s3".into(),
                 cwd: "/Users/x/dev/puget".into(),
-                reason: "startup".into(),
+                source: "startup".into(),
             },
             t0,
         );
@@ -2077,7 +2077,7 @@ mod tests {
         let now = utc("2026-08-25T10:00:00Z");
         let mut changed = reduce(
             &mut state,
-            &FleetEvent::SessionStart { session_id: "s1".into(), cwd: "/x".into(), reason: "startup".into() },
+            &FleetEvent::SessionStart { session_id: "s1".into(), cwd: "/x".into(), source: "startup".into() },
             now,
         );
         let hint = TerminalHint {

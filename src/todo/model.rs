@@ -665,8 +665,8 @@ pub enum DecisionSource {
     /// The worker asked (`HOBBES_DECISIONS ask`).
     #[default]
     Worker,
-    /// A held fleet permission gate. Answered by Approve/Deny in the UI
-    /// (`FleetShared::resolve_gate`) — never by the model.
+    /// A held fleet permission gate. Answered by the person in the Claude
+    /// Code terminal — never by the model.
     Gate { request_id: String },
     /// A fleet `NeedsAttention` notification (idle prompt, question…).
     Attention,

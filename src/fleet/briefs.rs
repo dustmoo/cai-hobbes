@@ -177,9 +177,10 @@ pub fn brief_from_summary_value(
             .unwrap_or_default()
     };
 
-    let headline = str_at("/summary")
-        .or_else(|| str_at("/current_task"))
-        .unwrap_or_else(|| truncate_summary(&v.to_string(), HEADLINE_MAX_CHARS));
+    // A summary that is itself JSON (a reply that wasn't parsed upstream) is
+    // unwrapped; one with no usable text is not shown at all.
+    let headline = clean_headline(&str_at("/summary").unwrap_or_default())
+        .or_else(|| clean_headline(&str_at("/current_task").unwrap_or_default()))?;
     let mut bullets = list_at("/entities/key_decisions");
     bullets.extend(list_at("/entities/key_topics"));
     bullets.truncate(MAX_BULLETS);
@@ -194,12 +195,41 @@ pub fn brief_from_summary_value(
     })
 }
 
+/// A display-safe headline: prose passes through; text that is (or wraps) a
+/// JSON object is parsed and its `summary`/`current_task` taken, salvaging a
+/// truncated `"summary"` string; nothing recoverable gives `None`. Never
+/// returns a string that itself looks like a JSON object.
+pub fn clean_headline(text: &str) -> Option<String> {
+    let t = text.trim();
+    if t.is_empty() {
+        return None;
+    }
+    if !crate::llm::looks_like_json_object(t) {
+        return Some(t.to_string());
+    }
+    let inner = crate::llm::extract_json_object(t)
+        .and_then(|v| {
+            ["/summary", "/current_task"].iter().find_map(|p| {
+                v.pointer(p)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !crate::llm::looks_like_json_object(s))
+                    .map(str::to_string)
+            })
+        })
+        .or_else(|| crate::llm::salvage_summary_text(t))?;
+    (!crate::llm::looks_like_json_object(&inner)).then_some(inner)
+}
+
 /// One display line from a brief: headline plus blocker, clipped — the shape
 /// written onto linked todos' `latest_progress`.
 pub fn progress_line(brief: &SessionBrief) -> String {
-    let mut line = truncate_summary(&brief.headline, 160);
+    // Briefs persisted before the headline was cleaned may still hold JSON.
+    let headline = clean_headline(&brief.headline).unwrap_or_default();
+    let mut line = truncate_summary(&headline, 160);
     if let Some(blocked) = &brief.blocked_on {
-        line.push_str(&format!("; blocked: {}", truncate_summary(blocked, 80)));
+        let sep = if line.is_empty() { "" } else { "; " };
+        line.push_str(&format!("{sep}blocked: {}", truncate_summary(blocked, 80)));
     }
     truncate_summary(&line, 200)
 }
@@ -618,10 +648,44 @@ mod tests {
         let b = brief_from_summary_value(&v, utc("2026-09-01T10:00:00Z"), false).unwrap();
         assert_eq!(b.headline, "fixing tests");
 
+        // No summary text at all: no brief, never the stringified JSON.
         let odd = serde_json::json!({"unexpected": "shape"});
-        let b = brief_from_summary_value(&odd, utc("2026-09-01T10:00:00Z"), false).unwrap();
-        assert!(b.headline.contains("unexpected"));
+        assert!(brief_from_summary_value(&odd, utc("2026-09-01T10:00:00Z"), false).is_none());
         assert!(brief_from_summary_value(&serde_json::Value::Null, utc("2026-09-01T10:00:00Z"), false).is_none());
+    }
+
+    #[test]
+    fn json_in_a_summary_is_unwrapped_or_dropped() {
+        let now = utc("2026-09-01T10:00:00Z");
+        // The reported bug: a truncated JSON object stored as the summary.
+        let cut = r#"{"summary":"Active Composio profile is 'Clearmirror.ai'. Hobbes was asked to verify the cal"#;
+        let v = serde_json::json!({ "summary": cut });
+        let b = brief_from_summary_value(&v, now, false).unwrap();
+        assert_eq!(b.headline, "Active Composio profile is 'Clearmirror.ai'. Hobbes was asked to verify the cal");
+        assert!(!progress_line(&b).contains('{'));
+
+        // A complete object (prose-wrapped, fenced) as the summary string.
+        let fenced = "Sure!\n```json\n{\"summary\":\"Shipped the digest\",\"current_task\":\"qa\"}\n```";
+        let b = brief_from_summary_value(&serde_json::json!({ "summary": fenced }), now, false).unwrap();
+        assert_eq!(b.headline, "Shipped the digest");
+
+        // current_task only.
+        let only_task = r#"{"summary":"","current_task":"fixing tests"}"#;
+        assert_eq!(clean_headline(only_task).as_deref(), Some("fixing tests"));
+
+        // Nothing recoverable: dropped.
+        assert_eq!(clean_headline(r#"{"entities":{"key_topics":["a"]}}"#), None);
+        assert!(brief_from_summary_value(&serde_json::json!({"summary": r#"{"entities":{}}"#}), now, false).is_none());
+
+        // A stored legacy brief headline is cleaned at display time.
+        let legacy = SessionBrief {
+            headline: cut.to_string(),
+            bullets: vec![],
+            blocked_on: None,
+            generated_at: now,
+            final_brief: false,
+        };
+        assert!(progress_line(&legacy).starts_with("Active Composio"));
     }
 
     #[test]
