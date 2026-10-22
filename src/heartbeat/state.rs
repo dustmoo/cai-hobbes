@@ -47,6 +47,11 @@ pub struct WakeRecord {
     /// What the wake did, filled in when it finishes.
     #[serde(default)]
     pub outcome: Option<String>,
+    /// What the wake actually did, one short line each ("Dispatched 'Clyde
+    /// prep'", "Raised: defer the Hetzner cutover?"), read from its tool calls
+    /// when it finishes. Empty = it decided nothing needed doing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<String>,
 }
 
 impl WakeRecord {
@@ -66,6 +71,7 @@ impl WakeRecord {
             defer_reason: None,
             cost_usd: None,
             outcome: None,
+            actions: Vec::new(),
         }
     }
 
