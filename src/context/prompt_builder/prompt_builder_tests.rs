@@ -2988,10 +2988,10 @@ fn briefing_parts_appear_only_when_they_have_something_to_say() {
     let gap = 47 * 60;
 
     // First turn: nothing came before.
-    assert_eq!(turn_briefing(&session, &[], fixed_clock(gap)), "");
+    assert_eq!(turn_briefing(&session, &[], &[], fixed_clock(gap)), "");
 
     // Long gap only: the elapsed line, nothing else.
-    let b = turn_briefing(&session, &prior, fixed_clock(gap));
+    let b = turn_briefing(&session, &prior, &[], fixed_clock(gap));
     assert_eq!(
         b,
         format!("{BRIEFING_HEADER}\n47 min since your last turn here ({}).", hhmm(utc(0)))
@@ -3000,12 +3000,12 @@ fn briefing_parts_appear_only_when_they_have_something_to_say() {
     // Short gap with a handoff note and no fired timer: a live conversation,
     // nothing to say.
     session.handoff = Some(note_at(utc(-60), None));
-    assert_eq!(turn_briefing(&session, &prior, fixed_clock(120)), "");
+    assert_eq!(turn_briefing(&session, &prior, &[], fixed_clock(120)), "");
 
     // Short gap, a bare fired timer: the timer line (no cause, no reason)
     // and the note, but no elapsed line.
     session.scheduled_timers = vec![briefing_timer("t1", "fired", Some(utc(60)), None, None, None)];
-    let b = turn_briefing(&session, &prior, fixed_clock(120));
+    let b = turn_briefing(&session, &prior, &[], fixed_clock(120));
     assert!(!b.contains("since your last turn here ("), "{b}");
     assert!(b.contains(&format!("Timer fired at {}: \"(no label)\".", hhmm(utc(60)))), "{b}");
     assert!(!b.contains("Why you set it"), "{b}");
@@ -3021,13 +3021,103 @@ fn briefing_parts_appear_only_when_they_have_something_to_say() {
         briefing_timer("cancelled", "cancelled", None, Some("cancelled"), None, None),
     ];
     session.handoff = None;
-    assert_eq!(turn_briefing(&session, &prior, fixed_clock(120)), "");
+    assert_eq!(turn_briefing(&session, &prior, &[], fixed_clock(120)), "");
 
     // A note older than a day is flagged.
     session.handoff = Some(note_at(utc(-30 * 3600), Some("the build fails twice")));
-    let b = turn_briefing(&session, &prior, fixed_clock(gap));
+    let b = turn_briefing(&session, &prior, &[], fixed_clock(gap));
     assert!(b.contains("Your handoff note, written 30 h 47 min ago (possibly out of date):"), "{b}");
     assert!(b.contains("Would change plan if: the build fails twice"), "{b}");
+}
+
+fn hb_event(kind: &str, summary: &str, at: chrono::DateTime<Utc>) -> crate::heartbeat::HeartbeatEvent {
+    crate::heartbeat::HeartbeatEvent::new(
+        crate::heartbeat::EventSource::Fleet,
+        kind,
+        summary,
+        crate::heartbeat::Urgency::Normal,
+        at,
+    )
+}
+
+#[test]
+fn briefing_lists_changes_to_dispatched_work() {
+    let session = create_test_session();
+    let prior = finished_turn_at(utc(0));
+
+    let mut done = hb_event("run_ended", "Fleet: dispatched run fix-ci ended", utc(60));
+    done.dispatched_from = Some("test_session".into());
+    let mut before = hb_event("run_ended", "old news", utc(-60));
+    before.dispatched_from = Some("test_session".into());
+    // The chat's own to-do (it is the worker): not work it dispatched.
+    let mut own = hb_event("worker_done", "Agent finished \"own task\"", utc(70));
+    own.session_id = Some("test_session".into());
+    // A run this chat launched that also names it as its session counts.
+    let mut both = hb_event("session_needs_attention", "Fleet: fix-ci — waiting on permission", utc(90));
+    both.session_id = Some("test_session".into());
+    both.dispatched_from = Some("test_session".into());
+
+    // A short gap with a dispatched-work change is news on its own.
+    let events = vec![before.clone(), done.clone(), own.clone(), both.clone()];
+    let b = turn_briefing(&session, &prior, &events, fixed_clock(120));
+    assert_eq!(
+        b,
+        format!(
+            "{BRIEFING_HEADER}\n\
+             Work you dispatched: Fleet: dispatched run fix-ci ended ({}).\n\
+             Work you dispatched: Fleet: fix-ci — waiting on permission ({}).",
+            hhmm(utc(60)),
+            hhmm(utc(90)),
+        )
+    );
+    // Only stale or own-work events: nothing to say on a short gap.
+    assert_eq!(turn_briefing(&session, &prior, &[before, own], fixed_clock(120)), "");
+
+    // Capped at the five most recent, oldest first.
+    let many: Vec<_> = (1..=8)
+        .map(|i| {
+            let mut e = hb_event("run_ended", &format!("run {i} ended"), utc(i * 10));
+            e.dispatched_from = Some("test_session".into());
+            e
+        })
+        .collect();
+    let b = turn_briefing(&session, &prior, &many, fixed_clock(120));
+    let listed: Vec<&str> = b.lines().filter(|l| l.starts_with("Work you dispatched")).collect();
+    assert_eq!(listed.len(), 5, "{b}");
+    assert!(listed[0].contains("run 4 ended") && listed[4].contains("run 8 ended"), "{b}");
+}
+
+#[test]
+fn dispatched_work_rides_the_boundary_tail_and_replays_unchanged() {
+    let mut sim = briefing_sim(LlmProvider::Claude);
+    let last = utc(sim.clock);
+    let mut ev = hb_event("run_ended", "Fleet: dispatched run fix-ci ended", last + chrono::Duration::minutes(1));
+    ev.dispatched_from = Some(sim.session.id.clone());
+    sim.clock += 120;
+    sim.session.messages.push(user_text_msg("how did it go?"));
+    sim.session.messages.push(placeholder_msg());
+    let boundary = PromptBuilder::new(&sim.session, &sim.settings)
+        .with_planner_today(Some(sim.planner.clone()))
+        .with_heartbeat_events(vec![ev.clone()])
+        .with_now(fixed_clock(sim.clock))
+        .build_prompt(String::new());
+    let tail = tail_text(&boundary);
+    let line = format!("Work you dispatched: Fleet: dispatched run fix-ci ended ({}).", hhmm(ev.at));
+    assert!(tail.contains(&line), "{tail}");
+    assert!(!boundary.prompt.system.clone().unwrap().contains("fix-ci"), "never in the system string");
+    sim.session.history_anchor = boundary.history_anchor;
+    sim.session.context_ledger.extend(boundary.ledger_entries.iter().cloned());
+
+    // A retry with newer events (and a later clock) replays the same bytes.
+    let mut later = hb_event("run_ended", "Fleet: dispatched run other ended", utc(sim.clock));
+    later.dispatched_from = Some(sim.session.id.clone());
+    let retry = PromptBuilder::new(&sim.session, &sim.settings)
+        .with_planner_today(Some(sim.planner.clone()))
+        .with_heartbeat_events(vec![ev, later])
+        .with_now(fixed_clock(sim.clock + 600))
+        .build_prompt(String::new());
+    assert!(retry.ledger_entries.is_empty());
+    assert_eq!(retry.prompt.messages, boundary.prompt.messages);
 }
 
 /// A sim whose session offers HOBBES_WRITE_HANDOFF (so the stable guidance

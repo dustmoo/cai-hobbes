@@ -254,6 +254,7 @@ impl HeartbeatState {
     }
 
     /// Events after `since`, oldest first.
+    #[cfg(test)]
     pub fn events_since(&self, since: DateTime<Utc>) -> Vec<&HeartbeatEvent> {
         self.events.iter().filter(|e| e.at > since).collect()
     }

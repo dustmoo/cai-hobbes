@@ -5,9 +5,9 @@
 //! call, first in shadow (see [`ShadowSalience`]).
 
 use std::collections::HashSet;
+#[cfg(test)]
 use std::sync::Mutex;
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::perception::*;
@@ -56,7 +56,6 @@ pub struct Decision {
 /// What the rules need beyond the events themselves.
 #[derive(Debug, Clone, Default)]
 pub struct SalienceCtx {
-    pub now: DateTime<Utc>,
     /// Event kinds the person muted (`heartbeat_muted_kinds`).
     pub muted_kinds: HashSet<String>,
     /// Sources switched off (`heartbeat_source_*`).
@@ -70,11 +69,14 @@ pub struct SalienceCtx {
     pub heartbeat_session_id: Option<String>,
     /// Projects with open agent-lane work (see [`agent_project_ids`]).
     pub agent_project_ids: HashSet<String>,
+    /// `dispatch_auto_continue`: a finished run already hands its result
+    /// back to the chat that dispatched it, the Heartbeat session included.
+    pub dispatch_auto_continue: bool,
 }
 
 impl SalienceCtx {
     /// Mutes from settings; the caller fills the planner/timer sets.
-    pub fn from_settings(settings: &crate::settings::Settings, now: DateTime<Utc>) -> Self {
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
         let mut muted_sources = HashSet::new();
         if !settings.heartbeat_source_planner {
             muted_sources.insert(EventSource::Planner);
@@ -86,7 +88,6 @@ impl SalienceCtx {
             muted_sources.insert(EventSource::Ci);
         }
         Self {
-            now,
             muted_kinds: settings
                 .heartbeat_muted_kinds
                 .iter()
@@ -94,8 +95,17 @@ impl SalienceCtx {
                 .filter(|k| !k.is_empty())
                 .collect(),
             muted_sources,
+            dispatch_auto_continue: settings.dispatch_auto_continue,
             ..Default::default()
         }
+    }
+
+    /// A run the Heartbeat session dispatched, whose result the auto-continue
+    /// already delivers to it: a wake on top would be a second turn.
+    fn continued_into_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
+        self.dispatch_auto_continue
+            && self.heartbeat_session_id.is_some()
+            && ev.dispatched_from == self.heartbeat_session_id
     }
 
     /// Work the Heartbeat is waiting on or launched itself.
@@ -146,6 +156,7 @@ pub trait Salience {
 /// | 2 | `worker_needs_you`, `worker_stuck`, `decision_raised` | WakeNow |
 /// | 3 | `ci_failed` on a project with open agent work | WakeNow  |
 /// | 4 | `ci_failed` elsewhere                         | Queue    |
+/// | 4b | `run_ended` from the Heartbeat session while auto-continue hands the result back | Note |
 /// | 5 | `worker_done` / `run_ended` / `session_needs_attention` the Heartbeat awaits (pending intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
 /// | 6 | `worker_done`, `session_needs_attention`      | Queue    |
 /// | 7 | `run_ended` (the dispatching chat is continued anyway) | Note |
@@ -172,6 +183,7 @@ impl RulesSalience {
                     .is_some_and(|p| ctx.agent_project_ids.contains(p));
                 if agent_work { Choice::WakeNow } else { Choice::Queue }
             }
+            KIND_RUN_ENDED if ctx.continued_into_heartbeat(ev) => Choice::Note,
             KIND_WORKER_DONE | KIND_RUN_ENDED | KIND_SESSION_NEEDS_ATTENTION if ctx.awaited(ev) => {
                 Choice::WakeNow
             }
@@ -216,16 +228,21 @@ impl Salience for RulesSalience {
 /// [`Self::take_shadow_decisions`] hands them to
 /// [`super::HeartbeatState::ingest`], which logs them without acting.
 ///
+/// Test-only until a shadow exists: this is the seam the runtime wraps
+/// `RulesSalience` in (see `runtime.rs`); drop the `cfg(test)` then.
+///
 /// The intended shadow is **Laya**, a ModernBERT decision model. It is not
 /// implemented here: Laya needs fine-tuning on our own labelled decisions
 /// first, which is why every decision and the person's reactions to events
 /// and wakes are logged in `HeartbeatState`.
+#[cfg(test)]
 pub struct ShadowSalience<P: Salience, S: Salience> {
     pub primary: P,
     pub shadow: S,
     recorded: Mutex<Vec<Decision>>,
 }
 
+#[cfg(test)]
 impl<P: Salience, S: Salience> ShadowSalience<P, S> {
     pub fn new(primary: P, shadow: S) -> Self {
         Self { primary, shadow, recorded: Mutex::new(Vec::new()) }
@@ -237,6 +254,7 @@ impl<P: Salience, S: Salience> ShadowSalience<P, S> {
     }
 }
 
+#[cfg(test)]
 impl<P: Salience, S: Salience> Salience for ShadowSalience<P, S> {
     fn decide(&self, events: &[HeartbeatEvent], ctx: &SalienceCtx) -> Vec<Decision> {
         let shadow = self.shadow.decide(events, ctx).into_iter().map(|mut d| {
@@ -258,6 +276,7 @@ impl<P: Salience, S: Salience> Salience for ShadowSalience<P, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn ev(source: EventSource, kind: &str, urgency: Urgency) -> HeartbeatEvent {
         HeartbeatEvent::new(source, kind, "x", urgency, Utc::now())
@@ -316,6 +335,10 @@ mod tests {
         assert_eq!(choice(&r, &ctx), Choice::Note);
         ctx.heartbeat_session_id = Some("hb".into());
         assert_eq!(choice(&r, &ctx), Choice::WakeNow);
+        // With auto-continue the result is already handed back: no second turn.
+        ctx.dispatch_auto_continue = true;
+        assert_eq!(choice(&r, &ctx), Choice::Note);
+        ctx.dispatch_auto_continue = false;
         // No Heartbeat session: a run with no parent is not "awaited".
         r.dispatched_from = None;
         ctx.heartbeat_session_id = None;
@@ -339,7 +362,7 @@ mod tests {
             heartbeat_muted_kinds: vec![" todo_overdue ".into(), "".into()],
             ..Default::default()
         };
-        let ctx = SalienceCtx::from_settings(&s, Utc::now());
+        let ctx = SalienceCtx::from_settings(&s);
         assert_eq!(ctx.muted_sources, HashSet::from([EventSource::Fleet]));
         assert_eq!(ctx.muted_kinds, HashSet::from(["todo_overdue".to_string()]));
     }

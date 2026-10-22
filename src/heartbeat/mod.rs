@@ -5,30 +5,34 @@
 //! budget caps wakes; a wake hands the dedicated Heartbeat session a
 //! briefing. Design: the "Hobbes Heartbeat" doc.
 //!
-//! This module is the pure engine; the runtime (polling, the Heartbeat
-//! session, the UI) is wired in from `main.rs`. One poll looks like:
+//! The engine (perception, salience, state, budget, wake) is pure; the
+//! runtime (`runtime.rs`, spawned from `main.rs`) polls it every 30 s,
+//! keeps the dedicated Heartbeat session and delivers wakes through the
+//! background chat queue. One poll looks like:
 //!
 //! ```text
 //! let evs = state.observe_planner(PlannerSnapshot::capture(&planner, now), now);
 //! //   + observe_fleet / observe_ci for the enabled sources
 //! let decisions = salience.decide(&evs, &ctx);
-//! let out = state.ingest(evs, decisions, now);
-//! if !out.wake_now.is_empty() {
-//!     match check_wake(&state.trail, &budget, spent_since(&state.trail, local_day_start(now)), now) {
-//!         Ok(()) => { /* drain_queue → briefing → record_wake(WakeRecord::fired(..)) */ }
-//!         Err(reason) => { state.record_wake(WakeRecord::deferred(.., reason)); } // stays queued
-//!     }
+//! state.ingest(evs, decisions, now);
+//! match wake::decide_wake(&state, &budget, spent_today, now, session_busy) {
+//!     Fire(trigger)  => { /* drain_queue → wake message → record_wake(fired) */ }
+//!     Defer { .. }   => { /* record_wake(deferred); events stay queued */ }
+//!     Idle | Busy    => {}
 //! }
 //! ```
-
-// The runtime pass wires this in and removes the allow.
-#![allow(dead_code)]
+//!
+//! Tool calls from the Heartbeat session pass `trust::gate_verdict`
+//! (`builtin_tools::heartbeat_gate`) at both tool-call sites.
 
 pub mod budget;
 pub mod ci;
 pub mod perception;
+pub mod runtime;
 pub mod salience;
 pub mod state;
+pub mod trust;
+pub mod wake;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -37,22 +41,10 @@ use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
 
-// The engine's public surface for the runtime pass (unused until then).
-#[allow(unused_imports)]
 pub use budget::{check_wake, local_day_start, spent_since, Budget};
-#[allow(unused_imports)]
-pub use perception::{
-    ci_events, fleet_events, merge_ci_snapshot, planner_events, FleetSnapshot, PlannerSnapshot,
-};
-#[allow(unused_imports)]
-pub use salience::{
-    agent_project_ids, intention_todo_ids, Choice, Decision, RulesSalience, Salience, SalienceCtx,
-    ShadowSalience,
-};
-#[allow(unused_imports)]
-pub use state::{
-    HeartbeatState, IngestOutcome, Reaction, ReactionKind, ReactionTarget, WakeRecord,
-};
+pub use perception::{FleetSnapshot, PlannerSnapshot};
+pub use salience::{agent_project_ids, intention_todo_ids, RulesSalience, Salience, SalienceCtx};
+pub use state::{HeartbeatState, WakeRecord};
 
 // ── Availability ────────────────────────────────────────────────────────────
 
@@ -177,9 +169,10 @@ pub struct CiRun {
 
 // ── Shared state + persistence ──────────────────────────────────────────────
 
-/// The live Heartbeat state, shared by the runtime and the UI. Hydrate it
-/// once at startup from [`load`].
-pub static HEARTBEAT: GlobalSignal<HeartbeatState> = Signal::global(HeartbeatState::default);
+/// The live Heartbeat state, shared by the runtime and the UI. Hydrated
+/// from [`load`] on first access — always after `session_store::init()`,
+/// which `main()` runs before the app launches.
+pub static HEARTBEAT: GlobalSignal<HeartbeatState> = Signal::global(load);
 
 /// `meta` key holding the JSON-serialized [`HeartbeatState`].
 pub const META_KEY: &str = "heartbeat_state";

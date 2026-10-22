@@ -4,9 +4,6 @@
 //! auth), parses the JSON, and keeps the newest completed run per
 //! (workflow, branch). The runtime diffs successive polls into events.
 
-// The runtime pass wires this in and removes the allow.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

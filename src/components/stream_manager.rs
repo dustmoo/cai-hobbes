@@ -722,9 +722,11 @@ impl StreamManagerContext {
                             // error; an outside effect → held for approval
                             // here, bypassing trust rules and always-allow
                             // (use_mcp_tool is never reached). The resume
-                            // path in chat.rs runs the same gate.
+                            // path in chat.rs runs the same gate. The
+                            // Heartbeat session gets the same scope rules
+                            // (`scope_gates` runs both gates).
                             let agent_time_gate =
-                                crate::components::builtin_tools::agent_time_gate(
+                                crate::components::builtin_tools::scope_gates(
                                     builtin_ctx,
                                     &tool_call,
                                     &args_json,

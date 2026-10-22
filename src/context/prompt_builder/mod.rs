@@ -38,6 +38,11 @@ pub struct PromptBuilder<'a> {
     /// (`builtin_tools::agent_time_tool_visible`); every other prompt has
     /// the tool stripped, whatever its MCP context says.
     pub(crate) agent_time_tools: bool,
+    /// Heartbeat events about work this chat dispatched (or carries), for
+    /// the turn briefing's "Work you dispatched" lines. Filled at the call
+    /// site from `HEARTBEAT.events_for_session_since`; read only when a new
+    /// boundary tail is created, so replays are unaffected.
+    pub(crate) heartbeat_events: Vec<crate::heartbeat::HeartbeatEvent>,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -48,7 +53,15 @@ impl<'a> PromptBuilder<'a> {
             planner_today: None,
             now: None,
             agent_time_tools: false,
+            heartbeat_events: Vec::new(),
         }
+    }
+
+    /// Attach Heartbeat events for the turn briefing. Pass
+    /// `HEARTBEAT.peek().events_for_session_since(session_id, <a week ago>)`.
+    pub fn with_heartbeat_events(mut self, events: Vec<crate::heartbeat::HeartbeatEvent>) -> Self {
+        self.heartbeat_events = events;
+        self
     }
 
     /// Offer the agent-time tool. Pass

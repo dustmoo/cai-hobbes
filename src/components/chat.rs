@@ -80,6 +80,22 @@ pub struct Message {
 #[derive(Clone, Copy)]
 pub struct ExpansionStateContext(pub Signal<HashMap<String, bool>>);
 
+/// Heartbeat events about work this chat dispatched, for the turn briefing
+/// (the briefing keeps the ones newer than the previous turn).
+fn heartbeat_briefing_events(session_id: &str) -> Vec<crate::heartbeat::HeartbeatEvent> {
+    let since = chrono::Utc::now() - chrono::Duration::days(crate::heartbeat::state::EVENT_MAX_AGE_DAYS);
+    let state = crate::heartbeat::HEARTBEAT.peek();
+    // The Heartbeat session's own wake message already lists these.
+    if state.session_id.as_deref() == Some(session_id) {
+        return Vec::new();
+    }
+    state
+        .events_for_session_since(session_id, since)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 // The main ChatWindow component
 #[component]
 pub fn ChatWindow(
@@ -440,10 +456,11 @@ pub fn ChatWindow(
                         planner: planner_state,
                         chat_command,
                     };
-                    // Agent time: the same scope gate as the streaming path,
-                    // with the user's approval in hand (an approved outside
-                    // effect runs; Deny, no intent, or an ended run refuse).
-                    let builtin = match crate::components::builtin_tools::agent_time_gate(
+                    // Agent time and the Heartbeat: the same scope gates as
+                    // the streaming path, with the user's approval in hand
+                    // (an approved outside effect runs; Deny, no intent, or
+                    // an ended run refuse).
+                    let builtin = match crate::components::builtin_tools::scope_gates(
                         builtin_ctx,
                         &tool_call,
                         &args_json,
@@ -715,6 +732,7 @@ pub fn ChatWindow(
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder = PromptBuilder::new(session, &settings_read)
                                         .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                                        .with_heartbeat_events(heartbeat_briefing_events(&target_id))
                                         .with_planner_today(
                                             crate::todo::handlers::planner_today_context(
                                                 &planner_state.read(),
@@ -896,6 +914,7 @@ pub fn ChatWindow(
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read)
                                 .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                                .with_heartbeat_events(heartbeat_briefing_events(&target_id))
                                 .with_planner_today(crate::todo::handlers::planner_today_context(
                                     &planner_state.read(),
                                     &settings_read,
@@ -1003,6 +1022,7 @@ pub fn ChatWindow(
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings)
                             .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
+                            .with_heartbeat_events(heartbeat_briefing_events(&target_id))
                             .with_planner_today(crate::todo::handlers::planner_today_context(
                                 &planner_state.read(),
                                 &settings,
