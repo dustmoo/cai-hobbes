@@ -1,5 +1,5 @@
 //! The agent lane on Today: the header's "Agents" readout, the lane column
-//! of cards (Needs you / Working / Stuck / Queued / Done today), and the
+//! of cards (Needs you / Working / Stuck / To review / Queued / Done today), and the
 //! fleet → `agent_state` sync (SYMBIOTIC_PLANNER.md §2, §4).
 //!
 //! Progress is reported, never judged: cards show the worker's own
@@ -125,6 +125,7 @@ pub(crate) fn card_age(todo: &Todo, worker: Option<&WorkerLabel>, now: DateTime<
             }
         }
         Some(AgentState::Stuck) => parts.push(format!("stuck {}", fmt_since(todo.updated_at, now))),
+        Some(AgentState::Review) => parts.push(format!("finished {}", fmt_since(todo.updated_at, now))),
         _ => {
             if let Some(m) = worker.and_then(|w| w.active_minutes) {
                 parts.push(model::format_minutes(m));
@@ -248,6 +249,10 @@ pub(crate) fn card_phrase(
     match state {
         Some(AgentState::NeedsYou) => q.or(b).or(p).or_else(|| Some("Waiting on you".to_string())),
         Some(AgentState::Stuck) => b.or(p).or_else(|| Some("Stuck \u{2014} check its worker".to_string())),
+        Some(AgentState::Review) => one_line(blocked)
+            .map(|o| format!("Open item: {o}"))
+            .or(p)
+            .or_else(|| Some("Finished \u{2014} open item to review".to_string())),
         _ => p.or(b),
     }
 }
@@ -269,6 +274,14 @@ pub(crate) fn primary_label(open: &CardOpen, need: bool, dest: Option<&str>, ans
     }
 }
 
+/// The primary action of a "To review" card: go look at the finished run.
+pub(crate) fn review_label(open: &CardOpen) -> String {
+    match open {
+        CardOpen::Details => "Details".to_string(),
+        _ => "Review \u{2197}".to_string(),
+    }
+}
+
 /// `Scheduled Oct 22 · Due Oct 25` for the expanded card.
 pub(crate) fn date_chip(todo: &Todo) -> Option<String> {
     let mut parts = Vec::new();
@@ -287,6 +300,8 @@ pub(crate) fn dot_class(state: Option<AgentState>) -> &'static str {
         // The Fleet's status colours: amber needs you, green working.
         Some(AgentState::NeedsYou) => "bg-[#f59e0b]",
         Some(AgentState::Stuck) => "bg-red-400",
+        // The Fleet's idle grey: finished, nothing running.
+        Some(AgentState::Review) => "bg-[#94a3b8]",
         Some(AgentState::Working) => "bg-[#34d399]",
         _ => "bg-fg-muted",
     }
@@ -318,10 +333,16 @@ pub(crate) fn AgentsReadout() -> Element {
     // Release gate: without the decision queue, "needs you" is a count only
     // (each card opens its worker instead).
     let decisions_on = use_context::<Signal<crate::settings::Settings>>().read().agent_time_enabled();
-    let (working, needs, done, minutes) = {
+    let (working, needs, done, minutes, review) = {
         let state = planner.read();
         let lane = lanes::agent_lane(&state.todos, today());
-        (lane.working.len(), lane.needs_you.len(), lane.done_today.len(), queue_minutes(&lane.needs_you))
+        (
+            lane.working.len(),
+            lane.needs_you.len(),
+            lane.done_today.len(),
+            queue_minutes(&lane.needs_you),
+            lane.review.len(),
+        )
     };
     rsx! {
         div {
@@ -360,6 +381,9 @@ pub(crate) fn AgentsReadout() -> Element {
             } else {
                 span { class: "font-mono text-[10px] text-fg-muted", "nothing waiting on you" }
             }
+            if review > 0 {
+                span { class: "font-mono text-[10px] text-fg-muted", "{review} to review" }
+            }
         }
     }
 }
@@ -375,7 +399,7 @@ const WK: &str = "inline-flex h-[18px] min-w-0 max-w-[60%] items-center gap-1 ro
 /// Two-line clamp for a title (the full text is the tooltip / expanded body).
 const LANE_CSS: &str = ".lane-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }";
 
-/// The agent lane: cards grouped Needs you / Working / Stuck / Queued /
+/// The agent lane: cards grouped Needs you / Working / Stuck / To review / Queued /
 /// Done today. `embedded` renders it as a collapsible section inside the
 /// right column (narrow windows) instead of its own column.
 #[component]
@@ -436,7 +460,8 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
         let blocked = open_decision
             .and_then(|d| d.brief.as_ref())
             .or(t.decision.as_ref().and_then(|d| d.brief.as_ref()))
-            .and_then(|b| b.blocked.clone());
+            .and_then(|b| b.blocked.clone())
+            .or_else(|| t.open_item.clone());
         let progress = t.latest_progress.clone();
         let cost = w.as_ref().and_then(|w| w.cost_usd);
         let model = w.as_ref().and(worker_model_label(t));
@@ -445,9 +470,14 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
             age = format!("updated {}", fmt_since(t.updated_at, now));
         }
         let brief = open_decision.and_then(|d| d.brief.clone());
+        let review = t.agent_state == Some(AgentState::Review);
         CardData {
             id: t.id.clone(),
-            primary: primary_label(&open, need, dest.as_deref(), answer.as_deref()),
+            primary: if review {
+                review_label(&open)
+            } else {
+                primary_label(&open, need, dest.as_deref(), answer.as_deref())
+            },
             open,
             state: t.agent_state,
             title: t.title.clone(),
@@ -467,6 +497,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let needs: Vec<CardData> = lane.needs_you.iter().map(|t| card(t)).collect();
     let working: Vec<CardData> = lane.working.iter().map(|t| card(t)).collect();
     let stuck: Vec<CardData> = lane.stuck.iter().map(|t| card(t)).collect();
+    let review: Vec<CardData> = lane.review.iter().map(|t| card(t)).collect();
     let queued: Vec<(String, String)> = lane
         .to_dispatch
         .iter()
@@ -497,10 +528,25 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let is_unfolded = |key: &'static str| unfolded.read().contains(key);
     let (working_shown, working_hidden) = shown("working", working.len());
     let (stuck_shown, stuck_hidden) = shown("stuck", stuck.len());
+    let (review_shown, review_hidden) = shown("review", review.len());
     let (queued_shown, queued_hidden) = shown("queued", queued.len());
     let (done_shown, done_hidden) = shown("done", done.len());
-    let (working_open, stuck_open, queued_open, done_open) =
-        (is_unfolded("working"), is_unfolded("stuck"), is_unfolded("queued"), is_unfolded("done"));
+    let (working_open, stuck_open, review_open, queued_open, done_open) = (
+        is_unfolded("working"),
+        is_unfolded("stuck"),
+        is_unfolded("review"),
+        is_unfolded("queued"),
+        is_unfolded("done"),
+    );
+    // "Mark done" on a review card: the same state-level completion the
+    // to-do rows use (also closes any focus-session row), then persist.
+    let mut planner_w = planner;
+    let mut mark_done = move |id: String| {
+        if planner_w.write().complete_todo(&id, Utc::now()) {
+            persist_todo(&planner_w, &id);
+            super::persist_focus_sessions(&mut planner_w);
+        }
+    };
 
     // Go to a Claude Code run's terminal; with no row to go by, or when
     // every rung fails, open the Fleet instead.
@@ -664,6 +710,26 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                     }
                     MoreRow { hidden: stuck_hidden, open: stuck_open, on_toggle: move |_| toggle_fold(unfolded, "stuck") }
                 }
+                if !review.is_empty() {
+                    div {
+                        class: "{SEC}",
+                        span { class: "h-[7px] w-[7px] rounded-full bg-[#94a3b8]" }
+                        span { class: "text-fg", "To review" }
+                        span { "\u{b7} {review.len()}" }
+                    }
+                    for c in review.into_iter().take(review_shown) {
+                        LaneCard {
+                            key: "{c.id}",
+                            data: c.clone(),
+                            need: false,
+                            on_open: open_card,
+                            on_details: move |id: String| detail.set(Some(id)),
+                            on_fleet: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
+                            on_done: move |id: String| mark_done(id),
+                        }
+                    }
+                    MoreRow { hidden: review_hidden, open: review_open, on_toggle: move |_| toggle_fold(unfolded, "review") }
+                }
                 if !queued.is_empty() {
                     div {
                         class: "{SEC}",
@@ -783,12 +849,15 @@ fn LaneCard(
     on_open: EventHandler<(String, CardOpen)>,
     on_details: EventHandler<String>,
     on_fleet: EventHandler<()>,
+    /// Set on "To review" cards: completes the to-do.
+    #[props(default)] on_done: Option<EventHandler<String>>,
 ) -> Element {
     let mut expanded = use_signal(|| false);
     let is_open = *expanded.read();
     let id = data.id.clone();
     let btn_id = data.id.clone();
     let details_id = data.id.clone();
+    let done_id = data.id.clone();
     let open = data.open.clone();
     let btn_open = data.open.clone();
     let has_worker_target = data.open != CardOpen::Details;
@@ -838,6 +907,17 @@ fn LaneCard(
                 }
                 div { class: "flex items-center gap-2 pl-[40px]",
                     span { class: "min-w-0 flex-1 truncate font-mono text-[10.5px] text-fg-muted", title: "{data.meta}", "{data.meta}" }
+                    if let Some(on_done) = on_done {
+                        button {
+                            class: "shrink-0 min-h-7 rounded px-2 text-[11px] text-fg-muted hover:bg-input hover:text-fg",
+                            title: "Complete this to-do",
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                on_done.call(done_id.clone());
+                            },
+                            "Mark done"
+                        }
+                    }
                     button {
                         class: "{primary_class}",
                         onclick: move |evt: MouseEvent| {
@@ -1104,6 +1184,13 @@ mod tests {
         // Stuck: blocker beats progress.
         assert_eq!(card_phrase(Some(Stuck), None, Some("p"), Some("no creds")).as_deref(), Some("Blocked: no creds"));
         assert!(card_phrase(Some(Stuck), None, None, None).unwrap().starts_with("Stuck"));
+        // Review: the open item, else progress, else a plain fallback.
+        assert_eq!(card_phrase(Some(Review), None, Some("p"), Some("verify() test pending")).as_deref(), Some("Open item: verify() test pending"));
+        assert_eq!(card_phrase(Some(Review), None, Some("p"), None).as_deref(), Some("p"));
+        assert!(card_phrase(Some(Review), None, None, None).unwrap().contains("open item"));
+        assert_eq!(dot_class(Some(Review)), "bg-[#94a3b8]");
+        assert_eq!(review_label(&CardOpen::Terminal("s".into())), "Review \u{2197}");
+        assert_eq!(review_label(&CardOpen::Details), "Details");
         // Working: progress, then blocker, else nothing.
         assert_eq!(card_phrase(Some(Working), None, Some("Drafting"), Some("b")).as_deref(), Some("Drafting"));
         assert_eq!(card_phrase(Some(Working), None, None, Some("b")).as_deref(), Some("Blocked: b"));

@@ -1131,7 +1131,7 @@ fn protected_overlap_warnings(state: &PlannerState, date: NaiveDate) -> Vec<Stri
 }
 
 /// The agent lane as a separate section: to dispatch, working, needs you,
-/// stuck. `None` when the lane is empty.
+/// stuck, to review. `None` when the lane is empty.
 fn agent_lane_section(state: &PlannerState, today: NaiveDate) -> Option<String> {
     let lane = super::lanes::agent_lane(&state.todos, today);
     if lane.is_empty() {
@@ -1149,6 +1149,11 @@ fn agent_lane_section(state: &PlannerState, today: NaiveDate) -> Option<String> 
                 let mut l = format!("[{}] {}", t.id, truncate_title(&t.title));
                 if let Some(p) = t.latest_progress.as_deref().filter(|p| !p.is_empty()) {
                     l.push_str(&format!(" — {}", truncate_title(p)));
+                }
+                if t.agent_state == Some(model::AgentState::Review) {
+                    if let Some(o) = t.open_item.as_deref().filter(|o| !o.is_empty()) {
+                        l.push_str(&format!(" (finished; open item: {})", truncate_title(o)));
+                    }
                 }
                 l
             })
@@ -1175,6 +1180,7 @@ fn agent_lane_section(state: &PlannerState, today: NaiveDate) -> Option<String> 
         out.push_str(&format!("\nNeeds you (waiting on the user): {}", lines.join("; ")));
     }
     list("Stuck", &lane.stuck, &mut out);
+    list("To review (run finished, open item left)", &lane.review, &mut out);
     Some(out)
 }
 
@@ -5973,7 +5979,17 @@ mod tests {
         assert_eq!(t.agent_state, Some(model::AgentState::NeedsYou));
         assert!(t.decision.as_ref().unwrap().question.contains("npm publish"));
 
-        // Ended with a blocked brief → stuck (nothing pending).
+        // Live, idle, blocked brief → stuck (nothing pending).
+        let mut live_blocked = fleet_row("run-1", json!("Idle"), json!({
+            "brief": {"headline": "Built 4 of 5 images", "blocked_on": "Llama 4 driver check fails", "generated_at": "2026-08-12T16:30:00Z"}
+        }));
+        live_blocked.id = "run-1".into();
+        live.sessions.insert("run-1".into(), live_blocked);
+        sync_agent_states(&mut state, &live, &[], now);
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Stuck));
+        assert_eq!(state.todo(&id).unwrap().open_item.as_deref(), Some("Llama 4 driver check fails"));
+
+        // Ended with a blocked brief → review: finished, open item left.
         live.sessions.clear();
         let ended = fleet_row("run-1", json!("Idle"), json!({
             "ended_at": "2026-08-12T17:00:00Z",
@@ -5983,7 +5999,7 @@ mod tests {
         assert_eq!(signal.brief.as_ref().unwrap().did, "Built 4 of 5 images");
         sync_agent_states(&mut state, &live, &[ended], now);
         let t = state.todo(&id).unwrap();
-        assert_eq!(t.agent_state, Some(model::AgentState::Stuck));
+        assert_eq!(t.agent_state, Some(model::AgentState::Review));
         assert!(t.decision.is_none(), "the gate's synthesized decision cleared");
     }
 

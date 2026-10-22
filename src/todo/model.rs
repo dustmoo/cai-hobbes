@@ -616,6 +616,9 @@ pub enum AgentState {
     NeedsYou,
     /// The latest brief says blocked and nothing is pending on the person.
     Stuck,
+    /// The run ended but its closing brief left an open item, and the to-do
+    /// isn't completed: finished, with something for the person to look at.
+    Review,
     Done,
 }
 
@@ -627,6 +630,7 @@ impl AgentState {
             AgentState::Working => "working",
             AgentState::NeedsYou => "needs_you",
             AgentState::Stuck => "stuck",
+            AgentState::Review => "review",
             AgentState::Done => "done",
         }
     }
@@ -637,6 +641,7 @@ impl AgentState {
             AgentState::Working => "working",
             AgentState::NeedsYou => "needs you",
             AgentState::Stuck => "stuck",
+            AgentState::Review => "to review",
             AgentState::Done => "done",
         }
     }
@@ -1498,6 +1503,11 @@ pub struct Todo {
     /// blocked: Y"). Never drives status — progress is reported, not judged.
     #[serde(default)]
     pub latest_progress: Option<String>,
+    /// Display-only: the linked session's latest brief `blocked_on` text —
+    /// the open item a finished run left (`AgentState::Review`) or the
+    /// blocker of a stuck one. Mirrors the brief; never drives status.
+    #[serde(default)]
+    pub open_item: Option<String>,
 
     // ── Symbiotic planner (SYMBIOTIC_PLANNER.md §4) ─────────────────────────
     // Every field defaults, so rows written before the lanes existed load as
@@ -1612,6 +1622,7 @@ impl Todo {
             origin: TodoOrigin::User,
             linked_fleet_session: None,
             latest_progress: None,
+            open_item: None,
             lane: Lane::Human,
             kind: None,
             time_category: None,
