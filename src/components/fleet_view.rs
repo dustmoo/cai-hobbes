@@ -1012,6 +1012,7 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
     let go_title = go_label(&session);
     let is_open = *expanded.read();
     let note_text = note.read().as_ref().map(|n| n.1.clone());
+    let automation_denied = note_text.is_some() && fleet::terminal_focus::automation_denied_for(&session);
 
     let (row_go, btn_go, answer_go, resume_s) = (
         session.clone(),
@@ -1091,7 +1092,23 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
             }
 
             if let Some(text) = note_text {
-                p { class: "px-3 pb-1.5 text-[11px] text-fg-muted", role: "status", "{text}" }
+                p {
+                    class: "px-3 pb-1.5 text-[11px] text-fg-muted",
+                    role: "status",
+                    "{text}"
+                    if automation_denied {
+                        " "
+                        button {
+                            class: "text-primary-300 hover:text-fg underline",
+                            onclick: move |_| {
+                                if let Err(e) = open::that_detached(fleet::terminal_focus::AUTOMATION_SETTINGS_URL) {
+                                    tracing::warn!("Couldn't open System Settings: {e}");
+                                }
+                            },
+                            "Open Settings"
+                        }
+                    }
+                }
             }
 
             if is_open {
@@ -1246,7 +1263,7 @@ mod tests {
         let ev = crate::fleet::events::FleetEvent::SessionStart {
             session_id: id.into(),
             cwd: format!("/x/{id}"),
-            reason: "startup".into(),
+            source: "startup".into(),
         };
         let mut st = fleet::FleetState::default();
         fleet::reduce(&mut st, &ev, now);

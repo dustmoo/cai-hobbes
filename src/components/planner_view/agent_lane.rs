@@ -101,7 +101,22 @@ pub(crate) fn fmt_since(from: DateTime<Utc>, now: DateTime<Utc>) -> String {
 }
 
 /// The card's right-hand meta: elapsed (state-appropriate) and cost if known.
+#[cfg(test)]
 pub(crate) fn card_meta(todo: &Todo, worker: Option<&WorkerLabel>, now: DateTime<Utc>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let age = card_age(todo, worker, now);
+    if !age.is_empty() {
+        parts.push(age);
+    }
+    if let Some(c) = worker.and_then(|w| w.cost_usd) {
+        parts.push(format!("${c:.2}"));
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// Elapsed time, state-appropriate: "waiting 9m", "stuck 12m", or the
+/// worker's active minutes today. Empty when nothing is known.
+pub(crate) fn card_age(todo: &Todo, worker: Option<&WorkerLabel>, now: DateTime<Utc>) -> String {
     let mut parts: Vec<String> = Vec::new();
     match todo.agent_state {
         Some(AgentState::NeedsYou) => {
@@ -115,9 +130,6 @@ pub(crate) fn card_meta(todo: &Todo, worker: Option<&WorkerLabel>, now: DateTime
                 parts.push(model::format_minutes(m));
             }
         }
-    }
-    if let Some(c) = worker.and_then(|w| w.cost_usd) {
-        parts.push(format!("${c:.2}"));
     }
     parts.join(" \u{b7} ")
 }
@@ -196,6 +208,104 @@ pub(crate) fn card_open(linked: Option<&str>, in_memory: bool, fleet_origin: Opt
     }
 }
 
+/// Sections fold after this many cards/rows ("▸ N more").
+pub(crate) const FOLD_AFTER: usize = 3;
+
+/// `(shown, hidden)` for a section of `total` items.
+pub(crate) fn fold_split(total: usize, expanded: bool) -> (usize, usize) {
+    if expanded || total <= FOLD_AFTER {
+        (total, 0)
+    } else {
+        (FOLD_AFTER, total - FOLD_AFTER)
+    }
+}
+
+/// One clean display line from worker text: JSON that was stored raw is
+/// unwrapped (or dropped), whitespace collapsed to its first line.
+fn one_line(text: Option<&str>) -> Option<String> {
+    let t = text?.trim();
+    let t = if crate::llm::looks_like_json_object(t) {
+        crate::fleet::briefs::clean_headline(t)?
+    } else {
+        t.to_string()
+    };
+    let line = t.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|l| !l.is_empty())
+}
+
+/// The card's single muted status phrase. Needs you: the question, else the
+/// blocker, else the latest progress. Stuck: the blocker, else progress.
+/// Otherwise: the latest progress, else the blocker. Always one line.
+pub(crate) fn card_phrase(
+    state: Option<AgentState>,
+    question: Option<&str>,
+    progress: Option<&str>,
+    blocked: Option<&str>,
+) -> Option<String> {
+    let q = one_line(question);
+    let p = one_line(progress);
+    let b = one_line(blocked).map(|b| format!("Blocked: {b}"));
+    match state {
+        Some(AgentState::NeedsYou) => q.or(b).or(p).or_else(|| Some("Waiting on you".to_string())),
+        Some(AgentState::Stuck) => b.or(p).or_else(|| Some("Stuck \u{2014} check its worker".to_string())),
+        _ => p.or(b),
+    }
+}
+
+/// The card's one primary action label. `dest` / `answer` are the terminal
+/// ladder's labels for a Claude Code row, when the fleet row is known.
+pub(crate) fn primary_label(open: &CardOpen, need: bool, dest: Option<&str>, answer: Option<&str>) -> String {
+    let arrow = |l: &str| if l.ends_with('\u{2197}') { l.to_string() } else { format!("{l} \u{2197}") };
+    match open {
+        CardOpen::Chat(_) => arrow(if need { "Answer in chat" } else { "Open chat" }),
+        CardOpen::Terminal(_) | CardOpen::Unresolved(_) => {
+            if need {
+                arrow(answer.filter(|l| !l.is_empty()).unwrap_or("Answer in terminal"))
+            } else {
+                arrow(dest.filter(|l| !l.is_empty()).unwrap_or("Go to terminal"))
+            }
+        }
+        CardOpen::Details => "Details".to_string(),
+    }
+}
+
+/// `Scheduled Oct 22 · Due Oct 25` for the expanded card.
+pub(crate) fn date_chip(todo: &Todo) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(d) = todo.scheduled_for {
+        parts.push(format!("Scheduled {}", d.format("%b %-d")));
+    }
+    if let Some(d) = todo.deadline {
+        parts.push(format!("Due {}", d.format("%b %-d")));
+    }
+    (!parts.is_empty()).then(|| parts.join(" \u{b7} "))
+}
+
+/// The dot's colour class for an agent state.
+pub(crate) fn dot_class(state: Option<AgentState>) -> &'static str {
+    match state {
+        Some(AgentState::NeedsYou) => "bg-yellow-300",
+        Some(AgentState::Stuck) => "bg-red-400",
+        Some(AgentState::Working) => "bg-primary-400",
+        _ => "bg-fg-muted",
+    }
+}
+
+/// The at-rest meta line: age · model · cost.
+pub(crate) fn meta_line(age: &str, model: Option<&str>, cost: Option<f64>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !age.is_empty() {
+        parts.push(age.to_string());
+    }
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        parts.push(m.to_string());
+    }
+    if let Some(c) = cost {
+        parts.push(format!("${c:.2}"));
+    }
+    parts.join(" \u{b7} ")
+}
+
 // ── Header readout ──────────────────────────────────────────────────────────
 
 /// The "Agents" header readout: working · needs you · done today, and the
@@ -256,9 +366,11 @@ pub(crate) fn AgentsReadout() -> Element {
 // ── The lane column ─────────────────────────────────────────────────────────
 
 const SEC: &str = "flex items-center gap-2 px-4 pt-3 pb-1.5 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
-const CARD: &str = "mx-3 mb-2 flex cursor-pointer flex-col gap-1 rounded-lg border border-faint border-l-2 border-l-[#EA8A2E] bg-card px-2.5 py-2 text-left hover:bg-input";
+const CARD: &str = "mx-3 mb-2 flex flex-col rounded-lg border border-faint border-l-2 border-l-[#EA8A2E] bg-card text-left";
 const MINI: &str = "mx-3 flex h-7 items-center gap-2 rounded px-2 text-xs text-fg whitespace-nowrap";
 const WK: &str = "inline-flex h-[18px] min-w-0 max-w-[60%] items-center gap-1 rounded-sm border border-faint px-1.5 font-mono text-[10px] text-fg";
+/// Two-line clamp for a title (the full text is the tooltip / expanded body).
+const LANE_CSS: &str = ".lane-title { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; }";
 
 /// The agent lane: cards grouped Needs you / Working / Stuck / Queued /
 /// Done today. `embedded` renders it as a collapsible section inside the
@@ -277,6 +389,10 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     // seconds); `note_seq` keeps an older fade from clearing a newer note.
     let mut note = use_signal(|| None::<String>);
     let mut note_seq = use_signal(|| 0u64);
+    // Whether the note should offer System Settings (macOS refused control).
+    let mut note_settings = use_signal(|| false);
+    // Sections shown past the fold ("▸ N more" clicked).
+    let unfolded = use_signal(std::collections::HashSet::<&'static str>::new);
 
     // A once-a-minute tick keeps "waiting 9m" honest.
     let mut tick = use_signal(|| 0u64);
@@ -298,33 +414,50 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let card = |t: &Todo| -> CardData {
         let w = label(t);
         let linked = t.linked_fleet_session.as_deref();
+        let row = linked.and_then(|sid| fleet.sessions.get(sid));
         let open = card_open(
             linked,
             linked.is_some_and(|sid| sessions.sessions.contains_key(sid)),
-            linked.and_then(|sid| fleet.sessions.get(sid)).map(|r| r.origin == FleetOrigin::Hobbes),
+            row.map(|r| r.origin == FleetOrigin::Hobbes),
         );
+        let need = t.agent_state == Some(AgentState::NeedsYou);
+        let open_decision = t.decision.as_ref().filter(|d| d.is_open());
+        let (dest, answer) = match row.filter(|r| r.origin == FleetOrigin::External) {
+            Some(r) => (
+                Some(crate::fleet::terminal_focus::destination_label(r)),
+                Some(crate::fleet::terminal_focus::answer_label(r)),
+            ),
+            None => (None, None),
+        };
+        let question = open_decision.map(|d| d.question.clone());
+        let blocked = open_decision
+            .and_then(|d| d.brief.as_ref())
+            .or(t.decision.as_ref().and_then(|d| d.brief.as_ref()))
+            .and_then(|b| b.blocked.clone());
+        let progress = t.latest_progress.clone();
+        let cost = w.as_ref().and_then(|w| w.cost_usd);
+        let model = w.as_ref().and(worker_model_label(t));
+        let mut age = card_age(t, w.as_ref(), now);
+        if age.is_empty() {
+            age = format!("updated {}", fmt_since(t.updated_at, now));
+        }
+        let brief = open_decision.and_then(|d| d.brief.clone());
         CardData {
             id: t.id.clone(),
+            primary: primary_label(&open, need, dest.as_deref(), answer.as_deref()),
             open,
-            outcome: t.outcome.clone().filter(|o| !o.trim().is_empty()).unwrap_or_else(|| t.title.clone()),
-            question: t.decision.as_ref().filter(|d| d.is_open()).map(|d| d.question.clone()),
-            gate: t
-                .decision
-                .as_ref()
-                .is_some_and(|d| d.is_open() && matches!(d.source, DecisionSource::Gate { .. })),
-            est: t
-                .decision
-                .as_ref()
-                .filter(|d| d.is_open())
-                .map(|d| lanes::est_label(d.est_minutes)),
-            progress: t.latest_progress.clone().filter(|p| !p.trim().is_empty()),
-            blocked: t
-                .decision
-                .as_ref()
-                .and_then(|d| d.brief.as_ref())
-                .and_then(|b| b.blocked.clone()),
-            meta: card_meta(t, w.as_ref(), now),
-            model: w.as_ref().and(worker_model_label(t)),
+            state: t.agent_state,
+            title: t.title.clone(),
+            outcome: t.outcome.clone().filter(|o| !o.trim().is_empty()),
+            phrase: card_phrase(t.agent_state, question.as_deref(), progress.as_deref(), blocked.as_deref()),
+            question,
+            options: open_decision.map(|d| d.options.clone()).unwrap_or_default(),
+            gate: open_decision.is_some_and(|d| matches!(d.source, DecisionSource::Gate { .. })),
+            est: open_decision.map(|d| lanes::est_label(d.est_minutes)),
+            did: brief.as_ref().map(|b| b.did.clone()).filter(|d| !d.trim().is_empty()),
+            next: brief.as_ref().and_then(|b| b.next.clone()),
+            dates: date_chip(t),
+            meta: meta_line(&age, model.as_deref(), cost),
             worker: w,
         }
     };
@@ -334,7 +467,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let queued: Vec<(String, String)> = lane
         .to_dispatch
         .iter()
-        .map(|t| (t.id.clone(), t.outcome.clone().filter(|o| !o.trim().is_empty()).unwrap_or_else(|| t.title.clone())))
+        .map(|t| (t.id.clone(), t.title.clone()))
         .collect();
     let done: Vec<(String, String, String)> = lane
         .done_today
@@ -346,7 +479,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                 .and_then(|w| w.active_minutes)
                 .map(model::format_minutes)
                 .unwrap_or_default();
-            (t.id.clone(), t.outcome.clone().filter(|o| !o.trim().is_empty()).unwrap_or_else(|| t.title.clone()), meta)
+            (t.id.clone(), t.title.clone(), meta)
         })
         .collect();
     let minutes = queue_minutes(&lane.needs_you);
@@ -357,6 +490,15 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     drop(fleet);
     drop(state);
 
+    let shown = |key: &'static str, total: usize| fold_split(total, unfolded.read().contains(key));
+    let is_unfolded = |key: &'static str| unfolded.read().contains(key);
+    let (working_shown, working_hidden) = shown("working", working.len());
+    let (stuck_shown, stuck_hidden) = shown("stuck", stuck.len());
+    let (queued_shown, queued_hidden) = shown("queued", queued.len());
+    let (done_shown, done_hidden) = shown("done", done.len());
+    let (working_open, stuck_open, queued_open, done_open) =
+        (is_unfolded("working"), is_unfolded("stuck"), is_unfolded("queued"), is_unfolded("done"));
+
     // Go to a Claude Code run's terminal; with no row to go by, or when
     // every rung fails, open the Fleet instead.
     let mut go_to_terminal = move |row: Option<FleetSession>| {
@@ -366,12 +508,14 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
         };
         spawn(async move {
             let name = row.display_name().to_string();
-            let outcome = crate::fleet::terminal_focus::go_to_session(row).await;
+            let denied = crate::fleet::terminal_focus::automation_denied_for(&row);
+            let outcome = crate::fleet::terminal_focus::go_to_session(row.clone()).await;
             if matches!(outcome, crate::fleet::terminal_focus::FocusOutcome::Failed(_)) {
                 chat_command.set(Some(ChatCommand::ToggleFleet));
             }
             let seq = *note_seq.peek() + 1;
             note_seq.set(seq);
+            note_settings.set(denied || crate::fleet::terminal_focus::automation_denied_for(&row));
             note.set(Some(outcome.note(&name)));
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             if *note_seq.peek() == seq {
@@ -403,6 +547,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     };
 
     rsx! {
+        style { "{LANE_CSS}" }
         div {
             class: "{root_class}",
             div {
@@ -429,7 +574,21 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                 }
             }
             if let Some(n) = note.read().clone() {
-                p { class: "px-4 pb-1 text-[11px] leading-relaxed text-fg-muted", "{n}" }
+                p { class: "px-4 pb-1 text-[11px] leading-relaxed text-fg-muted",
+                    "{n}"
+                    if *note_settings.read() {
+                        " "
+                        button {
+                            class: "text-primary-300 underline hover:text-fg",
+                            onclick: move |_| {
+                                if let Err(e) = open::that_detached(crate::fleet::terminal_focus::AUTOMATION_SETTINGS_URL) {
+                                    tracing::warn!("Couldn't open System Settings: {e}");
+                                }
+                            },
+                            "Open Settings"
+                        }
+                    }
+                }
             }
             if !is_collapsed {
                 if empty {
@@ -437,6 +596,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         "No agent work today. Hand a to-do over with @hobbes when you add it, or dispatch one from its row."
                     }
                 }
+                // Needs you is never folded: everything waiting on the person stays visible.
                 if !needs.is_empty() {
                     div {
                         class: "{SEC} pt-1",
@@ -453,7 +613,14 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         }
                     }
                     for c in needs {
-                        LaneCard { key: "{c.id}", data: c.clone(), need: true, on_open: open_card, on_details: move |id: String| detail.set(Some(id)) }
+                        LaneCard {
+                            key: "{c.id}",
+                            data: c.clone(),
+                            need: true,
+                            on_open: open_card,
+                            on_details: move |id: String| detail.set(Some(id)),
+                            on_fleet: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
+                        }
                     }
                 }
                 if !working.is_empty() {
@@ -463,9 +630,17 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         span { class: "text-fg", "Working" }
                         span { "\u{b7} {working.len()}" }
                     }
-                    for c in working {
-                        LaneCard { key: "{c.id}", data: c.clone(), need: false, on_open: open_card, on_details: move |id: String| detail.set(Some(id)) }
+                    for c in working.into_iter().take(working_shown) {
+                        LaneCard {
+                            key: "{c.id}",
+                            data: c.clone(),
+                            need: false,
+                            on_open: open_card,
+                            on_details: move |id: String| detail.set(Some(id)),
+                            on_fleet: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
+                        }
                     }
+                    MoreRow { hidden: working_hidden, open: working_open, on_toggle: move |_| toggle_fold(unfolded, "working") }
                 }
                 if !stuck.is_empty() {
                     div {
@@ -474,9 +649,17 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                         span { class: "text-fg", "Stuck" }
                         span { "\u{b7} {stuck.len()}" }
                     }
-                    for c in stuck {
-                        LaneCard { key: "{c.id}", data: c.clone(), need: false, on_open: open_card, on_details: move |id: String| detail.set(Some(id)) }
+                    for c in stuck.into_iter().take(stuck_shown) {
+                        LaneCard {
+                            key: "{c.id}",
+                            data: c.clone(),
+                            need: false,
+                            on_open: open_card,
+                            on_details: move |id: String| detail.set(Some(id)),
+                            on_fleet: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
+                        }
                     }
+                    MoreRow { hidden: stuck_hidden, open: stuck_open, on_toggle: move |_| toggle_fold(unfolded, "stuck") }
                 }
                 if !queued.is_empty() {
                     div {
@@ -486,12 +669,13 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                     }
                     div {
                         class: "flex flex-col gap-0.5",
-                        for (id, title) in queued {
+                        for (id, title) in queued.into_iter().take(queued_shown) {
                             div {
                                 key: "{id}",
                                 class: "{MINI} border border-dashed border-faint",
                                 button {
                                     class: "min-w-0 flex-1 truncate text-left hover:text-primary-300",
+                                    title: "{title}",
                                     onclick: {
                                         let id = id.clone();
                                         move |_| detail.set(Some(id.clone()))
@@ -510,6 +694,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                             }
                         }
                     }
+                    MoreRow { hidden: queued_hidden, open: queued_open, on_toggle: move |_| toggle_fold(unfolded, "queued") }
                 }
                 if !done.is_empty() {
                     div {
@@ -519,10 +704,11 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                     }
                     div {
                         class: "flex flex-col gap-0.5",
-                        for (id, title, meta) in done {
+                        for (id, title, meta) in done.into_iter().take(done_shown) {
                             button {
                                 key: "{id}",
                                 class: "{MINI} text-fg-muted hover:bg-card",
+                                title: "{title}",
                                 onclick: {
                                     let id = id.clone();
                                     move |_| detail.set(Some(id.clone()))
@@ -533,8 +719,31 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                             }
                         }
                     }
+                    MoreRow { hidden: done_hidden, open: done_open, on_toggle: move |_| toggle_fold(unfolded, "done") }
                 }
             }
+        }
+    }
+}
+
+fn toggle_fold(mut unfolded: Signal<std::collections::HashSet<&'static str>>, key: &'static str) {
+    let mut set = unfolded.write();
+    if !set.remove(key) {
+        set.insert(key);
+    }
+}
+
+/// "▸ N more" / "▾ Show less" under a folded section.
+#[component]
+fn MoreRow(hidden: usize, open: bool, on_toggle: EventHandler<()>) -> Element {
+    if hidden == 0 && !open {
+        return rsx! {};
+    }
+    rsx! {
+        button {
+            class: "mx-3 mb-1 px-2 text-left text-[11px] text-fg-muted hover:text-fg",
+            onclick: move |_| on_toggle.call(()),
+            if open { "\u{25be} Show less" } else { "\u{25b8} {hidden} more" }
         }
     }
 }
@@ -543,16 +752,25 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
 struct CardData {
     id: String,
     open: CardOpen,
-    outcome: String,
+    state: Option<AgentState>,
+    /// The to-do's full title (clamped at rest).
+    title: String,
+    /// The explicit definition of done, when one was set.
+    outcome: Option<String>,
+    /// The one muted status line.
+    phrase: Option<String>,
     question: Option<String>,
+    options: Vec<String>,
     gate: bool,
     est: Option<String>,
-    progress: Option<String>,
-    blocked: Option<String>,
+    did: Option<String>,
+    next: Option<String>,
+    dates: Option<String>,
+    /// age · model · cost
     meta: String,
+    /// The one primary action's label.
+    primary: String,
     worker: Option<WorkerLabel>,
-    /// The worker's model ("Haiku 5.5"), when dispatch recorded one.
-    model: Option<String>,
 }
 
 #[component]
@@ -561,74 +779,151 @@ fn LaneCard(
     need: bool,
     on_open: EventHandler<(String, CardOpen)>,
     on_details: EventHandler<String>,
+    on_fleet: EventHandler<()>,
 ) -> Element {
+    let mut expanded = use_signal(|| false);
+    let is_open = *expanded.read();
     let id = data.id.clone();
+    let btn_id = data.id.clone();
     let details_id = data.id.clone();
     let open = data.open.clone();
+    let btn_open = data.open.clone();
+    let has_worker_target = data.open != CardOpen::Details;
+    let terminal_card = matches!(data.open, CardOpen::Terminal(_) | CardOpen::Unresolved(_));
+    let dot = dot_class(data.state);
+    let pulse = if need { " animate-pulse" } else { "" };
     let hint = match &data.open {
         CardOpen::Chat(_) => "Open its chat",
         CardOpen::Terminal(_) => "Go to its terminal",
         CardOpen::Unresolved(_) => "Open its worker",
         CardOpen::Details => "Show details",
     };
+    let primary_class = if need {
+        "shrink-0 min-h-7 rounded border border-[#f59e0b] bg-[rgba(245,158,11,0.12)] px-2.5 text-[11px] font-medium text-[#fcd34d]"
+    } else {
+        "shrink-0 min-h-7 rounded border border-faint px-2.5 text-[11px] text-fg hover:bg-input"
+    };
     rsx! {
         div {
             class: if need { "{CARD} border-subtle" } else { "{CARD}" },
-            title: "{hint}",
-            onclick: move |_| on_open.call((id.clone(), open.clone())),
-            div { class: "flex items-start gap-2",
-                div { class: "min-w-0 flex-1 text-[12.5px] font-medium leading-[17px] text-fg", "{data.outcome}" }
-                if data.open != CardOpen::Details {
+            div {
+                class: "flex cursor-pointer flex-col gap-0.5 px-2.5 py-2 hover:bg-input",
+                title: "{hint}",
+                onclick: move |_| on_open.call((id.clone(), open.clone())),
+                div { class: "flex items-start gap-2",
                     button {
-                        class: "shrink-0 text-[10.5px] text-fg-muted hover:text-fg",
-                        title: "The to-do's details",
+                        class: "mt-px w-4 shrink-0 select-none text-[11px] text-fg-muted hover:text-fg",
+                        title: if is_open { "Collapse" } else { "Expand" },
+                        aria_label: if is_open { "Collapse" } else { "Expand" },
+                        aria_expanded: "{is_open}",
                         onclick: move |evt: MouseEvent| {
                             evt.stop_propagation();
-                            on_details.call(details_id.clone());
+                            let v = !*expanded.peek();
+                            expanded.set(v);
                         },
-                        "Details"
+                        if is_open { "\u{25be}" } else { "\u{25b8}" }
+                    }
+                    span { class: "mt-[5px] h-2 w-2 shrink-0 rounded-full {dot}{pulse}" }
+                    div {
+                        class: "lane-title min-w-0 flex-1 text-[12.5px] font-medium leading-[17px] text-fg",
+                        title: "{data.title}",
+                        "{data.title}"
+                    }
+                }
+                if let Some(p) = data.phrase.clone() {
+                    div { class: "truncate pl-[40px] text-[11.5px] leading-[15px] text-fg-muted", title: "{p}", "{p}" }
+                }
+                div { class: "flex items-center gap-2 pl-[40px]",
+                    span { class: "min-w-0 flex-1 truncate font-mono text-[10.5px] text-fg-muted", title: "{data.meta}", "{data.meta}" }
+                    button {
+                        class: "{primary_class}",
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            on_open.call((btn_id.clone(), btn_open.clone()));
+                        },
+                        "{data.primary}"
                     }
                 }
             }
-            if need {
-                if let Some(q) = data.question.clone() {
-                    div { class: "text-xs leading-4 text-fg", "\u{201c}{q}\u{201d}" }
-                } else {
-                    div { class: "text-xs leading-4 text-fg-muted", "Waiting on you \u{2014} check its worker." }
-                }
-            } else if let Some(p) = data.progress.clone() {
-                div { class: "truncate text-[11.5px] leading-[15px] text-fg-muted", title: "{p}", "{p}" }
-            } else if let Some(b) = data.blocked.clone() {
-                div { class: "truncate text-[11.5px] leading-[15px] text-fg-muted", "Blocked: {b}" }
-            }
-            div {
-                class: "flex items-center gap-2",
-                if let Some(w) = data.worker.clone() {
-                    span {
-                        class: "{WK}",
-                        title: if w.chat { "Hobbes chat" } else { "Claude Code run" },
-                        if w.chat {
-                            Icon { width: 11, height: 11, icon: fi_icons::FiMessageCircle }
-                        } else {
-                            Icon { width: 11, height: 11, icon: fi_icons::FiTerminal }
+            if is_open {
+                div { class: "flex flex-col gap-1.5 border-t border-faint px-2.5 py-2 pl-[40px]",
+                    div { class: "whitespace-pre-wrap break-words text-[12px] leading-[17px] text-fg", "{data.title}" }
+                    if let Some(o) = data.outcome.clone() {
+                        div { class: "text-[11.5px] leading-4 text-fg-muted",
+                            span { class: "text-fg-muted/70", "Done when: " }
+                            span { class: "text-fg", "{o}" }
                         }
-                        span { class: "truncate", "{w.name}" }
                     }
-                    if let Some(m) = data.model.clone() {
-                        span { class: "min-w-0 shrink truncate font-mono text-[10px] text-fg-muted", title: "Model", "\u{b7} {m}" }
+                    if let Some(d) = data.dates.clone() {
+                        span {
+                            class: "self-start rounded-sm border border-faint px-1.5 font-mono text-[10px] text-fg-muted",
+                            "{d}"
+                        }
                     }
-                } else {
-                    span { class: "font-mono text-[10px] text-fg-muted", "no worker yet" }
+                    if need {
+                        if let Some(q) = data.question.clone() {
+                            div { class: "text-xs leading-4 text-fg", "\u{201c}{q}\u{201d}" }
+                        }
+                        if !data.options.is_empty() {
+                            div { class: "text-[11.5px] leading-4 text-fg-muted",
+                                "Options: "
+                                {data.options.iter().enumerate().map(|(i, o)| format!("{}) {o}", i + 1)).collect::<Vec<_>>().join(" / ")}
+                            }
+                        }
+                        div { class: "flex gap-2 font-mono text-[10.5px]",
+                            if let Some(est) = data.est.clone() {
+                                span { class: "text-yellow-300", "{est}" }
+                            }
+                            if data.gate {
+                                span { class: "text-fg-muted", "permission" }
+                            }
+                        }
+                    }
+                    if let Some(d) = data.did.clone() {
+                        div { class: "text-[11.5px] leading-4 text-fg-muted",
+                            span { class: "text-fg-muted/70", "Did: " }
+                            "{d}"
+                        }
+                    }
+                    if let Some(n) = data.next.clone() {
+                        div { class: "text-[11.5px] leading-4 text-fg-muted",
+                            span { class: "text-fg-muted/70", "Next: " }
+                            "{n}"
+                        }
+                    }
+                    if let Some(w) = data.worker.clone() {
+                        span {
+                            class: "{WK}",
+                            title: if w.chat { "Hobbes chat" } else { "Claude Code run" },
+                            if w.chat {
+                                Icon { width: 11, height: 11, icon: fi_icons::FiMessageCircle }
+                            } else {
+                                Icon { width: 11, height: 11, icon: fi_icons::FiTerminal }
+                            }
+                            span { class: "truncate", "{w.name}" }
+                        }
+                    } else {
+                        span { class: "font-mono text-[10px] text-fg-muted", "no worker yet" }
+                    }
+                    div { class: "flex flex-wrap items-center gap-2 pt-0.5",
+                        if has_worker_target {
+                            button {
+                                class: "rounded border border-faint px-2 text-[11px] leading-5 text-fg-muted hover:bg-input hover:text-fg",
+                                title: "The to-do's details",
+                                onclick: move |_| on_details.call(details_id.clone()),
+                                "To-do details"
+                            }
+                        }
+                        if terminal_card {
+                            button {
+                                class: "rounded border border-faint px-2 text-[11px] leading-5 text-fg-muted hover:bg-input hover:text-fg",
+                                title: "Open the Fleet",
+                                onclick: move |_| on_fleet.call(()),
+                                "Open in Fleet"
+                            }
+                        }
+                    }
                 }
-                if need {
-                    if let Some(est) = data.est.clone() {
-                        span { class: "font-mono text-[11px] text-yellow-300 shrink-0", "{est}" }
-                    }
-                    if data.gate {
-                        span { class: "font-mono text-[10px] text-fg-muted shrink-0", "permission" }
-                    }
-                }
-                span { class: "ml-auto shrink-0 font-mono text-[11px] text-fg-muted", "{data.meta}" }
             }
         }
     }
@@ -793,5 +1088,71 @@ mod tests {
         lanes::ask_decision(&mut b, "q", vec![], None, None, None, now).unwrap();
         assert_eq!(queue_minutes(&[&a, &b]), 4);
         assert_eq!(fmt_since(now, now), "just now");
+    }
+
+    #[test]
+    fn phrase_priority_by_state() {
+        use AgentState::*;
+        // Needs you: question, then blocker, then progress, then a stub.
+        assert_eq!(card_phrase(Some(NeedsYou), Some("Ship four now?"), Some("p"), Some("b")).as_deref(), Some("Ship four now?"));
+        assert_eq!(card_phrase(Some(NeedsYou), None, Some("p"), Some("b")).as_deref(), Some("Blocked: b"));
+        assert_eq!(card_phrase(Some(NeedsYou), None, Some("p"), None).as_deref(), Some("p"));
+        assert_eq!(card_phrase(Some(NeedsYou), None, None, None).as_deref(), Some("Waiting on you"));
+        // Stuck: blocker beats progress.
+        assert_eq!(card_phrase(Some(Stuck), None, Some("p"), Some("no creds")).as_deref(), Some("Blocked: no creds"));
+        assert!(card_phrase(Some(Stuck), None, None, None).unwrap().starts_with("Stuck"));
+        // Working: progress, then blocker, else nothing.
+        assert_eq!(card_phrase(Some(Working), None, Some("Drafting"), Some("b")).as_deref(), Some("Drafting"));
+        assert_eq!(card_phrase(Some(Working), None, None, Some("b")).as_deref(), Some("Blocked: b"));
+        assert_eq!(card_phrase(Some(Working), None, Some("  "), None), None);
+        // One line only, whitespace collapsed.
+        assert_eq!(card_phrase(Some(Working), None, Some("a  b\n\nsecond line"), None).as_deref(), Some("a b"));
+    }
+
+    #[test]
+    fn raw_json_progress_is_unwrapped_or_hidden() {
+        let raw = r#"{"summary":"Active Composio profile is 'Clearmirror.ai'. Hobbe"#;
+        assert_eq!(
+            card_phrase(Some(AgentState::Working), None, Some(raw), None).as_deref(),
+            Some("Active Composio profile is 'Clearmirror.ai'. Hobbe")
+        );
+        assert_eq!(card_phrase(Some(AgentState::Working), None, Some(r#"{"entities":{}}"#), None), None);
+    }
+
+    #[test]
+    fn sections_fold_after_three() {
+        assert_eq!(fold_split(0, false), (0, 0));
+        assert_eq!(fold_split(3, false), (3, 0));
+        assert_eq!(fold_split(7, false), (3, 4));
+        assert_eq!(fold_split(7, true), (7, 0));
+    }
+
+    #[test]
+    fn primary_action_names_the_destination() {
+        let term = CardOpen::Terminal("s".into());
+        assert_eq!(primary_label(&term, false, Some("Focus iTerm2 tab"), Some("Answer in iTerm2")), "Focus iTerm2 tab \u{2197}");
+        assert_eq!(primary_label(&term, true, Some("Focus iTerm2 tab"), Some("Answer in iTerm2")), "Answer in iTerm2 \u{2197}");
+        assert_eq!(primary_label(&term, true, None, None), "Answer in terminal \u{2197}");
+        assert_eq!(primary_label(&CardOpen::Unresolved("s".into()), false, None, None), "Go to terminal \u{2197}");
+        let chat = CardOpen::Chat("c".into());
+        assert_eq!(primary_label(&chat, false, None, None), "Open chat \u{2197}");
+        assert_eq!(primary_label(&chat, true, None, None), "Answer in chat \u{2197}");
+        assert_eq!(primary_label(&CardOpen::Details, false, None, None), "Details");
+    }
+
+    #[test]
+    fn meta_line_joins_age_model_cost() {
+        assert_eq!(meta_line("waiting 9m", Some("Haiku 5.5"), Some(0.5)), "waiting 9m \u{b7} Haiku 5.5 \u{b7} $0.50");
+        assert_eq!(meta_line("", None, None), "");
+        assert_eq!(meta_line("12m", None, None), "12m");
+    }
+
+    #[test]
+    fn date_chip_lists_schedule_and_deadline() {
+        let mut t = Todo::new("x", 0.0);
+        assert_eq!(date_chip(&t), None);
+        t.scheduled_for = NaiveDate::from_ymd_opt(2026, 10, 22);
+        t.deadline = NaiveDate::from_ymd_opt(2026, 10, 25);
+        assert_eq!(date_chip(&t).as_deref(), Some("Scheduled Oct 22 \u{b7} Due Oct 25"));
     }
 }
