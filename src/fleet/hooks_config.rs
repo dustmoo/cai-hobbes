@@ -49,7 +49,8 @@ pub const FLEET_HOOK_EVENTS: &[(&str, u64)] = &[
 pub const TERMINAL_HINT_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit"];
 
 /// The handler object we register for one event. Terminal-hint events add
-/// `headers` (`"$VAR"` interpolated by Claude Code) and the matching
+/// `headers` (`"${VAR}"` interpolated by Claude Code; the braced form, since
+/// the bare `$__CFBundleIdentifier` came through mangled) and the matching
 /// `allowedEnvVars` — a variable that is unset, unlisted or stripped by
 /// admin policy arrives as an empty header.
 pub fn fleet_handler(port: u16, token: &str, event: &str, timeout: u64) -> Value {
@@ -61,7 +62,7 @@ pub fn fleet_handler(port: u16, token: &str, event: &str, timeout: u64) -> Value
     if TERMINAL_HINT_EVENTS.contains(&event) {
         let headers: Map<String, Value> = super::terminal_focus::HINT_HEADERS
             .iter()
-            .map(|(header, var, _)| ((*header).to_string(), Value::String(format!("${var}"))))
+            .map(|(header, var, _)| ((*header).to_string(), Value::String(format!("${{{var}}}"))))
             .collect();
         let vars: Vec<Value> = super::terminal_focus::HINT_HEADERS
             .iter()
@@ -405,15 +406,15 @@ mod tests {
         for event in TERMINAL_HINT_EVENTS {
             let handler = &v["hooks"][*event][0]["hooks"][0];
             let headers = handler["headers"].as_object().unwrap();
-            assert_eq!(headers["X-Hobbes-Term"], "$TERM_PROGRAM");
-            assert_eq!(headers["X-Hobbes-App"], "$__CFBundleIdentifier");
-            assert_eq!(headers["X-Hobbes-Iterm"], "$ITERM_SESSION_ID");
-            assert_eq!(headers["X-Hobbes-Wezterm"], "$WEZTERM_PANE");
-            assert_eq!(headers["X-Hobbes-Kitty"], "$KITTY_WINDOW_ID");
-            assert_eq!(headers["X-Hobbes-Kitty-Sock"], "$KITTY_LISTEN_ON");
-            assert_eq!(headers["X-Hobbes-Tmux"], "$TMUX");
-            assert_eq!(headers["X-Hobbes-Tmux-Pane"], "$TMUX_PANE");
-            assert_eq!(headers["X-Hobbes-Wt"], "$WT_SESSION");
+            assert_eq!(headers["X-Hobbes-Term"], "${TERM_PROGRAM}");
+            assert_eq!(headers["X-Hobbes-App"], "${__CFBundleIdentifier}");
+            assert_eq!(headers["X-Hobbes-Iterm"], "${ITERM_SESSION_ID}");
+            assert_eq!(headers["X-Hobbes-Wezterm"], "${WEZTERM_PANE}");
+            assert_eq!(headers["X-Hobbes-Kitty"], "${KITTY_WINDOW_ID}");
+            assert_eq!(headers["X-Hobbes-Kitty-Sock"], "${KITTY_LISTEN_ON}");
+            assert_eq!(headers["X-Hobbes-Tmux"], "${TMUX}");
+            assert_eq!(headers["X-Hobbes-Tmux-Pane"], "${TMUX_PANE}");
+            assert_eq!(headers["X-Hobbes-Wt"], "${WT_SESSION}");
             assert_eq!(headers.len(), 9);
             // Every interpolated variable must be allow-listed, or Claude
             // Code sends it empty.
@@ -424,7 +425,7 @@ mod tests {
                 .map(|v| v.as_str().unwrap())
                 .collect();
             for value in headers.values() {
-                let var = value.as_str().unwrap().trim_start_matches('$');
+                let var = value.as_str().unwrap().trim_start_matches("${").trim_end_matches('}');
                 assert!(allowed.contains(&var), "{var} not in allowedEnvVars");
             }
             assert_eq!(allowed.len(), headers.len());

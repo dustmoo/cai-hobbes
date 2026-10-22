@@ -181,6 +181,14 @@ fn is_iterm_session(s: &str) -> bool {
         && uuid.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
+/// A reverse-DNS bundle id (`com.googlecode.iterm2`): at least one dot,
+/// alphanumeric segments. A mangled interpolation (`undleIdentifier`) fails.
+fn is_bundle_id(s: &str) -> bool {
+    s.len() <= 128
+        && s.contains('.')
+        && s.split('.').all(|seg| !seg.is_empty() && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
 /// An absolute path with no control characters.
 fn is_abs_path(s: &str) -> bool {
     s.starts_with('/') && !s.chars().any(char::is_control)
@@ -204,9 +212,7 @@ pub(crate) fn validate_hint(field: HintField, raw: &[u8]) -> Result<Option<Strin
         HintField::TermProgram => {
             s.len() <= 64 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+-".contains(&b))
         }
-        HintField::BundleId => {
-            s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-        }
+        HintField::BundleId => is_bundle_id(s),
         HintField::Iterm => is_iterm_session(s),
         HintField::WeztermPane | HintField::KittyWindow => all_digits(s, 9),
         HintField::TmuxPane => s.strip_prefix('%').is_some_and(|n| all_digits(n, 9)),
@@ -344,6 +350,7 @@ fn term_program_info(tp: &str) -> Option<(&'static str, Option<&'static str>)> {
 pub(crate) fn hint_app_name(hint: &TerminalHint) -> Option<&'static str> {
     hint.bundle_id
         .as_deref()
+        .filter(|b| is_bundle_id(b))
         .and_then(app_name_for_bundle)
         .or_else(|| hint.term_program.as_deref().and_then(term_program_info).map(|(n, _)| n))
         .or_else(|| hint.wt_session.as_ref().map(|_| "Windows Terminal"))
@@ -352,8 +359,10 @@ pub(crate) fn hint_app_name(hint: &TerminalHint) -> Option<&'static str> {
 /// The bundle id to activate for a hint: the forwarded one, else one implied
 /// by `TERM_PROGRAM`.
 pub(crate) fn hint_bundle(hint: &TerminalHint) -> Option<String> {
+    // Rows stored before validation tightened may hold a mangled id.
     hint.bundle_id
         .clone()
+        .filter(|b| is_bundle_id(b))
         .or_else(|| hint.term_program.as_deref().and_then(term_program_info).and_then(|(_, b)| b).map(str::to_string))
 }
 
@@ -375,7 +384,10 @@ pub fn destination_label(session: &FleetSession) -> String {
         return "Open its chat".to_string();
     }
     let plan = plan_for(session);
+    // Host unknown: the ladder tries iTerm2, then Terminal, by tty.
+    let host_known = session.terminal.as_ref().and_then(hint_bundle).is_some();
     match plan.first() {
+        Some(Rung::FocusIterm | Rung::FocusTerminalApp) if !host_known => "Go to terminal tab".to_string(),
         Some(Rung::FocusIterm) => "Focus iTerm2 tab".to_string(),
         Some(Rung::FocusTerminalApp) => "Focus Terminal tab".to_string(),
         Some(Rung::Activate { app, .. }) => format!("Bring {app} forward"),
@@ -519,6 +531,18 @@ pub(crate) fn plan_ladder(
             match bundle.as_deref() {
                 Some(ITERM_BUNDLE) if !denied(ITERM_BUNDLE) => plan.push(Rung::FocusIterm),
                 Some(TERMINAL_BUNDLE) if !denied(TERMINAL_BUNDLE) => plan.push(Rung::FocusTerminalApp),
+                // Host unknown (no hint yet, or one without an app): find the
+                // session's tty from the process table and ask both apps
+                // that can be addressed by tty. Each rung checks its app is
+                // running first, so neither is launched.
+                None => {
+                    if !denied(ITERM_BUNDLE) {
+                        plan.push(Rung::FocusIterm);
+                    }
+                    if !denied(TERMINAL_BUNDLE) {
+                        plan.push(Rung::FocusTerminalApp);
+                    }
+                }
                 _ => {}
             }
             if let Some(b) = bundle.clone() {
@@ -1146,8 +1170,25 @@ mod tests {
         assert!(!plan_ladder(true, Some(&iterm), mac, &never, true)
             .iter()
             .any(|r| matches!(r, Rung::Resume { .. })));
-        // No hint while live: only the copy.
-        assert_eq!(plan_ladder(true, None, mac, &never, true), vec![Rung::Copy]);
+        // No hint while live: find the tab by tty in iTerm2, then Terminal,
+        // then copy.
+        assert_eq!(
+            plan_ladder(true, None, mac, &never, true),
+            vec![Rung::FocusIterm, Rung::FocusTerminalApp, Rung::Copy]
+        );
+        // A mangled bundle id (bare `$__CFBundleIdentifier` interpolation)
+        // is ignored: TERM_PROGRAM still says iTerm2.
+        let mangled = TerminalHint {
+            term_program: Some("iTerm.app".into()),
+            bundle_id: Some("undleIdentifier".into()),
+            ..Default::default()
+        };
+        assert_eq!(plan_ladder(true, Some(&mangled), mac, &never, true)[0], Rung::FocusIterm);
+        assert!(validate_hint(HintField::BundleId, b"undleIdentifier").is_err());
+        assert_eq!(
+            validate_hint(HintField::BundleId, b"com.googlecode.iterm2"),
+            Ok(Some("com.googlecode.iterm2".into()))
+        );
 
         // Ended: resume in its own terminal, then copy; never focus/activate.
         assert_eq!(
@@ -1196,7 +1237,7 @@ mod tests {
         assert_eq!(destination_label(&session_with(Some(iterm), true)), "Resume in iTerm2");
         let vs = session_with(Some(hint(Some("com.microsoft.VSCode"), Some("vscode"))), false);
         assert_eq!(destination_label(&vs), "Bring VS Code forward");
-        assert_eq!(destination_label(&session_with(None, false)), "Copy resume command");
+        assert_eq!(destination_label(&session_with(None, false)), "Go to terminal tab");
         assert_eq!(answer_label(&session_with(None, false)), "Answer in terminal");
         let mut chat = session_with(None, false);
         chat.origin = FleetOrigin::Hobbes;
