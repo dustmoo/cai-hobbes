@@ -198,6 +198,136 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                             }
                                         }
                                     }
+
+                                    if crate::heartbeat::heartbeat_available() {
+                                        {
+                                            let hb = local_settings.read().clone();
+                                            rsx! {
+                                                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mt-6 mb-3", "Heartbeat" }
+                                                div {
+                                                    class: "flex items-center justify-between mb-4",
+                                                    div {
+                                                        label { class: "text-sm font-medium text-fg-muted", "Enable Heartbeat" }
+                                                        p { class: "text-xs text-fg-muted", "Runs on its own between chats and spends from your connector." }
+                                                    }
+                                                    input {
+                                                        r#type: "checkbox",
+                                                        class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                                        checked: "{hb.heartbeat_enabled}",
+                                                        onchange: move |e| {
+                                                            local_settings.write().heartbeat_enabled = e.value() == "true";
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    class: "mb-4",
+                                                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Wakes per hour" }
+                                                    p { class: "text-xs text-fg-muted mb-1", "At most this many wakes in any 60 minutes (0 to 12). 0 never wakes." }
+                                                    input {
+                                                        r#type: "number",
+                                                        min: "0",
+                                                        max: "12",
+                                                        class: "w-32 rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
+                                                        value: "{hb.heartbeat_wakes_per_hour}",
+                                                        oninput: move |e| {
+                                                            if let Ok(v) = e.value().parse::<u32>() {
+                                                                local_settings.write().heartbeat_wakes_per_hour = v.min(12);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    class: "mb-4",
+                                                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Daily spend cap ($)" }
+                                                    p { class: "text-xs text-fg-muted mb-1", "Wakes pause for the day once their recorded cost reaches this." }
+                                                    input {
+                                                        r#type: "number",
+                                                        min: "0",
+                                                        step: "0.5",
+                                                        class: "w-32 rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
+                                                        value: "{hb.heartbeat_daily_usd}",
+                                                        oninput: move |e| {
+                                                            if let Ok(v) = e.value().parse::<f64>() {
+                                                                if v.is_finite() && v >= 0.0 {
+                                                                    local_settings.write().heartbeat_daily_usd = v;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                div {
+                                                    class: "mb-4",
+                                                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Sources" }
+                                                    p { class: "text-xs text-fg-muted mb-2", "What the Heartbeat watches. CI needs the gh CLI signed in." }
+                                                    div {
+                                                        class: "flex items-center gap-6",
+                                                        label {
+                                                            class: "flex items-center gap-2 text-sm text-fg-muted",
+                                                            input {
+                                                                r#type: "checkbox",
+                                                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                                                checked: "{hb.heartbeat_source_planner}",
+                                                                onchange: move |e| {
+                                                                    local_settings.write().heartbeat_source_planner = e.value() == "true";
+                                                                }
+                                                            }
+                                                            "Planner"
+                                                        }
+                                                        label {
+                                                            class: "flex items-center gap-2 text-sm text-fg-muted",
+                                                            input {
+                                                                r#type: "checkbox",
+                                                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                                                checked: "{hb.heartbeat_source_fleet}",
+                                                                onchange: move |e| {
+                                                                    local_settings.write().heartbeat_source_fleet = e.value() == "true";
+                                                                }
+                                                            }
+                                                            "Fleet"
+                                                        }
+                                                        label {
+                                                            class: "flex items-center gap-2 text-sm text-fg-muted",
+                                                            input {
+                                                                r#type: "checkbox",
+                                                                class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                                                checked: "{hb.heartbeat_source_ci}",
+                                                                onchange: move |e| {
+                                                                    local_settings.write().heartbeat_source_ci = e.value() == "true";
+                                                                }
+                                                            }
+                                                            "CI"
+                                                        }
+                                                    }
+                                                }
+                                                if !hb.heartbeat_muted_kinds.is_empty() {
+                                                    div {
+                                                        class: "mb-1",
+                                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Muted kinds" }
+                                                        p { class: "text-xs text-fg-muted mb-2", "Events of these kinds never wake the Heartbeat. Click one to unmute." }
+                                                        div {
+                                                            class: "flex flex-wrap gap-2",
+                                                            for kind in hb.heartbeat_muted_kinds.iter().cloned() {
+                                                                {
+                                                                    let k = kind.clone();
+                                                                    rsx! {
+                                                                        button {
+                                                                            key: "{kind}",
+                                                                            class: "px-2 py-0.5 rounded border border-subtle text-xs text-fg-muted hover:text-fg hover:bg-card",
+                                                                            title: "Unmute",
+                                                                            onclick: move |_| {
+                                                                                local_settings.write().heartbeat_muted_kinds.retain(|x| x != &k);
+                                                                            },
+                                                                            "{kind} ×"
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
