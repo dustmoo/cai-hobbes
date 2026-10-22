@@ -473,6 +473,32 @@ pub struct Settings {
     /// Takes effect at next launch (registration happens at manager init).
     #[serde(default)]
     pub terminal_enabled: bool,
+
+    // ── Heartbeat ───────────────────────────────────────────────────────────
+    /// Master switch for the Heartbeat (cheap watchers that notice planner,
+    /// Fleet and CI changes between chats and may wake a dedicated session).
+    /// Off by default. Read it through `heartbeat::heartbeat_active`, which
+    /// also applies the availability gate.
+    #[serde(default)]
+    pub heartbeat_enabled: bool,
+    /// Wake cap: at most this many wakes in any rolling 60 minutes. Over the
+    /// cap a wake is deferred and its events stay queued.
+    #[serde(default = "default_heartbeat_wakes_per_hour")]
+    pub heartbeat_wakes_per_hour: u32,
+    /// Daily wake spend cap in USD (local day).
+    #[serde(default = "default_heartbeat_daily_usd")]
+    pub heartbeat_daily_usd: f64,
+    /// Per-source watcher switches.
+    #[serde(default = "default_true")]
+    pub heartbeat_source_planner: bool,
+    #[serde(default = "default_true")]
+    pub heartbeat_source_fleet: bool,
+    #[serde(default = "default_true")]
+    pub heartbeat_source_ci: bool,
+    /// Event kinds (stable slugs, e.g. `"todo_overdue"`) the salience step
+    /// always ignores.
+    #[serde(default)]
+    pub heartbeat_muted_kinds: Vec<String>,
 }
 
 impl Settings {
@@ -511,6 +537,14 @@ impl Settings {
 
 fn default_fleet_retire_minutes() -> u32 {
     360
+}
+
+fn default_heartbeat_wakes_per_hour() -> u32 {
+    2
+}
+
+fn default_heartbeat_daily_usd() -> f64 {
+    5.0
 }
 
 fn default_planner_block_minutes() -> u32 {
@@ -990,6 +1024,13 @@ impl Default for Settings {
             fleet_retire_minutes: default_fleet_retire_minutes(),
             dispatch_auto_continue: true,
             terminal_enabled: false,
+            heartbeat_enabled: false,
+            heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
+            heartbeat_daily_usd: default_heartbeat_daily_usd(),
+            heartbeat_source_planner: true,
+            heartbeat_source_fleet: true,
+            heartbeat_source_ci: true,
+            heartbeat_muted_kinds: Vec::new(),
         }
     }
 }
