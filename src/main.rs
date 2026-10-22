@@ -2455,12 +2455,17 @@ fn app() -> Element {
             }
 
             // Delete the session if it has no messages (empty tab).
-            // Sessions with messages are preserved in History.
+            // Sessions with messages are preserved in History. The
+            // Heartbeat's own session is kept even while empty: it is
+            // waiting for its first wake, not an abandoned tab.
             {
                 let state = session_state.read();
-                let is_empty = state.sessions.get(&closing_session_id)
-                    .map(|s| s.messages.is_empty())
-                    .unwrap_or(true);
+                let is_heartbeat = heartbeat::HEARTBEAT.peek().session_id.as_deref()
+                    == Some(closing_session_id.as_str());
+                let is_empty = !is_heartbeat
+                    && state.sessions.get(&closing_session_id)
+                        .map(|s| s.messages.is_empty())
+                        .unwrap_or(true);
                 if is_empty {
                     drop(state);
                     session_state.write().delete_session(&closing_session_id);
