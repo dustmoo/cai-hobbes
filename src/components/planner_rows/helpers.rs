@@ -287,7 +287,6 @@ mod tests {
             working_since: None,
             day_minutes: Default::default(),
             day_seconds: Default::default(),
-            auto_passthrough: false,
             ended_at: None,
             pending_gate: None,
             transcript_path: None,

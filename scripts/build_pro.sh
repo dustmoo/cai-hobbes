@@ -114,6 +114,12 @@ if ! /usr/libexec/PlistBuddy -c "Print :NSFaceIDUsageDescription" "$PLIST" 2>/de
     /usr/libexec/PlistBuddy -c "Add :NSFaceIDUsageDescription string 'Hobbes uses Touch ID to securely access your API keys in the Keychain.'" "$PLIST"
 fi
 
+# Fleet click-to-terminal drives iTerm2/Terminal over Apple Events. Without
+# this key macOS never shows the Automation prompt and every call fails with
+# -1743 (the apple-events entitlement is in HobbesPro.entitlements).
+/usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription Hobbes Pro switches to the terminal tab where a Claude Code session is running." "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Hobbes Pro switches to the terminal tab where a Claude Code session is running." "$PLIST"
+
 # Set the app name to "Hobbes Pro" for direct download builds
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Hobbes Pro" "$PLIST" 2>/dev/null || \
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string Hobbes Pro" "$PLIST"

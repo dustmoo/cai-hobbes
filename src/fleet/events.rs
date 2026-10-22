@@ -51,7 +51,7 @@ pub enum FleetEvent {
         session_id: String,
         cwd: String,
         /// Hobbes-generated (the payload has no `tool_use_id` for this
-        /// event) — keys the held response.
+        /// event) — keys the pending gate and the Planner's gate decision.
         request_id: String,
         tool_name: String,
         tool_input: Value,

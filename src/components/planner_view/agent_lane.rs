@@ -174,10 +174,12 @@ pub(crate) enum CardOpen {
     /// A Hobbes chat that is in memory or a Hobbes-origin fleet row: open
     /// its tab (`SwitchToSession` hydrates a closed one from History).
     Chat(String),
-    /// A Claude Code run: open the Fleet.
-    Fleet,
+    /// A Claude Code run: go to its terminal (`terminal_focus`), falling
+    /// back to the Fleet when there's no way there.
+    Terminal(String),
     /// Linked, but neither in memory nor in the fleet mirror: decided on
-    /// click (a stored chat opens as a tab, anything else opens the Fleet).
+    /// click (a stored chat opens as a tab, a stored Claude Code run goes to
+    /// its terminal, anything else opens the Fleet).
     Unresolved(String),
     /// No worker yet: the to-do's details.
     Details,
@@ -189,7 +191,7 @@ pub(crate) fn card_open(linked: Option<&str>, in_memory: bool, fleet_origin: Opt
     match (linked, in_memory, fleet_origin) {
         (None, _, _) => CardOpen::Details,
         (Some(id), true, _) | (Some(id), _, Some(true)) => CardOpen::Chat(id.to_string()),
-        (Some(_), false, Some(false)) => CardOpen::Fleet,
+        (Some(id), false, Some(false)) => CardOpen::Terminal(id.to_string()),
         (Some(id), false, None) => CardOpen::Unresolved(id.to_string()),
     }
 }
@@ -271,6 +273,10 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut detail = use_context::<crate::components::todo_detail::TodoDetailContext>().0;
     let mut collapsed = use_signal(|| None::<bool>);
+    // Where the last go-to-terminal click ended up (fades after a few
+    // seconds); `note_seq` keeps an older fade from clearing a newer note.
+    let mut note = use_signal(|| None::<String>);
+    let mut note_seq = use_signal(|| 0u64);
 
     // A once-a-minute tick keeps "waiting 9m" honest.
     let mut tick = use_signal(|| 0u64);
@@ -351,15 +357,40 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
     drop(fleet);
     drop(state);
 
+    // Go to a Claude Code run's terminal; with no row to go by, or when
+    // every rung fails, open the Fleet instead.
+    let mut go_to_terminal = move |row: Option<FleetSession>| {
+        let Some(row) = row.filter(|r| r.origin == FleetOrigin::External) else {
+            chat_command.set(Some(ChatCommand::ToggleFleet));
+            return;
+        };
+        spawn(async move {
+            let name = row.display_name().to_string();
+            let outcome = crate::fleet::terminal_focus::go_to_session(row).await;
+            if matches!(outcome, crate::fleet::terminal_focus::FocusOutcome::Failed(_)) {
+                chat_command.set(Some(ChatCommand::ToggleFleet));
+            }
+            let seq = *note_seq.peek() + 1;
+            note_seq.set(seq);
+            note.set(Some(outcome.note(&name)));
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            if *note_seq.peek() == seq {
+                note.set(None);
+            }
+        });
+    };
     // Card click: open the worker so the person can unblock it there.
     let open_card = move |(id, open): (String, CardOpen)| match open {
         CardOpen::Chat(sid) => chat_command.set(Some(ChatCommand::SwitchToSession(sid))),
-        CardOpen::Fleet => chat_command.set(Some(ChatCommand::ToggleFleet)),
+        CardOpen::Terminal(sid) => {
+            let row = crate::fleet::shared().snapshot().sessions.get(&sid).cloned();
+            go_to_terminal(row.or_else(|| crate::fleet::store::load_session(&sid)));
+        }
         CardOpen::Unresolved(sid) => {
             if crate::session_store::contains(&sid) {
                 chat_command.set(Some(ChatCommand::SwitchToSession(sid)));
             } else {
-                chat_command.set(Some(ChatCommand::ToggleFleet));
+                go_to_terminal(crate::fleet::store::load_session(&sid));
             }
         }
         CardOpen::Details => detail.set(Some(id)),
@@ -396,6 +427,9 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                     onclick: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
                     "Fleet \u{203a}"
                 }
+            }
+            if let Some(n) = note.read().clone() {
+                p { class: "px-4 pb-1 text-[11px] leading-relaxed text-fg-muted", "{n}" }
             }
             if !is_collapsed {
                 if empty {
@@ -533,7 +567,7 @@ fn LaneCard(
     let open = data.open.clone();
     let hint = match &data.open {
         CardOpen::Chat(_) => "Open its chat",
-        CardOpen::Fleet => "Open it in the Fleet",
+        CardOpen::Terminal(_) => "Go to its terminal",
         CardOpen::Unresolved(_) => "Open its worker",
         CardOpen::Details => "Show details",
     };
@@ -688,7 +722,7 @@ mod tests {
         assert_eq!(card_open(None, false, None), CardOpen::Details, "no worker yet");
         assert_eq!(card_open(Some("c1"), true, None), CardOpen::Chat("c1".into()), "an open chat tab");
         assert_eq!(card_open(Some("c1"), false, Some(true)), CardOpen::Chat("c1".into()), "a Hobbes chat whose tab is closed");
-        assert_eq!(card_open(Some("cc"), false, Some(false)), CardOpen::Fleet, "a Claude Code run");
+        assert_eq!(card_open(Some("cc"), false, Some(false)), CardOpen::Terminal("cc".into()), "a Claude Code run");
         assert_eq!(card_open(Some("x"), false, None), CardOpen::Unresolved("x".into()), "decided on click");
     }
 
