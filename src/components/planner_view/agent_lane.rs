@@ -284,9 +284,10 @@ pub(crate) fn date_chip(todo: &Todo) -> Option<String> {
 /// The dot's colour class for an agent state.
 pub(crate) fn dot_class(state: Option<AgentState>) -> &'static str {
     match state {
-        Some(AgentState::NeedsYou) => "bg-yellow-300",
+        // The Fleet's status colours: amber needs you, green working.
+        Some(AgentState::NeedsYou) => "bg-[#f59e0b]",
         Some(AgentState::Stuck) => "bg-red-400",
-        Some(AgentState::Working) => "bg-primary-400",
+        Some(AgentState::Working) => "bg-[#34d399]",
         _ => "bg-fg-muted",
     }
 }
@@ -332,7 +333,7 @@ pub(crate) fn AgentsReadout() -> Element {
             div {
                 class: "flex h-[18px] items-center gap-2.5 whitespace-nowrap text-xs text-fg",
                 span { class: "inline-flex items-center gap-1",
-                    span { class: "h-[7px] w-[7px] rounded-full bg-primary-400" }
+                    span { class: "h-[7px] w-[7px] rounded-full bg-[#34d399]" }
                     "{working} working"
                 }
                 span { class: "inline-flex items-center gap-1",
@@ -366,7 +367,9 @@ pub(crate) fn AgentsReadout() -> Element {
 // ── The lane column ─────────────────────────────────────────────────────────
 
 const SEC: &str = "flex items-center gap-2 px-4 pt-3 pb-1.5 text-[11px] uppercase tracking-[0.08em] text-fg-muted";
-const CARD: &str = "mx-3 mb-2 flex flex-col rounded-lg border border-faint border-l-2 border-l-[#EA8A2E] bg-card text-left";
+/// Card frame. Only a card that needs the person gets the amber left edge,
+/// the same meaning it has in the Fleet.
+const CARD: &str = "mx-3 mb-2 flex flex-col rounded-lg border border-faint bg-card text-left";
 const MINI: &str = "mx-3 flex h-7 items-center gap-2 rounded px-2 text-xs text-fg whitespace-nowrap";
 const WK: &str = "inline-flex h-[18px] min-w-0 max-w-[60%] items-center gap-1 rounded-sm border border-faint px-1.5 font-mono text-[10px] text-fg";
 /// Two-line clamp for a title (the full text is the tooltip / expanded body).
@@ -600,7 +603,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                 if !needs.is_empty() {
                     div {
                         class: "{SEC} pt-1",
-                        span { class: "rounded-full bg-yellow-800 px-1.5 text-[10px] font-bold leading-4 text-yellow-300", "{n_needs}" }
+                        span { class: "rounded-full bg-[rgba(245,158,11,0.15)] px-1.5 text-[10px] font-bold leading-4 text-[#fcd34d]", "{n_needs}" }
                         span { class: "text-fg", "Needs you" }
                         span { class: "font-mono normal-case tracking-normal", "\u{b7} about {minutes} min" }
                         div { class: "flex-1" }
@@ -626,7 +629,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                 if !working.is_empty() {
                     div {
                         class: "{SEC}",
-                        span { class: "h-[7px] w-[7px] rounded-full bg-primary-400" }
+                        span { class: "h-[7px] w-[7px] rounded-full bg-[#34d399]" }
                         span { class: "text-fg", "Working" }
                         span { "\u{b7} {working.len()}" }
                     }
@@ -805,7 +808,7 @@ fn LaneCard(
     };
     rsx! {
         div {
-            class: if need { "{CARD} border-subtle" } else { "{CARD}" },
+            class: if need { "{CARD} border-subtle border-l-[3px] border-l-[#f59e0b]" } else { "{CARD}" },
             div {
                 class: "flex cursor-pointer flex-col gap-0.5 px-2.5 py-2 hover:bg-input",
                 title: "{hint}",
