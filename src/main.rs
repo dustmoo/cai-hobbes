@@ -59,6 +59,7 @@ mod tab_tidy;
 mod test_support;
 mod timers;
 mod handoff;
+mod heartbeat;
 mod todo;
 mod usage_log;
 mod settings;
