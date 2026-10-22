@@ -5,11 +5,12 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::perception::{
-    ci_events, fleet_events, merge_ci_snapshot, planner_events, FleetSnapshot, PlannerSnapshot,
+    ci_events, fleet_events, is_fleet_noise, merge_ci_snapshot, planner_events, FleetSnapshot,
+    PlannerSnapshot,
 };
 use super::salience::{Choice, Decision};
 use super::{CiRun, HeartbeatEvent};
@@ -22,6 +23,8 @@ pub const EVENT_MAX_AGE_DAYS: i64 = 7;
 pub const MAX_TRAIL: usize = 200;
 /// Wake records older than this are dropped.
 pub const TRAIL_MAX_AGE_DAYS: i64 = 7;
+/// Fired day anchors are remembered this long (they only matter for today).
+pub const FIRED_ANCHOR_KEEP_DAYS: i64 = 2;
 /// Reactions kept. Labels outlive their events (each carries the event's
 /// kind and summary), so this cap is the only bound.
 pub const MAX_REACTIONS: usize = 1000;
@@ -87,6 +90,17 @@ impl WakeRecord {
             ..Self::fired(at, trigger, event_ids, "")
         }
     }
+}
+
+/// A day anchor that has fired (see `anchors.rs`): each fires at most once
+/// per local day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiredAnchor {
+    /// The anchor's stable key ("workday_start", "meeting:<id>@<start>").
+    pub key: String,
+    /// The local day it fired for.
+    pub day: NaiveDate,
+    pub at: DateTime<Utc>,
 }
 
 /// What a reaction points at.
@@ -166,6 +180,9 @@ pub struct HeartbeatState {
     /// count them) until they age out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trail_cleared_at: Option<DateTime<Utc>>,
+    /// Day anchors already fired, so each fires at most once per local day.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fired_anchors: Vec<FiredAnchor>,
 }
 
 impl HeartbeatState {
@@ -309,15 +326,43 @@ impl HeartbeatState {
         id
     }
 
-    /// Fill in a finished wake's cost and outcome. False if unknown.
-    pub fn complete_wake(&mut self, id: &str, cost_usd: Option<f64>, outcome: Option<String>) -> bool {
+    /// Fill in a finished wake's cost, outcome and actions. False if unknown.
+    pub fn complete_wake(
+        &mut self,
+        id: &str,
+        cost_usd: Option<f64>,
+        outcome: Option<String>,
+        actions: Vec<String>,
+    ) -> bool {
         match self.trail.iter_mut().find(|w| w.id == id) {
             Some(w) => {
                 w.cost_usd = cost_usd;
                 w.outcome = outcome;
+                w.actions = actions;
                 true
             }
             None => false,
+        }
+    }
+
+    // ── Day anchors ──
+
+    /// Whether the anchor `key` already fired for local day `day`.
+    pub fn anchor_fired(&self, key: &str, day: NaiveDate) -> bool {
+        self.fired_anchors.iter().any(|a| a.key == key && a.day == day)
+    }
+
+    /// Remember that these anchors fired (a wake carrying them ran).
+    pub fn mark_anchors_fired<'a>(
+        &mut self,
+        keys: impl IntoIterator<Item = &'a str>,
+        day: NaiveDate,
+        now: DateTime<Utc>,
+    ) {
+        for key in keys {
+            if !self.anchor_fired(key, day) {
+                self.fired_anchors.push(FiredAnchor { key: key.to_string(), day, at: now });
+            }
         }
     }
 
@@ -367,7 +412,9 @@ impl HeartbeatState {
     /// and queue entries that pointed at them; cap the trail and reactions.
     pub fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = now - Duration::days(EVENT_MAX_AGE_DAYS);
-        self.events.retain(|e| e.at >= cutoff);
+        // Attention from sessions nobody dispatched is the Fleet's news, not
+        // the Heartbeat's (older builds journalled and queued it).
+        self.events.retain(|e| e.at >= cutoff && !is_fleet_noise(e));
         cap_front(&mut self.events, MAX_EVENTS);
         let live: HashSet<&str> = self.events.iter().map(|e| e.id.as_str()).collect();
         self.decisions.retain(|d| live.contains(d.event_id.as_str()));
@@ -376,6 +423,8 @@ impl HeartbeatState {
         self.trail.retain(|w| w.at >= trail_cutoff);
         cap_front(&mut self.trail, MAX_TRAIL);
         cap_front(&mut self.reactions, MAX_REACTIONS);
+        let anchor_cutoff = now - Duration::days(FIRED_ANCHOR_KEEP_DAYS);
+        self.fired_anchors.retain(|a| a.at >= anchor_cutoff);
     }
 
     /// Hide the current wake trail from the card ("Clear trail").
@@ -553,9 +602,49 @@ mod tests {
         assert_ne!(a, c);
         let w = s.record_wake(WakeRecord::fired(now(), "t", vec!["e".into()], "1 wake_now"));
         assert_eq!(s.trail.len(), 3);
-        assert!(s.complete_wake(&w, Some(0.12), Some("drafted a reply".into())));
+        assert!(s.complete_wake(&w, Some(0.12), Some("drafted a reply".into()), vec!["Wrote a handoff".into()]));
         assert_eq!(s.trail[2].cost_usd, Some(0.12));
-        assert!(!s.complete_wake("missing", None, None));
+        assert_eq!(s.trail[2].actions, vec!["Wrote a handoff".to_string()]);
+        assert!(!s.complete_wake("missing", None, None, vec![]));
+    }
+
+    #[test]
+    fn prune_drops_undispatched_attention_from_old_state() {
+        let mut s = HeartbeatState::default();
+        let mut noise = HeartbeatEvent::new(
+            EventSource::Fleet,
+            KIND_SESSION_NEEDS_ATTENTION,
+            "Fleet: repo — Claude is waiting for your input",
+            Urgency::Normal,
+            now(),
+        );
+        noise.session_id = Some("terminal".into());
+        let mut dispatched = noise.clone();
+        dispatched.id = "d".into();
+        dispatched.dispatched_from = Some("chat".into());
+        // As an older build would have left it: journalled and queued.
+        s.events.push(noise.clone());
+        s.decisions.push(dec(&noise, Choice::Queue));
+        s.queue.push(noise.id.clone());
+        s.events.push(dispatched.clone());
+        s.queue.push(dispatched.id.clone());
+        s.prune(now());
+        assert!(s.event(&noise.id).is_none());
+        assert_eq!(s.queue, vec!["d".to_string()]);
+        assert!(s.decisions.is_empty());
+    }
+
+    #[test]
+    fn anchors_fire_once_per_day_and_age_out() {
+        let mut s = HeartbeatState::default();
+        let today = now().date_naive();
+        assert!(!s.anchor_fired("workday_start", today));
+        s.mark_anchors_fired(["workday_start", "workday_start"], today, now());
+        assert!(s.anchor_fired("workday_start", today));
+        assert_eq!(s.fired_anchors.len(), 1);
+        assert!(!s.anchor_fired("workday_start", today.succ_opt().unwrap()));
+        s.prune(now() + Duration::days(FIRED_ANCHOR_KEEP_DAYS) + Duration::minutes(1));
+        assert!(s.fired_anchors.is_empty());
     }
 
     #[test]

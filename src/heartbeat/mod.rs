@@ -1,4 +1,5 @@
-//! The Heartbeat: a harness that stays awake between chats (Phase 2).
+//! The Heartbeat: a harness that stays awake between chats (Phase 2, made
+//! proactive in 2b: day anchors, a look-ahead briefing, worker diagnosis).
 //!
 //! Perception (cheap watchers, no LLM) turns planner, Fleet and CI changes
 //! into events; salience routes each to ignore / note / queue / wake; the
@@ -15,8 +16,10 @@
 //! //   + observe_fleet / observe_ci for the enabled sources
 //! let decisions = salience.decide(&evs, &ctx);
 //! state.ingest(evs, decisions, now);
-//! match wake::decide_wake(&state, &budget, spent_today, now, session_busy) {
-//!     Fire(trigger)  => { /* drain_queue → wake message → record_wake(fired) */ }
+//! let anchors = anchors::due_anchors(&state, &DayView::capture(..), now);
+//! match wake::decide_wake(&state, &budget, spent_today, now, session_busy, &anchors) {
+//!     Fire(trigger)  => { /* drain_queue → wake message → record_wake(fired),
+//!                           mark the anchors fired */ }
 //!     Defer { .. }   => { /* record_wake(deferred); events stay queued */ }
 //!     Idle | Busy    => {}
 //! }
@@ -25,8 +28,10 @@
 //! Tool calls from the Heartbeat session pass `trust::gate_verdict`
 //! (`builtin_tools::heartbeat_gate`) at both tool-call sites.
 
+pub mod anchors;
 pub mod budget;
 pub mod ci;
+pub mod diagnose;
 pub mod perception;
 pub mod runtime;
 pub mod salience;

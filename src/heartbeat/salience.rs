@@ -157,8 +157,8 @@ pub trait Salience {
 /// | 3 | `ci_failed` on a project with open agent work | WakeNow  |
 /// | 4 | `ci_failed` elsewhere                         | Queue    |
 /// | 4b | `run_ended` from the Heartbeat session while auto-continue hands the result back | Note |
-/// | 5 | `worker_done` / `run_ended` / `session_needs_attention` the Heartbeat awaits (pending intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
-/// | 6 | `worker_done`, `session_needs_attention`      | Queue    |
+/// | 5 | `worker_done` / `worker_review` / `run_ended` / `session_needs_attention` the Heartbeat awaits (pending intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
+/// | 6 | `worker_done`, `worker_review`, `session_needs_attention` | Queue |
 /// | 7 | `run_ended` (the dispatching chat is continued anyway) | Note |
 /// | 8 | `todo_overdue`, `ci_recovered`                | Queue    |
 /// | 9 | anything else: Low → Note, Normal/High → Queue (confidence 0.5) | — |
@@ -184,10 +184,12 @@ impl RulesSalience {
                 if agent_work { Choice::WakeNow } else { Choice::Queue }
             }
             KIND_RUN_ENDED if ctx.continued_into_heartbeat(ev) => Choice::Note,
-            KIND_WORKER_DONE | KIND_RUN_ENDED | KIND_SESSION_NEEDS_ATTENTION if ctx.awaited(ev) => {
+            KIND_WORKER_DONE | KIND_WORKER_REVIEW | KIND_RUN_ENDED | KIND_SESSION_NEEDS_ATTENTION
+                if ctx.awaited(ev) =>
+            {
                 Choice::WakeNow
             }
-            KIND_WORKER_DONE | KIND_SESSION_NEEDS_ATTENTION => Choice::Queue,
+            KIND_WORKER_DONE | KIND_WORKER_REVIEW | KIND_SESSION_NEEDS_ATTENTION => Choice::Queue,
             KIND_RUN_ENDED => Choice::Note,
             KIND_TODO_OVERDUE | KIND_CI_RECOVERED => Choice::Queue,
             _ => {
@@ -294,6 +296,7 @@ mod tests {
         assert_eq!(choice(&ev(p, KIND_WORKER_STUCK, Urgency::High), &ctx), Choice::WakeNow);
         assert_eq!(choice(&ev(p, KIND_DECISION_RAISED, Urgency::High), &ctx), Choice::WakeNow);
         assert_eq!(choice(&ev(p, KIND_WORKER_DONE, Urgency::Normal), &ctx), Choice::Queue);
+        assert_eq!(choice(&ev(p, KIND_WORKER_REVIEW, Urgency::Normal), &ctx), Choice::Queue);
         assert_eq!(choice(&ev(p, KIND_TODO_OVERDUE, Urgency::Normal), &ctx), Choice::Queue);
         let f = EventSource::Fleet;
         assert_eq!(choice(&ev(f, KIND_RUN_ENDED, Urgency::Low), &ctx), Choice::Note);
@@ -328,6 +331,9 @@ mod tests {
         let mut ctx = SalienceCtx::default();
         ctx.heartbeat_todo_ids.insert("t".into());
         assert_eq!(choice(&e, &ctx), Choice::WakeNow);
+        let mut review = ev(EventSource::Planner, KIND_WORKER_REVIEW, Urgency::Normal);
+        review.todo_id = Some("t".into());
+        assert_eq!(choice(&review, &ctx), Choice::WakeNow);
 
         let mut r = ev(EventSource::Fleet, KIND_RUN_ENDED, Urgency::Low);
         r.dispatched_from = Some("hb".into());
