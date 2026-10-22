@@ -118,6 +118,40 @@ fn age_label(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+/// Dollars as "$0.40"; clamped so zero (or float dust below it) reads
+/// "$0.00", never "$-0.00".
+pub fn money(usd: f64) -> String {
+    format!("${:.2}", usd.max(0.0) + 0.0)
+}
+
+/// The strip's status phrase, next move included: "Asleep · 3 queued · next
+/// check-in 10:28 · last wake 12m ago". Off and Deferred stand alone (a
+/// disabled Heartbeat has no counters; a deferral's reason is the news).
+/// `next_label` is the already-formatted local check-in time.
+pub fn strip_phrase(
+    status: &Status,
+    queued: usize,
+    next_label: Option<&str>,
+    last: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> String {
+    match status {
+        Status::Off | Status::Deferred(_) => return status.label(),
+        _ => {}
+    }
+    let mut parts = vec![status.label()];
+    if queued > 0 {
+        parts.push(format!("{queued} queued"));
+    }
+    if let Some(n) = next_label {
+        parts.push(format!("next check-in {n}"));
+    }
+    if let Some(t) = last {
+        parts.push(format!("last wake {}", age_label(t, now)));
+    }
+    parts.join(" · ")
+}
+
 /// One-line result of a wake: the defer reason, or cost + outcome.
 fn wake_line(w: &WakeRecord) -> String {
     if w.deferred {
@@ -142,6 +176,7 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
     let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
     let mut chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let mut open = use_signal(|| false);
 
     let persist = move || {
         settings_manager
@@ -167,6 +202,8 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
     let spent = budget::spent_since(&hb.trail, budget::local_day_start(now));
     let queued = hb.queue.len();
     let last = last_wake_at(&hb.trail);
+    let next_label = crate::heartbeat::wake::next_check_in(&hb, b.wakes_per_hour)
+        .map(|t| t.with_timezone(&chrono::Local).format("%-I:%M").to_string());
     let trail: Vec<WakeRecord> = recent_trail(&hb.trail, TRAIL_ROWS).into_iter().cloned().collect();
     // Pre-resolve each wake's events (summary, kind) and reactions so the
     // rsx holds no borrow of the global.
@@ -212,28 +249,37 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
     };
 
     let color = status.color();
+    // A deferral is the one state that needs eyes: the strip stays open.
+    let pinned = matches!(status, Status::Deferred(_));
+    let expanded = pinned || *open.read();
+    let phrase = strip_phrase(&status, queued, next_label.as_deref(), last, now);
     rsx! {
         div {
-            class: "mx-6 mb-3 rounded border border-subtle bg-section p-3",
+            class: "mx-6 mb-3 rounded border border-subtle bg-section",
             div {
-                class: "flex items-center gap-3 flex-wrap",
-                h2 { class: "text-sm font-semibold", "Heartbeat" }
-                span {
-                    class: "flex items-center gap-1.5 text-xs",
-                    style: "color: {color};",
-                    span { class: "inline-block w-2 h-2 rounded-full", style: "background: {color};" }
-                    { status.label() }
+                class: "min-h-11 px-3 flex items-center gap-2.5",
+                button {
+                    class: "flex items-center gap-2.5 min-w-0 flex-1 text-left select-none",
+                    aria_expanded: "{expanded}",
+                    onclick: move |_| {
+                        if !pinned {
+                            let v = !*open.peek();
+                            open.set(v);
+                        }
+                    },
+                    span { class: "text-[11px] text-fg-muted w-3 shrink-0", if expanded { "▾" } else { "▸" } }
+                    h2 { class: "text-sm font-semibold shrink-0", "Heartbeat" }
+                    span { class: "inline-block w-2 h-2 rounded-full shrink-0", style: "background: {color};" }
+                    span {
+                        class: if pinned { "text-xs truncate min-w-0" } else { "text-xs truncate min-w-0 text-fg-muted" },
+                        style: if pinned { format!("color: {color};") } else { String::new() },
+                        "{phrase}"
+                    }
                 }
-                div { class: "flex-1" }
-                if let Some(id) = session_id.clone() {
-                    button {
-                        class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
-                        onclick: move |_| {
-                            chat_command.set(Some(
-                                crate::components::chat_input::ChatCommand::SwitchToSession(id.clone()),
-                            ));
-                        },
-                        "Open chat"
+                if enabled {
+                    span {
+                        class: "text-xs text-fg-muted shrink-0 tabular-nums",
+                        { format!("{} of {} today", money(spent), money(b.daily_usd)) }
                     }
                 }
                 input {
@@ -246,18 +292,25 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
                     }
                 }
             }
-            div {
-                class: "mt-2 flex items-center gap-6 flex-wrap text-xs text-fg-muted",
-                span { { format!("Wakes this hour: {} of {}", wakes, b.wakes_per_hour) } }
-                span { { format!("Spent today: ${:.2} of ${:.2}", spent, b.daily_usd) } }
-                span { { format!("Queued: {queued}") } }
-                span {
-                    { match last {
-                        Some(t) => format!("Last wake: {}", age_label(t, now)),
-                        None => "Last wake: never".to_string(),
-                    } }
-                }
-            }
+            if expanded {
+                div {
+                    class: "px-3 pb-3",
+                    div {
+                        class: "flex items-center gap-6 flex-wrap text-xs text-fg-muted",
+                        span { { format!("Wakes this hour: {} of {}", wakes, b.wakes_per_hour) } }
+                        div { class: "flex-1" }
+                        if let Some(id) = session_id.clone() {
+                            button {
+                                class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
+                                onclick: move |_| {
+                                    chat_command.set(Some(
+                                        crate::components::chat_input::ChatCommand::SwitchToSession(id.clone()),
+                                    ));
+                                },
+                                "Open Heartbeat chat ↗"
+                            }
+                        }
+                    }
             if rows.is_empty() {
                 p {
                     class: "mt-2 text-xs text-fg-muted",
@@ -311,6 +364,8 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
                     }
                 }
             }
+            }
+            }
         }
     }
 }
@@ -342,6 +397,32 @@ mod tests {
         assert_eq!(status_of(&s, true, false), Status::Deferred("hourly cap".into()));
         s.trail.push(fired(t(1)));
         assert_eq!(status_of(&s, true, false), Status::Asleep);
+    }
+
+    #[test]
+    fn strip_phrase_carries_the_next_move() {
+        let now = Utc::now();
+        assert_eq!(
+            strip_phrase(&Status::Asleep, 3, Some("10:28"), Some(now - Duration::minutes(12)), now),
+            "Asleep · 3 queued · next check-in 10:28 · last wake 12m ago"
+        );
+        // Nothing queued, never woke: just the state.
+        assert_eq!(strip_phrase(&Status::Asleep, 0, None, None, now), "Asleep");
+        // Off has no counters; Deferred leads with its reason.
+        assert_eq!(strip_phrase(&Status::Off, 3, Some("10:28"), Some(now), now), "Off");
+        assert_eq!(
+            strip_phrase(&Status::Deferred("hourly cap".into()), 3, Some("10:28"), None, now),
+            "Deferred: hourly cap"
+        );
+    }
+
+    #[test]
+    fn money_never_shows_negative_zero() {
+        assert_eq!(money(0.0), "$0.00");
+        assert_eq!(money(-0.0), "$0.00");
+        assert_eq!(money(-0.0004), "$0.00");
+        assert_eq!(money(0.4), "$0.40");
+        assert_eq!(money(5.0), "$5.00");
     }
 
     #[test]

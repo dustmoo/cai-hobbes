@@ -106,22 +106,165 @@ fn waiting_label(status: &FleetStatus, wake_at: Option<DateTime<Utc>>) -> Option
     })
 }
 
-/// Needs-attention first, then most recent activity.
-fn sorted_sessions(state: &fleet::FleetState) -> Vec<FleetSession> {
-    let mut sessions: Vec<FleetSession> = state.sessions.values().cloned().collect();
-    sessions.sort_by(|a, b| {
-        b.status
-            .needs_attention()
-            .cmp(&a.status.needs_attention())
-            .then(b.last_event_at.cmp(&a.last_event_at))
-    });
-    sessions
+/// The three state groups the Fleet list is organised by. State, not origin:
+/// a Hobbes tab that needs you sits beside a terminal session that does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    NeedsYou,
+    Working,
+    Idle,
 }
+
+impl Group {
+    const ALL: [Group; 3] = [Group::NeedsYou, Group::Working, Group::Idle];
+
+    fn label(self) -> &'static str {
+        match self {
+            Group::NeedsYou => "Needs you",
+            Group::Working => "Working",
+            Group::Idle => "Idle",
+        }
+    }
+}
+
+/// Working covers background phases and timer waits: the session is still
+/// on the job and nothing is asked of the user.
+fn group_of(status: &FleetStatus) -> Group {
+    match status {
+        FleetStatus::NeedsAttention(_) => Group::NeedsYou,
+        FleetStatus::Working | FleetStatus::WorkingBackground | FleetStatus::Waiting => {
+            Group::Working
+        }
+        FleetStatus::Idle => Group::Idle,
+    }
+}
+
+/// Live sessions bucketed by [`Group`] (indexed `Group as usize`), each
+/// bucket most recent activity first.
+fn grouped_sessions(state: &fleet::FleetState) -> [Vec<FleetSession>; 3] {
+    let mut groups: [Vec<FleetSession>; 3] = Default::default();
+    for s in state.sessions.values() {
+        groups[group_of(&s.status) as usize].push(s.clone());
+    }
+    for g in groups.iter_mut() {
+        g.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at).then_with(|| a.id.cmp(&b.id)));
+    }
+    groups
+}
+
+/// Idle rows shown before the rest fold behind a toggle.
+const IDLE_VISIBLE: usize = 3;
+
+/// (rows shown, rows folded away) for the idle group.
+fn idle_split(total: usize, expanded: bool) -> (usize, usize) {
+    if expanded || total <= IDLE_VISIBLE {
+        (total, 0)
+    } else {
+        (IDLE_VISIBLE, total - IDLE_VISIBLE)
+    }
+}
+
+/// The header's one sentence as (amber needs-you part, muted rest):
+/// "1 needs you" · "3 working · 4h 10m agent time today".
+fn summary_parts(needs_you: usize, working: usize, agent_minutes: u32) -> (Option<String>, String) {
+    let needs = match needs_you {
+        0 => None,
+        1 => Some("1 needs you".to_string()),
+        n => Some(format!("{n} need you")),
+    };
+    let mut rest = Vec::new();
+    if working > 0 {
+        rest.push(format!("{working} working"));
+    }
+    if agent_minutes > 0 {
+        rest.push(format!("{} agent time today", format_minutes(agent_minutes)));
+    }
+    let rest = if rest.is_empty() && needs.is_none() {
+        "Nothing running".to_string()
+    } else {
+        rest.join(" · ")
+    };
+    (needs, rest)
+}
+
+/// The row's one status phrase, by priority: a held gate's tool and input,
+/// the notification message, the brief headline, the background/timer
+/// label, then "—".
+fn status_phrase(session: &FleetSession, now: DateTime<Utc>) -> String {
+    if let Some(gate) = &session.pending_gate {
+        return format!("{}: {}", gate.tool_name, gate.input_summary);
+    }
+    if let FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) = &session.status {
+        if !message.is_empty() {
+            return message.clone();
+        }
+    }
+    if let Some(b) = &session.brief {
+        if !b.headline.is_empty() {
+            return b.headline.clone();
+        }
+    }
+    background_label(&session.status, session.last_event_at, now)
+        .or_else(|| waiting_label(&session.status, session.wake_at))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// `/Users/me/Sites/x` -> `~/Sites/x` when under `home`.
+fn shorten_home(path: &str, home: Option<&str>) -> String {
+    let Some(home) = home.map(|h| h.trim_end_matches('/')).filter(|h| !h.is_empty()) else {
+        return path.to_string();
+    };
+    match path.strip_prefix(home) {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => path.to_string(),
+    }
+}
+
+/// The accessible/tooltip label for a row's go-to action.
+fn go_label(session: &FleetSession) -> String {
+    if session.origin == fleet::FleetOrigin::Hobbes {
+        return "Open chat tab".to_string();
+    }
+    let l = fleet::terminal_focus::destination_label(session);
+    if l.is_empty() { "Go to session".to_string() } else { l }
+}
+
+/// The amber primary button's label on a needs-you row.
+fn answer_button_label(session: &FleetSession) -> String {
+    if session.origin == fleet::FleetOrigin::Hobbes {
+        return "Answer in chat ↗".to_string();
+    }
+    let l = fleet::terminal_focus::answer_label(session);
+    let l = if l.is_empty() { "Answer in terminal".to_string() } else { l };
+    if l.ends_with('↗') { l } else { format!("{l} ↗") }
+}
+
+/// Wide-window layout: the Fleet root is a CSS size container, and past this
+/// width the state groups sit side by side as columns of compact cards (the
+/// app's responsive idiom is container queries, see `.tab-item` in
+/// main.css — no window-size polling). Rendered once, restyled by CSS, so
+/// expand/note state survives a resize.
+const FLEET_CSS: &str = r#"
+.fleet-root { container-type: inline-size; container-name: fleet; }
+.fleet-group-empty { display: none; }
+.fleet-name { flex: 0 1 auto; max-width: 20rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-project { flex: 0 1 auto; max-width: 14rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fleet-phrase { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@container fleet (min-width: 1600px) {
+  .fleet-groups { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; align-items: start; }
+  .fleet-group-empty { display: block; }
+  .fleet-row-line { flex-wrap: wrap; padding-top: 10px; padding-bottom: 10px; }
+  .fleet-project { flex: 1 1 0; max-width: none; }
+  .fleet-phrase { flex: 1 1 100%; order: 1; white-space: normal; overflow: visible; line-height: 1.45; }
+}
+"#;
 
 #[component]
 pub fn FleetView() -> Element {
     let fleet_state = use_context::<Signal<fleet::FleetState>>();
     let settings = use_context::<Signal<crate::settings::Settings>>();
+    let mut idle_open = use_signal(|| false);
 
     // Ages and live minute counts drift without events; nudge a re-render on
     // a slow clock.
@@ -137,33 +280,32 @@ pub fn FleetView() -> Element {
     let now = Utc::now();
     let today = Local::now().date_naive();
     let state = fleet_state.read();
-    let sessions = sorted_sessions(&state);
-    let needs_you = state.attention_count();
-    let active = state
-        .sessions
-        .values()
-        .filter(|s| s.status.is_active())
-        .count();
+    let groups = grouped_sessions(&state);
+    let live_count: usize = groups.iter().map(Vec::len).sum();
     let agent_minutes = fleet::fleet_agent_minutes_on(&state, today, now);
     let engaged_minutes = fleet::engaged_seconds_on(&state, today, now) / 60;
     let ended_today: Vec<FleetSession> = fleet::store::sessions_active_on(today)
         .into_iter()
         .filter(|r| !state.sessions.contains_key(&r.id))
         .collect();
-    let sessions_today = sessions.len() + ended_today.len();
     let enabled = settings.read().fleet_enabled;
     let connected = fleet::hooks_config::claude_settings_path()
         .and_then(|p| fleet::hooks_config::connected_port_file(&p))
         .is_some();
     drop(state);
+    let (needs_part, rest_part) = summary_parts(
+        groups[Group::NeedsYou as usize].len(),
+        groups[Group::Working as usize].len(),
+        agent_minutes,
+    );
 
     rsx! {
+        style { "{FLEET_CSS}" }
         div {
-            class: "flex-1 min-w-0 flex flex-col overflow-y-auto",
+            class: "fleet-root flex-1 min-w-0 flex flex-col overflow-y-auto",
 
-            // Header: identity left, the day's four live numbers right. The
-            // stat strip is the "how bad is it" glance — amber only when
-            // something actually needs the user.
+            // Header: identity, listener state, one muted sentence. Amber
+            // only when something actually needs the user.
             div {
                 class: "px-6 pt-6 pb-3 flex items-center gap-3 flex-wrap",
                 Icon {
@@ -196,70 +338,15 @@ pub fn FleetView() -> Element {
                     }
                 }
                 div { class: "flex-1" }
-                div {
-                    class: "flex items-center gap-6",
-                    Stat {
-                        value: needs_you.to_string(),
-                        label: "need you",
-                        accent: if needs_you > 0 { Some("#f59e0b".to_string()) } else { None },
-                    }
-                    Stat {
-                        value: active.to_string(),
-                        label: "active",
-                        accent: if active > 0 { Some("#34d399".to_string()) } else { None },
-                    }
-                    Stat { value: sessions_today.to_string(), label: "today", accent: None }
-                    Stat {
-                        value: crate::todo::model::format_minutes(agent_minutes),
-                        label: "agent time",
-                        accent: None,
-                    }
-                    // The exocortex multiplier: agent minutes over ENGAGED
-                    // minutes (wall-clock with ≥1 agent working) — average
-                    // concurrency while driving the fleet. Breaks, planning,
-                    // and walks don't decay it; parallel agents raise it.
-                    if let Some((mult, engaged)) =
-                        fleet::exocortex_multiplier(agent_minutes, engaged_minutes)
-                    {
-                        div {
-                            class: "flex items-baseline gap-1.5",
-                            title: format!(
-                                "{} of agent work across {} engaged — average concurrency while you're driving the fleet (the ribbon's peak is the high-water mark)",
-                                crate::todo::model::format_minutes(agent_minutes),
-                                crate::todo::model::format_minutes(engaged),
-                            ),
-                            Icon {
-                                width: 14,
-                                height: 14,
-                                icon: fi_icons::FiZap,
-                                class: "self-center",
-                                style: "color: #a78bfa;",
-                            }
-                            span {
-                                class: "text-lg font-semibold tabular-nums",
-                                style: "color: #a78bfa;",
-                                { format!("{:.1}×", mult) }
-                            }
-                            span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "exocortex" }
-                        }
-                    } else {
-                        // Not enough signal yet (no agent work, or under 5
-                        // engaged minutes) — dim the speedometer instead of
-                        // removing it, so the dashboard keeps its shape.
-                        div {
-                            class: "flex items-baseline gap-1.5",
-                            title: "Shows once the fleet has agent work and ≥5 engaged minutes today",
-                            Icon {
-                                width: 14,
-                                height: 14,
-                                icon: fi_icons::FiZap,
-                                class: "self-center opacity-40",
-                                style: "color: #a78bfa;",
-                            }
-                            span { class: "text-lg font-semibold tabular-nums text-fg-muted opacity-60", "—×" }
-                            span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "exocortex" }
+                p {
+                    class: "text-xs text-fg-muted",
+                    if let Some(n) = &needs_part {
+                        span { class: "font-semibold", style: "color: #f59e0b;", "{n}" }
+                        if !rest_part.is_empty() {
+                            " · "
                         }
                     }
+                    "{rest_part}"
                 }
             }
 
@@ -267,9 +354,7 @@ pub fn FleetView() -> Element {
                 crate::components::heartbeat_card::HeartbeatCard { now }
             }
 
-            ReviewBand { now, today }
-
-            if sessions.is_empty() {
+            if live_count == 0 {
                 div {
                     class: "px-6 py-8 text-sm text-fg-muted space-y-2",
                     p { "No Claude Code sessions observed yet." }
@@ -281,72 +366,58 @@ pub fn FleetView() -> Element {
                         p { "Hooks are connected. Sessions appear here the moment one starts (or fires its next event)." }
                     }
                 }
-            }
-
-            // Live sessions grouped by source — terminal sessions first (the
-            // fleet's raison d'être), Hobbes' own tabs below. Within each
-            // group: attention first, then most recent activity.
-            {
-                let (external, hobbes): (Vec<_>, Vec<_>) = sessions
-                    .iter()
-                    .cloned()
-                    .partition(|s| s.origin != fleet::FleetOrigin::Hobbes);
-                rsx! {
-                    SessionGroup { label: "Claude Code", rows: external, now, today }
-                    SessionGroup { label: "Hobbes tabs", rows: hobbes, now, today }
+            } else {
+                // One list grouped by state; side-by-side columns when the
+                // Fleet itself is wide (see FLEET_CSS).
+                div {
+                    class: "fleet-groups px-6 pt-3",
+                    for group in Group::ALL {
+                        {
+                            let rows = groups[group as usize].clone();
+                            let total = rows.len();
+                            let (shown, hidden) = if group == Group::Idle {
+                                idle_split(total, *idle_open.read())
+                            } else {
+                                (total, 0)
+                            };
+                            let folded = group == Group::Idle && (hidden > 0 || (*idle_open.read() && total > IDLE_VISIBLE));
+                            rsx! {
+                                div {
+                                    key: "{group.label()}",
+                                    class: if total == 0 { "fleet-group-empty mb-4" } else { "mb-4" },
+                                    p {
+                                        class: "text-[11px] uppercase tracking-wider text-fg-muted mb-2",
+                                        { format!("{} — {}", group.label(), total) }
+                                    }
+                                    div {
+                                        class: if group == Group::Idle { "flex flex-col gap-2 opacity-60" } else { "flex flex-col gap-2" },
+                                        for session in rows.into_iter().take(shown) {
+                                            FleetRow { key: "{session.id}", session: session.clone(), now, today }
+                                        }
+                                    }
+                                    if folded {
+                                        button {
+                                            class: "mt-2 text-xs text-fg-muted hover:text-fg transition-colors select-none",
+                                            onclick: move |_| { let v = !*idle_open.peek(); idle_open.set(v); },
+                                            if hidden > 0 {
+                                                { format!("▸ {hidden} more idle") }
+                                            } else {
+                                                "▾ Show fewer"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
             EarlierToday { rows: ended_today, now, today }
 
+            ReviewBand { now, today, agent_minutes, engaged_minutes }
+
             div { class: "pb-16" }
-        }
-    }
-}
-
-/// One origin's live sessions: a quiet section label and a responsive card
-/// grid. Hidden entirely when the group is empty.
-#[component]
-fn SessionGroup(
-    label: &'static str,
-    rows: Vec<FleetSession>,
-    now: DateTime<Utc>,
-    today: chrono::NaiveDate,
-) -> Element {
-    if rows.is_empty() {
-        return rsx! {};
-    }
-    let count = rows.len();
-    rsx! {
-        div {
-            class: "px-6 pt-3",
-            p {
-                class: "text-[11px] uppercase tracking-wider text-fg-muted mb-2",
-                { format!("{label} — {count}") }
-            }
-            div {
-                class: "grid gap-3",
-                style: "grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));",
-                for session in rows {
-                    FleetRow { key: "{session.id}", session: session.clone(), now, today }
-                }
-            }
-        }
-    }
-}
-
-/// One stat in the header strip: a number that carries meaning, a label that
-/// stays out of the way.
-#[component]
-fn Stat(value: String, label: &'static str, accent: Option<String>) -> Element {
-    let value_style = accent
-        .map(|c| format!("color: {c};"))
-        .unwrap_or_default();
-    rsx! {
-        div {
-            class: "flex items-baseline gap-1.5",
-            span { class: "text-lg font-semibold tabular-nums", style: "{value_style}", "{value}" }
-            span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "{label}" }
         }
     }
 }
@@ -411,7 +482,12 @@ fn EarlierToday(rows: Vec<FleetSession>, now: DateTime<Utc>, today: chrono::Naiv
 /// (yesterday's rollup never masquerades as today), collapsed to one line
 /// until wanted. The Roll-up button lives here, next to its subject.
 #[component]
-fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
+fn ReviewBand(
+    now: DateTime<Utc>,
+    today: chrono::NaiveDate,
+    agent_minutes: u32,
+    engaged_minutes: u32,
+) -> Element {
     let settings = use_context::<Signal<crate::settings::Settings>>();
     let mut open = use_signal(|| false);
 
@@ -559,7 +635,7 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
 
     rsx! {
         div {
-            class: "px-6 pb-1",
+            class: "px-6 pt-3 pb-1",
             div {
                 class: "rounded border border-subtle bg-section px-3 py-2",
                 div {
@@ -573,6 +649,7 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
                             span { class: "text-xs text-fg-muted truncate", "{preview}" }
                         }
                     }
+                    ExocortexFigure { agent_minutes, engaged_minutes }
                     if let Some(r) = &current {
                         span {
                             class: "text-[11px] text-fg-muted shrink-0",
@@ -631,6 +708,42 @@ fn ReviewBand(now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
     }
 }
 
+/// The exocortex multiplier: agent minutes over ENGAGED minutes (wall-clock
+/// with >=1 agent working) — average concurrency while driving the fleet.
+/// Breaks, planning, and walks don't decay it; parallel agents raise it.
+/// Dimmed rather than removed until there is enough signal.
+#[component]
+fn ExocortexFigure(agent_minutes: u32, engaged_minutes: u32) -> Element {
+    match fleet::exocortex_multiplier(agent_minutes, engaged_minutes) {
+        Some((mult, engaged)) => rsx! {
+            div {
+                class: "flex items-baseline gap-1.5 shrink-0",
+                title: format!(
+                    "{} of agent work across {} engaged — average concurrency while you're driving the fleet (the ribbon's peak is the high-water mark)",
+                    format_minutes(agent_minutes),
+                    format_minutes(engaged),
+                ),
+                Icon { width: 14, height: 14, icon: fi_icons::FiZap, class: "self-center", style: "color: #a78bfa;" }
+                span {
+                    class: "text-sm font-semibold tabular-nums",
+                    style: "color: #a78bfa;",
+                    { format!("{:.1}×", mult) }
+                }
+                span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "exocortex" }
+            }
+        },
+        None => rsx! {
+            div {
+                class: "flex items-baseline gap-1.5 shrink-0",
+                title: "Shows once the fleet has agent work and ≥5 engaged minutes today",
+                Icon { width: 14, height: 14, icon: fi_icons::FiZap, class: "self-center opacity-40", style: "color: #a78bfa;" }
+                span { class: "text-sm font-semibold tabular-nums text-fg-muted opacity-60", "—×" }
+                span { class: "text-[11px] uppercase tracking-wider text-fg-muted", "exocortex" }
+            }
+        },
+    }
+}
+
 // ── Boost ribbon ────────────────────────────────────────────────────────────
 
 /// The exocortex identity color (the header multiplier's violet). The ribbon
@@ -664,7 +777,7 @@ fn area_points(values: &[f32], upto: usize, max: f32) -> String {
     pts.join(" ")
 }
 
-/// The honesty caption under the ribbon: replayed minutes against the banked
+/// The honesty line on the ribbon's tooltip: replayed minutes against the banked
 /// truth. The reconstruction is boundary-events-only, so the two legitimately
 /// differ — the caption quantifies by how much instead of implying exactness.
 fn fidelity_line(replayed: u32, banked: u32) -> Option<String> {
@@ -743,6 +856,7 @@ fn BoostRibbon(date: chrono::NaiveDate, today: chrono::NaiveDate, now: DateTime<
     rsx! {
         div {
             class: "mt-3",
+            title: caption.clone().unwrap_or_default(),
             div {
                 class: "flex items-baseline gap-2",
                 span {
@@ -816,19 +930,55 @@ fn BoostRibbon(date: chrono::NaiveDate, today: chrono::NaiveDate, now: DateTime<
                 span { "6p" }
                 span { "12a" }
             }
-            if let Some(c) = caption {
-                p { class: "mt-1 text-[10px] text-fg-muted/70", "{c}" }
-            }
         }
     }
 }
 
+/// Show a one-line note under a row; it fades after ~4s (a newer note
+/// outlives an older one's timer).
+fn flash_note(mut note: Signal<Option<(i64, String)>>, text: String) {
+    let stamp = Utc::now().timestamp_millis();
+    note.set(Some((stamp, text)));
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        if note.peek().as_ref().map(|n| n.0) == Some(stamp) {
+            note.set(None);
+        }
+    });
+}
+
+/// Go to the session: a Hobbes tab switches (which also dismisses the fleet
+/// view); a Claude Code session walks the terminal-focus ladder and reports
+/// where it ended up.
+fn go_to(
+    session: FleetSession,
+    mut chat_command: Signal<Option<crate::components::chat_input::ChatCommand>>,
+    note: Signal<Option<(i64, String)>>,
+) {
+    if session.origin == fleet::FleetOrigin::Hobbes {
+        chat_command.set(Some(
+            crate::components::chat_input::ChatCommand::SwitchToSession(session.id.clone()),
+        ));
+        return;
+    }
+    let name = session.display_name().to_string();
+    spawn(async move {
+        let outcome = crate::fleet::terminal_focus::go_to_session(session).await;
+        let text = outcome.note(&name);
+        if !text.is_empty() {
+            flash_note(note, text);
+        }
+    });
+}
+
 #[component]
 fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
-    let mut chat_command =
+    let chat_command =
         use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
     let planner = use_context::<Signal<crate::todo::PlannerState>>();
     let session_state = use_context::<Signal<crate::session::SessionState>>();
+    let mut expanded = use_signal(|| false);
+    let note = use_signal(|| Option::<(i64, String)>::None);
 
     // Project attribution: terminal rows map by cwd against Project.path;
     // Hobbes rows carry their chat session's tag (hydrated tabs only).
@@ -857,244 +1007,199 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
     } else {
         "border-left: 3px solid transparent;".to_string()
     };
-    let minutes_today = session.minutes_on(today, now);
-    let auto = session.auto_passthrough;
     let is_hobbes = session.origin == fleet::FleetOrigin::Hobbes;
-    let session_id = session.id.clone();
-    let toggle_id = session.id.clone();
+    let phrase = status_phrase(&session, now);
+    let go_title = go_label(&session);
+    let is_open = *expanded.read();
+    let note_text = note.read().as_ref().map(|n| n.1.clone());
+
+    let (row_go, btn_go, answer_go, resume_s) = (
+        session.clone(),
+        session.clone(),
+        session.clone(),
+        session.clone(),
+    );
     let dismiss_id = session.id.clone();
 
     rsx! {
         div {
-            class: if is_hobbes {
-                "group rounded border border-subtle bg-section p-3 cursor-pointer hover:bg-card transition-colors flex flex-col"
-            } else {
-                "group rounded border border-subtle bg-section p-3 flex flex-col"
-            },
+            class: "group rounded border border-subtle bg-section",
             style: "{row_style}",
-            title: if is_hobbes { "Open this chat tab" } else { "" },
-            // A Hobbes row is a door back into its tab (SwitchToSession also
-            // dismisses the fleet view).
-            onclick: move |_| {
-                if is_hobbes {
-                    chat_command.set(Some(
-                        crate::components::chat_input::ChatCommand::SwitchToSession(
-                            session_id.clone(),
-                        ),
-                    ));
-                }
-            },
             div {
-                class: "flex items-center gap-3",
-                if session.origin == fleet::FleetOrigin::Hobbes {
-                    Icon { width: 16, height: 16, icon: fi_icons::FiMessageSquare }
-                } else {
-                    Icon { width: 16, height: 16, icon: fi_icons::FiTerminal }
+                class: "fleet-row-line min-h-11 px-3 py-1.5 flex items-center gap-2 cursor-pointer hover:bg-card transition-colors",
+                onclick: move |_| go_to(row_go.clone(), chat_command, note),
+                button {
+                    class: "shrink-0 w-4 text-[11px] text-fg-muted hover:text-fg select-none",
+                    title: if is_open { "Collapse" } else { "Expand" },
+                    aria_label: if is_open { "Collapse" } else { "Expand" },
+                    aria_expanded: "{is_open}",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                        let v = !*expanded.peek();
+                        expanded.set(v);
+                    },
+                    if is_open { "▾" } else { "▸" }
                 }
-                // Hide, hover-revealed like the tab-close idiom: the escape
-                // hatch for a card whose terminal went away without a
-                // SessionEnd (the sweeps never retire needs-attention rows).
-                // External only — Hobbes tabs leave the board when they close.
-                if !is_hobbes {
+                if is_hobbes {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiMessageSquare, class: "shrink-0" }
+                } else {
+                    Icon { width: 16, height: 16, icon: fi_icons::FiTerminal, class: "shrink-0" }
+                }
+                span { class: "fleet-name text-sm font-semibold", { session.display_name().to_string() } }
+                span {
+                    class: "fleet-project text-xs text-fg-muted",
+                    { project.clone().unwrap_or_default() }
+                }
+                // Status as a dot, not a pill — the full name of the state
+                // lives in the tooltip; attention pulses.
+                span {
+                    class: if attention {
+                        "w-2.5 h-2.5 rounded-full shrink-0 animate-pulse"
+                    } else {
+                        "w-2.5 h-2.5 rounded-full shrink-0"
+                    },
+                    style: "background-color: {chip_color};",
+                    title: "{chip_label}",
+                }
+                span { class: "fleet-phrase text-xs text-fg", title: "{phrase}", "{phrase}" }
+                span {
+                    class: "shrink-0 text-[11px] text-fg-muted tabular-nums",
+                    { age_label(session.last_event_at, now) }
+                }
+                if attention {
                     button {
-                        class: "order-last shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-fg-muted hover:text-fg",
-                        title: "Hide this session from the fleet (it comes back on its next event)",
+                        class: "shrink-0 px-3 py-1 text-xs font-medium rounded min-h-8",
+                        style: "border: 1px solid #f59e0b; background: rgba(245,158,11,0.12); color: #fcd34d;",
                         onclick: move |evt| {
                             evt.stop_propagation();
-                            fleet::shared().dismiss_session(&dismiss_id);
+                            go_to(answer_go.clone(), chat_command, note);
                         },
-                        Icon { width: 14, height: 14, icon: fi_icons::FiX }
+                        { answer_button_label(&session) }
                     }
-                }
-                div {
-                    class: "flex-1 min-w-0",
-                    div {
-                        class: "flex items-center gap-2",
-                        span {
-                            class: "text-sm font-semibold truncate",
-                            { session.display_name().to_string() }
-                        }
-                        if session.dispatched_todo.is_some() {
-                            span {
-                                class: "shrink-0 px-1.5 rounded-full border border-faint text-[10px] text-fg-muted",
-                                title: "Launched by Hobbes for a todo",
-                                "dispatched"
-                            }
-                        }
-                        // Status as a dot, not a pill — the full name of the
-                        // state lives in the tooltip; attention pulses.
-                        span {
-                            class: if attention {
-                                "w-2.5 h-2.5 rounded-full shrink-0 animate-pulse"
-                            } else {
-                                "w-2.5 h-2.5 rounded-full shrink-0"
-                            },
-                            style: "background-color: {chip_color};",
-                            title: "{chip_label}",
-                        }
-                        // Background phases are silent by design — a bare
-                        // dot reads as idle, so this one state gets words.
-                        if let Some(label) = background_label(&session.status, session.last_event_at, now)
-                            .or_else(|| waiting_label(&session.status, session.wake_at))
-                        {
-                            span {
-                                class: "shrink-0 text-[10px] text-fg-muted",
-                                style: "color: {chip_color};",
-                                { label }
-                            }
-                        }
-                    }
-                    // Project leads the subtitle so truncation eats the
-                    // path, never the tag.
-                    p {
-                        class: "text-xs text-fg-muted truncate",
-                        if let Some(proj) = &project {
-                            span { class: "text-fg", "{proj}" }
-                            span { " · " }
-                        }
-                        if session.origin == fleet::FleetOrigin::Hobbes {
-                            "Hobbes chat tab"
-                        } else {
-                            "{session.cwd}"
-                        }
+                } else {
+                    button {
+                        class: "shrink-0 px-1.5 py-1 text-sm text-fg-muted hover:text-fg opacity-60 group-hover:opacity-100 focus:opacity-100 transition-opacity",
+                        title: "{go_title}",
+                        aria_label: "{go_title}",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            go_to(btn_go.clone(), chat_command, note);
+                        },
+                        "↗"
                     }
                 }
             }
 
-            // The assignment this session carries, when a todo links to it.
-            {
-                let working_on = planner
-                    .read()
-                    .todos
-                    .iter()
-                    .find(|t| {
-                        t.linked_fleet_session.as_deref() == Some(session.id.as_str())
-                            && !matches!(
-                                t.status,
-                                crate::todo::model::TodoStatus::Completed
-                                    | crate::todo::model::TodoStatus::Cancelled
-                            )
-                    })
-                    .map(|t| t.title.clone());
-                rsx! {
-                    if let Some(title) = working_on {
-                        p {
-                            class: "mt-1 text-xs text-fg-muted truncate",
-                            span { class: "text-fg-muted/70", "working on: " }
-                            span { class: "text-fg", { fleet::truncate_summary(&title, 90) } }
-                        }
-                    }
-                }
+            if let Some(text) = note_text {
+                p { class: "px-3 pb-1.5 text-[11px] text-fg-muted", role: "status", "{text}" }
             }
 
-            // Attention detail line (what the session wants).
-            if let FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) = &session.status {
-                if !message.is_empty() {
-                    p { class: "mt-2 text-xs text-fg", "{message}" }
-                }
-            }
-
-            // Re-entry brief: what happened since you last looked. Status is
-            // ms-fresh, brief text is minutes-stale — make the age legible
-            // rather than letting the mix read as broken.
-            if let Some(brief) = &session.brief {
+            if is_open {
                 {
-                    let brief_age_min = (session.last_event_at - brief.generated_at).num_minutes();
-                    let turn_running = matches!(
-                        session.status,
-                        FleetStatus::Working | FleetStatus::WorkingBackground
-                    );
+                    let working_on = planner
+                        .read()
+                        .todos
+                        .iter()
+                        .find(|t| {
+                            t.linked_fleet_session.as_deref() == Some(session.id.as_str())
+                                && !matches!(
+                                    t.status,
+                                    crate::todo::model::TodoStatus::Completed
+                                        | crate::todo::model::TodoStatus::Cancelled
+                                )
+                        })
+                        .map(|t| t.title.clone());
+                    let home = dirs::home_dir().map(|h| h.to_string_lossy().into_owned());
+                    let mut facts: Vec<String> = Vec::new();
+                    if is_hobbes {
+                        facts.push("Hobbes chat tab".to_string());
+                    } else {
+                        facts.push(shorten_home(&session.cwd, home.as_deref()));
+                        if let Some(t) = fleet::terminal_focus::terminal_name(&session) {
+                            facts.push(t);
+                        }
+                    }
+                    let minutes_today = session.minutes_on(today, now);
+                    if minutes_today > 0 {
+                        facts.push(format!("{} today", format_minutes(minutes_today)));
+                    }
+                    if let Some(t) = session.working_since {
+                        facts.push(format!(
+                            "started {}",
+                            t.with_timezone(&Local).format("%-I:%M %p")
+                        ));
+                    }
+                    let facts = facts.join(" · ");
+                    let resume = fleet::terminal_focus::resume_command(&resume_s);
+                    let blocked = match (&session.brief, attention) {
+                        (Some(b), true) => b.blocked_on.clone(),
+                        _ => None,
+                    };
                     rsx! {
-                        p {
-                            class: "mt-2 text-xs text-fg",
-                            { fleet::truncate_summary(&brief.headline, 140) }
-                            if brief_age_min > 3 {
-                                span {
-                                    class: "text-fg-muted/60",
-                                    { format!("  · {}m old", brief_age_min) }
+                        div {
+                            class: "mx-3 mb-3 rounded bg-input p-2 space-y-1",
+                            if let Some(brief) = &session.brief {
+                                p { class: "text-xs text-fg", "{brief.headline}" }
+                                for b in brief.bullets.iter().take(3) {
+                                    p { class: "text-xs text-fg-muted", { format!("• {b}") } }
                                 }
                             }
-                        }
-                        // Hidden while a turn or background phase runs: a
-                        // session doing work is not blocked-waiting on the
-                        // user, whatever an older brief believed.
-                        if let Some(blocked) = &brief.blocked_on {
-                            if !turn_running {
+                            if let Some(blocked) = blocked {
                                 p {
                                     class: "text-xs",
                                     style: "color: #f59e0b;",
-                                    { format!("blocked: {}", fleet::truncate_summary(blocked, 100)) }
+                                    { format!("blocked: {}", fleet::truncate_summary(&blocked, 140)) }
+                                }
+                            }
+                            if let Some(title) = working_on {
+                                p {
+                                    class: "text-xs text-fg-muted",
+                                    span { class: "text-fg-muted/70", "working on: " }
+                                    span { class: "text-fg", { fleet::truncate_summary(&title, 120) } }
+                                }
+                            }
+                            p { class: "text-xs text-fg-muted break-all", "{facts}" }
+                            if session.dispatched_todo.is_some() {
+                                p { class: "text-[11px] text-fg-muted", "Launched by Hobbes for a todo" }
+                            }
+                            div {
+                                class: "pt-1 flex items-center gap-2 flex-wrap",
+                                button {
+                                    class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
+                                    onclick: {
+                                        let s = session.clone();
+                                        move |_| go_to(s.clone(), chat_command, note)
+                                    },
+                                    { format!("{} ↗", go_title) }
+                                }
+                                if let Some(cmd) = resume {
+                                    button {
+                                        class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
+                                        onclick: move |_| {
+                                            match feature_clipboard::copy_to_clipboard(&cmd) {
+                                                Ok(()) => flash_note(note, "Resume command copied".to_string()),
+                                                Err(e) => flash_note(note, format!("Couldn't copy: {e}")),
+                                            }
+                                        },
+                                        "Copy resume command"
+                                    }
+                                }
+                                div { class: "flex-1" }
+                                // The escape hatch for a card whose terminal went
+                                // away without a SessionEnd (the sweeps never
+                                // retire needs-attention rows). External only —
+                                // Hobbes tabs leave the board when they close.
+                                if !is_hobbes {
+                                    button {
+                                        class: "text-xs px-2 py-1 text-fg-muted hover:text-fg",
+                                        title: "Hide this session from the fleet (it comes back on its next event)",
+                                        onclick: move |_| fleet::shared().dismiss_session(&dismiss_id),
+                                        "Hide"
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            }
-
-            // A held gate renders inline with Approve / Deny. Resolution goes
-            // through the shared runtime; the server task does the rest and
-            // the drain loop repaints this row.
-            if let Some(gate) = session.pending_gate.clone() {
-                div {
-                    class: "mt-2 rounded bg-input p-2",
-                    div {
-                        class: "flex items-center gap-2",
-                        span { class: "text-xs font-semibold", "{gate.tool_name}" }
-                        span { class: "text-xs text-fg-muted", { age_label(gate.requested_at, now) } }
-                    }
-                    p { class: "mt-1 text-xs text-fg-muted break-all", "{gate.input_summary}" }
-                    div {
-                        class: "mt-2 flex gap-2",
-                        button {
-                            class: "px-3 py-1 text-xs font-bold rounded bg-btn-primary hover:bg-btn-primary-hover transition-colors",
-                            onclick: {
-                                let id = gate.request_id.clone();
-                                move |_| fleet::shared().resolve_gate(&id, true)
-                            },
-                            "Approve"
-                        }
-                        button {
-                            class: "px-3 py-1 text-xs font-bold rounded bg-red-900/60 hover:bg-red-800/60 transition-colors",
-                            onclick: {
-                                let id = gate.request_id.clone();
-                                move |_| fleet::shared().resolve_gate(&id, false)
-                            },
-                            "Deny"
-                        }
-                    }
-                }
-            }
-
-            // Per-session auto-passthrough: gates skip the in-app hold and go
-            // straight to the terminal prompt. Hover-revealed (the tab-close
-            // idiom) so it never competes with the brief; only the checkbox +
-            // its text are clickable, and only external sessions show it —
-            // Hobbes tabs approve tools in the tab itself.
-            if session.origin != fleet::FleetOrigin::Hobbes {
-                div {
-                    class: "opacity-0 group-hover:opacity-100 transition-opacity",
-                    label {
-                        class: "mt-2 inline-flex w-fit items-center gap-2 text-xs text-fg-muted cursor-pointer select-none",
-                        onclick: move |evt| evt.stop_propagation(),
-                        input {
-                            r#type: "checkbox",
-                            checked: auto,
-                            onchange: move |e| {
-                                fleet::shared().set_auto_passthrough(&toggle_id, e.value() == "true");
-                            },
-                        }
-                        "Answer permission prompts in the terminal (skip in-app approval)"
-                    }
-                }
-            }
-
-            // Footer, pinned bottom-right: recency and today's banked time.
-            div {
-                class: "mt-auto pt-2 flex items-baseline justify-end gap-2 text-[11px] text-fg-muted",
-                span { { age_label(session.last_event_at, now) } }
-                if minutes_today > 0 {
-                    span { "·" }
-                    span { { format!("{} today", format_minutes(minutes_today)) } }
                 }
             }
         }
@@ -1136,35 +1241,113 @@ mod tests {
         assert_eq!(background_label(&FleetStatus::Idle, quiet, now), None);
     }
 
+    fn session(id: &str, status: FleetStatus, origin: fleet::FleetOrigin, minutes_ago: i64) -> FleetSession {
+        let now = utc("2026-08-25T10:00:00Z");
+        let ev = crate::fleet::events::FleetEvent::SessionStart {
+            session_id: id.into(),
+            cwd: format!("/x/{id}"),
+            reason: "startup".into(),
+        };
+        let mut st = fleet::FleetState::default();
+        fleet::reduce(&mut st, &ev, now);
+        let mut s = st.sessions.remove(id).unwrap();
+        s.status = status;
+        s.origin = origin;
+        s.last_event_at = now - chrono::Duration::minutes(minutes_ago);
+        s
+    }
+
+    fn notif() -> FleetStatus {
+        FleetStatus::NeedsAttention(AttentionKind::Notification {
+            kind: "permission_prompt".into(),
+            message: "Allow Bash?".into(),
+        })
+    }
+
     #[test]
-    fn attention_sorts_first_then_recency() {
+    fn groups_by_state_not_origin_and_attention_leads() {
+        // The old origin grouping buried a Hobbes tab that needed you.
         let mut state = fleet::FleetState::default();
-        let t0 = utc("2026-08-25T10:00:00Z");
-        for (id, minutes_ago, needs) in [
-            ("old-idle", 50i64, false),
-            ("fresh-working", 1, false),
-            ("stale-gate", 40, true),
+        for s in [
+            session("idle-old", FleetStatus::Idle, fleet::FleetOrigin::External, 50),
+            session("work-fresh", FleetStatus::Working, fleet::FleetOrigin::External, 1),
+            session("tab-needs", notif(), fleet::FleetOrigin::Hobbes, 40),
+            session("cc-gate", FleetStatus::NeedsAttention(AttentionKind::Gate), fleet::FleetOrigin::External, 5),
+            session("bg", FleetStatus::WorkingBackground, fleet::FleetOrigin::Hobbes, 9),
+            session("timer", FleetStatus::Waiting, fleet::FleetOrigin::Hobbes, 3),
         ] {
-            let ev = crate::fleet::events::FleetEvent::SessionStart {
-                session_id: id.into(),
-                cwd: format!("/x/{id}"),
-                reason: "startup".into(),
-            };
-            fleet::reduce(&mut state, &ev, t0 - chrono::Duration::minutes(minutes_ago));
-            if needs {
-                let gate = crate::fleet::events::FleetEvent::PermissionRequest {
-                    session_id: id.into(),
-                    cwd: String::new(),
-                    request_id: "g".into(),
-                    tool_name: "Bash".into(),
-                    tool_input: serde_json::json!({}),
-                };
-                fleet::reduce(&mut state, &gate, t0 - chrono::Duration::minutes(minutes_ago));
-            }
+            state.sessions.insert(s.id.clone(), s);
         }
-        let sorted = sorted_sessions(&state);
-        let ids: Vec<&str> = sorted.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["stale-gate", "fresh-working", "old-idle"]);
+        let g = grouped_sessions(&state);
+        let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
+        assert_eq!(ids(Group::NeedsYou), vec!["cc-gate", "tab-needs"]);
+        assert_eq!(ids(Group::Working), vec!["work-fresh", "timer", "bg"]);
+        assert_eq!(ids(Group::Idle), vec!["idle-old"]);
+    }
+
+    #[test]
+    fn idle_folds_after_three() {
+        assert_eq!(idle_split(2, false), (2, 0));
+        assert_eq!(idle_split(3, false), (3, 0));
+        assert_eq!(idle_split(7, false), (3, 4));
+        assert_eq!(idle_split(7, true), (7, 0));
+    }
+
+    #[test]
+    fn summary_sentence_reads_naturally() {
+        assert_eq!(
+            summary_parts(1, 3, 250),
+            (Some("1 needs you".to_string()), "3 working · 4h 10m agent time today".to_string())
+        );
+        assert_eq!(summary_parts(2, 0, 0), (Some("2 need you".to_string()), String::new()));
+        assert_eq!(summary_parts(0, 2, 0), (None, "2 working".to_string()));
+        assert_eq!(summary_parts(0, 0, 0), (None, "Nothing running".to_string()));
+    }
+
+    #[test]
+    fn status_phrase_priority() {
+        let now = utc("2026-08-25T10:00:00Z");
+        let mut s = session("a", FleetStatus::Idle, fleet::FleetOrigin::External, 0);
+        assert_eq!(status_phrase(&s, now), "—");
+
+        s.status = FleetStatus::Waiting;
+        s.wake_at = None;
+        assert_eq!(status_phrase(&s, now), "timer");
+
+        s.brief = Some(fleet::SessionBrief {
+            headline: "Refactoring the gate resolver".into(),
+            bullets: vec![],
+            blocked_on: None,
+            generated_at: now,
+            final_brief: false,
+        });
+        assert_eq!(status_phrase(&s, now), "Refactoring the gate resolver");
+
+        s.status = notif();
+        assert_eq!(status_phrase(&s, now), "Allow Bash?");
+
+        s.pending_gate = Some(fleet::PendingGate {
+            request_id: "g".into(),
+            tool_name: "Bash".into(),
+            input_summary: "rm -rf node_modules".into(),
+            requested_at: now,
+        });
+        assert_eq!(status_phrase(&s, now), "Bash: rm -rf node_modules");
+    }
+
+    #[test]
+    fn home_is_shortened_to_a_tilde() {
+        assert_eq!(shorten_home("/Users/me/Sites/x", Some("/Users/me")), "~/Sites/x");
+        assert_eq!(shorten_home("/Users/me", Some("/Users/me/")), "~");
+        assert_eq!(shorten_home("/Users/meow/x", Some("/Users/me")), "/Users/meow/x");
+        assert_eq!(shorten_home("/opt/x", None), "/opt/x");
+    }
+
+    #[test]
+    fn hobbes_rows_use_chat_labels() {
+        let tab = session("t", notif(), fleet::FleetOrigin::Hobbes, 0);
+        assert_eq!(go_label(&tab), "Open chat tab");
+        assert_eq!(answer_button_label(&tab), "Answer in chat ↗");
     }
 
     #[test]

@@ -14,8 +14,9 @@ use super::HeartbeatEvent;
 use crate::components::chat::Message;
 use crate::components::shared::MessageContent;
 
-/// With events queued and no wake for this long, wake for a check-in.
-pub const CHECK_IN_MINUTES: i64 = 60;
+/// Queued events batch: a check-in waits until the OLDEST queued event is
+/// this old, so a burst of events becomes one wake.
+pub const QUEUE_BATCH_MINUTES: i64 = 10;
 /// Event lines per wake-message section; the rest are counted.
 const MAX_EVENT_LINES: usize = 12;
 /// A wake's outcome line is clipped to this.
@@ -36,7 +37,7 @@ pub const WAKE_HEADER: &str = "[Heartbeat wake]";
 pub enum WakeTrigger {
     /// Queued events whose salience decision was WakeNow, oldest first.
     Urgent(Vec<String>),
-    /// Events are queued and the Heartbeat hasn't woken for an hour.
+    /// Events have been queued long enough to batch, and the hourly pace allows a wake.
     CheckIn,
 }
 
@@ -69,10 +70,33 @@ pub fn last_fired_at(trail: &[WakeRecord]) -> Option<DateTime<Utc>> {
     trail.iter().filter(|w| !w.deferred).map(|w| w.at).max()
 }
 
+/// When a check-in wake is first due, the one rule `decide_wake` and the
+/// Fleet card's "next check-in" share: the queue is non-empty, the oldest
+/// queued event is [`QUEUE_BATCH_MINUTES`] old, and a full hourly-cap slot
+/// (`60 / wakes_per_hour` minutes) has passed since the last fired wake.
+/// `None` while the queue is empty or the cap is 0 (never). May be in the
+/// past (a wake held by the budget or a busy session).
+fn check_in_due(state: &HeartbeatState, wakes_per_hour: u32) -> Option<DateTime<Utc>> {
+    if state.queue.is_empty() || wakes_per_hour == 0 {
+        return None;
+    }
+    let oldest = state.queued().iter().map(|e| e.at).min()?;
+    let batched = oldest + Duration::minutes(QUEUE_BATCH_MINUTES);
+    Some(match last_fired_at(&state.trail) {
+        Some(last) => batched.max(last + Duration::seconds(3600 / wakes_per_hour as i64)),
+        None => batched,
+    })
+}
+
+/// When the next scheduled check-in is due (see [`check_in_due`]); display
+/// it in local time.
+pub fn next_check_in(state: &HeartbeatState, wakes_per_hour: u32) -> Option<DateTime<Utc>> {
+    check_in_due(state, wakes_per_hour)
+}
+
 /// The wake decision. Urgent events wake at once; otherwise a non-empty
-/// queue wakes for a check-in once the last wake (or, before the first
-/// wake, the oldest queued event) is [`CHECK_IN_MINUTES`] old. A busy
-/// session holds any wake; the budget then defers it.
+/// queue wakes for a check-in per [`check_in_due`]. A busy session holds
+/// any wake; the budget then defers it.
 pub fn decide_wake(
     state: &HeartbeatState,
     budget: &Budget,
@@ -84,12 +108,8 @@ pub fn decide_wake(
     let trigger = if !urgent.is_empty() {
         WakeTrigger::Urgent(urgent)
     } else {
-        let since = last_fired_at(&state.trail)
-            .or_else(|| state.queued().iter().map(|e| e.at).min());
-        match since {
-            Some(at) if !state.queue.is_empty() && now - at >= Duration::minutes(CHECK_IN_MINUTES) => {
-                WakeTrigger::CheckIn
-            }
+        match check_in_due(state, budget.wakes_per_hour) {
+            Some(due) if now >= due => WakeTrigger::CheckIn,
             _ => return WakeVerdict::Idle,
         }
     };
@@ -125,7 +145,7 @@ pub fn trigger_label(state: &HeartbeatState, trigger: &WakeTrigger) -> String {
 pub fn rule_label(trigger: &WakeTrigger, state: &HeartbeatState) -> String {
     let kind = match trigger {
         WakeTrigger::CheckIn => {
-            return format!("items are queued and you haven't woken for {CHECK_IN_MINUTES}+ minutes, so this is a check-in")
+            return format!("items have been queued for {QUEUE_BATCH_MINUTES}+ minutes and the hourly pace allows a wake, so this is a check-in")
         }
         WakeTrigger::Urgent(ids) => ids
             .iter()
@@ -446,30 +466,76 @@ mod tests {
         WakeRecord::fired(now() - Duration::minutes(mins_ago), "t", vec![], "")
     }
 
+    /// First minute (from `now()`) at which `decide_wake` fires, if any.
+    fn first_fire_minute(s: &HeartbeatState, b: &Budget) -> Option<i64> {
+        (0..300).find(|m| {
+            decide_wake(s, b, 0.0, now() + Duration::minutes(*m), false)
+                == WakeVerdict::Fire(WakeTrigger::CheckIn)
+        })
+    }
+
     #[test]
-    fn wake_now_fires_and_check_in_waits_an_hour() {
+    fn next_check_in_equals_the_first_fire() {
+        let mut s = HeartbeatState::default();
+        assert_eq!(next_check_in(&s, 2), None, "empty queue: nothing to check in on");
+
+        queue(&mut s, &ev(KIND_TODO_OVERDUE, 3), Choice::Queue);
+        let due = next_check_in(&s, 2).unwrap();
+        assert_eq!(due, now() + Duration::minutes(7));
+        assert_eq!(first_fire_minute(&s, &B), Some(7));
+
+        // With a recent wake the hourly slot (30 min at 2/h) dominates;
+        // deferred records don't count.
+        s.trail.push(fired(20));
+        s.trail.push(WakeRecord::deferred(now(), "t", vec![], "hourly cap"));
+        assert_eq!(next_check_in(&s, 2).unwrap(), now() + Duration::minutes(10));
+        assert_eq!(first_fire_minute(&s, &B), Some(10));
+    }
+
+    #[test]
+    fn a_burst_batches_into_one_wake_ten_minutes_after_the_first() {
+        let mut s = HeartbeatState::default();
+        // Three events within a minute, the first 4 minutes ago.
+        queue(&mut s, &ev(KIND_TODO_OVERDUE, 4), Choice::Queue);
+        queue(&mut s, &ev(KIND_RUN_ENDED, 4), Choice::Queue);
+        queue(&mut s, &ev(KIND_CI_FAILED, 3), Choice::Queue);
+        assert_eq!(first_fire_minute(&s, &B), Some(6));
+        assert_eq!(next_check_in(&s, 2), Some(now() + Duration::minutes(6)));
+    }
+
+    #[test]
+    fn wakes_are_spaced_by_the_hourly_cap_and_cap_zero_never_wakes() {
+        let mut s = HeartbeatState::default();
+        queue(&mut s, &ev(KIND_TODO_OVERDUE, 60), Choice::Queue);
+        s.trail.push(fired(5));
+        // 2/h -> 30 minutes apart.
+        assert_eq!(first_fire_minute(&s, &B), Some(25));
+        // 1/h -> an hour apart.
+        let one = Budget { wakes_per_hour: 1, daily_usd: 5.0 };
+        assert_eq!(first_fire_minute(&s, &one), Some(55));
+
+        let zero = Budget { wakes_per_hour: 0, daily_usd: 5.0 };
+        assert_eq!(next_check_in(&s, 0), None);
+        assert_eq!(first_fire_minute(&s, &zero), None);
+    }
+
+    #[test]
+    fn wake_now_fires_and_check_in_batches() {
         let mut s = HeartbeatState::default();
         assert_eq!(decide_wake(&s, &B, 0.0, now(), false), WakeVerdict::Idle);
 
-        // A queued (not urgent) event: no wake until it (or the last wake)
-        // is an hour old.
-        let q = ev(KIND_TODO_OVERDUE, 10);
+        // A queued (not urgent) event waits for the batch window.
+        let q = ev(KIND_TODO_OVERDUE, 4);
         queue(&mut s, &q, Choice::Queue);
         assert_eq!(decide_wake(&s, &B, 0.0, now(), false), WakeVerdict::Idle);
         assert_eq!(
-            decide_wake(&s, &B, 0.0, now() + Duration::minutes(50), false),
+            decide_wake(&s, &B, 0.0, now() + Duration::minutes(6), false),
             WakeVerdict::Fire(WakeTrigger::CheckIn)
         );
-        s.trail.push(fired(30));
-        assert_eq!(decide_wake(&s, &B, 0.0, now(), false), WakeVerdict::Idle);
-        assert_eq!(
-            decide_wake(&s, &B, 0.0, now() + Duration::minutes(30), false),
-            WakeVerdict::Fire(WakeTrigger::CheckIn)
-        );
-        // Deferred attempts don't reset the check-in clock.
+        // Deferred attempts don't reset the pacing clock.
         s.trail.push(WakeRecord::deferred(now(), "t", vec![], "hourly cap"));
         assert_eq!(
-            decide_wake(&s, &B, 0.0, now() + Duration::minutes(30), false),
+            decide_wake(&s, &B, 0.0, now() + Duration::minutes(6), false),
             WakeVerdict::Fire(WakeTrigger::CheckIn)
         );
 

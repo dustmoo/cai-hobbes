@@ -1593,10 +1593,6 @@ video {
   z-index: 100;
 }
 
-.order-last {
-  order: 9999;
-}
-
 .col-span-2 {
   grid-column: span 2 / span 2;
 }
@@ -2026,6 +2022,14 @@ video {
 
 .min-h-0 {
   min-height: 0px;
+}
+
+.min-h-11 {
+  min-height: 2.75rem;
+}
+
+.min-h-8 {
+  min-height: 2rem;
 }
 
 .min-h-\[2\.5rem\] {
@@ -5288,6 +5292,10 @@ video {
 
 .focus\:bg-input:focus {
   background-color: var(--color-bg-input);
+}
+
+.focus\:opacity-100:focus {
+  opacity: 1;
 }
 
 .focus\:outline-none:focus {
