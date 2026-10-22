@@ -350,7 +350,7 @@ fn sync_timer_waits(session_state: Signal<SessionState>, ids: impl IntoIterator<
             .peek()
             .sessions
             .get(&id)
-            .map(|s| (s.name.clone(), s.next_pending_timer()))
+            .map(|s| (s.display_title(), s.next_pending_timer()))
         else {
             continue;
         };

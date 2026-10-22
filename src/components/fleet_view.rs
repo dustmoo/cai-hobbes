@@ -428,6 +428,7 @@ pub fn FleetView() -> Element {
 #[component]
 fn EarlierToday(rows: Vec<FleetSession>, now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
     let mut open = use_signal(|| false);
+    let session_state = use_context::<Signal<crate::session::SessionState>>();
     if rows.is_empty() {
         return rsx! {};
     }
@@ -462,7 +463,7 @@ fn EarlierToday(rows: Vec<FleetSession>, now: DateTime<Utc>, today: chrono::Naiv
                             class: "flex items-baseline gap-2 text-xs",
                             span {
                                 class: "font-medium shrink-0 max-w-64 truncate",
-                                { s.display_name().to_string() }
+                                { row_label(s, &session_state.peek()).0 }
                             }
                             span { class: "text-fg-muted shrink-0",
                                 { crate::todo::model::format_minutes(s.minutes_on(today, now)) } }
@@ -971,6 +972,21 @@ fn go_to(
     });
 }
 
+/// A row's label and tab emoji. A Hobbes tab that is open reads its live
+/// tab label (the AI's topic or the user's rename) and emoji, so the Fleet
+/// matches the tab strip; otherwise the name the row was last reported with.
+fn row_label(
+    session: &FleetSession,
+    session_state: &crate::session::SessionState,
+) -> (String, Option<String>) {
+    if session.origin == fleet::FleetOrigin::Hobbes {
+        if let Some(s) = session_state.sessions.get(&session.id) {
+            return (s.display_title(), s.tab_emoji.clone().filter(|e| !e.trim().is_empty()));
+        }
+    }
+    (session.display_name().to_string(), None)
+}
+
 #[component]
 fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate) -> Element {
     let chat_command =
@@ -1008,6 +1024,11 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
         "border-left: 3px solid transparent;".to_string()
     };
     let is_hobbes = session.origin == fleet::FleetOrigin::Hobbes;
+    // Memoised: session_state changes on every streamed chunk, but the row
+    // only re-renders when its own label or emoji does.
+    let label_session = session.clone();
+    let label = use_memo(move || row_label(&label_session, &session_state.read()));
+    let (row_name, row_emoji) = label();
     let phrase = status_phrase(&session, now);
     let go_title = go_label(&session);
     let is_open = *expanded.read();
@@ -1041,12 +1062,14 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                     },
                     if is_open { "▾" } else { "▸" }
                 }
-                if is_hobbes {
+                if let Some(e) = &row_emoji {
+                    span { class: "shrink-0 text-[14px] leading-none w-4 text-center", "{e}" }
+                } else if is_hobbes {
                     Icon { width: 16, height: 16, icon: fi_icons::FiMessageSquare, class: "shrink-0" }
                 } else {
                     Icon { width: 16, height: 16, icon: fi_icons::FiTerminal, class: "shrink-0" }
                 }
-                span { class: "fleet-name text-sm font-semibold", { session.display_name().to_string() } }
+                span { class: "fleet-name text-sm font-semibold", "{row_name}" }
                 span {
                     class: "fleet-project text-xs text-fg-muted",
                     { project.clone().unwrap_or_default() }
@@ -1365,6 +1388,26 @@ mod tests {
         let tab = session("t", notif(), fleet::FleetOrigin::Hobbes, 0);
         assert_eq!(go_label(&tab), "Open chat tab");
         assert_eq!(answer_button_label(&tab), "Answer in chat ↗");
+    }
+
+    #[test]
+    fn hobbes_rows_show_the_tabs_live_label_and_emoji() {
+        let mut state = crate::session::SessionState::default();
+        let id = state.create_session_raw(None);
+        let mut row = session(&id, FleetStatus::Working, fleet::FleetOrigin::Hobbes, 0);
+        row.name = "Oct 22 - 09:15 AM".into();
+        if let Some(s) = state.sessions.get_mut(&id) {
+            s.tab_title = Some("Vendor research".into());
+            s.tab_emoji = Some("🔎".into());
+        }
+        assert_eq!(row_label(&row, &state), ("Vendor research".to_string(), Some("🔎".to_string())));
+        // A closed tab (not hydrated) falls back to the reported name.
+        let gone = session("gone", FleetStatus::Idle, fleet::FleetOrigin::Hobbes, 0);
+        assert_eq!(row_label(&gone, &state).1, None);
+        // Claude Code rows never borrow a tab's label.
+        let mut cc = session(&id, FleetStatus::Working, fleet::FleetOrigin::External, 0);
+        cc.name = "api-server".into();
+        assert_eq!(row_label(&cc, &state).1, None);
     }
 
     #[test]
