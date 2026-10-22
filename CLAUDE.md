@@ -117,6 +117,10 @@ Three virtual built-in servers are registered for AI introspection:
 
 Composio integration uses explicit per-user OAuth (P-002 through P-007) — see `SYSTEM_PATTERNS.md` for the full 6-point reconnect lifecycle.
 
+### Heartbeat (`src/heartbeat/`)
+
+The Heartbeat watches planner, Fleet and CI state every 30 s (no LLM in perception), routes events through `RulesSalience` to ignore / note / queue / wake-now, and wakes a dedicated "Heartbeat" chat session through the background chat queue, within an hourly and daily budget. It is off by default (`heartbeat_enabled`); `HEARTBEAT_PRO_ONLY` in `heartbeat/mod.rs` is the single Pro-gating switch. Invariants: the runtime tick is synchronous, so no Signal guard may cross an `.await`; briefing content lives only in the persisted boundary tail (`briefing.rs`, `ledger.rs`), never the stable system prefix; every tool call from the Heartbeat session goes through `builtin_tools::scope_gates` at both the stream_manager dispatch path and the chat.rs resume path; and the trust rules live in `heartbeat/trust.rs`, built on agent-time scope. See `ARCHITECTURE.md` (Heartbeat) for layers, rules and read-back.
+
 ### Multi-Tab Streaming State
 
 Streaming and summarization state is **per-session**, not global:

@@ -131,6 +131,81 @@ Hobbes implements several advanced patterns to ensure stability with "Thinking" 
 -   **`PromptBuilder` Refactor:** The `PromptBuilder` is updated to iterate over the `attachments` vector in each message. For each attachment, it creates a `Part` with `inlineData` containing the base64 string and the correct `mime_type`, correctly formatting the request for the Gemini API.
 -   **`MessageList` Rendering:** The message rendering logic in `MessageList` is updated to iterate over the `attachments` vector. It renders an `<img>` tag for image MIME types and a placeholder for other file types.
 
+## Heartbeat
+
+The Heartbeat is a harness that stays awake between chats. It watches the planner, the Fleet and GitHub CI without an LLM, decides what is worth the person's attention, and wakes a dedicated chat session (titled "Heartbeat") with a briefing when something calls for it. It is off by default (`heartbeat_enabled`). Code lives in `src/heartbeat/`; the Fleet card is `src/components/heartbeat_card.rs`. `HEARTBEAT_PRO_ONLY` (currently `false`) is the single switch for Pro gating.
+
+### Layers
+
+| Layer | Module | Role |
+|---|---|---|
+| Perception | `perception.rs` | Pure watchers. Each source is captured into a small serde snapshot (planner, Fleet, CI); successive snapshots are diffed into `HeartbeatEvent`s. The first capture of a source emits nothing. |
+| Salience | `salience.rs` | `RulesSalience` routes each event to `Ignore`, `Note`, `Queue` or `WakeNow`. The `Salience` trait and `ShadowSalience` are the seam for a future learned model (Laya, a ModernBERT decision model); no shadow is wired in yet, and it needs labelled decisions first. |
+| State | `state.rs` | `HeartbeatState`: snapshots, event journal, decisions, wake queue, wake trail and the person's reactions. Pure methods; persisted as JSON under the `heartbeat_state` key in the `meta` table of `sessions.db` (`mod.rs`, `save_async`, with a generation guard so out-of-order writes never clobber newer state). |
+| Budget | `budget.rs` | Hourly cap (rolling 60 minutes, counting only wakes that ran) and daily spend cap (wake cost since local midnight). |
+| Wake | `wake.rs` | Decides `Idle` / `Busy` / `Defer` / `Fire`, builds the wake message, and reads back each finished wake's cost and outcome. |
+| Runtime | `runtime.rs` | The 30 s loop spawned from `main.rs`. Also drives CI polling (`ci.rs`, `gh run list`, every 5 minutes, at most 12 projects, projects with open agent work first). |
+| Trust | `trust.rs` | Scope gate for tool calls from the Heartbeat session. |
+
+Only the runtime touches Dioxus signals. A tick is synchronous, so no signal guard is held across an `.await`.
+
+### Event kinds
+
+| Kind | Source | Urgency | Meaning |
+|---|---|---|---|
+| `worker_done` | planner | Normal | An agent to-do's worker moved to Done. |
+| `worker_needs_you` | planner | High | A worker moved to NeedsYou. |
+| `worker_stuck` | planner | High | A worker moved to Stuck. |
+| `decision_raised` | planner | High | A new open worker decision. Supersedes a same-to-do `worker_needs_you`. |
+| `todo_overdue` | planner | Normal | An open to-do became past its deadline (raised once). |
+| `session_needs_attention` | fleet | Normal, High for a dispatched run | A Fleet session newly needs attention. |
+| `run_ended` | fleet | Low | A dispatched run stopped running (ended, gone, or idle). |
+| `ci_failed` | ci | High | A workflow's newest completed run on a branch failed. |
+| `ci_recovered` | ci | Normal | A success after a failure on the same workflow and branch. |
+
+### Salience rules
+
+Rows are checked in order; the first match wins.
+
+| # | Event | Choice |
+|---|---|---|
+| 1 | source or kind muted (settings) | Ignore |
+| 2 | `worker_needs_you`, `worker_stuck`, `decision_raised` | WakeNow |
+| 3 | `ci_failed` on a project with open agent work | WakeNow |
+| 4 | `ci_failed` elsewhere | Queue |
+| 4b | `run_ended` from the Heartbeat session while auto-continue hands the result back | Note |
+| 5 | `worker_done` / `run_ended` / `session_needs_attention` the Heartbeat is waiting on (a pending timer intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
+| 6 | `worker_done`, `session_needs_attention` | Queue |
+| 7 | `run_ended` (the dispatching chat is continued anyway) | Note |
+| 8 | `todo_overdue`, `ci_recovered` | Queue |
+| 9 | anything else: Low becomes Note, Normal and High become Queue (confidence 0.5) | |
+
+Unknown kinds never wake on their own. Every decision is journalled, and the person's reactions (muting a kind, dismissing, marking useful) are stored as labels for training a future decider.
+
+### Wake logic
+
+- **WakeNow** events wake immediately, subject to budget and to the session being idle.
+- **Check-in:** a non-empty queue wakes for a check-in once an hour has passed since the last wake (or since the oldest queued event, before the first wake).
+- **Busy:** a session that is streaming, has queued messages, or is waiting on a permission request holds the wake; the next poll retries.
+- **Defer:** over budget, the runtime records a deferred wake in the trail and leaves the events queued. Deferred attempts do not count toward the hourly cap.
+- **Default budget:** 2 wakes per hour, $5.00 per day (`heartbeat_wakes_per_hour`, `heartbeat_daily_usd`).
+
+### Delivery and read-back
+
+Firing a wake drains the queue into a wake message (headed `[Heartbeat wake]`: why, rule, what changed, what the Heartbeat may do, budget line, standing instructions) and queues it as a user message in the Heartbeat session's background chat queue, the same path an unfocused dispatch uses. The session is created on first use and hydrated from the store in the background if it is not open. Each wake's trail record is closed when its reply arrives: cost is the session's usage between this wake and the next, and the outcome is the first line of the last reply. A wake whose message never reached the session is closed as not delivered after 30 minutes; a wake waiting on an approval is held for up to 24 hours. Journal and trail are capped (500 events kept for 7 days, 200 wake records, 1000 reactions).
+
+### Trust gate
+
+Every tool call from the Heartbeat session goes through `scope_gates` (`builtin_tools.rs`) at both tool-call sites: the stream manager dispatch path and the approval-resume path in `chat.rs`. It reuses the agent-time scope (`todo::agent_time::agent_time_scope`) with two differences: `HOBBES_DISPATCH` is held for approval (agent time denies it), and `HOBBES_DECISIONS` with `action=ask` is allowed (agent time denies it). `HOBBES_AGENT_TIME` is denied outright, because the Heartbeat holds no agent-time lease. Answering decisions, changing to-dos, plan, time blocks, projects or timers, and destructive actions are refused. Outside effects (sending, posting, repo changes, commands) are held for the person's approval.
+
+### Phase 1 pieces
+
+These are used by the Heartbeat and by every chat.
+
+- **Handoff notes** (`src/handoff.rs`): one note per chat, kept on the `Session`, written with `HOBBES_WRITE_HANDOFF` (fields: what it was doing, what it expects next, what would change its plan; 600 characters each, cut not refused). The note replaces the previous one.
+- **Turn briefing** (`src/context/prompt_builder/briefing.rs`): when a user turn follows a gap of at least 5 minutes, or a timer fired, the request tail opens with a short briefing: elapsed time, fired timers with their `reason` and `fire_cause`, changes the Heartbeat noticed to work the chat dispatched, and the handoff note with its age (flagged after 24 hours). The briefing is computed once when the boundary tail is created and persisted in that tail's body (`ledger.rs`); retries and later requests replay those bytes. It never enters the system prefix.
+- **Timer intentions** (`src/timers.rs`): a scheduled timer may carry a `reason` (the model's own words, capped), an `until` condition (`WakeCondition::WorkerDone { todo_id }`, which fires early when that to-do's worker finishes, done, needs the person or stuck), and a `fire_cause` recording why it fired (deadline reached while running, or deadline passed while Hobbes was closed).
+
 ## Interaction Flow (UML Sequence)
 
 This sequence diagram illustrates the detailed interaction between components for the new tool context flow.
