@@ -37,11 +37,12 @@ const DISPATCH_DESCRIPTION: &str = "Send a todo to a worker. target 'chat' opens
     multi-step reasoning or code. The choice must come from the allowed list; anything else is \
     refused.";
 
-/// Append the user's allowed models to `HOBBES_DISPATCH`'s description in
-/// the per-request tool list. The list comes from
-/// `Settings::allowed_models` (sorted, deduplicated), so the description,
-/// which sits in the cached tool prefix, changes only when the connector
-/// settings do.
+/// Append the user's allowed models (and, when the user lets the AI choose,
+/// their Composio profiles) to `HOBBES_DISPATCH`'s description in the
+/// per-request tool list. With profile choice off, or no profiles, the
+/// `profile` parameter is removed from the schema. Both lists come sorted
+/// from settings, so the tool, which sits in the cached tool prefix, changes
+/// only when the settings do.
 pub fn annotate_dispatch_models(
     tools: &mut [crate::llm::types::ToolDefinition],
     settings: &crate::settings::Settings,
@@ -49,7 +50,22 @@ pub fn annotate_dispatch_models(
     let Some(tool) = tools.iter_mut().find(|t| t.name == "HOBBES_DISPATCH") else {
         return;
     };
+    let profiles = if settings.dispatch_profile_choice {
+        settings.dispatch_profile_names()
+    } else {
+        Vec::new()
+    };
     tool.description = dispatch_description(&settings.allowed_models());
+    if profiles.is_empty() {
+        if let Some(props) = tool.parameters.get_mut("properties").and_then(|p| p.as_object_mut()) {
+            props.remove("profile");
+        }
+    } else {
+        tool.description.push_str(&format!(
+            " Profiles for target 'chat' (pick the one whose accounts the work belongs to; omit to use this tab's): {}.",
+            profiles.join(", ")
+        ));
+    }
 }
 
 /// `HOBBES_DISPATCH`'s description with the allowed list for `target: chat`.
@@ -344,7 +360,8 @@ impl PlannerClient {
                             "target": { "type": "string", "enum": ["chat", "claude_code"], "description": "Where the work runs." },
                             "instructions": { "type": "string", "description": "Extra guidance appended to the assignment." },
                             "connector": { "type": "string", "description": "chat only: the connector to run the new tab on (a connector name from the allowed list). Omit for the user's default." },
-                            "model": { "type": "string", "description": "chat: a model slug from the allowed list (omit for the user's default). claude_code: the Claude Code model (e.g. 'sonnet', 'opus')." }
+                            "model": { "type": "string", "description": "chat: a model slug from the allowed list (omit for the user's default). claude_code: the Claude Code model (e.g. 'sonnet', 'opus')." },
+                            "profile": { "type": "string", "description": "chat only: the Composio profile (whose connected accounts the worker uses) by name from the profiles list. Omit to use this tab's profile." }
                         },
                         "required": ["todo_id", "target"]
                     }))
@@ -661,5 +678,37 @@ mod tests {
         assert_eq!(tools.iter().find(|t| t.name == "HOBBES_DISPATCH").unwrap().description, once);
         // No connectors: says so instead of listing nothing.
         assert!(dispatch_description(&[]).contains("No models are configured"));
+    }
+
+    #[test]
+    fn dispatch_profile_parameter_follows_the_setting() {
+        let dispatch = |settings: &crate::settings::Settings| {
+            let mut tools: Vec<crate::llm::types::ToolDefinition> = PlannerClient::new()
+                .list_tools()
+                .iter()
+                .map(|t| crate::llm::types::ToolDefinition::from_mcp(t, "hobbes-planner"))
+                .collect();
+            annotate_dispatch_models(&mut tools, settings);
+            tools.into_iter().find(|t| t.name == "HOBBES_DISPATCH").unwrap()
+        };
+        let mut settings = crate::settings::test_delegation_settings();
+        // No profiles: nothing to choose, so no parameter.
+        assert!(dispatch(&settings).parameters["properties"].get("profile").is_none());
+
+        for (id, name) in [("p2", "Puget"), ("p1", "clearmirror")] {
+            settings.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        let on = dispatch(&settings);
+        assert!(on.parameters["properties"].get("profile").is_some());
+        assert!(on.description.ends_with("omit to use this tab's): clearmirror, Puget."), "{}", on.description);
+
+        settings.dispatch_profile_choice = false;
+        let off = dispatch(&settings);
+        assert!(off.parameters["properties"].get("profile").is_none());
+        assert!(!off.description.contains("Puget"), "{}", off.description);
     }
 }
