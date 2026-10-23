@@ -387,6 +387,12 @@ pub struct Settings {
     /// without having to call a tool for it. Costs tokens on every turn.
     #[serde(default = "default_true")]
     pub planner_inject_today_context: bool,
+    /// Let the AI pick which Composio profile a dispatched chat runs under
+    /// (HOBBES_DISPATCH `profile`). Off: a dispatched chat always takes the
+    /// dispatching tab's profile (else the active one) and the parameter is
+    /// withheld from the tool.
+    #[serde(default = "default_true")]
+    pub dispatch_profile_choice: bool,
     /// Timeline bounds, "HH:MM" local time.
     #[serde(default = "default_workday_start")]
     pub planner_workday_start: String,
@@ -973,6 +979,7 @@ impl Default for Settings {
             compact_tool_results: true,
             planner_enabled: true,
             planner_inject_today_context: true,
+            dispatch_profile_choice: true,
             planner_workday_start: default_workday_start(),
             planner_workday_end: default_workday_end(),
             planner_daily_capacity_minutes: default_daily_capacity_minutes(),
@@ -1795,6 +1802,46 @@ impl Settings {
         } else {
             None
         }
+    }
+
+    /// Composio profile names, sorted case-insensitively: the choices offered
+    /// to HOBBES_DISPATCH. Stable, since it rides in the cached tool prefix.
+    pub fn dispatch_profile_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .composio_profiles
+            .iter()
+            .map(|p| p.name.trim().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        names
+    }
+
+    /// Resolve a dispatch `profile` (a Composio profile name, case-insensitive,
+    /// or id) to a profile id. `Ok(None)` when none was asked for. Refused
+    /// when the user turned profile choice off, or the name matches no
+    /// profile: never a silent fallback to some other account.
+    pub fn resolve_dispatch_profile(&self, profile: Option<&str>) -> Result<Option<String>, String> {
+        let Some(asked) = profile.map(str::trim).filter(|p| !p.is_empty()) else {
+            return Ok(None);
+        };
+        if !self.dispatch_profile_choice {
+            return Err("the user has turned off choosing a profile for dispatched work; omit profile and the chat uses this tab's profile".to_string());
+        }
+        self.composio_profiles
+            .iter()
+            .find(|p| p.id == asked)
+            .or_else(|| self.composio_profiles.iter().find(|p| p.name.trim().eq_ignore_ascii_case(asked)))
+            .map(|p| Some(p.id.clone()))
+            .ok_or_else(|| {
+                let names = self.dispatch_profile_names();
+                if names.is_empty() {
+                    format!("unknown profile '{asked}'; no Composio profiles are configured")
+                } else {
+                    format!("unknown profile '{asked}'; profiles: {}", names.join(", "))
+                }
+            })
     }
 
     /// Get a mutable reference to the active Composio profile (matched by stable ID)

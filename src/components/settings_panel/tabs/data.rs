@@ -5,7 +5,7 @@ use crate::session::SessionState;
 use crate::settings::Settings;
 use dioxus::prelude::*;
 use std::io::Write;
-use zip::write::{FileOptions, ZipWriter};
+use zip::write::{SimpleFileOptions, ZipWriter};
 
 #[component]
 pub(in super::super) fn DataTab(
@@ -44,7 +44,7 @@ pub(in super::super) fn DataTab(
                                                 let mut zip_buffer = Vec::new();
                                                 {
                                                     let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
-                                                    zip.start_file("settings.json", FileOptions::default()).unwrap();
+                                                    zip.start_file("settings.json", SimpleFileOptions::default()).unwrap();
                                                     zip.write_all(settings_json.as_bytes()).unwrap();
                                                     zip.finish().unwrap();
                                                 }
@@ -165,7 +165,7 @@ pub(in super::super) fn DataTab(
                                                 let mut zip_buffer = Vec::new();
                                                 {
                                                     let mut zip = ZipWriter::new(std::io::Cursor::new(&mut zip_buffer));
-                                                    zip.start_file("history.json", FileOptions::default()).unwrap();
+                                                    zip.start_file("history.json", SimpleFileOptions::default()).unwrap();
                                                     zip.write_all(history_json.as_bytes()).unwrap();
                                                     zip.finish().unwrap();
                                                 }
