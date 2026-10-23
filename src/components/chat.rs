@@ -367,7 +367,7 @@ pub fn ChatWindow(
                         .peek()
                         .sessions
                         .get(&owning_id)
-                        .map(|s| s.name.clone())
+                        .map(|s| s.display_title())
                         .unwrap_or_default();
                     crate::fleet::bridge::report(
                         &owning_id,

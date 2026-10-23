@@ -287,7 +287,6 @@ mod tests {
             working_since: None,
             day_minutes: Default::default(),
             day_seconds: Default::default(),
-            auto_passthrough: false,
             ended_at: None,
             pending_gate: None,
             transcript_path: None,
@@ -302,6 +301,7 @@ mod tests {
             dispatched_from: None,
             continuation_sent: false,
             wake_at: None,
+            terminal: None,
         };
         s.working_since = matches!(
             s.status,

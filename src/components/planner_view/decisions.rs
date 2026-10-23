@@ -5,10 +5,13 @@
 //! Answering a worker's question goes through `lanes::resolve_decision`,
 //! then back to the worker over whatever channel exists (a Hobbes chat gets
 //! it as a queued message; a Claude Code run can't receive input, so the
-//! answer is recorded and the to-do returns to the queue). A permission
-//! gate is answered through `FleetShared::resolve_gate` — never as a
-//! decision the model could resolve. A call the agent-time run is waiting
-//! on your approval for shows here as a gate card too, answered through the
+//! answer is recorded and the to-do returns to the queue). A Claude Code
+//! permission prompt is answered in the terminal, where it carries choices
+//! the drawer can't offer (always allow, tell Claude what to do instead):
+//! its card offers "Answer in <terminal>", which takes the person there
+//! (`terminal_focus::go_to_session`), and the decision clears once the
+//! session moves on. A call the agent-time run is waiting on your approval
+//! for shows here as a gate card with Approve / Deny, answered through the
 //! chat's own approve / deny path (`agent_time::answer_held`).
 
 use chrono::{NaiveDate, Utc};
@@ -17,11 +20,10 @@ use dioxus_free_icons::{icons::fi_icons, Icon};
 
 use crate::components::chat_input::ChatCommand;
 use crate::context::trust_store::{self, DecisionKind, TrustDecision};
+use crate::fleet::{terminal_focus, FleetOrigin, FleetState};
 use crate::session::SessionState;
 use crate::todo::lanes;
-use crate::todo::model::{
-    AgentState, DecisionAnswer, DecisionDelivery, DecisionSource, ResolvedDecision,
-};
+use crate::todo::model::{DecisionDelivery, DecisionSource, ResolvedDecision};
 use crate::todo::store;
 use crate::todo::PlannerState;
 
@@ -104,6 +106,7 @@ fn held_card(h: &HeldApproval, intent: Option<&str>, now: chrono::DateTime<Utc>)
         question: format!("Waiting for your approval: {what}"),
         options: Vec::new(),
         gate: Some(h.execution_id.clone()),
+        terminal: None,
         est: lanes::est_label(Some(1)),
         worker: Some("agent time".to_string()),
         waiting: fmt_since(h.asked_at, now),
@@ -170,34 +173,22 @@ fn answer(
     Ok(delivery_line(&route))
 }
 
-/// Approve or deny a held permission gate. The fleet server owns the
-/// follow-up; the to-do records the answer so the wait isn't re-raised.
-fn answer_gate(mut planner: Signal<PlannerState>, todo_id: &str, request_id: &str, allow: bool) -> &'static str {
-    crate::fleet::shared().resolve_gate(request_id, allow);
-    let now = Utc::now();
-    {
-        let mut state = planner.write();
-        if let Some(t) = state.todo_mut(todo_id) {
-            if let Some(d) = t.decision.as_mut().filter(|d| d.is_open()) {
-                d.resolved = Some(DecisionAnswer {
-                    choice: if allow { "Approve".into() } else { "Deny".into() },
-                    note: None,
-                    at: now,
-                    delivery: None,
-                });
-            }
-            if allow {
-                t.agent_state = Some(AgentState::Working);
-            }
-            t.updated_at = now;
-        }
-    }
-    persist_todo(&planner, todo_id);
-    if allow {
-        "Approved at the permission gate \u{2014} the worker carries on."
-    } else {
-        "Denied at the permission gate."
-    }
+/// Take the person to the terminal of the Claude Code session behind a
+/// permission card. Returns the one-line note and whether it got there.
+async fn go_to_terminal(session_id: String) -> (String, bool) {
+    let row = crate::fleet::shared()
+        .snapshot()
+        .sessions
+        .get(&session_id)
+        .cloned()
+        .or_else(|| crate::fleet::store::load_session(&session_id));
+    let Some(row) = row else {
+        return ("That session is no longer in the Fleet.".to_string(), false);
+    };
+    let name = row.display_name().to_string();
+    let outcome = terminal_focus::go_to_session(row).await;
+    let ok = !matches!(outcome, terminal_focus::FocusOutcome::Failed(_));
+    (outcome.note(&name), ok)
 }
 
 // ── The drawer ──────────────────────────────────────────────────────────────
@@ -208,7 +199,11 @@ struct DecisionCard {
     context: String,
     question: String,
     options: Vec<String>,
+    /// A held agent-time call: answered with Approve / Deny.
     gate: Option<String>,
+    /// A Claude Code permission prompt: (fleet session id, "Answer in
+    /// iTerm2"). Answered in the terminal, never in the drawer.
+    terminal: Option<(String, String)>,
     est: String,
     worker: Option<String>,
     waiting: String,
@@ -222,6 +217,7 @@ struct DecisionCard {
 pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
     let planner = use_context::<Signal<PlannerState>>();
     let session_state = use_context::<Signal<SessionState>>();
+    let fleet_state = use_context::<Signal<FleetState>>();
     let mut chat_command = use_context::<Signal<Option<ChatCommand>>>();
     let mut expanded = use_signal(|| Option::<String>::None);
     // Results of answers given while the drawer is open (newest first).
@@ -244,6 +240,7 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
     let now = Utc::now();
     let (cards, minutes) = {
         let state = planner.read();
+        let fleet = fleet_state.read();
         let queue = lanes::needs_you(&state.todos);
         let minutes = queue_minutes(&queue);
         let cards: Vec<DecisionCard> = queue
@@ -251,17 +248,26 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
             .map(|t| {
                 let d = t.decision.as_ref().filter(|d| d.is_open());
                 let brief = d.and_then(|d| d.brief.clone());
+                let is_gate = d.is_some_and(|d| matches!(d.source, DecisionSource::Gate { .. }));
+                // Gates only come from Claude Code sessions (Hobbes tabs
+                // approve in their own chat), so every gate card goes to a
+                // terminal.
+                let terminal = t.linked_fleet_session.clone().filter(|_| is_gate).and_then(|sid| {
+                    match fleet.sessions.get(&sid) {
+                        Some(row) if row.origin == FleetOrigin::Hobbes => None,
+                        Some(row) => Some((sid, terminal_focus::answer_label(row))),
+                        None => Some((sid, "Answer in terminal".to_string())),
+                    }
+                });
                 DecisionCard {
                     todo_id: t.id.clone(),
                     context: t.outcome.clone().filter(|o| !o.trim().is_empty()).unwrap_or_else(|| t.title.clone()),
                     question: d
                         .map(|d| d.question.clone())
                         .unwrap_or_else(|| "Waiting on you \u{2014} no question recorded; check its worker.".into()),
-                    options: d.map(|d| d.options.clone()).unwrap_or_default(),
-                    gate: d.and_then(|d| match &d.source {
-                        DecisionSource::Gate { request_id } => Some(request_id.clone()),
-                        _ => None,
-                    }),
+                    options: if is_gate { Vec::new() } else { d.map(|d| d.options.clone()).unwrap_or_default() },
+                    gate: None,
+                    terminal,
                     est: lanes::est_label(d.and_then(|d| d.est_minutes)),
                     worker: d.and_then(|d| d.worker.clone()),
                     waiting: d.map(|d| fmt_since(d.asked_at, now)).unwrap_or_default(),
@@ -276,6 +282,7 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
             held.read().iter().map(|h| held_card(h, intent.as_deref(), now)).collect();
         let minutes = minutes + all.len() as u32;
         all.extend(cards);
+        drop(fleet);
         (all, minutes)
     };
     let header = queue_header(cards.len(), minutes);
@@ -382,18 +389,16 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
                                 on_result((id, line.to_string(), ok));
                                 return;
                             }
-                            let gate = planner.peek().todo(&id).and_then(|t| t.decision.as_ref()).and_then(|d| match &d.source {
-                                DecisionSource::Gate { request_id } if d.is_open() => Some(request_id.clone()),
-                                _ => None,
-                            });
-                            let outcome = match gate {
-                                Some(rid) => Ok(answer_gate(planner, &id, &rid, choice.eq_ignore_ascii_case("approve"))),
-                                None => answer(planner, session_state, &id, &choice),
-                            };
-                            match outcome {
+                            match answer(planner, session_state, &id, &choice) {
                                 Ok(line) => on_result((id, line.to_string(), true)),
                                 Err(e) => on_result((id, e, false)),
                             }
+                        },
+                        on_terminal: move |(id, sid): (String, String)| {
+                            spawn(async move {
+                                let (line, ok) = go_to_terminal(sid).await;
+                                on_result((id, line, ok));
+                            });
                         },
                     }
                 }
@@ -418,16 +423,18 @@ fn DecisionCardView(
     expanded: bool,
     on_toggle: EventHandler<String>,
     on_answer: EventHandler<(String, String)>,
+    on_terminal: EventHandler<(String, String)>,
 ) -> Element {
     let mut other = use_signal(String::new);
     let mut other_open = use_signal(|| false);
     let gate = card.gate.is_some();
+    let in_terminal = card.terminal.is_some();
     let options: Vec<String> = if gate {
         vec!["Approve".into(), "Deny".into()]
     } else {
         card.options.clone()
     };
-    let free_text = !gate && (options.is_empty() || *other_open.read());
+    let free_text = !gate && !in_terminal && (options.is_empty() || *other_open.read());
     let id = card.todo_id.clone();
     let dash = |s: &Option<String>| s.clone().filter(|x| !x.trim().is_empty()).unwrap_or_else(|| "\u{2014}".into());
 
@@ -436,6 +443,21 @@ fn DecisionCardView(
             class: "flex flex-col gap-2 rounded-lg border border-faint bg-card px-3 py-2.5",
             div { class: "text-[11.5px] text-fg-muted", "{card.context}" }
             div { class: "text-sm font-medium leading-5 text-fg", "{card.question}" }
+            if let Some((sid, label)) = card.terminal.clone() {
+                div {
+                    class: "flex flex-wrap items-center gap-1.5",
+                    button {
+                        class: "inline-flex items-center gap-1.5 rounded-md bg-btn-primary px-2.5 py-1 text-xs text-fg hover:bg-btn-primary-hover",
+                        title: "Claude Code asks in the terminal, with all its choices",
+                        onclick: {
+                            let id = id.clone();
+                            move |_| on_terminal.call((id.clone(), sid.clone()))
+                        },
+                        Icon { width: 11, height: 11, icon: fi_icons::FiTerminal }
+                        "{label}"
+                    }
+                }
+            }
             if !options.is_empty() {
                 div {
                     class: "flex flex-wrap gap-1.5",
@@ -510,7 +532,7 @@ fn DecisionCardView(
                         span { class: "truncate", "{w}" }
                     }
                 }
-                if gate {
+                if gate || in_terminal {
                     span { class: "font-mono text-[10px] text-fg-muted", "permission gate" }
                 }
                 span { class: "font-mono text-[11px] text-fg-muted", "waiting {card.waiting}" }

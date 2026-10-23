@@ -192,7 +192,7 @@ mod tests {
                 &FleetEvent::SessionStart {
                     session_id: format!("s{i}"),
                     cwd: format!("/Users/x/Sites/{n}"),
-                    reason: "startup".into(),
+                    source: "startup".into(),
                 },
                 Utc::now(),
             );
@@ -237,7 +237,7 @@ mod tests {
             &FleetEvent::SessionStart {
                 session_id: "s9".into(),
                 cwd: "/Users/x/Sites/puget-bench".into(),
-                reason: "startup".into(),
+                source: "startup".into(),
             },
             Utc::now(),
         );

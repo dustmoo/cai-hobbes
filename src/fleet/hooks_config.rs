@@ -14,24 +14,27 @@
 //!
 //! Hook config shape (verified against the hooks reference):
 //! `hooks.<Event>` is an array of matcher groups `{matcher?, hooks: [handler…]}`;
-//! an `http` handler is `{type: "http", url, timeout?}` with `timeout` in
-//! **seconds** (default 600 for http hooks). We register no `matcher`, so tool
-//! events match every tool.
+//! an `http` handler is `{type: "http", url, timeout?, headers?,
+//! allowedEnvVars?}` with `timeout` in **seconds** (default 600 for http
+//! hooks); header values interpolate `$VAR` only for variables listed in
+//! `allowedEnvVars`. We register no `matcher`, so tool events match every
+//! tool.
 
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
-/// (event, timeout seconds). PermissionRequest gets a generous 120s hold
-/// window — the listener answers ~10s before this expires so a silent
-/// Hobbes never delays the terminal prompt by more than the margin. The
-/// others are quick notifications; SessionEnd's shared budget rises to the
-/// per-hook timeout (docs), so 10s is both prompt and sufficient.
+/// (event, timeout seconds). All are quick notifications: Hobbes never
+/// holds a hook. PermissionRequest is answered at once with an empty body
+/// (no decision), so Claude Code shows its own prompt in the terminal and
+/// the Fleet only marks the session as needing the user. SessionEnd's
+/// shared budget rises to the per-hook timeout (docs), so 10s is both
+/// prompt and sufficient.
 pub const FLEET_HOOK_EVENTS: &[(&str, u64)] = &[
     ("SessionStart", 10),
     ("SessionEnd", 10),
     ("Stop", 10),
     ("Notification", 10),
-    ("PermissionRequest", 120),
+    ("PermissionRequest", 10),
     // Fidelity signals: a submitted prompt proves the user is handling the
     // session (turn starts, attention clears); each finished tool call is a
     // liveness heartbeat during otherwise-silent working turns.
@@ -40,11 +43,36 @@ pub const FLEET_HOOK_EVENTS: &[(&str, u64)] = &[
     ("SubagentStop", 10),
 ];
 
-/// Seconds the PermissionRequest hook is configured to wait.
-pub const PERMISSION_HOOK_TIMEOUT_SECS: u64 = 120;
-/// The listener resolves a held gate as passthrough this many seconds BEFORE
-/// the hook timeout, so the terminal prompt reliably appears as fallback.
-pub const GATE_TIMEOUT_MARGIN_SECS: u64 = 10;
+/// Events whose hook forwards the terminal's environment as headers
+/// (click-to-terminal). Start, resume, `/clear` and a Hobbes restart
+/// mid-session are all covered by these two.
+pub const TERMINAL_HINT_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit"];
+
+/// The handler object we register for one event. Terminal-hint events add
+/// `headers` (`"${VAR}"` interpolated by Claude Code; the braced form, since
+/// the bare `$__CFBundleIdentifier` came through mangled) and the matching
+/// `allowedEnvVars` — a variable that is unset, unlisted or stripped by
+/// admin policy arrives as an empty header.
+pub fn fleet_handler(port: u16, token: &str, event: &str, timeout: u64) -> Value {
+    let mut handler = json!({
+        "type": "http",
+        "url": hook_url(port, token, event),
+        "timeout": timeout,
+    });
+    if TERMINAL_HINT_EVENTS.contains(&event) {
+        let headers: Map<String, Value> = super::terminal_focus::HINT_HEADERS
+            .iter()
+            .map(|(header, var, _)| ((*header).to_string(), Value::String(format!("${{{var}}}"))))
+            .collect();
+        let vars: Vec<Value> = super::terminal_focus::HINT_HEADERS
+            .iter()
+            .map(|(_, var, _)| Value::String((*var).to_string()))
+            .collect();
+        handler["headers"] = Value::Object(headers);
+        handler["allowedEnvVars"] = Value::Array(vars);
+    }
+    handler
+}
 
 /// The URL a given event's hook posts to.
 pub fn hook_url(port: u16, token: &str, event: &str) -> String {
@@ -130,11 +158,7 @@ pub fn merge_fleet_hooks(settings: &mut Value, port: u16, token: &str) -> Result
     strip_ours(hooks);
 
     for (event, timeout) in FLEET_HOOK_EVENTS {
-        let handler = json!({
-            "type": "http",
-            "url": hook_url(port, token, event),
-            "timeout": timeout,
-        });
+        let handler = fleet_handler(port, token, event, *timeout);
         let group = json!({ "hooks": [handler] });
         hooks
             .entry(event.to_string())
@@ -183,13 +207,14 @@ pub fn connected_port(settings: &Value) -> Option<u16> {
 
 /// Do the Hobbes-owned entries in this settings value exactly match the
 /// current build's set — every [`FLEET_HOOK_EVENTS`] entry present with the
-/// expected URL and timeout, and no stale extras? False means Connect (or the
-/// startup self-heal) should re-merge. A file with no Hobbes entries at all
-/// is "not connected", not "outdated" — also false, callers gate on
+/// expected handler (URL, timeout, and for terminal-hint events the
+/// `headers` and `allowedEnvVars`), and no stale extras? False means Connect
+/// (or the startup self-heal) should re-merge. A file with no Hobbes entries
+/// at all is "not connected", not "outdated" — also false, callers gate on
 /// [`connected_port`] first.
 pub fn hooks_current(settings: &Value, port: u16, token: &str) -> bool {
     use std::collections::BTreeMap;
-    let mut found: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    let mut found: BTreeMap<String, Value> = BTreeMap::new();
     if let Some(hooks) = settings.get("hooks").and_then(Value::as_object) {
         for (event, groups) in hooks {
             let Some(groups) = groups.as_array() else { return false };
@@ -200,32 +225,19 @@ pub fn hooks_current(settings: &Value, port: u16, token: &str) -> bool {
                     .map(|a| a.as_slice())
                     .unwrap_or(&[])
                 {
-                    if is_our_handler(handler) {
-                        // A duplicate of ours for one event is drift too.
-                        if found
-                            .insert(
-                                event.clone(),
-                                (
-                                    handler
-                                        .get("url")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    handler.get("timeout").and_then(Value::as_u64).unwrap_or(0),
-                                ),
-                            )
-                            .is_some()
-                        {
-                            return false;
-                        }
+                    // A duplicate of ours for one event is drift too.
+                    if is_our_handler(handler)
+                        && found.insert(event.clone(), handler.clone()).is_some()
+                    {
+                        return false;
                     }
                 }
             }
         }
     }
-    let expected: BTreeMap<String, (String, u64)> = FLEET_HOOK_EVENTS
+    let expected: BTreeMap<String, Value> = FLEET_HOOK_EVENTS
         .iter()
-        .map(|(event, timeout)| ((*event).to_string(), (hook_url(port, token, event), *timeout)))
+        .map(|(event, timeout)| ((*event).to_string(), fleet_handler(port, token, event, *timeout)))
         .collect();
     found == expected
 }
@@ -384,11 +396,75 @@ mod tests {
             assert_eq!(handler["timeout"], *timeout);
             assert!(groups[0].get("matcher").is_none(), "no matcher: match all tools");
         }
-        // PermissionRequest carries the generous hold timeout.
-        assert_eq!(
-            v["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
-            PERMISSION_HOOK_TIMEOUT_SECS
-        );
+        // Nothing is held any more: PermissionRequest is a quick hook too.
+        assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 10);
+    }
+
+    #[test]
+    fn terminal_hint_events_forward_the_terminal_environment() {
+        let v = merged_empty();
+        for event in TERMINAL_HINT_EVENTS {
+            let handler = &v["hooks"][*event][0]["hooks"][0];
+            let headers = handler["headers"].as_object().unwrap();
+            assert_eq!(headers["X-Hobbes-Term"], "${TERM_PROGRAM}");
+            assert_eq!(headers["X-Hobbes-App"], "${__CFBundleIdentifier}");
+            assert_eq!(headers["X-Hobbes-Iterm"], "${ITERM_SESSION_ID}");
+            assert_eq!(headers["X-Hobbes-Wezterm"], "${WEZTERM_PANE}");
+            assert_eq!(headers["X-Hobbes-Kitty"], "${KITTY_WINDOW_ID}");
+            assert_eq!(headers["X-Hobbes-Kitty-Sock"], "${KITTY_LISTEN_ON}");
+            assert_eq!(headers["X-Hobbes-Tmux"], "${TMUX}");
+            assert_eq!(headers["X-Hobbes-Tmux-Pane"], "${TMUX_PANE}");
+            assert_eq!(headers["X-Hobbes-Wt"], "${WT_SESSION}");
+            assert_eq!(headers.len(), 9);
+            // Every interpolated variable must be allow-listed, or Claude
+            // Code sends it empty.
+            let allowed: Vec<&str> = handler["allowedEnvVars"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect();
+            for value in headers.values() {
+                let var = value.as_str().unwrap().trim_start_matches("${").trim_end_matches('}');
+                assert!(allowed.contains(&var), "{var} not in allowedEnvVars");
+            }
+            assert_eq!(allowed.len(), headers.len());
+        }
+        // The other events carry no headers.
+        for event in ["SessionEnd", "Stop", "PermissionRequest", "PostToolUse"] {
+            let handler = &v["hooks"][event][0]["hooks"][0];
+            assert!(handler.get("headers").is_none(), "{event}");
+            assert!(handler.get("allowedEnvVars").is_none(), "{event}");
+        }
+    }
+
+    #[test]
+    fn hooks_current_detects_the_pre_header_shape() {
+        // An install from before click-to-terminal: same URLs and timeouts,
+        // no headers, and the old 120s PermissionRequest hold.
+        let mut old = merged_empty();
+        for event in TERMINAL_HINT_EVENTS {
+            let h = old["hooks"][*event][0]["hooks"][0].as_object_mut().unwrap();
+            h.remove("headers");
+            h.remove("allowedEnvVars");
+        }
+        assert!(!hooks_current(&old, 43917, "tok123"), "missing headers must self-heal");
+
+        let mut old_hold = merged_empty();
+        old_hold["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] = json!(120);
+        assert!(!hooks_current(&old_hold, 43917, "tok123"));
+
+        // A changed header value or allow-list is drift too.
+        let mut edited = merged_empty();
+        edited["hooks"]["SessionStart"][0]["hooks"][0]["headers"]["X-Hobbes-Term"] = json!("");
+        assert!(!hooks_current(&edited, 43917, "tok123"));
+        let mut trimmed = merged_empty();
+        trimmed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["allowedEnvVars"] = json!(["TERM_PROGRAM"]);
+        assert!(!hooks_current(&trimmed, 43917, "tok123"));
+
+        // Re-merging heals it.
+        merge_fleet_hooks(&mut old, 43917, "tok123").unwrap();
+        assert!(hooks_current(&old, 43917, "tok123"));
     }
 
     #[test]

@@ -166,7 +166,7 @@ pub fn condition_cause(cond: &WakeCondition, todo: Option<&Todo>) -> Option<Stri
             let Some(todo) = todo else {
                 return Some(format!("to-do {} was deleted", todo_id));
             };
-            if let Some(state @ (AgentState::Done | AgentState::NeedsYou | AgentState::Stuck)) =
+            if let Some(state @ (AgentState::Done | AgentState::NeedsYou | AgentState::Stuck | AgentState::Review)) =
                 todo.agent_state
             {
                 return Some(format!("worker for '{}' finished: {}", todo.title, state.label()));

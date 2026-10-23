@@ -4,8 +4,9 @@
 //! sources (planner, Fleet; CI every `ci::CI_POLL_MINUTES` on a tokio task),
 //! decide salience, ingest, then wake the dedicated Heartbeat session if
 //! `wake::decide_wake` says so — by queueing a user message for the
-//! background chat queue, exactly like an unfocused dispatch. Finished wakes
-//! get their cost and outcome read back from the usage log and the session.
+//! background chat queue, exactly like an unfocused dispatch. Day anchors
+//! (`anchors.rs`) are checked every poll too. Finished wakes get their cost,
+//! outcome and actions read back from the usage log and the session.
 //!
 //! Everything here runs on the Dioxus side (only it may touch Signals); a
 //! tick is synchronous, so no signal guard ever crosses an `.await`.
@@ -15,10 +16,12 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Duration, Utc};
 use dioxus::prelude::*;
 
+use super::anchors::{due_anchors, Anchor, DayView};
+use super::diagnose::{self, Diagnosis, DiagnosisTarget};
 use super::wake::{self, TodoInfo, WakeBrief, WakeTrigger, WakeVerdict};
 use super::{
     agent_project_ids, check_wake, ci, intention_todo_ids, local_day_start, spent_since, Budget,
-    CiRun, FleetSnapshot, PlannerSnapshot, RulesSalience, Salience, SalienceCtx, WakeRecord,
+    CiRun, FleetSnapshot, HeartbeatEvent, PlannerSnapshot, RulesSalience, Salience, SalienceCtx, WakeRecord,
     HEARTBEAT,
 };
 use crate::components::chat_queue;
@@ -110,7 +113,10 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
         }
         if settings.heartbeat_source_fleet {
             let snap = FleetSnapshot::capture(&deps.fleet.peek());
-            events.extend(hb.observe_fleet(snap, now));
+            let fleet_events = hb.observe_fleet(snap, now);
+            // The person's own sessions needing attention are the Fleet's
+            // news; only dispatched runs and linked workers are kept.
+            events.extend(super::perception::filter_fleet_noise(fleet_events, &worker_sessions(&deps.planner.peek())));
         } else {
             hb.fleet = None;
         }
@@ -243,6 +249,16 @@ fn maybe_start_ci_poll(deps: HeartbeatDeps, pacer: &mut Pacer, now: DateTime<Utc
     pacer.ci_task = Some(tokio::spawn(ci::fetch_all(projects)));
 }
 
+/// Session → to-do for open agent to-dos linked to a worker session.
+fn worker_sessions(planner: &crate::todo::PlannerState) -> HashMap<String, String> {
+    planner
+        .todos
+        .iter()
+        .filter(|t| t.lane == crate::todo::model::Lane::Agent && !t.status.is_closed())
+        .filter_map(|t| Some((t.linked_fleet_session.clone()?, t.id.clone())))
+        .collect()
+}
+
 fn salience_ctx(deps: HeartbeatDeps, settings: &Settings, session_id: Option<&str>) -> SalienceCtx {
     let mut ctx = SalienceCtx::from_settings(settings);
     {
@@ -271,10 +287,12 @@ fn maybe_wake(
 ) -> bool {
     let budget = Budget::from_settings(settings);
     let busy = session_busy(deps, session_id, streaming);
+    let day = day_view(deps, settings, now);
     let verdict = {
         let hb = HEARTBEAT.peek();
+        let anchors: Vec<Anchor> = day.as_ref().map(|d| due_anchors(&hb, d, now)).unwrap_or_default();
         let spent = spent_since(&hb.trail, local_day_start(now));
-        wake::decide_wake(&hb, &budget, spent, now, busy)
+        wake::decide_wake(&hb, &budget, spent, now, busy, &anchors)
     };
     match verdict {
         WakeVerdict::Idle | WakeVerdict::Busy => false,
@@ -286,10 +304,74 @@ fn maybe_wake(
             true
         }
         WakeVerdict::Fire(trigger) => {
-            fire_wake(deps, settings, session_id, &budget, trigger, now);
+            fire_wake(deps, settings, session_id, &budget, trigger, day.as_ref(), now);
             true
         }
     }
+}
+
+/// Today's [`DayView`] when the planner is on and the Heartbeat watches it;
+/// `None` turns day anchors and the look-ahead off.
+fn day_view(deps: HeartbeatDeps, settings: &Settings, now: DateTime<Utc>) -> Option<DayView> {
+    (settings.planner_enabled && settings.heartbeat_source_planner)
+        .then(|| DayView::capture(&deps.planner.peek(), settings, now))
+}
+
+/// Tails for the workers a wake's events point at. A Hobbes chat worker
+/// shows its last messages (hydrated, or one indexed row from the store); a
+/// Claude Code run shows the end of its transcript (a small tail read; the
+/// tick is synchronous, so no guard is held across it).
+fn diagnoses(
+    deps: HeartbeatDeps,
+    targets: &[DiagnosisTarget],
+    todos: &HashMap<String, TodoInfo>,
+) -> Vec<Diagnosis> {
+    let mut out = Vec::new();
+    for t in targets {
+        let todo_title = t.todo_id.as_ref().and_then(|id| todos.get(id)).map(|i| i.title.clone());
+        // A Hobbes chat worker.
+        let chat = {
+            let state = deps.session_state.peek();
+            state.sessions.get(&t.session_id).map(|s| (s.name.clone(), diagnose::chat_tail(&s.messages)))
+        };
+        let chat = chat.or_else(|| {
+            crate::session_store::load_session(&t.session_id).map(|s| (s.name.clone(), diagnose::chat_tail(&s.messages)))
+        });
+        if let Some((name, tail)) = chat {
+            if let Some(tail) = tail {
+                out.push(Diagnosis { subject: todo_title.unwrap_or(name), state: t.state, source: "chat", tail });
+            }
+            continue;
+        }
+        // A Claude Code run: the live row, or the stored one once it ended.
+        let row = deps
+            .fleet
+            .peek()
+            .sessions
+            .get(&t.session_id)
+            .cloned()
+            .or_else(|| crate::fleet::store::load_session(&t.session_id));
+        let Some(row) = row else { continue };
+        let Some(path) = row.transcript_path.as_deref().filter(|p| !p.is_empty()) else {
+            continue;
+        };
+        let tail = match crate::fleet::transcript::read_tail(path, diagnose::TRANSCRIPT_TAIL_BYTES) {
+            Ok(text) => diagnose::transcript_tail(&text),
+            Err(e) => {
+                tracing::debug!("heartbeat: transcript unreadable for {}: {e}", t.session_id);
+                None
+            }
+        };
+        if let Some(tail) = tail {
+            out.push(Diagnosis {
+                subject: todo_title.unwrap_or_else(|| row.display_name().to_string()),
+                state: t.state,
+                source: "Claude Code transcript",
+                tail,
+            });
+        }
+    }
+    out
 }
 
 fn fire_wake(
@@ -298,12 +380,14 @@ fn fire_wake(
     session_id: &str,
     budget: &Budget,
     trigger: WakeTrigger,
+    day: Option<&DayView>,
     now: DateTime<Utc>,
 ) {
-    let todos: HashMap<String, TodoInfo> = {
+    let (todos, targets): (HashMap<String, TodoInfo>, Vec<DiagnosisTarget>) = {
         let hb = HEARTBEAT.peek();
         let planner = deps.planner.peek();
-        hb.queued()
+        let queued: Vec<HeartbeatEvent> = hb.queued().into_iter().cloned().collect();
+        let todos = queued
             .iter()
             .filter_map(|e| e.todo_id.as_deref())
             .filter_map(|id| {
@@ -311,8 +395,10 @@ fn fire_wake(
                     (id.to_string(), TodoInfo { title: t.title.clone(), latest_progress: t.latest_progress.clone() })
                 })
             })
-            .collect()
+            .collect();
+        (todos, diagnose::diagnosis_targets(&queued))
     };
+    let diagnoses = diagnoses(deps, &targets, &todos);
     let trust = super::trust::trust_summary(settings.planner_enabled, settings.agent_time_enabled());
     let text = {
         let mut hb = HEARTBEAT.write();
@@ -327,22 +413,30 @@ fn fire_wake(
         }
         let why = wake::trigger_label(&hb, &trigger);
         let rule = wake::rule_label(&trigger, &hb);
+        // Every due anchor rides this wake, whatever triggered it.
+        let anchors: Vec<Anchor> = day.map(|d| due_anchors(&hb, d, now)).unwrap_or_default();
         let ids = hb.queue.clone();
         let choices = wake::choice_summary(&hb, &ids);
         let last_wake = wake::last_fired_at(&hb.trail);
         let budget_line = wake::budget_line(&hb.trail, budget, spent, now);
         let events = hb.drain_queue();
         let text = wake::build_wake_message(&WakeBrief {
+            ahead: day,
             why: why.clone(),
             rule,
+            anchors: &anchors,
             events: &events,
             last_wake,
             todos: &todos,
+            diagnoses: &diagnoses,
             trust: &trust,
             budget_line,
             now: now.with_timezone(&chrono::Local),
         });
         hb.record_wake(WakeRecord::fired(now, why, ids, choices));
+        if let Some(d) = day {
+            hb.mark_anchors_fired(anchors.iter().map(|a| a.key.as_str()), d.today, now);
+        }
         text
     };
     // The background chat queue sends it: its drain runs for any hydrated
@@ -378,11 +472,13 @@ fn complete_finished_wakes(
         return false;
     }
     let busy = session_busy(deps, session_id, streaming);
-    let done: Vec<(String, f64, String)> = {
+    let done: Vec<(String, f64, String, Vec<String>)> = {
         let state = deps.session_state.peek();
         let Some(session) = state.sessions.get(session_id) else {
             return false;
         };
+        let planner = deps.planner.peek();
+        let title = |id: &str| planner.todo(id).map(|t| t.title.clone());
         let log = deps.usage_log.peek();
         let oldest = open.iter().map(|(w, _)| w.at).min().unwrap_or(now);
         let spend: Vec<wake::Spend<'_>> = log
@@ -396,8 +492,12 @@ fn complete_finished_wakes(
                 // Only the newest wake can still be running; older ones
                 // ended when the next fired.
                 let busy = busy && until.is_none();
-                wake::wake_completion(w, *until, session_id, &session.messages, &spend, busy, now)
-                    .map(|(cost, outcome)| (w.id.clone(), cost, outcome))
+                wake::wake_completion(w, *until, session_id, &session.messages, &spend, busy, now).map(
+                    |(cost, outcome)| {
+                        let actions = wake::wake_actions(&session.messages, w.at, *until, title);
+                        (w.id.clone(), cost, outcome, actions)
+                    },
+                )
             })
             .collect()
     };
@@ -405,8 +505,8 @@ fn complete_finished_wakes(
         return false;
     }
     let mut hb = HEARTBEAT.write();
-    for (id, cost, outcome) in done {
-        hb.complete_wake(&id, Some(cost), Some(outcome));
+    for (id, cost, outcome, actions) in done {
+        hb.complete_wake(&id, Some(cost), Some(outcome), actions);
     }
     true
 }

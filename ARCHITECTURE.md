@@ -143,7 +143,9 @@ The Heartbeat is a harness that stays awake between chats. It watches the planne
 | Salience | `salience.rs` | `RulesSalience` routes each event to `Ignore`, `Note`, `Queue` or `WakeNow`. The `Salience` trait and `ShadowSalience` are the seam for a future learned model (Laya, a ModernBERT decision model); no shadow is wired in yet, and it needs labelled decisions first. |
 | State | `state.rs` | `HeartbeatState`: snapshots, event journal, decisions, wake queue, wake trail and the person's reactions. Pure methods; persisted as JSON under the `heartbeat_state` key in the `meta` table of `sessions.db` (`mod.rs`, `save_async`, with a generation guard so out-of-order writes never clobber newer state). |
 | Budget | `budget.rs` | Hourly cap (rolling 60 minutes, counting only wakes that ran) and daily spend cap (wake cost since local midnight). |
-| Wake | `wake.rs` | Decides `Idle` / `Busy` / `Defer` / `Fire`, builds the wake message, and reads back each finished wake's cost and outcome. |
+| Anchors | `anchors.rs` | `DayView` (workday bounds, meetings, capacity, deadlines, agent lane, captured from the planner) and the day anchors due from it; also renders the look-ahead. |
+| Diagnose | `diagnose.rs` | Picks the workers in trouble a wake carries and renders a capped tail of their record (Claude Code transcript or Hobbes chat). |
+| Wake | `wake.rs` | Decides `Idle` / `Busy` / `Defer` / `Fire` (with the skip rule), builds the wake message, and reads back each finished wake's cost, outcome and actions. |
 | Runtime | `runtime.rs` | The 30 s loop spawned from `main.rs`. Also drives CI polling (`ci.rs`, `gh run list`, every 5 minutes, at most 12 projects, projects with open agent work first). |
 | Trust | `trust.rs` | Scope gate for tool calls from the Heartbeat session. |
 
@@ -156,9 +158,10 @@ Only the runtime touches Dioxus signals. A tick is synchronous, so no signal gua
 | `worker_done` | planner | Normal | An agent to-do's worker moved to Done. |
 | `worker_needs_you` | planner | High | A worker moved to NeedsYou. |
 | `worker_stuck` | planner | High | A worker moved to Stuck. |
+| `worker_review` | planner | Normal | A run ended with an open item for the person (Review). |
 | `decision_raised` | planner | High | A new open worker decision. Supersedes a same-to-do `worker_needs_you`. |
 | `todo_overdue` | planner | Normal | An open to-do became past its deadline (raised once). |
-| `session_needs_attention` | fleet | Normal, High for a dispatched run | A Fleet session newly needs attention. |
+| `session_needs_attention` | fleet | High for a dispatched run | A dispatched run, or a session linked to an open agent to-do, newly needs attention. Sessions nobody dispatched are not journalled at all (the Fleet shows them), and prune drops any an older build left. |
 | `run_ended` | fleet | Low | A dispatched run stopped running (ended, gone, or idle). |
 | `ci_failed` | ci | High | A workflow's newest completed run on a branch failed. |
 | `ci_recovered` | ci | Normal | A success after a failure on the same workflow and branch. |
@@ -174,8 +177,8 @@ Rows are checked in order; the first match wins.
 | 3 | `ci_failed` on a project with open agent work | WakeNow |
 | 4 | `ci_failed` elsewhere | Queue |
 | 4b | `run_ended` from the Heartbeat session while auto-continue hands the result back | Note |
-| 5 | `worker_done` / `run_ended` / `session_needs_attention` the Heartbeat is waiting on (a pending timer intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
-| 6 | `worker_done`, `session_needs_attention` | Queue |
+| 5 | `worker_done` / `worker_review` / `run_ended` / `session_needs_attention` the Heartbeat is waiting on (a pending timer intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
+| 6 | `worker_done`, `worker_review`, `session_needs_attention` | Queue |
 | 7 | `run_ended` (the dispatching chat is continued anyway) | Note |
 | 8 | `todo_overdue`, `ci_recovered` | Queue |
 | 9 | anything else: Low becomes Note, Normal and High become Queue (confidence 0.5) | |
@@ -185,14 +188,25 @@ Unknown kinds never wake on their own. Every decision is journalled, and the per
 ### Wake logic
 
 - **WakeNow** events wake immediately, subject to budget and to the session being idle.
-- **Check-in:** a non-empty queue wakes for a check-in once an hour has passed since the last wake (or since the oldest queued event, before the first wake).
+- **Day anchors** (`anchors.rs`) wake from the day itself: the start of the workday (`planner_workday_start`, open for 2 hours), 45 minutes before each firm, busy calendar event (an external planner block; open until it starts), when today's plan is over capacity (`Capacity::over_by`, from the workday start to its end), and 30 minutes before the workday ends (`planner_workday_end`). Workday anchors skip weekends. Each fires at most once per local day (`HeartbeatState::fired_anchors`); an anchor held by the budget or a busy session retries on later polls until its window lapses. Every due anchor rides whichever wake fires. Needs the planner on and the planner source watched.
+- **Skip rule:** only an anchor or an actionable queued event wakes. Actionable: anything routed to WakeNow, `worker_needs_you`, `worker_stuck`, `worker_review`, `decision_raised`, `todo_overdue`, and a dispatched session needing attention. Everything else queued (plain `worker_done`, CI elsewhere, recoveries) waits and rides along with the next real wake.
+- **Check-in:** actionable queued events wake for a check-in once the oldest of them is 10 minutes old and a full hourly slot (`60 / wakes_per_hour` minutes) has passed since the last wake.
 - **Busy:** a session that is streaming, has queued messages, or is waiting on a permission request holds the wake; the next poll retries.
 - **Defer:** over budget, the runtime records a deferred wake in the trail and leaves the events queued. Deferred attempts do not count toward the hourly cap.
 - **Default budget:** 2 wakes per hour, $5.00 per day (`heartbeat_wakes_per_hour`, `heartbeat_daily_usd`).
 
 ### Delivery and read-back
 
-Firing a wake drains the queue into a wake message (headed `[Heartbeat wake]`: why, rule, what changed, what the Heartbeat may do, budget line, standing instructions) and queues it as a user message in the Heartbeat session's background chat queue, the same path an unfocused dispatch uses. The session is created on first use and hydrated from the store in the background if it is not open. Each wake's trail record is closed when its reply arrives: cost is the session's usage between this wake and the next, and the outcome is the first line of the last reply. A wake whose message never reached the session is closed as not delivered after 30 minutes; a wake waiting on an approval is held for up to 24 hours. Journal and trail are capped (500 events kept for 7 days, 200 wake records, 1000 reactions).
+Firing a wake drains the queue into a wake message and queues it as a user message in the Heartbeat session's background chat queue, the same path an unfocused dispatch uses. The message, headed `[Heartbeat wake]`, reads in this order:
+
+1. **The next few hours:** calendar events in the next 4 hours (local times), today's plan against capacity, deadlines today and tomorrow, overdue count, and the agent lane counts with the items that need the person.
+2. **Why** it woke, the rule, and any day anchors due.
+3. **What changed** since the last wake, and what is still queued from before.
+4. **Workers to diagnose:** for each worker in the wake that is stuck, needs the person, raised a decision or finished with an open item (at most 3), the end of its record capped at 1,500 characters: the Claude Code transcript digest (`fleet::transcript`, read from the Fleet row's `transcript_path`) or the last few messages of a Hobbes chat worker. Quoted behind `| ` so no line starts with `/`. It goes only to the person's own provider, like the rest of the wake.
+5. What the Heartbeat may do, and the budget line.
+6. **Standing instructions**, goal-directed: pick the single most useful thing for the day (prep for the next meeting, propose what to defer when over capacity, draft a follow-up, unblock a worker); for a diagnosed worker, name the actual blocker and fix it within the rules or raise one clear decision; write a handoff note; or say in one line that nothing is worth doing.
+
+The session is created on first use and hydrated from the store in the background if it is not open. Each wake's trail record is closed when its reply arrives: cost is the session's usage between this wake and the next, the outcome is the first line of the last reply, and the actions (`wake::wake_actions`) are one line per meaningful tool call the session made during the wake: "Dispatched '…'", "Raised: …", "Added to-do '…'", "Updated '…'", "Wrote a handoff", "Set a timer: …", and "Asked approval: <tool>" for anything held for the person (with "(approved)" or "(declined)" once answered). Read-only calls and failures are left out. A wake whose message never reached the session is closed as not delivered after 30 minutes; a wake waiting on an approval is held for up to 24 hours. Journal and trail are capped (500 events kept for 7 days, 200 wake records, 1000 reactions).
 
 ### Trust gate
 

@@ -2074,31 +2074,15 @@ Recent Messages:
                 // The model's response is expected to be a JSON string.
                 tracing::trace!("Raw LLM summary response: {} chars", part.text.len());
 
-                // Attempt to parse the text directly as JSON.
-                if let Ok(json_value) = serde_json::from_str(&part.text) {
+                // Whole text, fenced, or prose-wrapped JSON.
+                if let Some(json_value) = super::extract_json_object(&part.text) {
                     return Ok(json_value);
                 }
 
-                // If direct parsing fails, try to extract it from a markdown code block.
-                if let Some(start) = part.text.find('{') {
-                    if let Some(end) = part.text.rfind('}') {
-                        let potential_json = &part.text[start..=end];
-                        if let Ok(json_value) = serde_json::from_str(potential_json) {
-                            tracing::warn!("Successfully parsed JSON from markdown code block.");
-                            return Ok(json_value);
-                        }
-                    }
-                }
-
-                // If all parsing fails, return the raw text as the summary.
-                tracing::warn!(
-                    "Failed to parse LLM response as JSON. Returning raw text as summary."
-                );
-                let fallback_json = serde_json::json!({
-                    "summary": part.text,
-                    "entities": {}
-                });
-                return Ok(fallback_json);
+                // Truncated/unparseable: salvage the summary, never store
+                // raw JSON as the summary.
+                tracing::warn!("Failed to parse LLM response as JSON. Salvaging the summary text.");
+                return Ok(super::summary_fallback_value(&part.text));
             }
         }
 

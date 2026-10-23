@@ -64,7 +64,7 @@ impl StreamManagerContext {
                         || !cs.current_task.trim().is_empty())
                     .then(|| serde_json::to_value(cs).ok())
                     .flatten();
-                    (s.name.clone(), json, s.next_pending_timer())
+                    (s.display_title(), json, s.next_pending_timer())
                 }
                 None => (String::new(), None, None),
             }

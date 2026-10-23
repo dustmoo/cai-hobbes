@@ -63,9 +63,11 @@ pub struct WorkerSignal {
 /// 2. the worker waits on the person (pending gate or attention flag) → `NeedsYou`
 /// 3. an open worker-asked decision → `NeedsYou`
 /// 4. the worker is working → `Working`
-/// 5. the brief's `blocked` is set (and, by order, nothing is pending) → `Stuck`
-/// 6. the session ended → `Done`
-/// 7. otherwise → `None`
+/// 5. the brief's `blocked` is set on a live (not ended) run → `Stuck`
+/// 6. the session ended with a `blocked` open item → `Review` (finished, but
+///    there is something for the person to look at)
+/// 7. the session ended cleanly → `Done`
+/// 8. otherwise → `None`
 pub fn derive_agent_state(todo: &Todo, signal: Option<&WorkerSignal>) -> Option<AgentState> {
     if todo.status == TodoStatus::Completed {
         return Some(AgentState::Done);
@@ -82,16 +84,16 @@ pub fn derive_agent_state(todo: &Todo, signal: Option<&WorkerSignal>) -> Option<
     if s.status == WorkerStatus::Working {
         return Some(AgentState::Working);
     }
-    if s
+    let blocked = s
         .brief
         .as_ref()
         .and_then(|b| b.blocked.as_deref())
-        .is_some_and(|b| !b.trim().is_empty())
-    {
-        return Some(AgentState::Stuck);
-    }
+        .is_some_and(|b| !b.trim().is_empty());
     if s.ended {
-        return Some(AgentState::Done);
+        return Some(if blocked { AgentState::Review } else { AgentState::Done });
+    }
+    if blocked {
+        return Some(AgentState::Stuck);
     }
     None
 }
@@ -107,7 +109,7 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
     if todo.lane != Lane::Agent {
         return false;
     }
-    let before = (todo.agent_state, todo.decision.clone());
+    let before = (todo.agent_state, todo.decision.clone(), todo.open_item.clone());
 
     let waiting = signal.status == WorkerStatus::WaitingOnUser || signal.gate.is_some();
     let synthesized_open = todo
@@ -132,7 +134,14 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
     if let Some(state) = derive_agent_state(todo, Some(signal)) {
         todo.agent_state = Some(state);
     }
-    let changed = before != (todo.agent_state, todo.decision.clone());
+    todo.open_item = signal
+        .brief
+        .as_ref()
+        .and_then(|b| b.blocked.as_deref())
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string);
+    let changed = before != (todo.agent_state, todo.decision.clone(), todo.open_item.clone());
     if changed {
         todo.updated_at = now;
     }
@@ -143,7 +152,7 @@ fn synthesize_decision(signal: &WorkerSignal, now: DateTime<Utc>) -> Option<Deci
     let (question, options, source) = if let Some(g) = &signal.gate {
         (
             format!("Allow {}? {}", g.tool_name, g.input_summary.trim()),
-            vec!["Approve".to_string(), "Deny".to_string()],
+            Vec::new(),
             DecisionSource::Gate {
                 request_id: g.request_id.clone(),
             },
@@ -219,8 +228,8 @@ pub fn ask_decision(
 /// Record the person's answer to an open decision. Returns the log entry;
 /// delivery to the worker happens at the edge, which then calls
 /// [`record_delivery`]. Gate decisions are refused: a permission gate is the
-/// person's own Approve/Deny in the Fleet or decision-queue UI
-/// (`FleetShared::resolve_gate`), never something the model answers.
+/// prompt the person answers in the Claude Code terminal, never something
+/// the model answers.
 pub fn resolve_decision(
     state: &mut PlannerState,
     todo_id: &str,
@@ -239,8 +248,8 @@ pub fn resolve_decision(
         .ok_or_else(|| format!("'{}' has no open decision.", title))?;
     if matches!(decision.source, DecisionSource::Gate { .. }) {
         return Err(format!(
-            "'{}' is waiting on a permission gate. Only the user can approve or deny it, \
-             in the Fleet or the decision queue — it cannot be answered by a tool.",
+            "'{}' is waiting on a permission gate. Only the user can answer it, \
+             in the Claude Code terminal — it cannot be answered by a tool.",
             title
         ));
     }
@@ -334,6 +343,8 @@ pub struct AgentLane<'a> {
     pub working: Vec<&'a Todo>,
     pub needs_you: Vec<&'a Todo>,
     pub stuck: Vec<&'a Todo>,
+    /// Runs that ended with an open item still to look at.
+    pub review: Vec<&'a Todo>,
     /// Agent to-dos that reached `Done` (or were completed) on `today`.
     pub done_today: Vec<&'a Todo>,
 }
@@ -344,6 +355,7 @@ impl AgentLane<'_> {
             && self.working.is_empty()
             && self.needs_you.is_empty()
             && self.stuck.is_empty()
+            && self.review.is_empty()
             && self.done_today.is_empty()
     }
 
@@ -353,6 +365,7 @@ impl AgentLane<'_> {
             (self.working.len(), "working"),
             (self.needs_you.len(), "needs you"),
             (self.stuck.len(), "stuck"),
+            (self.review.len(), "to review"),
             (self.to_dispatch.len(), "to dispatch"),
             (self.done_today.len(), "done today"),
         ]
@@ -390,6 +403,7 @@ pub fn agent_lane(todos: &[Todo], today: NaiveDate) -> AgentLane<'_> {
             Some(AgentState::NeedsYou) => lane.needs_you.push(t),
             Some(AgentState::Working) => lane.working.push(t),
             Some(AgentState::Stuck) => lane.stuck.push(t),
+            Some(AgentState::Review) => lane.review.push(t),
             Some(AgentState::Queued) | None => {
                 if t.linked_fleet_session.is_some() && t.agent_state.is_none() {
                     lane.working.push(t);
@@ -431,7 +445,7 @@ pub fn decision_line(t: &Todo) -> Option<String> {
         extras.push(w.clone());
     }
     if matches!(d.source, DecisionSource::Gate { .. }) {
-        extras.push("permission gate — the user approves in the Fleet".into());
+        extras.push("permission prompt — the user answers it in the terminal".into());
     }
     Some(format!("[{}] {} ({})", t.id, d.question, extras.join("; ")))
 }
@@ -491,6 +505,14 @@ mod tests {
             next: None,
         });
         assert_eq!(derive_agent_state(&t, Some(&blocked)), Some(AgentState::Stuck));
+        // An ended run with an open item is finished, not stuck.
+        let mut ended_blocked = blocked.clone();
+        ended_blocked.ended = true;
+        assert_eq!(derive_agent_state(&t, Some(&ended_blocked)), Some(AgentState::Review));
+        // A completed to-do stays Done whatever the brief says.
+        let mut completed = agent_todo();
+        completed.mark_completed(Utc::now());
+        assert_eq!(derive_agent_state(&completed, Some(&ended_blocked)), Some(AgentState::Done));
         // Blocked text in the headline alone is NOT read as stuck.
         let mut headline_only = signal(WorkerStatus::Idle);
         headline_only.brief = Some(Brief { did: "blocked on review".into(), blocked: None, next: None });
@@ -520,10 +542,10 @@ mod tests {
         assert_eq!(t.agent_state, Some(AgentState::NeedsYou));
         let d = t.decision.clone().unwrap();
         assert!(d.question.contains("Bash") && d.question.contains("npm publish"));
-        assert_eq!(d.options, vec!["Approve", "Deny"]);
+        assert!(d.options.is_empty(), "answered in the terminal: no Approve/Deny options");
         assert!(matches!(d.source, DecisionSource::Gate { .. }));
 
-        // Approved in the Fleet: the worker resumes; the synthesized
+        // Answered in the terminal: the worker resumes; the synthesized
         // decision clears itself.
         assert!(apply_worker_signal(&mut t, &signal(WorkerStatus::Working), now));
         assert!(t.decision.is_none());
@@ -570,7 +592,7 @@ mod tests {
         assert_eq!(t.agent_state, Some(AgentState::Queued));
         assert!(t.latest_progress.as_deref().unwrap().contains("Move to Phase 3"));
 
-        // Gate decisions are the user's own Approve/Deny.
+        // Gate decisions are answered by the user in the terminal.
         let mut g = agent_todo();
         let mut gated = signal(WorkerStatus::WaitingOnUser);
         gated.gate = Some(GateSignal { request_id: "g".into(), tool_name: "Bash".into(), input_summary: "rm".into() });
@@ -600,17 +622,20 @@ mod tests {
         ask_decision(&mut needs, "?", vec![], None, None, None, now).unwrap();
         let mut stuck = agent_todo();
         stuck.agent_state = Some(AgentState::Stuck);
+        let mut review = agent_todo();
+        review.agent_state = Some(AgentState::Review);
         let mut done = agent_todo();
         done.mark_completed(now);
         let human = Todo::new("h", 0.0);
-        let todos = vec![queued, working, needs, stuck, done, human];
+        let todos = vec![queued, working, needs, stuck, review, done, human];
         let lane = agent_lane(&todos, today);
         assert_eq!(lane.to_dispatch.len(), 1);
         assert_eq!(lane.working.len(), 1);
         assert_eq!(lane.needs_you.len(), 1);
         assert_eq!(lane.stuck.len(), 1);
+        assert_eq!(lane.review.len(), 1);
         assert_eq!(lane.done_today.len(), 1);
-        assert_eq!(lane.counts_line(), "1 working · 1 needs you · 1 stuck · 1 to dispatch · 1 done today");
+        assert_eq!(lane.counts_line(), "1 working · 1 needs you · 1 stuck · 1 to review · 1 to dispatch · 1 done today");
         assert_eq!(needs_you(&todos).len(), 1);
         assert!(decision_line(lane.needs_you[0]).unwrap().contains("about 1 min"));
     }

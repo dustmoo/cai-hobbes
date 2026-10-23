@@ -1,4 +1,4 @@
-//! Fleet observation & approval gates (Phase B, Pro).
+//! Fleet observation (Phase B, Pro).
 //!
 //! Every Claude Code session on the machine reports in through global
 //! `type: "http"` hooks registered in `~/.claude/settings.json`
@@ -50,6 +50,7 @@ pub mod replay;
 pub mod hooks_config;
 pub mod server;
 pub mod store;
+pub mod terminal_focus;
 pub mod transcript;
 
 use std::collections::{BTreeMap, HashMap};
@@ -144,11 +145,16 @@ impl FleetStatus {
     }
 }
 
-/// A held `PermissionRequest` awaiting an in-app Approve/Deny.
+/// A Claude Code permission prompt the session is waiting on. Display only:
+/// the hook is answered at once with "no decision", so the user answers the
+/// prompt in the terminal (it carries choices the Fleet can't offer —
+/// always-allow, "tell Claude what to do instead", AskUserQuestion options).
+/// Cleared when the session moves on (a tool runs, the turn stops, a prompt
+/// is submitted).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingGate {
     /// Hobbes-generated id (the hook payload carries no `tool_use_id` for
-    /// PermissionRequest) — keys the oneshot in [`FleetShared::gates`].
+    /// PermissionRequest); keys the Planner's gate decision.
     pub request_id: String,
     pub tool_name: String,
     /// Compact JSON of `tool_input`, truncated for display.
@@ -204,10 +210,6 @@ pub struct FleetSession {
     /// zeroed them out.
     #[serde(default)]
     pub day_seconds: BTreeMap<NaiveDate, u32>,
-    /// When set, PermissionRequests for this session are answered with an
-    /// immediate empty-body passthrough (terminal prompt appears; no UI hold).
-    #[serde(default)]
-    pub auto_passthrough: bool,
     /// Set on `SessionEnd`; ended rows leave the live map but stay in the DB.
     #[serde(default)]
     pub ended_at: Option<DateTime<Utc>>,
@@ -260,6 +262,9 @@ pub struct FleetSession {
     /// When a `Waiting` session's next timer is due.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake_at: Option<DateTime<Utc>>,
+    /// The terminal a Claude Code session runs in, from hook headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<terminal_focus::TerminalHint>,
 }
 
 impl FleetSession {
@@ -273,7 +278,6 @@ impl FleetSession {
             working_since: None,
             day_minutes: BTreeMap::new(),
             day_seconds: BTreeMap::new(),
-            auto_passthrough: false,
             ended_at: None,
             pending_gate: None,
             transcript_path: None,
@@ -288,6 +292,7 @@ impl FleetSession {
             dispatched_from: None,
             continuation_sent: false,
             wake_at: None,
+            terminal: None,
         }
     }
 
@@ -757,55 +762,30 @@ pub fn note_transcript_and_dirty(
     }
 }
 
-/// How a held gate was resolved.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GateOutcome {
-    Allow,
-    Deny,
-    /// Hobbes stepped aside (timeout margin hit or auto-passthrough): the
-    /// hook gets an empty 2xx body and the terminal prompt appears.
-    Passthrough,
-}
-
-impl GateOutcome {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            GateOutcome::Allow => "allow",
-            GateOutcome::Deny => "deny",
-            GateOutcome::Passthrough => "passthrough",
-        }
-    }
-}
-
-/// Pure state transition for a resolved gate. Allow/Deny mean the turn
-/// resumes (a fresh Working span opens); passthrough keeps the session in
-/// NeedsAttention — the user still has a terminal prompt to answer — but
-/// clears the no-longer-actionable pending gate.
-pub fn resolve_gate_in_state(
+/// Fold a terminal hint captured from hook headers into the session — the
+/// live-map entry and its persisted clone in `changed` in lockstep. An empty
+/// hint (variables unset or stripped by policy) changes nothing. When the
+/// row isn't already in `changed` but the hint moved, the row is added so it
+/// persists.
+pub fn apply_terminal_hint(
     state: &mut FleetState,
-    request_id: &str,
-    outcome: GateOutcome,
-    now: DateTime<Utc>,
-) -> Option<FleetSession> {
-    let session = state.sessions.values_mut().find(|s| {
-        s.pending_gate
-            .as_ref()
-            .is_some_and(|g| g.request_id == request_id)
-    })?;
-    session.pending_gate = None;
-    match outcome {
-        GateOutcome::Allow | GateOutcome::Deny => {
-            session.status = FleetStatus::Working;
-            session.attention_at = None;
-            session.working_since = Some(now);
-            session.last_event_at = now;
-        }
-        GateOutcome::Passthrough => {
-            // Status stays NeedsAttention(Gate): the decision moved to the
-            // terminal, the user is still needed.
-        }
+    changed: &mut Vec<FleetSession>,
+    session_id: &str,
+    hint: &terminal_focus::TerminalHint,
+) {
+    if hint.is_empty() && hint.started_at.is_none() {
+        return;
     }
-    Some(session.clone())
+    let Some(s) = state.sessions.get_mut(session_id) else { return };
+    let moved = s.terminal.get_or_insert_with(Default::default).merge_from(hint);
+    if !moved {
+        return;
+    }
+    let row = s.clone();
+    match changed.iter_mut().find(|r| r.id == session_id) {
+        Some(r) => r.terminal = row.terminal,
+        None => changed.push(row),
+    }
 }
 
 /// Staleness sweep: Working sessions silent for over [`STALENESS_MINUTES`]
@@ -1194,8 +1174,6 @@ pub fn agent_lane_minutes(pro: bool, in_app_agent: u32, fleet: u32) -> u32 {
 /// `.await`.
 pub struct FleetShared {
     pub state: Mutex<FleetState>,
-    /// Held PermissionRequest responders, keyed by request id.
-    gates: Mutex<HashMap<String, tokio::sync::oneshot::Sender<GateOutcome>>>,
     /// Bumped after every state change; the UI drain loop subscribes.
     notify: tokio::sync::watch::Sender<u64>,
     /// Finished dispatched runs whose parent chats are owed a continuation.
@@ -1214,7 +1192,6 @@ impl FleetShared {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(FleetState::default()),
-            gates: Mutex::new(HashMap::new()),
             notify: tokio::sync::watch::channel(0).0,
             continuations: Mutex::new(Vec::new()),
         }
@@ -1259,76 +1236,14 @@ impl FleetShared {
         )
     }
 
-    pub(crate) fn register_gate(
-        &self,
-        request_id: &str,
-    ) -> tokio::sync::oneshot::Receiver<GateOutcome> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.gates
-            .lock()
-            .expect("fleet gates lock poisoned")
-            .insert(request_id.to_string(), tx);
-        rx
-    }
-
-    pub(crate) fn take_gate(
-        &self,
-        request_id: &str,
-    ) -> Option<tokio::sync::oneshot::Sender<GateOutcome>> {
-        self.gates
-            .lock()
-            .expect("fleet gates lock poisoned")
-            .remove(request_id)
-    }
-
-    /// UI resolution of a held gate. No-op when the gate already timed out
-    /// (its responder is gone) — the server task owns all follow-up state
-    /// changes and event logging.
-    pub fn resolve_gate(&self, request_id: &str, allow: bool) {
-        if let Some(tx) = self.take_gate(request_id) {
-            let _ = tx.send(if allow {
-                GateOutcome::Allow
-            } else {
-                GateOutcome::Deny
-            });
-        }
-    }
-
-    /// Per-session auto-passthrough toggle (UI). Persists and pokes.
-    pub fn set_auto_passthrough(&self, session_id: &str, on: bool) {
+    /// Hide a session from the board (UI). Persists the ended row, logs a
+    /// `Dismissed` ledger event, and pokes.
+    pub fn dismiss_session(&self, session_id: &str) {
         let row = {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
-            match state.sessions.get_mut(session_id) {
-                Some(s) => {
-                    s.auto_passthrough = on;
-                    Some(s.clone())
-                }
-                None => None,
-            }
-        };
-        if let Some(row) = row {
-            store::persist_sessions(std::slice::from_ref(&row));
-            self.poke();
-        }
-    }
-
-    /// Hide a session from the board (UI). Any held gate is released as a
-    /// passthrough so a still-alive hook falls back to its terminal prompt
-    /// rather than hanging. Persists the ended row, logs a `Dismissed`
-    /// ledger event, and pokes.
-    pub fn dismiss_session(&self, session_id: &str) {
-        let (row, gate_id) = {
-            let mut state = self.state.lock().expect("fleet state lock poisoned");
-            let gate_id = state
-                .sessions
-                .get(session_id)
-                .and_then(|s| s.pending_gate.as_ref().map(|g| g.request_id.clone()));
-            (dismiss_in_state(&mut state, session_id), gate_id)
+            dismiss_in_state(&mut state, session_id)
         };
         let Some(row) = row else { return };
-        if let Some(tx) = gate_id.as_deref().and_then(|id| self.take_gate(id)) {
-            let _ = tx.send(GateOutcome::Passthrough);
-        }
         store::persist_sessions(std::slice::from_ref(&row));
         store::append_event(session_id, "Dismissed", "{}");
         self.poke();
@@ -1502,7 +1417,7 @@ mod tests {
         FleetEvent::SessionStart {
             session_id: id.into(),
             cwd: "/Users/x/dev/hobbes".into(),
-            reason: "startup".into(),
+            source: "startup".into(),
         }
     }
 
@@ -1744,7 +1659,7 @@ mod tests {
             &FleetEvent::SessionStart {
                 session_id: "s2".into(),
                 cwd: "/Users/x/dev/hobbes".into(), // same name as s1
-                reason: "startup".into(),
+                source: "startup".into(),
             },
             t0,
         );
@@ -1753,7 +1668,7 @@ mod tests {
             &FleetEvent::SessionStart {
                 session_id: "s3".into(),
                 cwd: "/Users/x/dev/puget".into(),
-                reason: "startup".into(),
+                source: "startup".into(),
             },
             t0,
         );
@@ -2156,48 +2071,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_gate_allow_resumes_working() {
+    fn terminal_hint_folds_into_the_live_row_and_its_persisted_clone() {
+        use terminal_focus::TerminalHint;
         let mut state = FleetState::default();
         let now = utc("2026-08-25T10:00:00Z");
-        reduce(
+        let mut changed = reduce(
             &mut state,
-            &FleetEvent::PermissionRequest {
-                session_id: "s1".into(),
-                cwd: "/x".into(),
-                request_id: "g1".into(),
-                tool_name: "Bash".into(),
-                tool_input: serde_json::json!({}),
-            },
+            &FleetEvent::SessionStart { session_id: "s1".into(), cwd: "/x".into(), source: "startup".into() },
             now,
         );
-        let later = now + chrono::Duration::minutes(1);
-        let row = resolve_gate_in_state(&mut state, "g1", GateOutcome::Allow, later).unwrap();
-        assert_eq!(row.status, FleetStatus::Working);
-        assert_eq!(row.working_since, Some(later));
-        assert!(row.pending_gate.is_none());
-        // Unknown request id: no-op.
-        assert!(resolve_gate_in_state(&mut state, "nope", GateOutcome::Deny, later).is_none());
-    }
+        let hint = TerminalHint {
+            bundle_id: Some(terminal_focus::ITERM_BUNDLE.into()),
+            started_at: Some(now),
+            ..Default::default()
+        };
+        apply_terminal_hint(&mut state, &mut changed, "s1", &hint);
+        assert_eq!(state.sessions["s1"].terminal.as_ref(), Some(&hint));
+        assert_eq!(changed[0].terminal.as_ref(), Some(&hint));
 
-    #[test]
-    fn resolve_gate_passthrough_keeps_needs_attention() {
-        let mut state = FleetState::default();
-        let now = utc("2026-08-25T10:00:00Z");
-        reduce(
-            &mut state,
-            &FleetEvent::PermissionRequest {
-                session_id: "s1".into(),
-                cwd: "/x".into(),
-                request_id: "g1".into(),
-                tool_name: "Bash".into(),
-                tool_input: serde_json::json!({}),
-            },
-            now,
-        );
-        let row =
-            resolve_gate_in_state(&mut state, "g1", GateOutcome::Passthrough, now).unwrap();
-        assert!(row.status.needs_attention(), "terminal prompt still waits on the user");
-        assert!(row.pending_gate.is_none(), "gate is no longer actionable in-app");
+        // An empty hint changes nothing; an unchanged one adds no row.
+        let mut none = Vec::new();
+        apply_terminal_hint(&mut state, &mut none, "s1", &TerminalHint::default());
+        apply_terminal_hint(&mut state, &mut none, "s1", &hint);
+        assert!(none.is_empty());
+        // A moved hint for a row not in `changed` is added so it persists.
+        let newer = TerminalHint { iterm_session: Some("w1t1p0:x".into()), ..Default::default() };
+        apply_terminal_hint(&mut state, &mut none, "s1", &newer);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].terminal.as_ref().unwrap().iterm_session.as_deref(), Some("w1t1p0:x"));
+        // Unknown session: no-op.
+        apply_terminal_hint(&mut state, &mut none, "nope", &newer);
+        assert_eq!(none.len(), 1);
     }
 
     #[test]
@@ -2385,7 +2289,10 @@ mod tests {
         );
         let mut s = state.sessions["s1"].clone();
         s.day_minutes.insert(date("2026-08-25"), 12);
-        s.auto_passthrough = true;
+        s.terminal = Some(terminal_focus::TerminalHint {
+            term_program: Some("iTerm.app".into()),
+            ..Default::default()
+        });
         let json = serde_json::to_string(&s).unwrap();
         let back: FleetSession = serde_json::from_str(&json).unwrap();
         assert_eq!(back, s);
@@ -2881,17 +2788,6 @@ mod tests {
             "last_event_at":"2026-08-25T10:00:00Z","working_since":null}"#;
         let old: FleetSession = serde_json::from_str(legacy).unwrap();
         assert!(old.brief.is_none() && old.transcript_path.is_none() && old.brief_dirty_at.is_none());
-    }
-
-    #[test]
-    fn shared_gate_registry_round_trips() {
-        let shared = FleetShared::new();
-        let mut rx = shared.register_gate("g1");
-        shared.resolve_gate("g1", true);
-        assert_eq!(rx.try_recv().unwrap(), GateOutcome::Allow);
-        // Resolving an unknown gate is a no-op.
-        shared.resolve_gate("g2", false);
-        assert!(shared.take_gate("g1").is_none());
     }
 
     #[test]

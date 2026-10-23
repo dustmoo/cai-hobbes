@@ -24,6 +24,8 @@ use crate::todo::PlannerState;
 pub const KIND_WORKER_DONE: &str = "worker_done";
 pub const KIND_WORKER_NEEDS_YOU: &str = "worker_needs_you";
 pub const KIND_WORKER_STUCK: &str = "worker_stuck";
+/// A run ended with an open item for the person (`AgentState::Review`).
+pub const KIND_WORKER_REVIEW: &str = "worker_review";
 pub const KIND_TODO_OVERDUE: &str = "todo_overdue";
 pub const KIND_DECISION_RAISED: &str = "decision_raised";
 pub const KIND_SESSION_NEEDS_ATTENTION: &str = "session_needs_attention";
@@ -137,8 +139,8 @@ fn todo_event(
 
 /// Diff two planner snapshots:
 /// - an agent-lane to-do whose `agent_state` moved into Done / NeedsYou /
-///   Stuck → `worker_done` (Normal) / `worker_needs_you` (High) /
-///   `worker_stuck` (High);
+///   Stuck / Review → `worker_done` (Normal) / `worker_needs_you` (High) /
+///   `worker_stuck` (High) / `worker_review` (Normal);
 /// - a to-do that became overdue → `todo_overdue` (Normal), once — it stays
 ///   overdue in every later snapshot, so it never fires again;
 /// - a new open worker decision → `decision_raised` (High). It supersedes a
@@ -185,6 +187,11 @@ pub fn planner_events(
                         KIND_WORKER_STUCK,
                         format!("Agent working on \"{}\" is stuck", c.title),
                         Urgency::High,
+                    )),
+                    Some(AgentState::Review) => Some((
+                        KIND_WORKER_REVIEW,
+                        format!("Agent finished \"{}\" with an open item to review", c.title),
+                        Urgency::Normal,
                     )),
                     _ => None,
                 };
@@ -370,6 +377,34 @@ pub fn fleet_events(
         }
     }
     out
+}
+
+/// A `session_needs_attention` event about a session nobody dispatched and
+/// no to-do is linked to: the person's own terminal or tab. The Fleet already
+/// shows those, so the Heartbeat neither journals nor queues them.
+pub fn is_fleet_noise(ev: &HeartbeatEvent) -> bool {
+    ev.kind == KIND_SESSION_NEEDS_ATTENTION && ev.todo_id.is_none() && ev.dispatched_from.is_none()
+}
+
+/// Drop [`is_fleet_noise`] events from a fleet diff. `workers` maps the
+/// session linked to an open agent to-do (a Hobbes chat worker, or a run
+/// linked after the fact) to that to-do: such a session's attention event is
+/// kept and tagged with the to-do, so it reads as worker news.
+pub fn filter_fleet_noise(
+    events: Vec<HeartbeatEvent>,
+    workers: &HashMap<String, String>,
+) -> Vec<HeartbeatEvent> {
+    events
+        .into_iter()
+        .filter_map(|mut ev| {
+            if ev.kind == KIND_SESSION_NEEDS_ATTENTION && ev.todo_id.is_none() {
+                if let Some(todo) = ev.session_id.as_ref().and_then(|s| workers.get(s)) {
+                    ev.todo_id = Some(todo.clone());
+                }
+            }
+            (!is_fleet_noise(&ev)).then_some(ev)
+        })
+        .collect()
 }
 
 // ── CI ──────────────────────────────────────────────────────────────────────
@@ -631,6 +666,36 @@ mod tests {
         assert_eq!(evs[0].urgency, Urgency::High);
         assert_eq!(evs[0].todo_id.as_deref(), Some("todo-1"));
         assert_eq!(evs[0].dispatched_from.as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn review_transition_raises_worker_review() {
+        let prev = snap(&[agent_todo("a", AgentState::Working)], day(20));
+        let cur = snap(&[agent_todo("a", AgentState::Review)], day(20));
+        let evs = planner_events(&prev, &cur, t0());
+        assert_eq!(kinds(&evs), vec![KIND_WORKER_REVIEW]);
+        assert_eq!(evs[0].urgency, Urgency::Normal);
+    }
+
+    #[test]
+    fn undispatched_attention_is_noise_unless_a_worker() {
+        let prev = fleet(&[]);
+        let cur = fleet(&[
+            ("mine", fs(FleetPhase::NeedsAttention, false)),
+            ("chat-worker", fs(FleetPhase::NeedsAttention, false)),
+            ("run", fs(FleetPhase::NeedsAttention, true)),
+        ]);
+        let evs = fleet_events(&prev, &cur, t0());
+        assert_eq!(evs.len(), 3);
+        assert!(evs.iter().filter(|e| is_fleet_noise(e)).count() == 2);
+        let workers = HashMap::from([("chat-worker".to_string(), "todo-9".to_string())]);
+        let kept = filter_fleet_noise(evs, &workers);
+        let mut ids: Vec<_> = kept.iter().map(|e| e.session_id.clone().unwrap()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["chat-worker".to_string(), "run".to_string()]);
+        let worker = kept.iter().find(|e| e.session_id.as_deref() == Some("chat-worker")).unwrap();
+        assert_eq!(worker.todo_id.as_deref(), Some("todo-9"));
+        assert!(kept.iter().all(|e| !is_fleet_noise(e)));
     }
 
     #[test]
