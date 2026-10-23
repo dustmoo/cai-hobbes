@@ -547,6 +547,16 @@ impl Session {
         move_message_to_end(&mut self.messages, message_id, ts)
     }
 
+    /// When this tab's earliest pending timer is due, if it has one.
+    /// See also [`SessionState::timer_waits`].
+    pub fn next_pending_timer(&self) -> Option<DateTime<Utc>> {
+        self.scheduled_timers
+            .iter()
+            .filter(|t| t.status == crate::timers::TimerStatus::Pending)
+            .map(|t| t.fire_at)
+            .min()
+    }
+
     pub fn increment_turn_count(&mut self) {
         self.current_ai_turn_count += 1;
     }
@@ -1668,6 +1678,14 @@ impl SessionState {
                 store::next_seq(),
             ),
         ]
+    }
+
+    /// Hydrated tabs with a pending timer, and when the earliest is due.
+    pub fn timer_waits(&self) -> std::collections::HashMap<String, DateTime<Utc>> {
+        self.sessions
+            .iter()
+            .filter_map(|(id, s)| s.next_pending_timer().map(|at| (id.clone(), at)))
+            .collect()
     }
 
     pub fn create_session_raw(&mut self, initial_profile: Option<String>) -> String {

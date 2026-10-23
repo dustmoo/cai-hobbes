@@ -1,6 +1,6 @@
 use super::super::planner_view::PlannerSelection;
 use super::DEFAULT_PROFILE_COLOR;
-use crate::fleet::{FleetOrigin, FleetSession, FleetStatus};
+use crate::fleet::{FleetOrigin, FleetSession};
 use crate::todo::model::{self, FocusActor, FocusSession, Priority, TimeBlock, Todo, TodoStatus};
 use crate::todo::views::{self, ListOrder, TodoView};
 use crate::todo::PlannerState;
@@ -94,12 +94,7 @@ pub(super) fn who_state(
         return WhoState::YouFocusing;
     }
 
-    let fleet_working = fleet.is_some_and(|f| {
-        matches!(
-            f.status,
-            FleetStatus::Working | FleetStatus::WorkingBackground
-        )
-    });
+    let fleet_working = fleet.is_some_and(|f| f.status.is_active());
     let agent_focus = live_focus.is_some_and(|f| matches!(f.actor, FocusActor::Agent { .. }));
     let hobbes_carrier = fleet.is_some_and(|f| f.origin == FleetOrigin::Hobbes);
 
@@ -306,6 +301,7 @@ mod tests {
             dispatched_todo: None,
             dispatched_from: None,
             continuation_sent: false,
+            wake_at: None,
         };
         s.working_since = matches!(
             s.status,
@@ -364,12 +360,15 @@ mod tests {
         open.linked_fleet_session = Some("fs_1".into());
         let fs = fleet_session(FleetOrigin::Hobbes, FleetStatus::WorkingBackground);
         assert_eq!(
-            who_state(&open, None, Some(&fs), badge),
+            who_state(&open, None, Some(&fs), badge.clone()),
             WhoState::Hobbes {
                 initial: "W".into(),
                 color: "bg-purple-600".into()
             }
         );
+        // A Hobbes tab waiting on its own timer is still on the job.
+        let waiting = fleet_session(FleetOrigin::Hobbes, FleetStatus::Waiting);
+        assert!(matches!(who_state(&open, None, Some(&waiting), badge), WhoState::Hobbes { .. }));
     }
 
     #[test]

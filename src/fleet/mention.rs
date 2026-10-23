@@ -99,6 +99,13 @@ fn render_session(s: &FleetSession, now: DateTime<Utc>, today: NaiveDate) -> Str
     let status = match &s.status {
         super::FleetStatus::Working => "working".to_string(),
         super::FleetStatus::WorkingBackground => "working (background agents)".to_string(),
+        super::FleetStatus::Waiting => match s.wake_at {
+            Some(w) => format!(
+                "waiting on a timer (due {})",
+                w.with_timezone(&chrono::Local).format("%-I:%M %p")
+            ),
+            None => "waiting on a timer".to_string(),
+        },
         super::FleetStatus::Idle => "idle".to_string(),
         super::FleetStatus::NeedsAttention(super::AttentionKind::Gate) => {
             "waiting on a permission approval".to_string()

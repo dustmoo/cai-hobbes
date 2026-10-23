@@ -56,7 +56,8 @@ pub fn reconcile_verdict(
             let typed = latest_typed_user_ts?;
             (typed > alert).then_some(Correction::ClearAttention)
         }
-        FleetStatus::Idle => None,
+        // Hobbes tabs only (no transcript); the sweep idles an overdue wait.
+        FleetStatus::Waiting | FleetStatus::Idle => None,
     }
 }
 

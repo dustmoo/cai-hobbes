@@ -334,6 +334,30 @@ mod tab_cycle_tests {
     }
 }
 
+/// Keep the fleet's Waiting state in step with these tabs' timers after some
+/// fired (or at startup): a tab between turns with a timer still pending is
+/// Waiting until it; one whose last timer fired goes back to idle. Tabs
+/// mid-turn are left alone: their turn end reports the same thing.
+fn sync_timer_waits(session_state: Signal<SessionState>, ids: impl IntoIterator<Item = String>) {
+    let streaming = STREAMING_SESSIONS.peek().clone();
+    for id in ids {
+        if streaming.contains(&id) {
+            continue;
+        }
+        let Some((name, next)) = session_state
+            .peek()
+            .sessions
+            .get(&id)
+            .map(|s| (s.name.clone(), s.next_pending_timer()))
+        else {
+            continue;
+        };
+        if next.is_some() || fleet::bridge::is_waiting(&id) {
+            fleet::bridge::report(&id, &name, fleet::bridge::turn_end_signal(next));
+        }
+    }
+}
+
 /// Show a timer toast and auto-clear it after a few seconds (unless a newer
 /// toast replaced it in the meantime). Avoids the reminder lingering forever.
 fn flash_timer_toast(msg: String) {
@@ -2046,6 +2070,16 @@ fn app() -> Element {
                         );
                     }
                 }
+                // Tabs still holding a pending timer (or whose timers fired
+                // while away) show their waiting state from the start.
+                let timer_tabs: Vec<String> = session_state
+                    .peek()
+                    .sessions
+                    .values()
+                    .filter(|s| !s.scheduled_timers.is_empty())
+                    .map(|s| s.id.clone())
+                    .collect();
+                sync_timer_waits(session_state, timer_tabs);
                 if !missed.is_empty() {
                     crate::session::SessionState::save_async(&session_state.read(), None);
                     flash_timer_toast(format!(
@@ -2090,6 +2124,9 @@ fn app() -> Element {
                         );
                     }
                     crate::session::SessionState::save_async(&session_state.read(), None);
+                    let fired_tabs: std::collections::HashSet<String> =
+                        fired.iter().map(|t| t.session_id.clone()).collect();
+                    sync_timer_waits(session_state, fired_tabs);
 
                     for timer in fired {
                         // Only steal focus / raise the window if the user opted

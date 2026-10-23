@@ -69,6 +69,7 @@ fn status_chip(status: &FleetStatus) -> (&'static str, &'static str) {
     match status {
         FleetStatus::Working => ("working", "#34d399"),
         FleetStatus::WorkingBackground => ("background agents", "#2dd4bf"),
+        FleetStatus::Waiting => ("waiting on a timer", "#60a5fa"),
         FleetStatus::Idle => ("idle", "#94a3b8"),
         FleetStatus::NeedsAttention(AttentionKind::Gate) => ("waiting on you", "#f59e0b"),
         FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) => {
@@ -91,6 +92,18 @@ fn background_label(status: &FleetStatus, last_event_at: DateTime<Utc>, now: Dat
     } else {
         Some("background".to_string())
     }
+}
+
+/// Visible label for a tab waiting on its own timer: when it picks back up
+/// (local time), so a quiet card doesn't read as idle.
+fn waiting_label(status: &FleetStatus, wake_at: Option<DateTime<Utc>>) -> Option<String> {
+    if *status != FleetStatus::Waiting {
+        return None;
+    }
+    Some(match wake_at {
+        Some(w) => format!("timer · {}", w.with_timezone(&chrono::Local).format("%-I:%M %p")),
+        None => "timer".to_string(),
+    })
 }
 
 /// Needs-attention first, then most recent activity.
@@ -129,12 +142,7 @@ pub fn FleetView() -> Element {
     let active = state
         .sessions
         .values()
-        .filter(|s| {
-            matches!(
-                s.status,
-                FleetStatus::Working | FleetStatus::WorkingBackground
-            )
-        })
+        .filter(|s| s.status.is_active())
         .count();
     let agent_minutes = fleet::fleet_agent_minutes_on(&state, today, now);
     let engaged_minutes = fleet::engaged_seconds_on(&state, today, now) / 60;
@@ -922,7 +930,9 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                         }
                         // Background phases are silent by design — a bare
                         // dot reads as idle, so this one state gets words.
-                        if let Some(label) = background_label(&session.status, session.last_event_at, now) {
+                        if let Some(label) = background_label(&session.status, session.last_event_at, now)
+                            .or_else(|| waiting_label(&session.status, session.wake_at))
+                        {
                             span {
                                 class: "shrink-0 text-[10px] text-fg-muted",
                                 style: "color: {chip_color};",

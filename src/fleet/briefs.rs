@@ -329,6 +329,7 @@ pub fn status_report(
             let (status, attention): (&str, Option<String>) = match &s.status {
                 super::FleetStatus::Working => ("working", None),
                 super::FleetStatus::WorkingBackground => ("working_background", None),
+                super::FleetStatus::Waiting => ("waiting_on_timer", None),
                 super::FleetStatus::Idle if s.ended_at.is_some() => ("ended", None),
                 super::FleetStatus::Idle => ("idle", None),
                 super::FleetStatus::NeedsAttention(kind) => (

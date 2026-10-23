@@ -121,6 +121,14 @@ pub fn parse_duration_secs(input: &str) -> Option<i64> {
     Some(total)
 }
 
+/// Hover text for a tab waiting on its own timer.
+pub fn waiting_title(fire_at: DateTime<Utc>) -> String {
+    format!(
+        "Waiting on a timer · {}",
+        fire_at.with_timezone(&chrono::Local).format("%-I:%M %p")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
