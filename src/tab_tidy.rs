@@ -8,6 +8,8 @@
 //!  2. **Idle** — untouched for `IDLE_DAYS`+ with no open linked to-do.
 //!  3. **Unsorted** — no (live) planner project, with a suggested one from a
 //!     cheap word match, or `None` for "keep unsorted".
+//!  4. **Other** — every remaining closable tab, oldest first, so the sheet
+//!     can close any open tab, not just the suggested ones.
 //!
 //! Finished and idle are *close* suggestions and never include the active
 //! tab, a streaming tab, a tab with a pending timer, or a pinned tab (there
@@ -85,17 +87,28 @@ pub struct UnsortedTab {
     pub suggested_project: Option<String>,
 }
 
+/// An open tab with no suggestion: offered for closing only if the person
+/// ticks it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OtherTab {
+    pub session_id: String,
+    pub last_updated: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TidySuggestions {
     pub finished: Vec<FinishedTab>,
     pub idle: Vec<IdleTab>,
     pub unsorted: Vec<UnsortedTab>,
+    /// Closable tabs in none of the lists above, least recently active
+    /// first. Never includes a protected tab.
+    pub other: Vec<OtherTab>,
 }
 
 #[cfg(test)]
 impl TidySuggestions {
     pub fn is_empty(&self) -> bool {
-        self.finished.is_empty() && self.idle.is_empty() && self.unsorted.is_empty()
+        self.finished.is_empty() && self.idle.is_empty() && self.unsorted.is_empty() && self.other.is_empty()
     }
 }
 
@@ -156,8 +169,14 @@ pub fn suggest(
                 session_id: t.session_id.clone(),
                 suggested_project: suggest_project(t, &linked, projects),
             });
+        } else if !protected(t) {
+            out.other.push(OtherTab {
+                session_id: t.session_id.clone(),
+                last_updated: t.last_updated,
+            });
         }
     }
+    out.other.sort_by_key(|o| o.last_updated);
     out
 }
 
@@ -476,7 +495,38 @@ mod tests {
     fn no_projects_means_no_unsorted_list() {
         let s = suggest(&[tab("a", "x", 1)], &[], &[], now());
         assert!(s.unsorted.is_empty());
-        assert!(s.is_empty());
+        // Still closable by hand, under Other.
+        assert_eq!(ids(&s.other, |o| &o.session_id), vec!["a"]);
+    }
+
+    #[test]
+    fn every_open_tab_lands_in_exactly_one_list() {
+        let mut filed_old = tab("filed-old", "Halcyon notes", 6);
+        filed_old.project_id = Some("p1".into());
+        let mut filed_new = tab("filed-new", "Halcyon copy", 1);
+        filed_new.project_id = Some("p1".into());
+        let tabs = vec![filed_new, tab("loose", "Random chat", 2), filed_old, tab("stale", "Old", 9)];
+        let s = suggest(&tabs, &[], &[proj("p1", "Halcyon")], now());
+        assert_eq!(ids(&s.idle, |i| &i.session_id), vec!["stale"]);
+        assert_eq!(ids(&s.unsorted, |u| &u.session_id), vec!["loose"]);
+        // Filed, recent tabs had no list before; now they're closable, oldest first.
+        assert_eq!(ids(&s.other, |o| &o.session_id), vec!["filed-old", "filed-new"]);
+    }
+
+    #[test]
+    fn other_never_offers_a_protected_tab() {
+        let mut active = tab("active", "Here", 1);
+        active.is_active = true;
+        active.project_id = Some("p1".into());
+        let s = suggest(&[active], &[], &[proj("p1", "P")], now());
+        assert!(s.other.is_empty());
+    }
+
+    #[test]
+    fn without_projects_every_unsuggested_tab_is_other() {
+        let s = suggest(&[tab("a", "A", 1), tab("b", "B", 3)], &[], &[], now());
+        assert!(s.unsorted.is_empty());
+        assert_eq!(ids(&s.other, |o| &o.session_id), vec!["b", "a"]);
     }
 
     #[test]

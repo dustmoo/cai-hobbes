@@ -207,9 +207,13 @@ pub struct ChatDispatchOpts<'a> {
     /// A validated model choice to pin the new tab to (`None` = the user's
     /// default).
     pub choice: Option<ModelChoice>,
-    /// The chat that asked: its Composio profile is inherited, and the new
-    /// worker is linked to it for the dispatch relay (`todo::relay`).
+    /// The chat that asked: its Composio profile is inherited unless
+    /// `profile` names one, and the new worker is linked to it for the
+    /// dispatch relay (`todo::relay`).
     pub parent_session_id: Option<&'a str>,
+    /// A validated Composio profile id for the new tab
+    /// (`Settings::resolve_dispatch_profile`).
+    pub profile: Option<String>,
     /// Switch to the new tab (the model's dispatch does). `false` leaves the
     /// user where they are; the caller opens the tab in the background.
     pub focus: bool,
@@ -222,6 +226,8 @@ pub struct ChatDispatched {
     pub title: String,
     /// The model the new chat runs on (its pin, else the default).
     pub model: String,
+    /// The Composio profile the new chat runs under, by name.
+    pub profile_name: Option<String>,
 }
 
 /// **The chat branch of `HOBBES_DISPATCH`, reusable**: open a new tab
@@ -235,26 +241,27 @@ pub fn dispatch_to_chat(
 ) -> Result<ChatDispatched, String> {
     let (todo, project) = dispatchable(&deps, todo_id)?;
     let mut prompt = build_assignment_prompt(&todo, project.as_ref(), opts.instructions);
-    // Inherit the dispatching tab's Composio profile (else the global
-    // default), as every UI path that opens a tab does. A tab with no
-    // profile would see every profile's Composio tools, which collide by
-    // name ("Duplicate function declaration").
+    // The chosen profile, else inherit the dispatching tab's Composio
+    // profile (else the global default), as every UI path that opens a tab
+    // does. A tab with no profile would see every profile's Composio tools,
+    // which collide by name ("Duplicate function declaration").
     let profile = opts
-        .parent_session_id
-        .and_then(|pid| {
+        .profile
+        .clone()
+        .or_else(|| opts.parent_session_id.and_then(|pid| {
             deps.session_state
                 .peek()
                 .sessions
                 .get(pid)
                 .and_then(|s| s.composio_profile.clone())
-        })
+        }))
         .or_else(|| deps.settings.peek().get_active_profile().map(|p| p.id.clone()));
     let new_id = {
         let mut state = deps.session_state.write();
         // create_session makes the new tab the active session; an unfocused
         // dispatch keeps the user where they are.
         let previous_active = state.active_session_id.clone();
-        let id = state.create_session(profile);
+        let id = state.create_session(profile.clone());
         if let Some(s) = state.sessions.get_mut(&id) {
             s.project_id = todo.project_id.clone();
             if let Some(c) = &opts.choice {
@@ -316,7 +323,10 @@ pub fn dispatch_to_chat(
         ));
     }
     crate::components::chat_queue::request_drain();
-    Ok(ChatDispatched { session_id: new_id, title: todo.title, model })
+    let profile_name = profile.as_deref().and_then(|id| {
+        deps.settings.peek().composio_profiles.iter().find(|p| p.id == id).map(|p| p.name.clone())
+    });
+    Ok(ChatDispatched { session_id: new_id, title: todo.title, model, profile_name })
 }
 
 /// The HOBBES_DISPATCH handler. Returns (status-ok?, response) like the
@@ -358,18 +368,24 @@ pub fn handle_dispatch(
                 .peek()
                 .resolve_model_choice(connector, model.as_deref())
                 .map_err(|e| format!("Not dispatched: {e}. Omit connector and model for the user's default."))?;
+            let profile = deps
+                .settings
+                .peek()
+                .resolve_dispatch_profile(args.get("profile").and_then(|v| v.as_str()))
+                .map_err(|e| format!("Not dispatched: {e}."))?;
             // New tab, project-tagged, pinned, linked, seeded, focused.
             let d = dispatch_to_chat(
                 deps,
                 todo_id,
-                ChatDispatchOpts { instructions, choice, parent_session_id, focus: true },
+                ChatDispatchOpts { instructions, choice, parent_session_id, profile, focus: true },
             )?;
             Ok(format!(
-                "Dispatched '{}' to a new chat tab (session {}) on {}. The assignment \
+                "Dispatched '{}' to a new chat tab (session {}) on {}{}. The assignment \
                  sends automatically; progress will flow back onto the todo.",
                 d.title,
                 d.session_id,
-                crate::settings::short_model_label(&d.model)
+                crate::settings::short_model_label(&d.model),
+                d.profile_name.map(|n| format!(", profile {n}")).unwrap_or_default()
             ))
         }
         "claude_code" => {
@@ -665,6 +681,72 @@ pub(crate) mod tests {
         let id = todo.id.clone();
         planner.todos.push(todo);
         (planner, id)
+    }
+
+    fn settings_with_profiles() -> crate::settings::Settings {
+        let mut settings = crate::settings::test_delegation_settings();
+        for (id, name) in [("p-cm", "ClearMirror"), ("p-puget", "Puget")] {
+            settings.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        settings.active_composio_profile = Some("p-cm".into());
+        settings
+    }
+
+    #[test]
+    fn a_chat_dispatch_runs_under_the_chosen_profile() {
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let spawner = RecordingSpawner(Default::default());
+
+            // Chosen: overrides the dispatching tab's profile.
+            let (planner, id) = planner_with("Reconcile the Puget invoices");
+            let mut ctx = test_ctx_with(planner, settings_with_profiles());
+            let parent = ctx.session_state.write().create_session_raw(Some("p-cm".into()));
+            let ok = handle_dispatch(
+                ctx,
+                &serde_json::json!({"todo_id": id, "target": "chat", "profile": "puget"}),
+                &spawner,
+                Some(&parent),
+            )
+            .unwrap();
+            assert!(ok.contains("profile Puget"), "{ok}");
+            let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
+            assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-puget"));
+
+            // Omitted: the dispatching tab's profile, as before.
+            let (planner, id) = planner_with("Draft the ClearMirror post");
+            let mut ctx = test_ctx_with(planner, settings_with_profiles());
+            let parent = ctx.session_state.write().create_session_raw(Some("p-cm".into()));
+            handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&parent)).unwrap();
+            let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
+            assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-cm"));
+
+            // Unknown, or choice turned off: refused, nothing opened.
+            let mut off = settings_with_profiles();
+            off.dispatch_profile_choice = false;
+            for (settings, needle) in [
+                (settings_with_profiles(), "unknown profile 'Acme'; profiles: ClearMirror, Puget"),
+                (off, "turned off choosing a profile"),
+            ] {
+                let (planner, id) = planner_with("Look something up");
+                let ctx = test_ctx_with(planner, settings);
+                let err = handle_dispatch(
+                    ctx,
+                    &serde_json::json!({"todo_id": id, "target": "chat", "profile": "Acme"}),
+                    &spawner,
+                    None,
+                )
+                .unwrap_err();
+                assert!(err.contains(needle), "{err}");
+                assert!(ctx.session_state.peek().sessions.is_empty(), "no tab opened");
+            }
+
+            dioxus::prelude::rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[test]

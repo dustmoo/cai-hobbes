@@ -598,19 +598,39 @@ impl LlmFormatConverter for GeminiConnector {
             });
         }
 
-        let system_instruction = prompt.system.as_ref().map(|s| SystemInstruction {
-            parts: vec![Part::Text {
-                text: s.clone(),
-                thought: None,
-            }],
+        // Gemini rejects requests with more than 128 tool declarations. Pick
+        // which tools stay (built-ins and tools in use win, bulk Composio
+        // discoveries go first) and tell the model what's missing.
+        const GEMINI_TOOL_LIMIT: usize = 128;
+        let tool_cap = prompt.cap_tool_count(GEMINI_TOOL_LIMIT);
+        if let Some(cap) = &tool_cap {
+            tracing::warn!(
+                "Tool count ({}) exceeds Gemini limit ({}). Withheld {}: {}",
+                prompt.tools.len(),
+                GEMINI_TOOL_LIMIT,
+                cap.dropped.len(),
+                crate::log_utils::cap_list(&cap.dropped, 5)
+            );
+        }
+        let system_text = match (&prompt.system, &tool_cap) {
+            (Some(s), Some(cap)) => Some(format!("{s}{}", cap.note)),
+            (None, Some(cap)) => Some(cap.note.trim_start().to_string()),
+            (s, None) => s.clone(),
+        };
+        let system_instruction = system_text.map(|text| SystemInstruction {
+            parts: vec![Part::Text { text, thought: None }],
         });
 
         let tools = if prompt.tools.is_empty() {
             None
         } else {
+            let sent_tools: Vec<&crate::llm::ToolDefinition> = match &tool_cap {
+                Some(cap) => cap.keep.iter().map(|&i| &prompt.tools[i]).collect(),
+                None => prompt.tools.iter().collect(),
+            };
             // Route through Gemini schema sanitizer for type coercion, array-items fix, enum stripping
             let mut function_declarations = Vec::new();
-            for t in &prompt.tools {
+            for t in sent_tools {
                 let sanitized_name =
                     crate::gemini::convert::get_prefixed_tool_name(&t.server_name, &t.name);
 
@@ -645,19 +665,6 @@ impl LlmFormatConverter for GeminiConnector {
                         );
                     }
                 }
-            }
-
-            // Enforce Gemini's 128-tool limit to prevent 400 errors
-            const GEMINI_TOOL_LIMIT: usize = 128;
-            if function_declarations.len() > GEMINI_TOOL_LIMIT {
-                let original_count = function_declarations.len();
-                function_declarations.truncate(GEMINI_TOOL_LIMIT);
-                tracing::warn!(
-                    "Tool count ({}) exceeds Gemini limit ({}). Truncated {} tools.",
-                    original_count,
-                    GEMINI_TOOL_LIMIT,
-                    original_count - GEMINI_TOOL_LIMIT
-                );
             }
 
             if function_declarations.is_empty() {
@@ -3171,6 +3178,47 @@ mod tests {
         let native = connector.to_native_request(&prompt, true);
         let serialized = serde_json::to_string(&native).unwrap();
         assert!(!serialized.contains("thoughtSignature"), "{}", serialized);
+    }
+
+    #[test]
+    fn over_128_tools_withholds_composio_first_and_tells_the_model() {
+        let tool = |server: &str, name: String| crate::llm::ToolDefinition {
+            name,
+            server_name: server.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let mut tools: Vec<_> = (0..130)
+            .map(|i| tool("composio-native:p1", format!("GOOGLEDRIVE_T{i:03}")))
+            .collect();
+        tools.push(tool("playwright", "navigate".into()));
+        let prompt = LlmPrompt {
+            system: Some("persona".into()),
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
+            messages: vec![],
+            tools,
+        };
+        let config = GeminiConfig {
+            api_key: Some("test-key".to_string()),
+            chat_model: "gemini-2.5-pro".to_string(),
+            summary_model: "gemini-2.5-flash".to_string(),
+            thinking_enabled: false,
+            thinking_level: "high".to_string(),
+            thinking_budget: None,
+            model_slots: vec![],
+            context_tuning: Default::default(),
+            context_caching_enabled: false,
+            cache_ttl_seconds: 300,
+        };
+        let native = GeminiConnector::new(config).to_native_request(&prompt, true);
+        let decls = native["tools"][0]["function_declarations"].as_array().unwrap();
+        assert_eq!(decls.len(), 128);
+        assert!(decls.iter().any(|d| d["name"] == "playwright_navigate"));
+        let system = native["system_instruction"]["parts"][0]["text"].as_str().unwrap();
+        assert!(system.starts_with("persona"));
+        assert!(system.contains("<TOOLS_WITHHELD>") && system.contains("3 of 131"), "{system}");
     }
 
     #[tokio::test]
