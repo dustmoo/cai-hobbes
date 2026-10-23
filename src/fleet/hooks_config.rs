@@ -23,18 +23,20 @@
 use serde_json::{json, Map, Value};
 use std::path::Path;
 
-/// (event, timeout seconds). All are quick notifications: Hobbes never
-/// holds a hook. PermissionRequest is answered at once with an empty body
-/// (no decision), so Claude Code shows its own prompt in the terminal and
-/// the Fleet only marks the session as needing the user. SessionEnd's
-/// shared budget rises to the per-hook timeout (docs), so 10s is both
-/// prompt and sufficient.
+/// (event, timeout seconds). PermissionRequest gets a generous 120s window
+/// because a headless run Hobbes dispatched (`claude -p`, no terminal) has
+/// its request HELD for an in-app Approve / Deny; the listener answers
+/// [`GATE_TIMEOUT_MARGIN_SECS`] before this expires. Interactive sessions
+/// are still answered at once with an empty body (no decision), so their
+/// terminal prompt is never delayed by the longer timeout. The others are
+/// quick notifications; SessionEnd's shared budget rises to the per-hook
+/// timeout (docs), so 10s is both prompt and sufficient.
 pub const FLEET_HOOK_EVENTS: &[(&str, u64)] = &[
     ("SessionStart", 10),
     ("SessionEnd", 10),
     ("Stop", 10),
     ("Notification", 10),
-    ("PermissionRequest", 10),
+    ("PermissionRequest", PERMISSION_HOOK_TIMEOUT_SECS),
     // Fidelity signals: a submitted prompt proves the user is handling the
     // session (turn starts, attention clears); each finished tool call is a
     // liveness heartbeat during otherwise-silent working turns.
@@ -42,6 +44,12 @@ pub const FLEET_HOOK_EVENTS: &[(&str, u64)] = &[
     ("PostToolUse", 10),
     ("SubagentStop", 10),
 ];
+
+/// Seconds the PermissionRequest hook is configured to wait.
+pub const PERMISSION_HOOK_TIMEOUT_SECS: u64 = 120;
+/// The listener resolves a held gate as passthrough this many seconds BEFORE
+/// the hook timeout, so the hook never times out on Claude Code's side.
+pub const GATE_TIMEOUT_MARGIN_SECS: u64 = 10;
 
 /// Events whose hook forwards the terminal's environment as headers
 /// (click-to-terminal). Start, resume, `/clear` and a Hobbes restart
@@ -396,8 +404,12 @@ mod tests {
             assert_eq!(handler["timeout"], *timeout);
             assert!(groups[0].get("matcher").is_none(), "no matcher: match all tools");
         }
-        // Nothing is held any more: PermissionRequest is a quick hook too.
-        assert_eq!(v["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"], 10);
+        // PermissionRequest carries the hold window headless dispatched
+        // runs need.
+        assert_eq!(
+            v["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            PERMISSION_HOOK_TIMEOUT_SECS
+        );
     }
 
     #[test]
@@ -441,7 +453,7 @@ mod tests {
     #[test]
     fn hooks_current_detects_the_pre_header_shape() {
         // An install from before click-to-terminal: same URLs and timeouts,
-        // no headers, and the old 120s PermissionRequest hold.
+        // no headers.
         let mut old = merged_empty();
         for event in TERMINAL_HINT_EVENTS {
             let h = old["hooks"][*event][0]["hooks"][0].as_object_mut().unwrap();
@@ -450,9 +462,17 @@ mod tests {
         }
         assert!(!hooks_current(&old, 43917, "tok123"), "missing headers must self-heal");
 
-        let mut old_hold = merged_empty();
-        old_hold["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] = json!(120);
-        assert!(!hooks_current(&old_hold, 43917, "tok123"));
+        // The short-lived 10s PermissionRequest (too short to hold a
+        // headless run's request) must self-heal back to the hold window.
+        let mut short_hold = merged_empty();
+        short_hold["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"] = json!(10);
+        assert!(!hooks_current(&short_hold, 43917, "tok123"));
+        merge_fleet_hooks(&mut short_hold, 43917, "tok123").unwrap();
+        assert!(hooks_current(&short_hold, 43917, "tok123"));
+        assert_eq!(
+            short_hold["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+            PERMISSION_HOOK_TIMEOUT_SECS
+        );
 
         // A changed header value or allow-list is drift too.
         let mut edited = merged_empty();

@@ -278,7 +278,8 @@ impl<'a> PromptBuilder<'a> {
         // A user-turn boundary: the first build after a new user text message.
         // A tail already anchored there means this is a retry of that build.
         let at_boundary = has_param_user
-            || (anchor_msg.is_some_and(ledger::is_user_text) && existing_tail.is_none());
+            || (anchor_msg.is_some_and(|m| ledger::is_user_text(m) || crate::todo::relay::starts_turn(m))
+                && existing_tail.is_none());
 
         // 2. The history window: everything from the persisted trim anchor on.
         // If we know the provider's context window size, the history must
@@ -471,10 +472,12 @@ impl<'a> PromptBuilder<'a> {
         // tool result full even when later tool calls or text follow it within
         // the same turn — the Gmail-fetch-then-summarise case that previously
         // collapsed the fetch to a fixed cap mid-turn.
+        // A relay that woke this chat starts its turn the same way.
         let current_turn_start_idx = session_messages
             .iter()
             .rposition(|m| {
-                m.author == "User" && matches!(m.content, MessageContent::Text { .. })
+                (m.author == "User" && matches!(m.content, MessageContent::Text { .. }))
+                    || crate::todo::relay::starts_turn(m)
             })
             .map(|i| i + 1)
             .unwrap_or(0);
@@ -723,6 +726,16 @@ impl<'a> PromptBuilder<'a> {
                             messages.push(ChatMessage {
                                 role: ChatRole::User,
                                 content: vec![ContentBlock::Text { text: context_text }],
+                            });
+                        }
+                    }
+                    // Dispatch relay: incoming copies only, framed as
+                    // information from another agent — never as the user.
+                    MessageContent::Relay(note) => {
+                        if let Some(text) = crate::todo::relay::prompt_text(note) {
+                            messages.push(ChatMessage {
+                                role: ChatRole::User,
+                                content: vec![ContentBlock::Text { text }],
                             });
                         }
                     }

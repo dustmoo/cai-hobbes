@@ -248,6 +248,11 @@ pub trait LlmConnector: Send + Sync {
         let value = self.summarize_conversation(String::new(), framing).await?;
         // The conversation summarizer returns a JSON object with a `summary`
         // field; fall back to the whole payload as text if the shape differs.
+        // Unrecoverable output (the fallback returns Null) is an error, so
+        // the caller keeps the tool result instead of storing "null".
+        if value.is_null() {
+            return Err("tool-result summary came back empty".into());
+        }
         let summary = value
             .get("summary")
             .and_then(|v| v.as_str())
@@ -280,6 +285,9 @@ pub trait LlmConnector: Send + Sync {
         framed_day: String,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let value = self.summarize_conversation(String::new(), framed_day).await?;
+        if value.is_null() {
+            return Err("day roll-up came back empty".into());
+        }
         Ok(value
             .get("summary")
             .and_then(|v| v.as_str())

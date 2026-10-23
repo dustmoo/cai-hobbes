@@ -5,9 +5,13 @@
 //! Auto-approval rationale: dispatch itself is metadata-only (it creates a
 //! session/row and a prompt). The dispatched WORK stays fully gated — a chat
 //! tab runs the normal in-app approval flow (with trust rules), and a
-//! headless run uses the default permission mode so its PermissionRequests
-//! hold in the Fleet UI for Approve/Deny. Never `--bare` (it skips hooks and
-//! would make the run invisible to the fleet) and never bypass modes.
+//! headless run uses the default permission mode. It has no terminal to
+//! prompt in, so the Fleet listener holds its PermissionRequests (the row's
+//! `dispatched_todo` marks it) for Approve / Deny in the Fleet or the
+//! Planner's decision drawer; unanswered for about two minutes, the request
+//! is refused and the run carries on without that tool. Never `--bare` (it
+//! skips hooks and would make the run invisible to the fleet) and never
+//! bypass modes.
 
 use dioxus::prelude::{Readable, Writable};
 
@@ -39,6 +43,11 @@ fn chat_worker_note(todo_id: &str, decisions_on: bool) -> String {
          the answer will arrive here as a message."
     )
 }
+
+/// The line a chat worker linked to its parent chat gets (`todo::relay`).
+const RELAY_WORKER_NOTE: &str = "\nYou were dispatched from another chat. To ask it a question or hand it a \
+     result, call HOBBES_MESSAGE_PARENT; a short completion report goes to it automatically \
+     when you finish.";
 
 /// What the spawner is asked to launch. Separated behind a trait so the
 /// handler is testable without running `claude`.
@@ -199,7 +208,8 @@ pub struct ChatDispatchOpts<'a> {
     /// default).
     pub choice: Option<ModelChoice>,
     /// The chat that asked: its Composio profile is inherited unless
-    /// `profile` names one.
+    /// `profile` names one, and the new worker is linked to it for the
+    /// dispatch relay (`todo::relay`).
     pub parent_session_id: Option<&'a str>,
     /// A validated Composio profile id for the new tab
     /// (`Settings::resolve_dispatch_profile`).
@@ -273,6 +283,10 @@ pub fn dispatch_to_chat(
     if let Some(c) = &opts.choice {
         log_pin(&new_id, Some(c));
     }
+    // The parent ↔ worker link the dispatch relay travels along.
+    let linked = opts
+        .parent_session_id
+        .is_some_and(|parent| crate::todo::relay::record_link(deps.session_state, parent, &new_id, todo_id));
     crate::session::SessionState::save_signal(&deps.session_state, None);
     let model = {
         let settings = deps.settings.peek();
@@ -292,6 +306,9 @@ pub fn dispatch_to_chat(
     }
     let decisions_on = deps.settings.peek().agent_time_enabled();
     prompt.push_str(&chat_worker_note(todo_id, decisions_on));
+    if linked && deps.settings.peek().dispatch_relay_mode != crate::settings::DispatchRelayMode::Off {
+        prompt.push_str(RELAY_WORKER_NOTE);
+    }
     if let Some(t) = deps.planner.peek().todo(todo_id) {
         let _ = crate::todo::store::save_todo(t);
     }
@@ -456,8 +473,9 @@ pub fn handle_dispatch(
             }
             Ok(format!(
                 "Dispatched '{}' to a headless Claude Code run in {path} (fleet session \
-                 {run_id}). Its permission requests will appear in the Fleet for approval; \
-                 progress lands on the todo via briefs.",
+                 {run_id}). Its permission requests wait for the user's Approve / Deny in \
+                 the Fleet or the decision queue (refused if unanswered for about two \
+                 minutes); progress lands on the todo via briefs.",
                 todo.title
             ))
         }

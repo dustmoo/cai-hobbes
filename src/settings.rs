@@ -269,6 +269,40 @@ fn default_prev_tab_group() -> String {
     "CmdOrCtrl+Alt+Shift+[".to_string()
 }
 
+/// How a chat and the chat workers it dispatched may message each other
+/// (`todo::relay`; Settings → Planner).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchRelayMode {
+    /// No relays: workers never report back.
+    Off,
+    /// Workers report to their parent chat (completion reports, and
+    /// questions / results / progress via `HOBBES_MESSAGE_PARENT`).
+    #[default]
+    Report,
+    /// Reports, plus the parent may message its workers
+    /// (`HOBBES_MESSAGE_WORKER`).
+    TwoWay,
+}
+
+impl DispatchRelayMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DispatchRelayMode::Off => "off",
+            DispatchRelayMode::Report => "report",
+            DispatchRelayMode::TwoWay => "two_way",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "off" => DispatchRelayMode::Off,
+            "two_way" => DispatchRelayMode::TwoWay,
+            _ => DispatchRelayMode::Report,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub struct Settings {
@@ -471,6 +505,10 @@ pub struct Settings {
     /// result back to that chat and let the conversation continue on its own.
     #[serde(default = "default_true")]
     pub dispatch_auto_continue: bool,
+    /// Messages between a chat and the chat workers it dispatched
+    /// (`todo::relay`): off, worker → parent reports (default), or two-way.
+    #[serde(default)]
+    pub dispatch_relay_mode: DispatchRelayMode,
 
     // ── Terminal ────────────────────────────────────────────────────────────
     /// Register the native `hobbes-terminal` MCP server (persistent per-chat
@@ -1030,6 +1068,7 @@ impl Default for Settings {
             fleet_briefs_enabled: true,
             fleet_retire_minutes: default_fleet_retire_minutes(),
             dispatch_auto_continue: true,
+            dispatch_relay_mode: DispatchRelayMode::default(),
             terminal_enabled: false,
             heartbeat_enabled: false,
             heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
@@ -3189,6 +3228,8 @@ mod tests {
         tab_title_provisional: false,
         history_anchor: None,
         context_ledger: Vec::new(),
+        dispatch_link: None,
+        dispatched_workers: Vec::new(),
         }
     }
 

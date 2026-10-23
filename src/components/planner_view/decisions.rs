@@ -5,10 +5,14 @@
 //! Answering a worker's question goes through `lanes::resolve_decision`,
 //! then back to the worker over whatever channel exists (a Hobbes chat gets
 //! it as a queued message; a Claude Code run can't receive input, so the
-//! answer is recorded and the to-do returns to the queue). A Claude Code
-//! permission prompt is answered in the terminal, where it carries choices
-//! the drawer can't offer (always allow, tell Claude what to do instead):
-//! its card offers "Answer in <terminal>", which takes the person there
+//! answer is recorded and the to-do returns to the queue). A permission
+//! request from a headless run Hobbes dispatched (`claude -p`, no terminal)
+//! is held by the Fleet listener: its card offers Approve / Deny, answered
+//! through `FleetShared::resolve_gate` — never as a decision the model
+//! could resolve. An interactive Claude Code session's permission prompt is
+//! answered in the terminal, where it carries choices the drawer can't
+//! offer (always allow, tell Claude what to do instead): its card offers
+//! "Answer in <terminal>", which takes the person there
 //! (`terminal_focus::go_to_session`), and the decision clears once the
 //! session moves on. A call the agent-time run is waiting on your approval
 //! for shows here as a gate card with Approve / Deny, answered through the
@@ -23,7 +27,9 @@ use crate::context::trust_store::{self, DecisionKind, TrustDecision};
 use crate::fleet::{terminal_focus, FleetOrigin, FleetState};
 use crate::session::SessionState;
 use crate::todo::lanes;
-use crate::todo::model::{DecisionDelivery, DecisionSource, ResolvedDecision};
+use crate::todo::model::{
+    AgentState, DecisionAnswer, DecisionDelivery, DecisionSource, ResolvedDecision,
+};
 use crate::todo::store;
 use crate::todo::PlannerState;
 
@@ -107,6 +113,7 @@ fn held_card(h: &HeldApproval, intent: Option<&str>, now: chrono::DateTime<Utc>)
         options: Vec::new(),
         gate: Some(h.execution_id.clone()),
         terminal: None,
+        permission: true,
         est: lanes::est_label(Some(1)),
         worker: Some("agent time".to_string()),
         waiting: fmt_since(h.asked_at, now),
@@ -173,6 +180,74 @@ fn answer(
     Ok(delivery_line(&route))
 }
 
+/// Approve or deny a headless dispatched run's held permission request. The
+/// fleet server owns the follow-up; the to-do records the answer so the
+/// wait isn't re-raised. `Err` when the request is no longer held (it timed
+/// out, or the run moved on).
+pub(crate) fn answer_gate(
+    mut planner: Signal<PlannerState>,
+    todo_id: &str,
+    request_id: &str,
+    allow: bool,
+) -> Result<&'static str, String> {
+    if !crate::fleet::shared().resolve_gate(request_id, allow) {
+        return Err("That request is no longer waiting \u{2014} it timed out or the run moved on.".to_string());
+    }
+    let now = Utc::now();
+    {
+        let mut state = planner.write();
+        if let Some(t) = state.todo_mut(todo_id) {
+            if let Some(d) = t.decision.as_mut().filter(|d| d.is_open()) {
+                d.resolved = Some(DecisionAnswer {
+                    choice: if allow { "Approve".into() } else { "Deny".into() },
+                    note: None,
+                    at: now,
+                    delivery: None,
+                });
+            }
+            t.agent_state = Some(AgentState::Working);
+            t.updated_at = now;
+        }
+    }
+    persist_todo(&planner, todo_id);
+    Ok(if allow {
+        "Approved \u{2014} the run carries on."
+    } else {
+        "Denied \u{2014} the run carries on without that tool."
+    })
+}
+
+/// How a gate card is answered: `(held request id, terminal target)`.
+/// Gates only come from Claude Code sessions (Hobbes tabs approve in their
+/// own chat). A headless dispatched run's request is held for Approve /
+/// Deny in the drawer; an interactive session's goes to its terminal. A
+/// headless run's request that is no longer pending gets neither (it timed
+/// out or moved on, and there is no terminal to send the person to).
+fn gate_actions(
+    gate_request: Option<&str>,
+    linked: Option<&str>,
+    row: Option<&crate::fleet::FleetSession>,
+) -> (Option<String>, Option<(String, String)>) {
+    let Some(rid) = gate_request else { return (None, None) };
+    if row.and_then(|r| r.held_gate()).is_some_and(|g| g.request_id == rid) {
+        return (Some(rid.to_string()), None);
+    }
+    let terminal = linked.and_then(|sid| match row {
+        Some(row) if row.origin == FleetOrigin::Hobbes || row.is_headless_dispatch() => None,
+        Some(row) => Some((sid.to_string(), terminal_focus::answer_label(row))),
+        None => Some((sid.to_string(), "Answer in terminal".to_string())),
+    });
+    (None, terminal)
+}
+
+/// The open gate decision's request id on a to-do, when there is one.
+fn open_gate_request(planner: &PlannerState, todo_id: &str) -> Option<String> {
+    planner.todo(todo_id).and_then(|t| t.decision.as_ref()).and_then(|d| match &d.source {
+        DecisionSource::Gate { request_id } if d.is_open() => Some(request_id.clone()),
+        _ => None,
+    })
+}
+
 /// Take the person to the terminal of the Claude Code session behind a
 /// permission card. Returns the one-line note and whether it got there.
 async fn go_to_terminal(session_id: String) -> (String, bool) {
@@ -199,11 +274,15 @@ struct DecisionCard {
     context: String,
     question: String,
     options: Vec<String>,
-    /// A held agent-time call: answered with Approve / Deny.
+    /// Answered with Approve / Deny: a held agent-time call (its execution
+    /// id) or a headless dispatched run's held permission request (its
+    /// request id).
     gate: Option<String>,
     /// A Claude Code permission prompt: (fleet session id, "Answer in
     /// iTerm2"). Answered in the terminal, never in the drawer.
     terminal: Option<(String, String)>,
+    /// A permission request of any kind: never answered with free text.
+    permission: bool,
     est: String,
     worker: Option<String>,
     waiting: String,
@@ -248,17 +327,14 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
             .map(|t| {
                 let d = t.decision.as_ref().filter(|d| d.is_open());
                 let brief = d.and_then(|d| d.brief.clone());
-                let is_gate = d.is_some_and(|d| matches!(d.source, DecisionSource::Gate { .. }));
-                // Gates only come from Claude Code sessions (Hobbes tabs
-                // approve in their own chat), so every gate card goes to a
-                // terminal.
-                let terminal = t.linked_fleet_session.clone().filter(|_| is_gate).and_then(|sid| {
-                    match fleet.sessions.get(&sid) {
-                        Some(row) if row.origin == FleetOrigin::Hobbes => None,
-                        Some(row) => Some((sid, terminal_focus::answer_label(row))),
-                        None => Some((sid, "Answer in terminal".to_string())),
-                    }
+                let gate_request = d.and_then(|d| match &d.source {
+                    DecisionSource::Gate { request_id } => Some(request_id.clone()),
+                    _ => None,
                 });
+                let is_gate = gate_request.is_some();
+                let row = t.linked_fleet_session.as_deref().and_then(|sid| fleet.sessions.get(sid));
+                let (held, terminal) =
+                    gate_actions(gate_request.as_deref(), t.linked_fleet_session.as_deref(), row);
                 DecisionCard {
                     todo_id: t.id.clone(),
                     context: t.outcome.clone().filter(|o| !o.trim().is_empty()).unwrap_or_else(|| t.title.clone()),
@@ -266,8 +342,9 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
                         .map(|d| d.question.clone())
                         .unwrap_or_else(|| "Waiting on you \u{2014} no question recorded; check its worker.".into()),
                     options: if is_gate { Vec::new() } else { d.map(|d| d.options.clone()).unwrap_or_default() },
-                    gate: None,
+                    gate: held,
                     terminal,
+                    permission: is_gate,
                     est: lanes::est_label(d.and_then(|d| d.est_minutes)),
                     worker: d.and_then(|d| d.worker.clone()),
                     waiting: d.map(|d| fmt_since(d.asked_at, now)).unwrap_or_default(),
@@ -389,7 +466,11 @@ pub(crate) fn DecisionDrawer(open: Signal<bool>) -> Element {
                                 on_result((id, line.to_string(), ok));
                                 return;
                             }
-                            match answer(planner, session_state, &id, &choice) {
+                            let outcome = match open_gate_request(&planner.peek(), &id) {
+                                Some(rid) => answer_gate(planner, &id, &rid, choice.eq_ignore_ascii_case("approve")),
+                                None => answer(planner, session_state, &id, &choice),
+                            };
+                            match outcome {
                                 Ok(line) => on_result((id, line.to_string(), true)),
                                 Err(e) => on_result((id, e, false)),
                             }
@@ -428,13 +509,12 @@ fn DecisionCardView(
     let mut other = use_signal(String::new);
     let mut other_open = use_signal(|| false);
     let gate = card.gate.is_some();
-    let in_terminal = card.terminal.is_some();
     let options: Vec<String> = if gate {
         vec!["Approve".into(), "Deny".into()]
     } else {
         card.options.clone()
     };
-    let free_text = !gate && !in_terminal && (options.is_empty() || *other_open.read());
+    let free_text = !card.permission && (options.is_empty() || *other_open.read());
     let id = card.todo_id.clone();
     let dash = |s: &Option<String>| s.clone().filter(|x| !x.trim().is_empty()).unwrap_or_else(|| "\u{2014}".into());
 
@@ -532,7 +612,7 @@ fn DecisionCardView(
                         span { class: "truncate", "{w}" }
                     }
                 }
-                if gate || in_terminal {
+                if card.permission {
                     span { class: "font-mono text-[10px] text-fg-muted", "permission gate" }
                 }
                 span { class: "font-mono text-[11px] text-fg-muted", "waiting {card.waiting}" }
@@ -596,6 +676,29 @@ mod tests {
         assert_eq!(c.question, "Waiting for your approval: HOBBES_INVOKE_SKILL github-security");
         assert_eq!(c.context, "Agent time \u{b7} Analyze fleet blockers");
         assert_eq!(c.blocked.as_deref(), Some("The skill's permission is set to Ask."));
+    }
+
+    #[test]
+    fn headless_gates_are_approved_here_interactive_ones_in_the_terminal() {
+        let now = Utc::now();
+        let mut row = crate::fleet::FleetSession::new("run", "/x", now);
+        row.pending_gate = Some(crate::fleet::PendingGate {
+            request_id: "g1".into(),
+            tool_name: "Bash".into(),
+            input_summary: "npm test".into(),
+            requested_at: now,
+        });
+        // Interactive session: answered in its terminal.
+        let (held, term) = gate_actions(Some("g1"), Some("run"), Some(&row));
+        assert_eq!(held, None);
+        assert_eq!(term.unwrap().1, "Answer in terminal");
+        // Headless dispatched run: Approve / Deny here.
+        row.dispatched_todo = Some("todo-1".into());
+        assert_eq!(gate_actions(Some("g1"), Some("run"), Some(&row)), (Some("g1".into()), None));
+        // A stale request on the headless run: nothing to act on.
+        assert_eq!(gate_actions(Some("old"), Some("run"), Some(&row)), (None, None));
+        // Not a gate.
+        assert_eq!(gate_actions(None, Some("run"), Some(&row)), (None, None));
     }
 
     #[test]

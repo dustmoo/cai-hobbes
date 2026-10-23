@@ -377,11 +377,27 @@ pub fn terminal_name(session: &FleetSession) -> Option<String> {
     session.terminal.as_ref().and_then(hint_app_name).map(str::to_string)
 }
 
+/// A live headless run Hobbes dispatched (`claude -p`): there is no
+/// terminal to go to, and its permission requests are answered in Hobbes.
+/// Once it ends, resuming it (an interactive session) is fine.
+fn headless_live(session: &FleetSession) -> bool {
+    session.is_headless_dispatch() && session.ended_at.is_none()
+}
+
+/// The go-to label of a live headless run.
+pub const HEADLESS_DESTINATION_LABEL: &str = "No terminal (headless run)";
+/// The answer label of a headless run: its requests are held for an in-app
+/// Approve / Deny.
+pub const HEADLESS_ANSWER_LABEL: &str = "Approve or deny in Hobbes";
+
 /// Label for the row's go-to action: "Focus iTerm2 tab", "Bring VS Code
-/// forward", "Copy resume command".
+/// forward", "Copy resume command"; a live headless run has none.
 pub fn destination_label(session: &FleetSession) -> String {
     if session.origin == FleetOrigin::Hobbes {
         return "Open its chat".to_string();
+    }
+    if headless_live(session) {
+        return HEADLESS_DESTINATION_LABEL.to_string();
     }
     let plan = plan_for(session);
     // Host unknown: the ladder tries iTerm2, then Terminal, by tty.
@@ -397,8 +413,12 @@ pub fn destination_label(session: &FleetSession) -> String {
     }
 }
 
-/// Label for a needs-you row's primary action: "Answer in iTerm2".
+/// Label for a needs-you row's primary action: "Answer in iTerm2"; a
+/// headless run is answered in Hobbes.
 pub fn answer_label(session: &FleetSession) -> String {
+    if session.is_headless_dispatch() {
+        return HEADLESS_ANSWER_LABEL.to_string();
+    }
     match terminal_name(session) {
         Some(app) => format!("Answer in {app}"),
         None => "Answer in terminal".to_string(),
@@ -999,6 +1019,12 @@ pub async fn go_to_session(session: FleetSession) -> FocusOutcome {
     if session.origin == FleetOrigin::Hobbes {
         return FocusOutcome::Failed("This is a Hobbes chat \u{2014} open its tab instead.".to_string());
     }
+    if headless_live(&session) {
+        return FocusOutcome::Failed(
+            "A headless run Hobbes started \u{2014} it has no terminal. Approve or deny its requests in the Fleet."
+                .to_string(),
+        );
+    }
     match tokio::task::spawn_blocking(move || walk_ladder(&session)).await {
         Ok(outcome) => outcome,
         Err(e) => FocusOutcome::Failed(format!("Couldn't reach the terminal ({e}).")),
@@ -1242,6 +1268,30 @@ mod tests {
         let mut chat = session_with(None, false);
         chat.origin = FleetOrigin::Hobbes;
         assert_eq!(resume_command(&chat), None);
+    }
+
+    #[test]
+    fn headless_dispatched_runs_have_no_terminal() {
+        let mut run = session_with(None, false);
+        run.dispatched_todo = Some("todo-1".into());
+        assert_eq!(destination_label(&run), HEADLESS_DESTINATION_LABEL);
+        assert_eq!(answer_label(&run), HEADLESS_ANSWER_LABEL);
+        // Interactive sessions keep the terminal labels.
+        assert_eq!(answer_label(&session_with(None, false)), "Answer in terminal");
+        assert_ne!(destination_label(&session_with(None, false)), HEADLESS_DESTINATION_LABEL);
+        // Once it ended it can be resumed like any session.
+        run.ended_at = Some(Utc::now());
+        assert_ne!(destination_label(&run), HEADLESS_DESTINATION_LABEL);
+    }
+
+    #[tokio::test]
+    async fn going_to_a_live_headless_run_explains_there_is_no_terminal() {
+        let mut run = session_with(None, false);
+        run.dispatched_todo = Some("todo-1".into());
+        match go_to_session(run).await {
+            FocusOutcome::Failed(why) => assert!(why.contains("no terminal"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]

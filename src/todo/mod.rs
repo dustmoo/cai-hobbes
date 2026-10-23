@@ -26,6 +26,7 @@ pub mod project_identity;
 pub mod project_match;
 pub mod project_merge;
 pub mod quick_add;
+pub mod relay;
 pub mod store;
 pub mod views;
 

@@ -373,6 +373,14 @@ pub struct Session {
     /// gone are dropped by `prune_orphaned_ledger`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub context_ledger: Vec<LedgerEntry>,
+    /// Dispatch relay, worker side: the chat that dispatched this tab and the
+    /// to-do it works on (`todo::relay`). Messages travel only along this
+    /// edge. `None` for every tab not dispatched from a chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_link: Option<crate::todo::relay::DispatchLink>,
+    /// Dispatch relay, parent side: worker tabs dispatched from this chat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatched_workers: Vec<String>,
 }
 
 /// What a [`LedgerEntry`] records.
@@ -1743,6 +1751,8 @@ impl SessionState {
             tab_title_provisional: false,
             history_anchor: None,
             context_ledger: Vec::new(),
+            dispatch_link: None,
+            dispatched_workers: Vec::new(),
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -2346,6 +2356,8 @@ mod tests {
             tab_title_provisional: false,
             history_anchor: None,
             context_ledger: Vec::new(),
+            dispatch_link: None,
+            dispatched_workers: Vec::new(),
             }
         }
 
@@ -3194,6 +3206,8 @@ mod tests {
             tab_title_provisional: false,
             history_anchor: None,
             context_ledger: Vec::new(),
+            dispatch_link: None,
+            dispatched_workers: Vec::new(),
             messages: vec![
                 Message {
                     id: msg1_id,

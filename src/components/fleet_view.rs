@@ -3,10 +3,12 @@
 //! selected.
 //!
 //! Reads the UI mirror `Signal<fleet::FleetState>` (fed by the drain loop in
-//! `main.rs`). Actions go the other way through `fleet::shared()`:
-//! Approve/Deny resolve a held gate's oneshot, the auto-passthrough toggle
-//! writes state + store directly. Status colors are computed values, so they
-//! ride inline `style:` attributes (Tailwind purges computed class names).
+//! `main.rs`). Actions go the other way through `fleet::shared()`: a
+//! headless run Hobbes dispatched has its permission requests held, and its
+//! row's Approve / Deny resolve the held gate's oneshot; an interactive
+//! session's request is answered in its terminal (the row takes the person
+//! there). Status colors are computed values, so they ride inline `style:`
+//! attributes (Tailwind purges computed class names).
 
 use chrono::{DateTime, Local, Utc};
 use dioxus::prelude::*;
@@ -140,16 +142,48 @@ fn group_of(status: &FleetStatus) -> Group {
 }
 
 /// Live sessions bucketed by [`Group`] (indexed `Group as usize`), each
-/// bucket most recent activity first.
+/// bucket most recent activity first — except that idle rows whose brief
+/// says they are blocked lead the Idle group.
 fn grouped_sessions(state: &fleet::FleetState) -> [Vec<FleetSession>; 3] {
     let mut groups: [Vec<FleetSession>; 3] = Default::default();
     for s in state.sessions.values() {
         groups[group_of(&s.status) as usize].push(s.clone());
     }
-    for g in groups.iter_mut() {
-        g.sort_by(|a, b| b.last_event_at.cmp(&a.last_event_at).then_with(|| a.id.cmp(&b.id)));
+    for (i, g) in groups.iter_mut().enumerate() {
+        let blocked_first = i == Group::Idle as usize;
+        g.sort_by(|a, b| {
+            let ord = if blocked_first {
+                blocked_text(b).is_some().cmp(&blocked_text(a).is_some())
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            ord.then_with(|| b.last_event_at.cmp(&a.last_event_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
     }
     groups
+}
+
+/// The brief's blocker, shown whenever the session is not on the job (no
+/// turn, background phase or timer running): a session doing work is not
+/// blocked-waiting on the user, whatever an older brief believed.
+fn blocked_text(session: &FleetSession) -> Option<String> {
+    if session.status.is_active() {
+        return None;
+    }
+    session
+        .brief
+        .as_ref()
+        .and_then(|b| b.blocked_on.as_deref())
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .map(str::to_string)
+}
+
+/// The brief's headline, display-safe: briefs stored before headlines were
+/// cleaned may hold raw JSON, which is unwrapped or dropped.
+fn brief_headline(session: &FleetSession) -> Option<String> {
+    session.brief.as_ref().and_then(|b| fleet::briefs::clean_headline(&b.headline))
 }
 
 /// Idle rows shown before the rest fold behind a toggle.
@@ -187,9 +221,9 @@ fn summary_parts(needs_you: usize, working: usize, agent_minutes: u32) -> (Optio
     (needs, rest)
 }
 
-/// The row's one status phrase, by priority: a held gate's tool and input,
-/// the notification message, the brief headline, the background/timer
-/// label, then "—".
+/// The row's one status phrase, by priority: a pending gate's tool and
+/// input, the notification message, the brief's blocker (when the session
+/// isn't running), the brief headline, the background/timer label, then "—".
 fn status_phrase(session: &FleetSession, now: DateTime<Utc>) -> String {
     if let Some(gate) = &session.pending_gate {
         return format!("{}: {}", gate.tool_name, gate.input_summary);
@@ -199,10 +233,11 @@ fn status_phrase(session: &FleetSession, now: DateTime<Utc>) -> String {
             return message.clone();
         }
     }
-    if let Some(b) = &session.brief {
-        if !b.headline.is_empty() {
-            return b.headline.clone();
-        }
+    if let Some(b) = blocked_text(session) {
+        return format!("blocked: {b}");
+    }
+    if let Some(h) = brief_headline(session) {
+        return h;
     }
     background_label(&session.status, session.last_event_at, now)
         .or_else(|| waiting_label(&session.status, session.wake_at))
@@ -467,9 +502,9 @@ fn EarlierToday(rows: Vec<FleetSession>, now: DateTime<Utc>, today: chrono::Naiv
                             }
                             span { class: "text-fg-muted shrink-0",
                                 { crate::todo::model::format_minutes(s.minutes_on(today, now)) } }
-                            if let Some(b) = &s.brief {
+                            if let Some(h) = brief_headline(s) {
                                 span { class: "text-fg-muted truncate",
-                                    { fleet::truncate_summary(&b.headline, 120) } }
+                                    { fleet::truncate_summary(&h, 120) } }
                             }
                         }
                     }
@@ -948,6 +983,9 @@ fn flash_note(mut note: Signal<Option<(i64, String)>>, text: String) {
     });
 }
 
+/// Shown when Approve / Deny reaches a request that is no longer held.
+const GATE_GONE_NOTE: &str = "That request is no longer waiting \u{2014} it timed out or the run moved on.";
+
 /// Go to the session: a Hobbes tab switches (which also dismisses the fleet
 /// view); a Claude Code session walks the terminal-focus ladder and reports
 /// where it ended up.
@@ -1030,6 +1068,13 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
     let label = use_memo(move || row_label(&label_session, &session_state.read()));
     let (row_name, row_emoji) = label();
     let phrase = status_phrase(&session, now);
+    let phrase_blocked = session.pending_gate.is_none()
+        && blocked_text(&session).is_some_and(|b| phrase == format!("blocked: {b}"));
+    let phrase_style = if phrase_blocked { "color: #f59e0b;" } else { "" };
+    // A headless run Hobbes dispatched has no terminal: its permission
+    // request is held for Approve / Deny right here.
+    let held_gate = session.held_gate().map(|g| g.request_id.clone());
+    let headless_live = session.is_headless_dispatch() && session.ended_at.is_none();
     let go_title = go_label(&session);
     let is_open = *expanded.read();
     let note_text = note.read().as_ref().map(|n| n.1.clone());
@@ -1042,6 +1087,7 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
         session.clone(),
     );
     let dismiss_id = session.id.clone();
+    let row_dismiss_id = session.id.clone();
 
     rsx! {
         div {
@@ -1085,12 +1131,39 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                     style: "background-color: {chip_color};",
                     title: "{chip_label}",
                 }
-                span { class: "fleet-phrase text-xs text-fg", title: "{phrase}", "{phrase}" }
+                span { class: "fleet-phrase text-xs text-fg", style: "{phrase_style}", title: "{phrase}", "{phrase}" }
                 span {
                     class: "shrink-0 text-[11px] text-fg-muted tabular-nums",
                     { age_label(session.last_event_at, now) }
                 }
-                if attention {
+                if let Some(rid) = held_gate.clone() {
+                    button {
+                        class: "shrink-0 px-3 py-1 text-xs font-medium rounded min-h-8",
+                        style: "border: 1px solid #f59e0b; background: rgba(245,158,11,0.12); color: #fcd34d;",
+                        title: "Let the headless run use this tool",
+                        onclick: {
+                            let rid = rid.clone();
+                            move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                if !fleet::shared().resolve_gate(&rid, true) {
+                                    flash_note(note, GATE_GONE_NOTE.to_string());
+                                }
+                            }
+                        },
+                        "Approve"
+                    }
+                    button {
+                        class: "shrink-0 px-3 py-1 text-xs font-medium rounded min-h-8 border border-subtle text-fg-muted hover:text-fg hover:bg-card",
+                        title: "Refuse this tool; the run carries on without it",
+                        onclick: move |evt: MouseEvent| {
+                            evt.stop_propagation();
+                            if !fleet::shared().resolve_gate(&rid, false) {
+                                flash_note(note, GATE_GONE_NOTE.to_string());
+                            }
+                        },
+                        "Deny"
+                    }
+                } else if attention {
                     button {
                         class: "shrink-0 px-3 py-1 text-xs font-medium rounded min-h-8",
                         style: "border: 1px solid #f59e0b; background: rgba(245,158,11,0.12); color: #fcd34d;",
@@ -1100,7 +1173,7 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                         },
                         { answer_button_label(&session) }
                     }
-                } else {
+                } else if !headless_live {
                     button {
                         class: "shrink-0 px-1.5 py-1 text-sm text-fg-muted hover:text-fg opacity-60 group-hover:opacity-100 focus:opacity-100 transition-opacity",
                         title: "{go_title}",
@@ -1110,6 +1183,22 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                             go_to(btn_go.clone(), chat_command, note);
                         },
                         "↗"
+                    }
+                }
+                // Hide, hover-revealed like the tab-close idiom (as before the
+                // redesign): the escape hatch for a row whose terminal went
+                // away without a SessionEnd. External only: Hobbes tabs leave
+                // the board when they close. Also in the expanded details.
+                if !is_hobbes {
+                    button {
+                        class: "shrink-0 px-1 py-1 text-fg-muted hover:text-fg opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity",
+                        title: "Hide this session from the fleet (it comes back on its next event)",
+                        aria_label: "Hide this session from the fleet",
+                        onclick: move |evt| {
+                            evt.stop_propagation();
+                            fleet::shared().dismiss_session(&row_dismiss_id);
+                        },
+                        Icon { width: 14, height: 14, icon: fi_icons::FiX }
                     }
                 }
             }
@@ -1171,15 +1260,15 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                     }
                     let facts = facts.join(" · ");
                     let resume = fleet::terminal_focus::resume_command(&resume_s);
-                    let blocked = match (&session.brief, attention) {
-                        (Some(b), true) => b.blocked_on.clone(),
-                        _ => None,
-                    };
+                    let blocked = blocked_text(&session);
+                    let headline = brief_headline(&session);
                     rsx! {
                         div {
                             class: "mx-3 mb-3 rounded bg-input p-2 space-y-1",
                             if let Some(brief) = &session.brief {
-                                p { class: "text-xs text-fg", "{brief.headline}" }
+                                if let Some(h) = headline {
+                                    p { class: "text-xs text-fg", "{h}" }
+                                }
                                 for b in brief.bullets.iter().take(3) {
                                     p { class: "text-xs text-fg-muted", { format!("• {b}") } }
                                 }
@@ -1199,18 +1288,24 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                                 }
                             }
                             p { class: "text-xs text-fg-muted break-all", "{facts}" }
-                            if session.dispatched_todo.is_some() {
+                            if session.is_headless_dispatch() {
+                                p { class: "text-[11px] text-fg-muted",
+                                    "Headless run launched by Hobbes for a todo \u{2014} no terminal; approve or deny its permission requests here (unanswered for about two minutes, a request is refused)."
+                                }
+                            } else if session.dispatched_todo.is_some() {
                                 p { class: "text-[11px] text-fg-muted", "Launched by Hobbes for a todo" }
                             }
                             div {
                                 class: "pt-1 flex items-center gap-2 flex-wrap",
-                                button {
-                                    class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
-                                    onclick: {
-                                        let s = session.clone();
-                                        move |_| go_to(s.clone(), chat_command, note)
-                                    },
-                                    { format!("{} ↗", go_title) }
+                                if !headless_live {
+                                    button {
+                                        class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card",
+                                        onclick: {
+                                            let s = session.clone();
+                                            move |_| go_to(s.clone(), chat_command, note)
+                                        },
+                                        { format!("{} ↗", go_title) }
+                                    }
                                 }
                                 if let Some(cmd) = resume {
                                     button {
@@ -1373,6 +1468,103 @@ mod tests {
             requested_at: now,
         });
         assert_eq!(status_phrase(&s, now), "Bash: rm -rf node_modules");
+    }
+
+    fn brief(headline: &str, blocked: Option<&str>) -> fleet::SessionBrief {
+        fleet::SessionBrief {
+            headline: headline.into(),
+            bullets: vec![],
+            blocked_on: blocked.map(str::to_string),
+            generated_at: utc("2026-08-25T10:00:00Z"),
+            final_brief: false,
+        }
+    }
+
+    #[test]
+    fn idle_rows_show_their_blocker_ahead_of_the_headline() {
+        let now = utc("2026-08-25T10:00:00Z");
+        let mut s = session("a", FleetStatus::Idle, fleet::FleetOrigin::External, 0);
+        s.brief = Some(brief("Wired the exporter", Some("needs the staging API key")));
+        assert_eq!(blocked_text(&s).as_deref(), Some("needs the staging API key"));
+        assert_eq!(status_phrase(&s, now), "blocked: needs the staging API key");
+        // Needs-you rows are not active either: the blocker still shows.
+        s.status = FleetStatus::NeedsAttention(AttentionKind::Gate);
+        assert!(blocked_text(&s).is_some());
+        // A running session is not blocked, whatever the older brief said.
+        for active in [FleetStatus::Working, FleetStatus::WorkingBackground, FleetStatus::Waiting] {
+            s.status = active;
+            assert_eq!(blocked_text(&s), None);
+            assert_eq!(status_phrase(&s, now), "Wired the exporter");
+        }
+        // Blank blockers are ignored.
+        s.status = FleetStatus::Idle;
+        s.brief = Some(brief("Wired the exporter", Some("  ")));
+        assert_eq!(status_phrase(&s, now), "Wired the exporter");
+    }
+
+    #[test]
+    fn blocked_idle_rows_lead_the_idle_group() {
+        let mut state = fleet::FleetState::default();
+        let mut blocked = session("blocked-old", FleetStatus::Idle, fleet::FleetOrigin::External, 90);
+        blocked.brief = Some(brief("x", Some("waiting on review")));
+        for s in [
+            session("fresh", FleetStatus::Idle, fleet::FleetOrigin::External, 1),
+            blocked,
+            session("older", FleetStatus::Idle, fleet::FleetOrigin::External, 30),
+        ] {
+            state.sessions.insert(s.id.clone(), s);
+        }
+        let g = grouped_sessions(&state);
+        let ids: Vec<&str> = g[Group::Idle as usize].iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["blocked-old", "fresh", "older"]);
+    }
+
+    #[test]
+    fn legacy_json_headlines_are_cleaned_for_display() {
+        let now = utc("2026-08-25T10:00:00Z");
+        let mut s = session("a", FleetStatus::Idle, fleet::FleetOrigin::External, 0);
+        s.brief = Some(brief(r#"{"summary": "Fixed the login redirect", "current_task": "tests"}"#, None));
+        assert_eq!(brief_headline(&s).as_deref(), Some("Fixed the login redirect"));
+        assert_eq!(status_phrase(&s, now), "Fixed the login redirect");
+        // Unrecoverable JSON debris is dropped, never shown raw.
+        s.brief = Some(brief(r#"{"bullets": ["a"]}"#, None));
+        assert_eq!(brief_headline(&s), None);
+        assert_eq!(status_phrase(&s, now), "—");
+    }
+
+    #[test]
+    fn headless_runs_are_answered_in_hobbes_not_a_terminal() {
+        let mut run = session("run", FleetStatus::NeedsAttention(AttentionKind::Gate), fleet::FleetOrigin::External, 0);
+        run.dispatched_todo = Some("todo-1".into());
+        run.pending_gate = Some(fleet::PendingGate {
+            request_id: "g".into(),
+            tool_name: "Bash".into(),
+            input_summary: "npm test".into(),
+            requested_at: utc("2026-08-25T10:00:00Z"),
+        });
+        assert!(run.held_gate().is_some());
+        assert!(!answer_button_label(&run).contains("terminal"));
+        assert_eq!(go_label(&run), fleet::terminal_focus::HEADLESS_DESTINATION_LABEL);
+        // The same request on an interactive session is not held.
+        let mut cc = run.clone();
+        cc.dispatched_todo = None;
+        assert!(cc.held_gate().is_none());
+        assert!(answer_button_label(&cc).starts_with("Answer in"));
+        // A dispatched run resumed in a real terminal answers there.
+        let mut resumed = run.clone();
+        resumed.terminal = Some(fleet::terminal_focus::TerminalHint {
+            term_program: Some("iTerm.app".into()),
+            ..Default::default()
+        });
+        assert!(!resumed.is_headless_dispatch());
+        assert!(resumed.held_gate().is_none());
+        // Hobbes's own bundle id alone (inherited by `claude -p`) is not a terminal.
+        let mut headless = run.clone();
+        headless.terminal = Some(fleet::terminal_focus::TerminalHint {
+            bundle_id: Some("ai.clearmirror.cai-hobbes".into()),
+            ..Default::default()
+        });
+        assert!(headless.is_headless_dispatch());
     }
 
     #[test]

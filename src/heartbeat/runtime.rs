@@ -268,6 +268,8 @@ fn salience_ctx(deps: HeartbeatDeps, settings: &Settings, session_id: Option<&st
         if let Some(sid) = session_id {
             let messages = state.sessions.get(sid).map(|s| s.messages.as_slice()).unwrap_or(&[]);
             ctx.heartbeat_todo_ids = wake::heartbeat_todo_ids(&deps.fleet.peek(), sid, messages);
+            ctx.relayed_todo_ids =
+                crate::todo::relay::relayed_todo_ids(&state, &deps.planner.peek(), settings, sid);
         }
     }
     ctx.agent_project_ids = agent_project_ids(&deps.planner.peek());

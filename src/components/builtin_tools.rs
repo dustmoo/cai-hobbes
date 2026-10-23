@@ -51,6 +51,8 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_LIST_TIMERS",
     "HOBBES_CANCEL_TIMER",
     "HOBBES_FLEET_STATUS",
+    "HOBBES_MESSAGE_PARENT",
+    "HOBBES_MESSAGE_WORKER",
     "HOBBES_TODO_CREATE",
     "HOBBES_TODO_UPDATE",
     "HOBBES_TODO_LIST",
@@ -632,6 +634,20 @@ pub async fn dispatch_builtin_tool(
             })
         }
 
+        // Dispatch relay (todo::relay): parent ↔ its own chat workers only,
+        // refused by mode and link inside the handlers.
+        "HOBBES_MESSAGE_PARENT" => {
+            let (status, response) =
+                crate::todo::relay::handle_message_parent(deps, args_json, session_id);
+            Some(BuiltinOutcome { status, response, persist: true })
+        }
+
+        "HOBBES_MESSAGE_WORKER" => {
+            let (status, response) =
+                crate::todo::relay::handle_message_worker(deps, args_json, session_id);
+            Some(BuiltinOutcome { status, response, persist: true })
+        }
+
         "HOBBES_PROJECT_MERGE" => {
             let (status, response) = project_merge_tool(deps, args_json, user_approved).await;
             Some(BuiltinOutcome {
@@ -1150,7 +1166,8 @@ mod tests {
     /// fails as an unintercepted call.
     #[test]
     fn every_core_client_tool_is_dispatchable() {
-        for tool in crate::mcp::core_client::CoreClient::new().list_tools() {
+        let relay = crate::mcp::core_client::CoreClient::relay_tools();
+        for tool in crate::mcp::core_client::CoreClient::new().list_tools().into_iter().chain(relay) {
             assert!(
                 is_builtin_tool(&tool.name),
                 "CoreClient advertises '{}' but BUILTIN_TOOLS does not list it — \

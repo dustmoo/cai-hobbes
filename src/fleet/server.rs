@@ -12,14 +12,28 @@
 //!
 //! # Permission requests
 //!
-//! `PermissionRequest` is never held. Per the verified hook contract a 2xx
-//! with an **empty body** means "no decision": Claude Code shows its own
-//! permission prompt in the terminal, with the choices the Fleet can't offer
-//! (always allow, tell Claude what to do instead, AskUserQuestion options).
-//! The listener answers that way at once and records the request as the
-//! session's pending gate, so the Fleet shows the session needs the user and
-//! takes them to the terminal. (Hobbes's own chat tabs keep their in-app
-//! approvals; those never come through here.)
+//! Per the verified hook contract a 2xx with an **empty body** means "no
+//! decision", and an allow / deny rides
+//! `hookSpecificOutput.decision.behavior`. Every request is recorded as the
+//! session's pending gate, then answered one of two ways:
+//!
+//! - **Interactive sessions** (the default) are answered at once with the
+//!   empty body: Claude Code shows its own permission prompt in the
+//!   terminal, with the choices the Fleet can't offer (always allow, tell
+//!   Claude what to do instead, AskUserQuestion options), and the Fleet
+//!   takes the person there.
+//! - **Headless runs Hobbes dispatched** (`claude -p`, stdin closed — see
+//!   `todo::dispatch`; identified by the row's `dispatched_todo`,
+//!   [`super::FleetSession::is_headless_dispatch`]) have no terminal to
+//!   prompt in, so the response is HELD: the handler registers a oneshot
+//!   keyed by the request id and waits for the Fleet / Planner Approve or
+//!   Deny ([`FleetShared::resolve_gate`]). A timer gives up
+//!   [`GATE_TIMEOUT_MARGIN_SECS`] before the configured hook timeout and
+//!   answers with the empty body — for a headless run that means the tool
+//!   is not permitted and the run carries on without it.
+//!
+//! (Hobbes's own chat tabs keep their in-app approvals; those never come
+//! through here.)
 //!
 //! # Terminal hints
 //!
@@ -39,8 +53,9 @@ use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 
 use super::events::{parse_event, FleetEvent};
+use super::hooks_config::{GATE_TIMEOUT_MARGIN_SECS, PERMISSION_HOOK_TIMEOUT_SECS};
 use super::terminal_focus::{hint_from_headers, TerminalHint};
-use super::{store, sweep_stale, FleetShared};
+use super::{resolve_gate_in_state, store, sweep_stale, FleetShared, GateOutcome};
 
 /// Default fixed port; on bind failure the listener falls back to an
 /// ephemeral port (`:0`) and persists whatever it got in meta so hook
@@ -60,11 +75,21 @@ pub struct FleetServerConfig {
     /// Port to try; 0 binds ephemeral.
     pub port: u16,
     pub token: String,
+    /// How long a headless run's held gate waits for an Approve / Deny
+    /// before resolving as passthrough. Production: hook timeout minus the
+    /// safety margin.
+    pub gate_hold: Duration,
 }
 
 impl FleetServerConfig {
     pub fn new(port: u16, token: String) -> Self {
-        Self { port, token }
+        Self {
+            port,
+            token,
+            gate_hold: Duration::from_secs(
+                PERMISSION_HOOK_TIMEOUT_SECS.saturating_sub(GATE_TIMEOUT_MARGIN_SECS),
+            ),
+        }
     }
 }
 
@@ -220,6 +245,31 @@ fn respond(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
         .expect("static response builds")
 }
 
+/// The verified PermissionRequest decision shape.
+fn decision_body(outcome: GateOutcome) -> String {
+    match outcome {
+        GateOutcome::Allow => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": { "behavior": "allow" }
+            }
+        })
+        .to_string(),
+        GateOutcome::Deny => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {
+                    "behavior": "deny",
+                    "message": "Denied from Hobbes."
+                }
+            }
+        })
+        .to_string(),
+        // Empty 2xx body == no decision.
+        GateOutcome::Passthrough => String::new(),
+    }
+}
+
 async fn handle(
     shared: Arc<FleetShared>,
     cfg: FleetServerConfig,
@@ -301,7 +351,7 @@ async fn handle(
     let now = chrono::Utc::now();
     let transcript_path = crate::fleet::events::transcript_path_from_body(&body);
     let prompt_id = crate::fleet::events::prompt_id_from_body(&body);
-    {
+    let held = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
         // Revival: an event for a session that retired (or resumed after
         // SessionEnd) rejoins with its stored row, keeping banked time.
@@ -326,7 +376,22 @@ async fn handle(
         }
         store::persist_sessions(&changed);
         store::save_coverage(&crate::fleet::sync_coverage(&mut state, now));
-    }
+        // A headless dispatched run's permission request is held for the
+        // in-app Approve / Deny. Register the responder BEFORE the state
+        // becomes visible (the poke), so a UI click racing the snapshot can
+        // never miss it.
+        match &event {
+            FleetEvent::PermissionRequest { request_id, .. }
+                if state
+                    .sessions
+                    .get(event.session_id())
+                    .is_some_and(|s| s.is_headless_dispatch()) =>
+            {
+                Some((request_id.clone(), shared.register_gate(request_id)))
+            }
+            _ => None,
+        }
+    };
     shared.poke();
 
     // Title refresh at ingest: the card should match the Claude Code session
@@ -365,10 +430,44 @@ async fn handle(
         }
     }
 
-    // Every event — PermissionRequest included — answers immediately with
-    // an empty 2xx: for a permission request that is "no decision", and
-    // Claude Code shows its own prompt in the terminal.
-    Ok(respond(StatusCode::OK, ""))
+    // Everything except a headless run's held gate answers immediately with
+    // an empty 2xx — for an interactive permission request that is "no
+    // decision", and Claude Code shows its own prompt in the terminal.
+    let Some((request_id, rx)) = held else {
+        return Ok(respond(StatusCode::OK, ""));
+    };
+
+    // Hold for the UI, or give up shortly before the hook's own timeout.
+    let outcome = tokio::select! {
+        decision = rx => decision.unwrap_or(GateOutcome::Passthrough),
+        _ = tokio::time::sleep(cfg.gate_hold) => {
+            // Drop the now-dead responder so a late UI click is a no-op.
+            let _ = shared.take_gate(&request_id);
+            GateOutcome::Passthrough
+        }
+    };
+    finish_gate(&shared, event.session_id(), &request_id, outcome);
+    Ok(respond(StatusCode::OK, &decision_body(outcome)))
+}
+
+/// Post-decision bookkeeping for a held gate: state transition,
+/// persistence, decision log, UI poke. Synchronous — called after all
+/// awaits are done.
+fn finish_gate(shared: &FleetShared, session_id: &str, request_id: &str, outcome: GateOutcome) {
+    let now = chrono::Utc::now();
+    let changed = {
+        let mut state = shared.state.lock().expect("fleet state lock poisoned");
+        resolve_gate_in_state(&mut state, request_id, outcome, now)
+    };
+    if let Some(row) = changed {
+        store::persist_sessions(std::slice::from_ref(&row));
+    }
+    store::append_event(
+        session_id,
+        "GateDecision",
+        &serde_json::json!({ "request_id": request_id, "outcome": outcome.as_str() }).to_string(),
+    );
+    shared.poke();
 }
 
 // ── Identity (port + token in session_store meta) ───────────────────────────
@@ -418,8 +517,15 @@ mod tests {
 
     /// Spin up a listener on an ephemeral port.
     async fn test_server() -> (Arc<FleetShared>, FleetServer, String) {
+        test_server_with_hold(5000).await
+    }
+
+    /// A listener whose held gates (headless dispatched runs) give up after
+    /// `hold_ms`.
+    async fn test_server_with_hold(hold_ms: u64) -> (Arc<FleetShared>, FleetServer, String) {
         let shared = Arc::new(FleetShared::new());
-        let cfg = FleetServerConfig::new(0, "testtok".into());
+        let mut cfg = FleetServerConfig::new(0, "testtok".into());
+        cfg.gate_hold = Duration::from_millis(hold_ms);
         let server = start(shared.clone(), cfg).await.unwrap();
         let base = format!("http://127.0.0.1:{}/fleet/testtok", server.port);
         (shared, server, base)
@@ -512,8 +618,116 @@ mod tests {
         server.shutdown();
     }
 
+    /// Seed a row the way `precreate_dispatched_session` does for a headless
+    /// HOBBES_DISPATCH run.
+    fn seed_headless(shared: &FleetShared, id: &str) {
+        let mut row = crate::fleet::FleetSession::new(id, "/Users/x/dev/hobbes", chrono::Utc::now());
+        row.dispatched_todo = Some("todo-1".into());
+        assert!(row.is_headless_dispatch());
+        shared.state.lock().unwrap().sessions.insert(id.into(), row);
+    }
+
+    /// Answer the session's gate from "the UI" as soon as it shows up.
+    fn ui_answers(shared: &Arc<FleetShared>, id: &'static str, allow: bool) -> tokio::task::JoinHandle<()> {
+        let shared = shared.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let gate = shared.snapshot().sessions.get(id).and_then(|s| s.pending_gate.clone());
+                if let Some(gate) = gate {
+                    assert!(shared.gate_is_held(&gate.request_id));
+                    assert!(shared.resolve_gate(&gate.request_id, allow));
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("gate never appeared in state");
+        })
+    }
+
     #[tokio::test]
-    async fn permission_requests_are_never_held() {
+    async fn headless_dispatched_gate_is_held_and_approved_from_the_ui() {
+        let (shared, server, base) = test_server().await;
+        seed_headless(&shared, "h1");
+        let ui = ui_answers(&shared, "h1", true);
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/PermissionRequest"))
+            .body(permission_body("h1"))
+            .send()
+            .await
+            .unwrap();
+        ui.await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["hookSpecificOutput"]["decision"]["behavior"], "allow",
+            "verified contract: decision.behavior, not permissionDecision"
+        );
+        assert_eq!(body["hookSpecificOutput"]["hookEventName"], "PermissionRequest");
+        let snap = shared.snapshot();
+        assert_eq!(snap.sessions["h1"].status, FleetStatus::Working);
+        assert!(snap.sessions["h1"].pending_gate.is_none());
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn headless_dispatched_gate_denied_from_the_ui() {
+        let (shared, server, base) = test_server().await;
+        seed_headless(&shared, "h1");
+        let ui = ui_answers(&shared, "h1", false);
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/PermissionRequest"))
+            .body(permission_body("h1"))
+            .send()
+            .await
+            .unwrap();
+        ui.await.unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["hookSpecificOutput"]["decision"]["behavior"], "deny");
+        assert!(body["hookSpecificOutput"]["decision"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Hobbes"));
+        assert!(shared.snapshot().sessions["h1"].pending_gate.is_none());
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unanswered_headless_gate_times_out_to_an_empty_passthrough() {
+        // 100ms stands in for the production 110s (120s hook timeout minus
+        // the 10s margin).
+        let (shared, server, base) = test_server_with_hold(100).await;
+        seed_headless(&shared, "h1");
+        let started = std::time::Instant::now();
+        let resp = reqwest::Client::new()
+            .post(format!("{base}/PermissionRequest"))
+            .body(permission_body("h1"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(100), "it was held");
+        assert_eq!(resp.status(), 200);
+        assert!(resp.bytes().await.unwrap().is_empty(), "passthrough is an EMPTY 2xx");
+        let snap = shared.snapshot();
+        assert!(snap.sessions["h1"].pending_gate.is_none());
+        assert_eq!(snap.sessions["h1"].status, FleetStatus::Working, "the run carries on");
+        // A late UI click on the dead gate is a no-op.
+        assert!(!shared.resolve_gate("whatever", true));
+        server.shutdown();
+    }
+
+    #[test]
+    fn gate_timing_margin_matches_the_hook_contract() {
+        let cfg = FleetServerConfig::new(0, "t".into());
+        assert_eq!(
+            cfg.gate_hold,
+            Duration::from_secs(PERMISSION_HOOK_TIMEOUT_SECS - GATE_TIMEOUT_MARGIN_SECS)
+        );
+        assert!(cfg.gate_hold < Duration::from_secs(PERMISSION_HOOK_TIMEOUT_SECS));
+    }
+
+    #[tokio::test]
+    async fn interactive_permission_requests_are_never_held() {
         let (shared, server, base) = test_server().await;
         let client = reqwest::Client::new();
 
@@ -540,6 +754,8 @@ mod tests {
             FleetStatus::NeedsAttention(AttentionKind::Gate)
         );
         let gate = snap.sessions["s1"].pending_gate.as_ref().expect("kept for display");
+        assert!(!shared.gate_is_held(&gate.request_id), "no responder for an interactive session");
+        assert!(!shared.resolve_gate(&gate.request_id, true));
         assert_eq!(gate.tool_name, "Bash");
         assert!(gate.input_summary.contains("rm -rf node_modules"));
 

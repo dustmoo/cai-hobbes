@@ -128,6 +128,12 @@ fn drain_cancel_stream_requests() -> Vec<String> {
 static PENDING_TAB_REOPEN: GlobalSignal<std::collections::HashSet<String>> =
     Signal::global(std::collections::HashSet::new);
 
+/// Ask the `ChatCommand` handler to reopen `session_id` in the tab strip
+/// (a dispatch relay waking a chat whose tab was closed — `todo::relay`).
+pub(crate) fn request_tab_reopen(session_id: &str) {
+    PENDING_TAB_REOPEN.write().insert(session_id.to_string());
+}
+
 /// Drain `PENDING_TAB_REOPEN`, subscribing the caller to it. Same idiom as
 /// `drain_cancel_stream_requests`: the read (not the write) is what makes a
 /// later insert re-run the subscribed effect.
@@ -346,14 +352,24 @@ fn sync_timer_waits(session_state: Signal<SessionState>, ids: impl IntoIterator<
         if streaming.contains(&id) {
             continue;
         }
-        let Some((name, next)) = session_state
+        let Some((name, next, awaiting_approval)) = session_state
             .peek()
             .sessions
             .get(&id)
-            .map(|s| (s.display_title(), s.next_pending_timer()))
+            .map(|s| (s.display_title(), s.next_pending_timer(), heartbeat::wake::has_pending_approval(&s.messages)))
         else {
             continue;
         };
+        // A tab waiting on the user (a held approval, or any needs-you row)
+        // keeps that state: reporting a timer wait would clear it.
+        let needs_you = fleet::shared()
+            .state
+            .lock()
+            .map(|st| st.sessions.get(&id).is_some_and(|r| r.status.needs_attention()))
+            .unwrap_or(false);
+        if awaiting_approval || needs_you {
+            continue;
+        }
         if next.is_some() || fleet::bridge::is_waiting(&id) {
             fleet::bridge::report(&id, &name, fleet::bridge::turn_end_signal(next));
         }
@@ -2032,6 +2048,29 @@ fn app() -> Element {
                 if due {
                     chat_command.set(Some(ChatCommand::AgentTimeStart));
                 }
+            }
+        });
+    }
+
+    // Dispatch relay: a chat worker's to-do can finish after its last turn
+    // (a brief lands later and marks it Done / Review). This sweep hands
+    // those completion reports to the parent chat; the worker's turn end
+    // covers the rest. Latched per worker, so a report goes out once.
+    {
+        let planner_state = planner_state;
+        let session_state = session_state;
+        use_future(move || async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let streaming = STREAMING_SESSIONS.peek().clone();
+                crate::todo::relay::sweep_completion_reports(
+                    crate::todo::relay::RelaySignals {
+                        session_state,
+                        planner: planner_state,
+                        settings,
+                    },
+                    &streaming,
+                );
             }
         });
     }
