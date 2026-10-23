@@ -232,7 +232,7 @@ impl<'a> PromptBuilder<'a> {
                 message_to_check.is_some_and(|m| matches!(m.content, MessageContent::ToolCall(_)));
 
             if last_message_was_tool {
-                let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool execution has completed. Use the tool output above to answer the user's request. Do not ask the user for the tool output again. When reporting specific values from tool outputs (like dates, IDs, or file paths), present them exactly as returned. Do not transform, reformat, or convert them (e.g. date conversion) unless explicitly requested by the user.";
+                let tool_completion_instruction = "\n\nTOOL COMPLETION INSTRUCTION: The tool results are above. If finishing the user's request needs more tool calls, make them now; otherwise answer from the results. Do not ask the user for the tool output again. When reporting specific values from tool outputs (like dates, IDs, or file paths), present them exactly as returned. Do not transform, reformat, or convert them (e.g. date conversion) unless explicitly requested by the user.";
                 turn_instructions.push_str(tool_completion_instruction);
             } else {
                 let continuation_instruction = "\n\nCONTINUATION INSTRUCTION: You were the last one to speak. The user has not replied. Continue the conversation based on the existing context. Do not repeat yourself. Provide new information or ask a clarifying question.";

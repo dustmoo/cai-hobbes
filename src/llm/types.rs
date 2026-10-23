@@ -116,7 +116,101 @@ pub struct LlmPrompt {
     pub tools: Vec<ToolDefinition>,
 }
 
+/// What [`LlmPrompt::cap_tool_count`] keeps when a provider caps the number
+/// of tool declarations per request.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCap {
+    /// Indices into `prompt.tools` to send, in their original order (the
+    /// cached tool prefix stays stable while the drop set does).
+    pub keep: Vec<usize>,
+    /// `server/tool` names left out of this request.
+    pub dropped: Vec<String>,
+    /// Appended to the system instruction so the model knows the tools are
+    /// missing and how to get them back.
+    pub note: String,
+}
+
+/// How readily a tool is left out when over a provider's tool-count cap
+/// (lower stays longer).
+fn tool_drop_tier(tool: &ToolDefinition, used: &std::collections::HashSet<&str>) -> u8 {
+    use crate::mcp::manager::{
+        is_composio_native, HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER,
+    };
+    let wire = crate::gemini::convert::get_prefixed_tool_name(&tool.server_name, &tool.name);
+    let builtin = [HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER]
+        .contains(&tool.server_name.as_str());
+    let composio = is_composio_native(&tool.server_name);
+    // Composio's own meta-tools (search, clear, ...) are how the model frees
+    // room, so they stay with the built-ins.
+    let composio_meta = composio && tool.name.starts_with("COMPOSIO_");
+    if builtin || composio_meta || used.contains(tool.name.as_str()) || used.contains(wire.as_str()) {
+        0
+    } else if composio {
+        // Bulk-discovered toolkits go first: a single search can add dozens.
+        2
+    } else {
+        // Servers the user configured or the model loaded on purpose.
+        1
+    }
+}
+
 impl LlmPrompt {
+    /// Choose which tools fit under a provider's per-request tool-count
+    /// `limit`. `None` when everything fits. Built-in Hobbes tools, Composio's
+    /// meta-tools and tools already called in this conversation are kept;
+    /// dynamically discovered Composio tools are left out before other MCP
+    /// servers' tools, latest in the list first.
+    pub fn cap_tool_count(&self, limit: usize) -> Option<ToolCap> {
+        if self.tools.len() <= limit {
+            return None;
+        }
+        let used: std::collections::HashSet<&str> = self
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { name, .. } | ContentBlock::ToolResult { name, .. } => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        let tiers: Vec<u8> = self.tools.iter().map(|t| tool_drop_tier(t, &used)).collect();
+        // Drop order: highest tier first, later tools before earlier ones.
+        let mut order: Vec<usize> = (0..self.tools.len()).collect();
+        order.sort_by_key(|&i| (std::cmp::Reverse(tiers[i]), std::cmp::Reverse(i)));
+        let mut drop = vec![false; self.tools.len()];
+        for &i in order.iter().take(self.tools.len() - limit) {
+            drop[i] = true;
+        }
+        let keep: Vec<usize> = (0..self.tools.len()).filter(|&i| !drop[i]).collect();
+        let dropped: Vec<String> = (0..self.tools.len())
+            .filter(|&i| drop[i])
+            .map(|i| {
+                let t = &self.tools[i];
+                if t.server_name.is_empty() {
+                    t.name.clone()
+                } else {
+                    format!("{}/{}", t.server_name, t.name)
+                }
+            })
+            .collect();
+        let composio_dropped = (0..self.tools.len()).any(|i| drop[i] && tiers[i] == 2);
+        let mut note = format!(
+            "\n\n<TOOLS_WITHHELD>\n\
+            This model accepts at most {limit} tools per request, so {} of {} loaded tools were left out of this one: {}.\n\
+            You cannot call them until room is freed.",
+            dropped.len(),
+            self.tools.len(),
+            crate::log_utils::cap_list(&dropped, 20),
+        );
+        if composio_dropped {
+            note.push_str(" Call COMPOSIO_CLEAR_TOOLS to drop discovered Composio tools you no longer need, then search again for just the ones the task needs.");
+        }
+        note.push_str(" If a missing tool is needed, tell the user rather than working around it.\n</TOOLS_WITHHELD>");
+        Some(ToolCap { keep, dropped, note })
+    }
+
     /// Enforce a context window budget by compressing content and trimming as needed.
     ///
     /// Phase 1:   If system + tools alone exceed the budget, drop the largest unused
@@ -306,5 +400,99 @@ impl LlmPrompt {
         }
 
         drop_count
+    }
+}
+
+#[cfg(test)]
+mod tool_cap_tests {
+    use super::*;
+
+    fn tool(server: &str, name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            server_name: server.into(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    fn prompt(tools: Vec<ToolDefinition>, messages: Vec<ChatMessage>) -> LlmPrompt {
+        LlmPrompt {
+            system: None,
+            system_volatile_offset: None,
+            turn_scoped: Vec::new(),
+            history_rewritten: false,
+            messages,
+            tools,
+        }
+    }
+
+    fn kept_names(p: &LlmPrompt, cap: &ToolCap) -> Vec<String> {
+        cap.keep.iter().map(|&i| p.tools[i].name.clone()).collect()
+    }
+
+    #[test]
+    fn under_the_limit_keeps_everything() {
+        let p = prompt(vec![tool("playwright", "navigate")], vec![]);
+        assert_eq!(p.cap_tool_count(1), None);
+    }
+
+    #[test]
+    fn discovered_composio_tools_go_before_other_servers() {
+        // Sorted by wire name, Composio sorts ahead of playwright: a plain
+        // truncation kept the Composio tools and cut playwright.
+        let p = prompt(
+            vec![
+                tool("composio-native:p1", "GOOGLEDOCS_CREATE"),
+                tool("composio-native:p1", "GOOGLEDRIVE_LIST"),
+                tool("hobbes-core", "HOBBES_SET_TIMER"),
+                tool("playwright", "navigate"),
+            ],
+            vec![],
+        );
+        let cap = p.cap_tool_count(2).unwrap();
+        assert_eq!(kept_names(&p, &cap), ["HOBBES_SET_TIMER", "navigate"]);
+        assert_eq!(
+            cap.dropped,
+            ["composio-native:p1/GOOGLEDOCS_CREATE", "composio-native:p1/GOOGLEDRIVE_LIST"]
+        );
+        assert!(cap.note.contains("COMPOSIO_CLEAR_TOOLS"), "{}", cap.note);
+    }
+
+    #[test]
+    fn builtins_composio_meta_and_used_tools_are_kept() {
+        let used = ChatMessage {
+            role: ChatRole::Assistant,
+            content: vec![ContentBlock::ToolCall {
+                id: "1".into(),
+                name: crate::gemini::convert::get_prefixed_tool_name("composio-native:p1", "GOOGLEDOCS_GET"),
+                arguments: serde_json::json!({}),
+                signature: None,
+            }],
+        };
+        let p = prompt(
+            vec![
+                tool("composio-native:p1", "COMPOSIO_CLEAR_TOOLS"),
+                tool("composio-native:p1", "GOOGLEDOCS_GET"),
+                tool("composio-native:p1", "GOOGLEDOCS_LIST"),
+                tool("hobbes-planner", "HOBBES_DISPATCH"),
+                tool("playwright", "navigate"),
+            ],
+            vec![used],
+        );
+        let cap = p.cap_tool_count(3).unwrap();
+        assert_eq!(kept_names(&p, &cap), ["COMPOSIO_CLEAR_TOOLS", "GOOGLEDOCS_GET", "HOBBES_DISPATCH"]);
+    }
+
+    #[test]
+    fn within_a_tier_the_latest_tools_go_first_and_order_is_kept() {
+        let p = prompt(
+            vec![tool("a-server", "one"), tool("b-server", "two"), tool("c-server", "three")],
+            vec![],
+        );
+        let cap = p.cap_tool_count(2).unwrap();
+        assert_eq!(cap.keep, [0, 1]);
+        assert_eq!(cap.dropped, ["c-server/three"]);
+        assert!(!cap.note.contains("COMPOSIO_CLEAR_TOOLS"));
     }
 }
