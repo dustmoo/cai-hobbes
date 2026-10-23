@@ -58,6 +58,7 @@ mod tab_tidy;
 #[cfg(test)]
 mod test_support;
 mod timers;
+mod handoff;
 mod todo;
 mod usage_log;
 mod settings;
@@ -2031,10 +2032,13 @@ fn app() -> Element {
     // ── AI-settable timer scheduler ──────────────────────────────────────────
     // Polls every 5s for due timers (HOBBES_SET_TIMER) and fires them: focus the
     // window + toast, and for `prompt` mode enqueue the prompt and switch to its
-    // session so ChatInput's drain runs it. Timers missed while the app was
-    // closed are surfaced as a reminder but never auto-run (no surprise turns).
+    // session so ChatInput's drain runs it. A timer with a wake condition
+    // (`until`) also fires as soon as the planner shows it met
+    // (`timers::wake_cause`). Timers missed while the app was closed are
+    // surfaced as a reminder but never auto-run (no surprise turns).
     {
         let mut session_state = session_state;
+        let planner_state = planner_state;
         let mut chat_command = chat_command;
         let settings = settings;
         let window = window.clone();
@@ -2056,7 +2060,7 @@ fn app() -> Element {
                         for session in state.sessions.values_mut() {
                             for t in session.scheduled_timers.iter_mut() {
                                 if t.is_due(now) {
-                                    t.status = crate::timers::TimerStatus::Fired;
+                                    t.fire(now, crate::timers::CAUSE_MISSED);
                                     missed.push(t.label.clone().unwrap_or_else(|| "(timer)".into()));
                                     missed_timers.push(t.clone());
                                 }
@@ -2094,28 +2098,43 @@ fn app() -> Element {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     let now = chrono::Utc::now();
 
-                    // Cheap read-only check first so we don't mark the signal
-                    // dirty (and re-render) every 5s when nothing is due.
-                    let any_due = session_state
-                        .read()
-                        .sessions
-                        .values()
-                        .any(|s| s.scheduled_timers.iter().any(|t| t.is_due(now)));
-                    if !any_due {
+                    // Cheap read-only pass first so we don't mark the signal
+                    // dirty (and re-render) every 5s when nothing is due. It
+                    // collects (session, timer, cause) for the write pass.
+                    let wakes: Vec<(String, String, String)> = {
+                        let planner = planner_state.peek();
+                        session_state
+                            .read()
+                            .sessions
+                            .values()
+                            .flat_map(|s| s.scheduled_timers.iter().map(move |t| (&s.id, t)))
+                            .filter_map(|(sid, t)| {
+                                crate::timers::wake_cause(t, |id| planner.todo(id), now)
+                                    .map(|cause| (sid.clone(), t.id.clone(), cause))
+                            })
+                            .collect()
+                    };
+                    if wakes.is_empty() {
                         continue;
                     }
 
                     let mut fired: Vec<crate::timers::ScheduledTimer> = Vec::new();
                     {
                         let mut state = session_state.write();
-                        for session in state.sessions.values_mut() {
-                            for t in session.scheduled_timers.iter_mut() {
-                                if t.is_due(now) {
-                                    t.status = crate::timers::TimerStatus::Fired;
-                                    fired.push(t.clone());
-                                }
-                            }
+                        for (session_id, timer_id, cause) in wakes {
+                            let Some(t) = state.sessions.get_mut(&session_id).and_then(|s| {
+                                s.scheduled_timers.iter_mut().find(|t| {
+                                    t.id == timer_id && t.status == crate::timers::TimerStatus::Pending
+                                })
+                            }) else {
+                                continue;
+                            };
+                            t.fire(now, cause);
+                            fired.push(t.clone());
                         }
+                    }
+                    if fired.is_empty() {
+                        continue;
                     }
                     for t in &fired {
                         crate::session_events::log_event(

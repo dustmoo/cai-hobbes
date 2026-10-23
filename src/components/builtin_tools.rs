@@ -44,6 +44,7 @@ use dioxus::prelude::*;
 pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_PAGE_RESULT",
     "HOBBES_UPDATE_SCRATCHPAD",
+    "HOBBES_WRITE_HANDOFF",
     "HOBBES_INVOKE_SKILL",
     "HOBBES_UNLOAD_SKILL",
     "HOBBES_SET_TIMER",
@@ -474,8 +475,38 @@ pub async fn dispatch_builtin_tool(
             })
         }
 
+        "HOBBES_WRITE_HANDOFF" => {
+            let (status, response) =
+                crate::handoff::handle_write_handoff(&mut session_state.write(), args_json, session_id);
+            Some(BuiltinOutcome {
+                status,
+                response,
+                persist: true,
+            })
+        }
+
         "HOBBES_SET_TIMER" => {
-            let (status, response) = session_state.write().handle_set_timer(args_json, session_id);
+            // An intention must name a to-do whose worker is running, or it
+            // could only ever fire at its deadline. Checked here because the
+            // planner lives outside SessionState.
+            let planner = deps.planner.read();
+            if let Some(todo_id) = args_json
+                .get("until_worker_done")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                if let Err(msg) = crate::timers::validate_worker_target(todo_id, planner.todo(todo_id)) {
+                    return Some(BuiltinOutcome {
+                        status: ToolCallStatus::Error,
+                        response: msg,
+                        persist: false,
+                    });
+                }
+            }
+            let (status, response) = session_state.write().handle_set_timer(args_json, session_id, |id| {
+                planner.todo(id).map(|t| t.title.clone())
+            });
             Some(BuiltinOutcome {
                 status,
                 response,
@@ -484,7 +515,10 @@ pub async fn dispatch_builtin_tool(
         }
 
         "HOBBES_LIST_TIMERS" => {
-            let (status, response) = session_state.read().handle_list_timers(session_id);
+            let planner = deps.planner.read();
+            let (status, response) = session_state
+                .read()
+                .handle_list_timers(session_id, |id| planner.todo(id).map(|t| t.title.clone()));
             Some(BuiltinOutcome {
                 status,
                 response,

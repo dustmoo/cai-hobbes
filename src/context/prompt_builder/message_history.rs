@@ -189,7 +189,9 @@ pub(crate) struct LinearisedMessages {
 }
 
 /// Push rendered ledger entries; tails are listed in `turn_scoped`. Only the
-/// current request's tail renders unless `all_tails` (Claude).
+/// current request's tail renders unless `all_tails` (Claude) or the tail
+/// carries a turn briefing (rendered for every provider, so the briefing
+/// stays in view for its whole turn and the history stays append-only).
 fn emit_entries(
     messages: &mut Vec<ChatMessage>,
     turn_scoped: &mut Vec<usize>,
@@ -199,7 +201,10 @@ fn emit_entries(
 ) {
     for entry in entries.into_iter().flatten() {
         if entry.kind == LedgerKind::Tail {
-            if !all_tails && Some(entry.id) != current_tail {
+            if !all_tails
+                && Some(entry.id) != current_tail
+                && !super::briefing::carries_briefing(&entry.body)
+            {
                 continue;
             }
             messages.push(ledger::system_message(ledger::render_entry(entry)));
@@ -382,10 +387,25 @@ impl<'a> PromptBuilder<'a> {
                 None => transient.extend(ledger::boundary_updates(&live, &latest, uuid::Uuid::nil())),
             }
         }
-        let tail_text = || {
-            let now = self.now.unwrap_or_else(chrono::Local::now).to_rfc3339();
-            ledger::tail_body(&now, &ctx.turn_instructions)
+        // One clock read per build: the tail's clock and the briefing's
+        // elapsed times use the same instant.
+        let now = self.now.unwrap_or_else(chrono::Local::now);
+        // The turn briefing rides only on a user-turn boundary's tail: the
+        // messages before the turn's user message are the earlier turns.
+        // Mid-turn tails carry none (the boundary tail already holds it).
+        let briefing = if at_boundary {
+            let turn_start = if has_param_user {
+                session_messages.len()
+            } else {
+                anchor_msg
+                    .and_then(|a| session_messages.iter().position(|m| m.id == a.id))
+                    .unwrap_or(session_messages.len())
+            };
+            super::briefing::turn_briefing(self.session, &session_messages[..turn_start], now)
+        } else {
+            String::new()
         };
+        let tail_text = || ledger::tail_body(&now.to_rfc3339(), &briefing, &ctx.turn_instructions);
         let current_tail = match (persist_anchor, existing_tail) {
             (Some(_), Some(tail)) => Some(tail.id),
             (Some(anchor), None) => {

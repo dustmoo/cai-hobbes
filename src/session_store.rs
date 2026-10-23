@@ -1815,6 +1815,10 @@ mod event_tests {
             label: Some("test".to_string()),
             prompt: None,
             status: TimerStatus::Pending,
+            reason: None,
+            until: None,
+            fired_at: None,
+            fire_cause: None,
         }
     }
 

@@ -322,6 +322,9 @@ pub struct Session {
     /// Persisted so pending timers survive a restart and can be re-scheduled.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scheduled_timers: Vec<crate::timers::ScheduledTimer>,
+    /// The model's latest note to its future self (HOBBES_WRITE_HANDOFF).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<crate::handoff::HandoffNote>,
     /// Tool calls executed during the current turn of THIS session.
     /// Per-session (never global): two tabs streaming concurrently must not
     /// see each other's tool calls, and cancelling one tab must not wipe the
@@ -1018,15 +1021,22 @@ impl SessionState {
     }
 
     /// HOBBES_SET_TIMER: schedule a timer/reminder for this session.
+    ///
+    /// `until_worker_done` makes it an intention (fire when that to-do's
+    /// worker finishes, or at the deadline). Whether the to-do can be waited
+    /// on is checked by the dispatcher, which holds the planner
+    /// (`timers::validate_worker_target`); `todo_title` only names it in the
+    /// confirmation.
     pub fn handle_set_timer(
         &mut self,
         args_json: &serde_json::Value,
         session_id: &str,
+        todo_title: impl Fn(&str) -> Option<String>,
     ) -> (crate::components::shared::ToolCallStatus, String) {
         use crate::components::shared::ToolCallStatus;
         use crate::timers::{
-            MAX_DELAY_SECS, MIN_DELAY_SECS, ScheduledTimer, TimerMode, TimerStatus,
-            parse_duration_secs,
+            MAX_DELAY_SECS, MIN_DELAY_SECS, ScheduledTimer, TimerMode, TimerStatus, WakeCondition,
+            clean_reason, parse_duration_secs,
         };
 
         // Delay accepts either `delay_secs` (integer) or `delay` ("10m", "1h30m").
@@ -1079,6 +1089,13 @@ impl SessionState {
             .get("label")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let reason = clean_reason(args_json.get("reason").and_then(|v| v.as_str()));
+        let until = args_json
+            .get("until_worker_done")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| WakeCondition::WorkerDone { todo_id: id.to_string() });
 
         if mode == TimerMode::Prompt && prompt.as_deref().map(str::trim).unwrap_or("").is_empty() {
             return (
@@ -1098,8 +1115,13 @@ impl SessionState {
             label,
             prompt,
             status: TimerStatus::Pending,
+            reason,
+            until,
+            fired_at: None,
+            fire_cause: None,
         };
-        let summary = timer.summary();
+        let summary = timer.summary_with(todo_title);
+        let deadline_note = if timer.until.is_some() { " at the latest" } else { "" };
 
         {
             let Some(session) = self.sessions.get_mut(session_id) else {
@@ -1126,7 +1148,7 @@ impl SessionState {
         };
         (
             ToolCallStatus::Completed,
-            format!("Timer set — fires in {}. {}", human, summary),
+            format!("Timer set — fires in {}{}. {}", human, deadline_note, summary),
         )
     }
 
@@ -1134,6 +1156,7 @@ impl SessionState {
     pub fn handle_list_timers(
         &self,
         session_id: &str,
+        todo_title: impl Fn(&str) -> Option<String>,
     ) -> (crate::components::shared::ToolCallStatus, String) {
         use crate::components::shared::ToolCallStatus;
         use crate::timers::TimerStatus;
@@ -1145,7 +1168,7 @@ impl SessionState {
                 s.scheduled_timers
                     .iter()
                     .filter(|t| t.status == TimerStatus::Pending)
-                    .map(|t| t.summary())
+                    .map(|t| t.summary_with(&todo_title))
                     .collect()
             })
             .unwrap_or_default();
@@ -1712,6 +1735,7 @@ impl SessionState {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            handoff: None,
             tool_call_history: Vec::new(),
             tab_emoji: None,
             tab_title: None,
@@ -2086,6 +2110,95 @@ mod tests {
         assert!(s.cancel_running_calls("again", now).is_empty(), "nothing left running");
     }
 
+    mod timer_tools {
+        use super::*;
+        use crate::components::shared::ToolCallStatus;
+        use crate::timers::{TimerStatus, WakeCondition};
+
+        fn state_with_session() -> (SessionState, String) {
+            let mut state = SessionState { save_disabled: true, ..Default::default() };
+            let id = state.create_session_raw(None);
+            (state, id)
+        }
+
+        fn no_titles(_: &str) -> Option<String> {
+            None
+        }
+
+        #[test]
+        fn set_timer_trims_reason_and_parses_until() {
+            let (mut state, sid) = state_with_session();
+            let args = serde_json::json!({
+                "delay": "10m",
+                "label": "Check the suite",
+                "reason": "  See whether the run passed, then report.  ",
+                "until_worker_done": " tdo_1 ",
+            });
+            let (status, text) =
+                state.handle_set_timer(&args, &sid, |id| (id == "tdo_1").then(|| "Run the suite".to_string()));
+            assert_eq!(status, ToolCallStatus::Completed, "{text}");
+            let t = &state.sessions[&sid].scheduled_timers[0];
+            assert_eq!(t.reason.as_deref(), Some("See whether the run passed, then report."));
+            assert_eq!(t.until, Some(WakeCondition::WorkerDone { todo_id: "tdo_1".into() }));
+            assert_eq!(t.status, TimerStatus::Pending);
+            assert!(text.contains("fires in 10m00s at the latest"), "{text}");
+            assert!(text.contains("or sooner when the worker for 'Run the suite' finishes"), "{text}");
+            assert!(text.contains("reason: See whether the run passed"), "{text}");
+        }
+
+        #[test]
+        fn set_timer_blank_reason_and_until_are_none() {
+            let (mut state, sid) = state_with_session();
+            let args = serde_json::json!({ "delay_secs": 60, "reason": "   ", "until_worker_done": "" });
+            let (status, text) = state.handle_set_timer(&args, &sid, no_titles);
+            assert_eq!(status, ToolCallStatus::Completed);
+            let t = &state.sessions[&sid].scheduled_timers[0];
+            assert!(t.reason.is_none());
+            assert!(t.until.is_none());
+            assert!(!text.contains("at the latest"), "{text}");
+            assert!(!text.contains("reason:"), "{text}");
+        }
+
+        #[test]
+        fn set_timer_caps_long_reason() {
+            let (mut state, sid) = state_with_session();
+            let long = "x".repeat(2_000);
+            let args = serde_json::json!({ "delay": "5m", "reason": long });
+            state.handle_set_timer(&args, &sid, no_titles);
+            let reason = state.sessions[&sid].scheduled_timers[0].reason.clone().unwrap();
+            assert_eq!(reason.chars().count(), crate::timers::MAX_REASON_CHARS);
+            assert!(reason.ends_with('…'));
+        }
+
+        #[test]
+        fn set_timer_still_requires_a_deadline() {
+            let (mut state, sid) = state_with_session();
+            let args = serde_json::json!({ "reason": "wait for it", "until_worker_done": "tdo_1" });
+            let (status, text) = state.handle_set_timer(&args, &sid, no_titles);
+            assert_eq!(status, ToolCallStatus::Error);
+            assert!(text.contains("delay"), "{text}");
+            assert!(state.sessions[&sid].scheduled_timers.is_empty());
+        }
+
+        #[test]
+        fn list_timers_shows_reason_and_condition() {
+            let (mut state, sid) = state_with_session();
+            let args = serde_json::json!({
+                "delay": "1h",
+                "reason": "Review the worker's output.",
+                "until_worker_done": "tdo_9",
+            });
+            state.handle_set_timer(&args, &sid, no_titles);
+            let (status, text) = state.handle_list_timers(&sid, no_titles);
+            assert_eq!(status, ToolCallStatus::Completed);
+            assert!(text.contains("or sooner when the worker for to-do tdo_9 finishes"), "{text}");
+            // With the planner's titles, the to-do is named.
+            let (_, named) = state.handle_list_timers(&sid, |_| Some("Run the suite".to_string()));
+            assert!(named.contains("the worker for 'Run the suite' finishes"), "{named}");
+            assert!(text.contains("reason: Review the worker's output."), "{text}");
+        }
+    }
+
     mod tab_identity {
         use super::*;
 
@@ -2225,6 +2338,7 @@ mod tests {
                 current_ai_turn_count: 0,
                 watch_word_recovery_count: 0,
                 scheduled_timers: Vec::new(),
+                handoff: None,
                 tool_call_history: Vec::new(),
                 tab_emoji: None,
                 tab_title: None,
@@ -3191,6 +3305,7 @@ mod tests {
             current_ai_turn_count: 0,
             watch_word_recovery_count: 0,
             scheduled_timers: Vec::new(),
+            handoff: None,
             tool_call_history: Vec::new(),
         };
 

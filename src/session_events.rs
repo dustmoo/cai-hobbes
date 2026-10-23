@@ -141,6 +141,8 @@ pub enum SessionEvent {
     /// or part of a history-trim snapshot). Builds that predate the ledger
     /// skip this kind, like any unknown kind.
     LedgerEntryAdded { entry: crate::session::LedgerEntry },
+    /// HOBBES_WRITE_HANDOFF replaced the session's handoff note.
+    HandoffWritten { note: crate::handoff::HandoffNote },
 }
 
 impl SessionEvent {
@@ -172,6 +174,7 @@ impl SessionEvent {
             SessionEvent::SessionForked { .. } => "SessionForked",
             SessionEvent::MessageEdited { .. } => "MessageEdited",
             SessionEvent::LedgerEntryAdded { .. } => "LedgerEntryAdded",
+            SessionEvent::HandoffWritten { .. } => "HandoffWritten",
         }
     }
 }
@@ -225,6 +228,7 @@ fn blank_session() -> Session {
         current_ai_turn_count: 0,
         watch_word_recovery_count: 0,
         scheduled_timers: Vec::new(),
+        handoff: None,
         tool_call_history: Vec::new(),
         tab_emoji: None,
         tab_title: None,
@@ -290,6 +294,7 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         | E::ToolCall { message }
         | E::ToolResult { message } => upsert_message(session, message),
         E::ScratchpadSet { content } => session.scratchpad = content.clone(),
+        E::HandoffWritten { note } => session.handoff = Some(note.clone()),
         E::SkillLoaded { name, payload } => {
             session.loaded_skills.insert(name.clone(), payload.clone());
         }
@@ -708,6 +713,10 @@ mod tests {
             label: Some("tea".to_string()),
             prompt: None,
             status: crate::timers::TimerStatus::Pending,
+            reason: None,
+            until: None,
+            fired_at: None,
+            fire_cause: None,
         };
 
         let tool_done = {
@@ -1302,6 +1311,26 @@ mod tests {
                 assert_eq!(p.created_at, l.created_at);
             }
         });
+    }
+
+    #[test]
+    fn handoff_written_replays_latest_note() {
+        let note = |doing: &str| crate::handoff::HandoffNote {
+            doing: doing.to_string(),
+            expect_next: "next".to_string(),
+            would_change_mind: None,
+            written_at: base_ts(),
+        };
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "s".into(), name: "n".into() },
+            SessionEvent::HandoffWritten { note: note("first") },
+            SessionEvent::HandoffWritten { note: note("second") },
+        ]);
+        assert_eq!(project(None, &events).handoff, Some(note("second")));
+        let ev = SessionEvent::HandoffWritten { note: note("x") };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v.get("kind").and_then(|k| k.as_str()), Some(ev.kind()));
+        assert_eq!(serde_json::from_value::<SessionEvent>(v).unwrap(), ev);
     }
 
     #[test]
