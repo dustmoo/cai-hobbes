@@ -50,6 +50,22 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                     div {
                                         class: "flex items-center justify-between mb-4",
                                         div {
+                                            label { class: "text-sm font-medium text-fg-muted", "Let the AI Choose a Profile When Dispatching" }
+                                            p { class: "text-xs text-fg-muted", "A dispatched chat can run under another Composio profile (e.g. a client's accounts) when the work belongs there. Off: it always uses the profile of the tab that dispatched it." }
+                                        }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{local_settings.read().dispatch_profile_choice}",
+                                            onchange: move |e| {
+                                                local_settings.write().dispatch_profile_choice = e.value() == "true";
+                                            }
+                                        }
+                                    }
+
+                                    div {
+                                        class: "flex items-center justify-between mb-4",
+                                        div {
                                             label { class: "text-sm font-medium text-fg-muted", "Roll Unfinished Work Forward" }
                                             p { class: "text-xs text-fg-muted", "Todos scheduled for a past day move onto today when the planner opens." }
                                         }

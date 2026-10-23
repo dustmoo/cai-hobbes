@@ -368,6 +368,77 @@ fn overlap_column_style_scaled(col: usize, count: usize, avail: f64) -> String {
     )
 }
 
+/// Horizontal lane plan for the ruler, as fractions of the block area.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LaneSplit {
+    /// The user's blocks occupy `0..blocks_end`.
+    blocks_end: f64,
+    /// Calendar events occupy `cal_start..cal_end` (empty when none in view).
+    cal_start: f64,
+    cal_end: f64,
+    /// Agent spans occupy `agent_start..1.0`.
+    agent_start: f64,
+}
+
+/// Share of the block area given to the user's blocks when calendar events
+/// are in view and the agent lane is not drawn.
+const CAL_LANE_BLOCKS_SPLIT: f64 = 0.6;
+/// Same, with all three lanes: blocks 40%, calendar 30%, agents 30%.
+const THREE_LANE_BLOCKS_SPLIT: f64 = 0.4;
+const THREE_LANE_CAL_END: f64 = 0.7;
+
+/// Decide the lane layout. With no calendar events in view the blocks keep
+/// the full width (minus the agent lane when present); with events, they get
+/// a dedicated lane wide enough to read titles.
+fn lane_split(has_cal: bool, has_agent: bool) -> LaneSplit {
+    match (has_cal, has_agent) {
+        (false, false) => LaneSplit { blocks_end: 1.0, cal_start: 1.0, cal_end: 1.0, agent_start: 1.0 },
+        (false, true) => LaneSplit {
+            blocks_end: AGENT_LANE_SPLIT,
+            cal_start: AGENT_LANE_SPLIT,
+            cal_end: AGENT_LANE_SPLIT,
+            agent_start: AGENT_LANE_SPLIT,
+        },
+        (true, false) => LaneSplit {
+            blocks_end: CAL_LANE_BLOCKS_SPLIT,
+            cal_start: CAL_LANE_BLOCKS_SPLIT,
+            cal_end: 1.0,
+            agent_start: 1.0,
+        },
+        (true, true) => LaneSplit {
+            blocks_end: THREE_LANE_BLOCKS_SPLIT,
+            cal_start: THREE_LANE_BLOCKS_SPLIT,
+            cal_end: THREE_LANE_CAL_END,
+            agent_start: THREE_LANE_CAL_END,
+        },
+    }
+}
+
+/// Inline horizontal style for item `col` of `count` side by side inside the
+/// lane `start..end` (fractions of the block area; 44px hour gutter left,
+/// 4px margin right at the day's edge).
+fn lane_column_style(col: usize, count: usize, start: f64, end: f64) -> String {
+    let count = count.max(1);
+    let col = col.min(count - 1);
+    let frac = (end - start) / count as f64;
+    let left = start + frac * col as f64;
+    format!(
+        " left: calc(44px + (100% - 48px) * {left:.4}); width: calc((100% - 48px) * {frac:.4} - 3px);"
+    )
+}
+
+/// How many to-dos the "Not on the timeline" list shows before folding.
+const UNSCHEDULED_FOLD: usize = 6;
+
+/// `(visible, hidden)` counts for a list folded to [`UNSCHEDULED_FOLD`].
+fn fold_counts(total: usize, expanded: bool) -> (usize, usize) {
+    if expanded || total <= UNSCHEDULED_FOLD {
+        (total, 0)
+    } else {
+        (UNSCHEDULED_FOLD, total - UNSCHEDULED_FOLD)
+    }
+}
+
 /// Where the agent sub-column starts, as a fraction of the block area. The
 /// person keeps the left ~66%; fleet spans get the right third.
 const AGENT_LANE_SPLIT: f64 = 0.66;
@@ -376,17 +447,24 @@ const AGENT_LANE_SPLIT: f64 = 0.66;
 /// with a 2px gutter within the lane's right-hand region (`col` of `count`,
 /// 0-indexed). `(0, 1)` — the common case — keeps the classic full-lane
 /// footprint.
-fn agent_span_style(top: f64, height: f64, background: bool, col: usize, count: usize) -> String {
+fn agent_span_style(
+    top: f64,
+    height: f64,
+    background: bool,
+    col: usize,
+    count: usize,
+    lane_start: f64,
+) -> String {
     let count = count.max(1);
     let col = col.min(count.saturating_sub(1));
     let sub = 1.0 / count as f64;
-    let start_frac = AGENT_LANE_SPLIT + (1.0 - AGENT_LANE_SPLIT) * sub * col as f64;
+    let start_frac = lane_start + (1.0 - lane_start) * sub * col as f64;
     let mut style = if count <= 1 {
         format!(
             "top: {top}px; height: {height}px; left: calc(44px + (100% - 48px) * {start_frac:.4}); right: 4px;"
         )
     } else {
-        let width_frac = (1.0 - AGENT_LANE_SPLIT) * sub;
+        let width_frac = (1.0 - lane_start) * sub;
         format!(
             "top: {top}px; height: {height}px; left: calc(44px + (100% - 48px) * {start_frac:.4}); width: calc((100% - 48px) * {width_frac:.4} - 2px);"
         )
@@ -867,7 +945,7 @@ pub(crate) fn TodayRail(
         ui_state
             .peek()
             .planner_rail_view
-            .unwrap_or(range_math::RailView::Workday)
+            .unwrap_or(range_math::RailView::Now)
     });
     let mut body_h = use_signal(|| 0.0f64);
     let mut wheel_acc = use_signal(|| 0.0f64);
@@ -968,6 +1046,7 @@ pub(crate) fn TodayRail(
 
     // The End-the-day card takes over the foot of the rail when open.
     let mut end_day_open = use_signal(|| false);
+    let mut unscheduled_expanded = use_signal(|| false);
     let mut reflection = use_signal(String::new);
     // Carry-over is opt-OUT: unfinished work follows you unless you say
     // otherwise, so the signal holds what was *unchecked*, and a day change
@@ -1086,6 +1165,9 @@ pub(crate) fn TodayRail(
             .cloned()
             .collect()
     };
+    let unscheduled_total = unblocked.len();
+    let (unscheduled_visible, unscheduled_hidden) =
+        fold_counts(unscheduled_total, *unscheduled_expanded.read());
     // Linked blocks render their todo's *current* title (the copy stored on
     // the block goes stale the moment the todo is renamed) and show a done
     // treatment once the todo is closed.
@@ -1265,9 +1347,10 @@ pub(crate) fn TodayRail(
     // Overlap columns for the ruler: computed from the *stored* positions of
     // every block on the day (a mid-drag preview keeps its column — width
     // reflow mid-drag would jitter). Keyed by block id.
-    let overlap_columns = assign_overlap_columns(
-        &blocks
+    let block_ids_in_columns = |external: bool| -> Vec<(String, u32, u32)> {
+        blocks
             .iter()
+            .filter(|b| matches!(b.source, BlockSource::External { .. }) == external)
             .map(|b| {
                 (
                     b.id.clone(),
@@ -1275,8 +1358,21 @@ pub(crate) fn TodayRail(
                     minutes_in_local_day(&b.end).max(0) as u32,
                 )
             })
-            .collect::<Vec<_>>(),
-    );
+            .collect()
+    };
+    // The user's own blocks and mirrored calendar events lay out in separate
+    // lanes, so each set gets its own overlap columns.
+    let overlap_columns = assign_overlap_columns(&block_ids_in_columns(false));
+    let cal_columns = assign_overlap_columns(&block_ids_in_columns(true));
+    let cal_in_view = blocks.iter().any(|b| {
+        matches!(b.source, BlockSource::External { .. })
+            && range_math::out_of_range(
+                minutes_in_local_day(&b.start),
+                minutes_in_local_day(&b.end),
+                view,
+            )
+            .is_none()
+    });
 
     // The agent lane: fleet working time on the viewed day, reconstructed
     // from the stored event log. Read through a memo because it costs two
@@ -1340,11 +1436,8 @@ pub(crate) fn TodayRail(
     let rollup = rollup_memo.read().clone();
     // The person's blocks give up the right sub-column only while there is
     // something to put there.
-    let lane_avail = if agent_spans.is_empty() {
-        1.0
-    } else {
-        AGENT_LANE_SPLIT
-    };
+    let lanes = lane_split(cal_in_view, !agent_spans.is_empty());
+    let lane_avail = lanes.blocks_end;
 
     // Free slots worth offering: gaps in the busy set, and on today only the
     // ones still ahead of you — the morning you already spent is not a slot.
@@ -1595,7 +1688,7 @@ pub(crate) fn TodayRail(
             div {
                 id: "planner-rail-body",
                 class: "relative rounded border border-faint bg-app",
-                style: "flex: 1 1 0%; min-height: 260px;",
+                style: "flex: 1 1 0%; min-height: 480px;",
                 onclick: move |evt| {
                     let y = evt.data.element_coordinates().y;
                     let minutes = range_math::y_to_minute(y, view, pph).max(0.0) as u32;
@@ -1804,7 +1897,7 @@ pub(crate) fn TodayRail(
                     ) {
                         {
                             let style =
-                                agent_span_style(top, height, item.background, item.col, item.count);
+                                agent_span_style(top, height, item.background, item.col, item.count, lanes.agent_start);
                             rsx! {
                                 div {
                                     key: "{item.key}",
@@ -1885,7 +1978,17 @@ pub(crate) fn TodayRail(
                             .get(&block.id)
                             .copied()
                             .unwrap_or((0, 1));
-                        block_style.push_str(&overlap_column_style_scaled(col, count, lane_avail));
+                        if is_external {
+                            let (ccol, ccount) = cal_columns.get(&block.id).copied().unwrap_or((0, 1));
+                            block_style.push_str(&lane_column_style(
+                                ccol,
+                                ccount,
+                                lanes.cal_start,
+                                lanes.cal_end,
+                            ));
+                        } else {
+                            block_style.push_str(&overlap_column_style_scaled(col, count, lane_avail));
+                        }
                         if let Some(c) = &yt_colour {
                             block_style.push_str(&format!(
                                 " background: {c}; color: {};",
@@ -2155,7 +2258,7 @@ pub(crate) fn TodayRail(
                 div {
                     class: "flex flex-col gap-1",
                     h3 { class: "text-[10px] uppercase tracking-[0.08em] text-fg-muted", "Not on the timeline" }
-                    for todo in unblocked {
+                    for todo in unblocked.iter().take(unscheduled_visible).cloned() {
                         {
                             let todo_id = todo.id.clone();
                             let title = todo.title.clone();
@@ -2234,6 +2337,19 @@ pub(crate) fn TodayRail(
                                     }
                                 }
                             }
+                        }
+                    }
+                    if unscheduled_hidden > 0 {
+                        button {
+                            class: "self-start rounded px-2 py-1 text-[11px] text-fg-muted hover:bg-input hover:text-fg",
+                            onclick: move |_| unscheduled_expanded.set(true),
+                            "Show {unscheduled_hidden} more"
+                        }
+                    } else if *unscheduled_expanded.read() && unscheduled_total > UNSCHEDULED_FOLD {
+                        button {
+                            class: "self-start rounded px-2 py-1 text-[11px] text-fg-muted hover:bg-input hover:text-fg",
+                            onclick: move |_| unscheduled_expanded.set(false),
+                            "Show less"
                         }
                     }
                 }
@@ -3008,6 +3124,50 @@ mod tests {
     }
 
     #[test]
+    fn lane_split_gives_calendar_a_dedicated_lane() {
+        let none = lane_split(false, false);
+        assert_eq!((none.blocks_end, none.agent_start), (1.0, 1.0));
+        let agent = lane_split(false, true);
+        assert_eq!((agent.blocks_end, agent.agent_start), (AGENT_LANE_SPLIT, AGENT_LANE_SPLIT));
+        let cal = lane_split(true, false);
+        assert_eq!((cal.blocks_end, cal.cal_start, cal.cal_end), (0.6, 0.6, 1.0));
+        let both = lane_split(true, true);
+        assert_eq!(both.blocks_end, both.cal_start);
+        assert_eq!(both.cal_end, both.agent_start);
+        assert!(both.blocks_end < both.cal_end && both.cal_end < 1.0);
+    }
+
+    #[test]
+    fn lane_column_style_shares_the_lane_side_by_side() {
+        let one = lane_column_style(0, 1, 0.6, 1.0);
+        assert!(one.contains("0.6000") && one.contains("0.4000"));
+        let second = lane_column_style(1, 2, 0.6, 1.0);
+        assert!(second.contains("calc(44px + (100% - 48px) * 0.8000)"));
+        assert!(second.contains("* 0.2000 - 3px"));
+        // Out-of-range column clamps instead of overflowing the lane.
+        assert_eq!(lane_column_style(5, 2, 0.6, 1.0), second);
+    }
+
+    #[test]
+    fn calendar_events_in_their_own_lane_do_not_squeeze_blocks() {
+        // Events overlapping each other share the calendar lane...
+        let ev = vec![("e1".to_string(), 600, 660), ("e2".to_string(), 600, 630)];
+        let c = assign_overlap_columns(&ev);
+        assert_eq!(c["e1"].1, 2);
+        // ...while a block at the same time keeps a full lane of its own.
+        let b = assign_overlap_columns(&[("b".to_string(), 600, 660)]);
+        assert_eq!(b["b"], (0, 1));
+    }
+
+    #[test]
+    fn fold_counts_cap_at_six_until_expanded() {
+        assert_eq!(fold_counts(0, false), (0, 0));
+        assert_eq!(fold_counts(6, false), (6, 0));
+        assert_eq!(fold_counts(20, false), (6, 14));
+        assert_eq!(fold_counts(20, true), (20, 0));
+    }
+
+    #[test]
     fn local_minutes_round_trip() {
         let date: NaiveDate = "2026-08-12".parse().unwrap();
         let dt = local_minutes_to_utc(date, 570);
@@ -3130,11 +3290,11 @@ mod tests {
 
     #[test]
     fn agent_lane_geometry_sits_in_the_right_sub_column() {
-        let style = agent_span_style(24.0, 48.0, false, 0, 1);
+        let style = agent_span_style(24.0, 48.0, false, 0, 1, AGENT_LANE_SPLIT);
         assert!(style.contains("left: calc(44px + (100% - 48px) * 0.6600)"), "{style}");
         assert!(style.contains("right: 4px"), "{style}");
         assert!(!style.contains("opacity"), "a driven span is not dimmed");
-        assert!(agent_span_style(0.0, 10.0, true, 0, 1).contains("opacity: 0.65"));
+        assert!(agent_span_style(0.0, 10.0, true, 0, 1, AGENT_LANE_SPLIT).contains("opacity: 0.65"));
 
         // A person's block yields the sub-column only when the lane exists.
         assert_eq!(overlap_column_style_scaled(0, 1, 1.0), overlap_column_style(0, 1));
@@ -3146,10 +3306,10 @@ mod tests {
 
         // Two sub-columns within the lane split its right-hand region, not
         // the whole block area.
-        let sub0 = agent_span_style(0.0, 10.0, false, 0, 2);
+        let sub0 = agent_span_style(0.0, 10.0, false, 0, 2, AGENT_LANE_SPLIT);
         assert!(sub0.contains("left: calc(44px + (100% - 48px) * 0.6600)"), "{sub0}");
         assert!(sub0.contains("width: calc((100% - 48px) * 0.1700 - 2px)"), "{sub0}");
-        let sub1 = agent_span_style(0.0, 10.0, false, 1, 2);
+        let sub1 = agent_span_style(0.0, 10.0, false, 1, 2, AGENT_LANE_SPLIT);
         assert!(sub1.contains("left: calc(44px + (100% - 48px) * 0.8300)"), "{sub1}");
     }
 
