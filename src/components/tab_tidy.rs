@@ -168,7 +168,11 @@ pub fn TidyTabsSheet(props: TidyTabsSheetProps) -> Element {
                     span { class: "text-lg font-semibold text-fg", "Tidy tabs" }
                     span {
                         class: "text-[12.5px] text-fg-muted",
-                        "{props.tabs.len()} open · {suggestion_count} suggestions"
+                        if sug.other.is_empty() {
+                            "{props.tabs.len()} open · {suggestion_count} suggestions"
+                        } else {
+                            "{props.tabs.len()} open · {suggestion_count} suggestions · {sug.other.len()} other"
+                        }
                     }
                 }
 
