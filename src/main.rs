@@ -352,14 +352,24 @@ fn sync_timer_waits(session_state: Signal<SessionState>, ids: impl IntoIterator<
         if streaming.contains(&id) {
             continue;
         }
-        let Some((name, next)) = session_state
+        let Some((name, next, awaiting_approval)) = session_state
             .peek()
             .sessions
             .get(&id)
-            .map(|s| (s.display_title(), s.next_pending_timer()))
+            .map(|s| (s.display_title(), s.next_pending_timer(), heartbeat::wake::has_pending_approval(&s.messages)))
         else {
             continue;
         };
+        // A tab waiting on the user (a held approval, or any needs-you row)
+        // keeps that state: reporting a timer wait would clear it.
+        let needs_you = fleet::shared()
+            .state
+            .lock()
+            .map(|st| st.sessions.get(&id).is_some_and(|r| r.status.needs_attention()))
+            .unwrap_or(false);
+        if awaiting_approval || needs_you {
+            continue;
+        }
         if next.is_some() || fleet::bridge::is_waiting(&id) {
             fleet::bridge::report(&id, &name, fleet::bridge::turn_end_signal(next));
         }
