@@ -30,8 +30,9 @@ const DISPATCH_DESCRIPTION: &str = "Send a todo to a worker. target 'chat' opens
     that starts on the assignment immediately; target 'claude_code' launches a headless Claude \
     Code run in the todo's project directory (the project must have a path). Either way the todo \
     joins the agent lane, links to the worker, and its state (working / needs you / stuck / done) \
-    and progress flow back onto it automatically; a headless run's permission requests appear in \
-    the Fleet for approval. Keep the todo's title a short name (about 80 characters): put the brief in its \
+    and progress flow back onto it automatically; a headless run's permission requests wait for \
+    the user's Approve / Deny in the Fleet or the decision queue, and a request left unanswered \
+    for about two minutes is refused (the run carries on without that tool). Keep the todo's title a short name (about 80 characters): put the brief in its \
     'notes' and any extra guidance in 'instructions', never in the title. Set the todo's \
     'outcome' first so the worker knows what done looks like. For target 'chat' you may pick the worker's model (connector + model): a cheaper, faster \
     model (e.g. a Haiku) for routine lookups, summaries and formatting; a stronger one for \

@@ -5,9 +5,13 @@
 //! Auto-approval rationale: dispatch itself is metadata-only (it creates a
 //! session/row and a prompt). The dispatched WORK stays fully gated — a chat
 //! tab runs the normal in-app approval flow (with trust rules), and a
-//! headless run uses the default permission mode so its PermissionRequests
-//! hold in the Fleet UI for Approve/Deny. Never `--bare` (it skips hooks and
-//! would make the run invisible to the fleet) and never bypass modes.
+//! headless run uses the default permission mode. It has no terminal to
+//! prompt in, so the Fleet listener holds its PermissionRequests (the row's
+//! `dispatched_todo` marks it) for Approve / Deny in the Fleet or the
+//! Planner's decision drawer; unanswered for about two minutes, the request
+//! is refused and the run carries on without that tool. Never `--bare` (it
+//! skips hooks and would make the run invisible to the fleet) and never
+//! bypass modes.
 
 use dioxus::prelude::{Readable, Writable};
 
@@ -453,8 +457,9 @@ pub fn handle_dispatch(
             }
             Ok(format!(
                 "Dispatched '{}' to a headless Claude Code run in {path} (fleet session \
-                 {run_id}). Its permission requests will appear in the Fleet for approval; \
-                 progress lands on the todo via briefs.",
+                 {run_id}). Its permission requests wait for the user's Approve / Deny in \
+                 the Fleet or the decision queue (refused if unanswered for about two \
+                 minutes); progress lands on the todo via briefs.",
                 todo.title
             ))
         }

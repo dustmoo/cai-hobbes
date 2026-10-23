@@ -2577,6 +2577,7 @@ pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession) -> super::lane
             request_id: g.request_id.clone(),
             tool_name: g.tool_name.clone(),
             input_summary: g.input_summary.clone(),
+            held: row.is_headless_dispatch(),
         }),
         attention_message,
         attention_at: row.attention_at,

@@ -31,12 +31,27 @@ pub enum WorkerStatus {
     WaitingOnUser,
 }
 
-/// A held permission gate, as the fleet reports it.
+/// A pending permission request, as the fleet reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateSignal {
     pub request_id: String,
     pub tool_name: String,
     pub input_summary: String,
+    /// A headless run Hobbes dispatched: the request is held for the
+    /// person's in-app Approve / Deny. `false` = an interactive session,
+    /// answered in its own terminal.
+    pub held: bool,
+}
+
+/// The options a gate decision offers: Approve / Deny for a held gate (a
+/// headless dispatched run — no terminal to answer in), none for an
+/// interactive session (answered in the terminal).
+pub fn gate_options(held: bool) -> Vec<String> {
+    if held {
+        vec!["Approve".to_string(), "Deny".to_string()]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The linked worker's state, reduced to the fields the derivation may use.
@@ -130,6 +145,17 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
     } else if !waiting && synthesized_open {
         todo.decision = None;
     }
+    // Keep an open gate decision's options in step with where it can be
+    // answered (stored decisions from older builds offered Approve / Deny
+    // for every session).
+    if let (Some(g), Some(d)) = (&signal.gate, todo.decision.as_mut()) {
+        if d.is_open() && d.source == (DecisionSource::Gate { request_id: g.request_id.clone() }) {
+            let want = gate_options(g.held);
+            if d.options != want {
+                d.options = want;
+            }
+        }
+    }
 
     if let Some(state) = derive_agent_state(todo, Some(signal)) {
         todo.agent_state = Some(state);
@@ -152,7 +178,7 @@ fn synthesize_decision(signal: &WorkerSignal, now: DateTime<Utc>) -> Option<Deci
     let (question, options, source) = if let Some(g) = &signal.gate {
         (
             format!("Allow {}? {}", g.tool_name, g.input_summary.trim()),
-            Vec::new(),
+            gate_options(g.held),
             DecisionSource::Gate {
                 request_id: g.request_id.clone(),
             },
@@ -228,8 +254,9 @@ pub fn ask_decision(
 /// Record the person's answer to an open decision. Returns the log entry;
 /// delivery to the worker happens at the edge, which then calls
 /// [`record_delivery`]. Gate decisions are refused: a permission gate is the
-/// prompt the person answers in the Claude Code terminal, never something
-/// the model answers.
+/// person's own answer — Approve / Deny in the Fleet or decision drawer for
+/// a headless dispatched run (`FleetShared::resolve_gate`), the terminal
+/// prompt for an interactive session — never something the model answers.
 pub fn resolve_decision(
     state: &mut PlannerState,
     todo_id: &str,
@@ -248,8 +275,9 @@ pub fn resolve_decision(
         .ok_or_else(|| format!("'{}' has no open decision.", title))?;
     if matches!(decision.source, DecisionSource::Gate { .. }) {
         return Err(format!(
-            "'{}' is waiting on a permission gate. Only the user can answer it, \
-             in the Claude Code terminal — it cannot be answered by a tool.",
+            "'{}' is waiting on a permission gate. Only the user can answer it \
+             (Approve / Deny in the Fleet or the decision queue for a headless run, \
+             otherwise in the Claude Code terminal) — it cannot be answered by a tool.",
             title
         ));
     }
@@ -445,7 +473,12 @@ pub fn decision_line(t: &Todo) -> Option<String> {
         extras.push(w.clone());
     }
     if matches!(d.source, DecisionSource::Gate { .. }) {
-        extras.push("permission prompt — the user answers it in the terminal".into());
+        // Options present = held for an in-app answer (headless run).
+        extras.push(if d.options.is_empty() {
+            "permission prompt — the user answers it in the terminal".into()
+        } else {
+            "permission gate — the user approves or denies it in Hobbes".into()
+        });
     }
     Some(format!("[{}] {} ({})", t.id, d.question, extras.join("; ")))
 }
@@ -520,7 +553,7 @@ mod tests {
 
         // A pending gate outranks a blocked brief: something IS pending.
         let mut gated = blocked.clone();
-        gated.gate = Some(GateSignal { request_id: "g1".into(), tool_name: "Bash".into(), input_summary: "ls".into() });
+        gated.gate = Some(GateSignal { request_id: "g1".into(), tool_name: "Bash".into(), input_summary: "ls".into(), held: false });
         assert_eq!(derive_agent_state(&t, Some(&gated)), Some(AgentState::NeedsYou));
 
         let mut ended = signal(WorkerStatus::Idle);
@@ -537,7 +570,7 @@ mod tests {
         let mut t = agent_todo();
         let now = Utc::now();
         let mut gated = signal(WorkerStatus::WaitingOnUser);
-        gated.gate = Some(GateSignal { request_id: "g1".into(), tool_name: "Bash".into(), input_summary: "npm publish".into() });
+        gated.gate = Some(GateSignal { request_id: "g1".into(), tool_name: "Bash".into(), input_summary: "npm publish".into(), held: false });
         assert!(apply_worker_signal(&mut t, &gated, now));
         assert_eq!(t.agent_state, Some(AgentState::NeedsYou));
         let d = t.decision.clone().unwrap();
@@ -551,6 +584,29 @@ mod tests {
         assert!(t.decision.is_none());
         assert_eq!(t.agent_state, Some(AgentState::Working));
         assert!(!apply_worker_signal(&mut t, &signal(WorkerStatus::Working), now), "idempotent");
+    }
+
+    #[test]
+    fn headless_gate_offers_approve_deny_and_stale_options_are_corrected() {
+        let now = Utc::now();
+        // A headless dispatched run: held in-app, so Approve / Deny.
+        let mut t = agent_todo();
+        let mut gated = signal(WorkerStatus::WaitingOnUser);
+        gated.gate = Some(GateSignal { request_id: "g1".into(), tool_name: "Bash".into(), input_summary: "npm test".into(), held: true });
+        assert!(apply_worker_signal(&mut t, &gated, now));
+        assert_eq!(t.decision.as_ref().unwrap().options, vec!["Approve", "Deny"]);
+        assert!(decision_line(&t).unwrap().contains("approves or denies it in Hobbes"));
+
+        // A stored interactive gate decision from an older build that still
+        // offers Approve / Deny loses the options it can't act on.
+        let mut old = agent_todo();
+        let mut interactive = gated.clone();
+        interactive.gate.as_mut().unwrap().held = false;
+        apply_worker_signal(&mut old, &interactive, now);
+        old.decision.as_mut().unwrap().options = gate_options(true);
+        assert!(apply_worker_signal(&mut old, &interactive, now));
+        assert!(old.decision.as_ref().unwrap().options.is_empty());
+        assert!(decision_line(&old).unwrap().contains("answers it in the terminal"));
     }
 
     #[test]
@@ -595,7 +651,7 @@ mod tests {
         // Gate decisions are answered by the user in the terminal.
         let mut g = agent_todo();
         let mut gated = signal(WorkerStatus::WaitingOnUser);
-        gated.gate = Some(GateSignal { request_id: "g".into(), tool_name: "Bash".into(), input_summary: "rm".into() });
+        gated.gate = Some(GateSignal { request_id: "g".into(), tool_name: "Bash".into(), input_summary: "rm".into(), held: true });
         apply_worker_signal(&mut g, &gated, now);
         let gid = g.id.clone();
         state.todos.push(g);

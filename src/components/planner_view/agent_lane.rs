@@ -471,6 +471,15 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
         }
         let brief = open_decision.and_then(|d| d.brief.clone());
         let review = t.agent_state == Some(AgentState::Review);
+        let gate = open_decision.is_some_and(|d| matches!(d.source, DecisionSource::Gate { .. }));
+        // A headless dispatched run's held request: Approve / Deny on the
+        // card (there is no terminal to answer in).
+        let held_gate = open_decision
+            .and_then(|d| match &d.source {
+                DecisionSource::Gate { request_id } => Some(request_id.clone()),
+                _ => None,
+            })
+            .filter(|rid| row.and_then(|r| r.held_gate()).is_some_and(|g| &g.request_id == rid));
         CardData {
             id: t.id.clone(),
             primary: if review {
@@ -484,8 +493,12 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
             outcome: t.outcome.clone().filter(|o| !o.trim().is_empty()),
             phrase: card_phrase(t.agent_state, question.as_deref(), progress.as_deref(), blocked.as_deref()),
             question,
-            options: open_decision.map(|d| d.options.clone()).unwrap_or_default(),
-            gate: open_decision.is_some_and(|d| matches!(d.source, DecisionSource::Gate { .. })),
+            // A gate's choices are the held-gate buttons (or the terminal),
+            // never a printed option list: older stored gate decisions
+            // carry Approve / Deny even where they can't be acted on.
+            options: if gate { Vec::new() } else { open_decision.map(|d| d.options.clone()).unwrap_or_default() },
+            gate,
+            held_gate,
             est: open_decision.map(|d| lanes::est_label(d.est_minutes)),
             did: brief.as_ref().map(|b| b.did.clone()).filter(|d| !d.trim().is_empty()),
             next: brief.as_ref().and_then(|b| b.next.clone()),
@@ -566,6 +579,23 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
             note_seq.set(seq);
             note_settings.set(denied || crate::fleet::terminal_focus::automation_denied_for(&row));
             note.set(Some(outcome.note(&name)));
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            if *note_seq.peek() == seq {
+                note.set(None);
+            }
+        });
+    };
+    // Approve / Deny on a headless run's held permission request.
+    let mut answer_held_gate = move |(todo_id, rid, allow): (String, String, bool)| {
+        let line = match super::decisions::answer_gate(planner, &todo_id, &rid, allow) {
+            Ok(l) => l.to_string(),
+            Err(e) => e,
+        };
+        let seq = *note_seq.peek() + 1;
+        note_seq.set(seq);
+        note_settings.set(false);
+        note.set(Some(line));
+        spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(4)).await;
             if *note_seq.peek() == seq {
                 note.set(None);
@@ -669,6 +699,7 @@ pub(crate) fn AgentLaneColumn(#[props(default)] embedded: bool) -> Element {
                             on_open: open_card,
                             on_details: move |id: String| detail.set(Some(id)),
                             on_fleet: move |_| chat_command.set(Some(ChatCommand::ToggleFleet)),
+                            on_gate: move |g: (String, String, bool)| answer_held_gate(g),
                         }
                     }
                 }
@@ -831,6 +862,9 @@ struct CardData {
     question: Option<String>,
     options: Vec<String>,
     gate: bool,
+    /// A headless dispatched run's held permission request (its id):
+    /// answered with Approve / Deny on the card.
+    held_gate: Option<String>,
     est: Option<String>,
     did: Option<String>,
     next: Option<String>,
@@ -851,6 +885,8 @@ fn LaneCard(
     on_fleet: EventHandler<()>,
     /// Set on "To review" cards: completes the to-do.
     #[props(default)] on_done: Option<EventHandler<String>>,
+    /// Approve / Deny of a held gate: (to-do id, request id, allow).
+    #[props(default)] on_gate: Option<EventHandler<(String, String, bool)>>,
 ) -> Element {
     let mut expanded = use_signal(|| false);
     let is_open = *expanded.read();
@@ -918,13 +954,40 @@ fn LaneCard(
                             "Mark done"
                         }
                     }
-                    button {
-                        class: "{primary_class}",
-                        onclick: move |evt: MouseEvent| {
-                            evt.stop_propagation();
-                            on_open.call((btn_id.clone(), btn_open.clone()));
-                        },
-                        "{data.primary}"
+                    if let (Some(rid), Some(on_gate)) = (data.held_gate.clone(), on_gate) {
+                        button {
+                            class: "{primary_class}",
+                            title: "Let the headless run use this tool",
+                            onclick: {
+                                let (tid, rid) = (btn_id.clone(), rid.clone());
+                                move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    on_gate.call((tid.clone(), rid.clone(), true));
+                                }
+                            },
+                            "Approve"
+                        }
+                        button {
+                            class: "shrink-0 min-h-7 rounded border border-faint px-2.5 text-[11px] text-fg hover:bg-input",
+                            title: "Refuse this tool; the run carries on without it",
+                            onclick: {
+                                let (tid, rid) = (btn_id.clone(), rid.clone());
+                                move |evt: MouseEvent| {
+                                    evt.stop_propagation();
+                                    on_gate.call((tid.clone(), rid.clone(), false));
+                                }
+                            },
+                            "Deny"
+                        }
+                    } else {
+                        button {
+                            class: "{primary_class}",
+                            onclick: move |evt: MouseEvent| {
+                                evt.stop_propagation();
+                                on_open.call((btn_id.clone(), btn_open.clone()));
+                            },
+                            "{data.primary}"
+                        }
                     }
                 }
             }

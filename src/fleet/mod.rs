@@ -145,12 +145,16 @@ impl FleetStatus {
     }
 }
 
-/// A Claude Code permission prompt the session is waiting on. Display only:
-/// the hook is answered at once with "no decision", so the user answers the
-/// prompt in the terminal (it carries choices the Fleet can't offer —
-/// always-allow, "tell Claude what to do instead", AskUserQuestion options).
-/// Cleared when the session moves on (a tool runs, the turn stops, a prompt
-/// is submitted).
+/// A Claude Code permission prompt the session is waiting on.
+///
+/// For an interactive session it is display only: the hook is answered at
+/// once with "no decision", so the user answers the prompt in the terminal
+/// (it carries choices the Fleet can't offer — always-allow, "tell Claude
+/// what to do instead", AskUserQuestion options). For a headless run Hobbes
+/// dispatched ([`FleetSession::is_headless_dispatch`]) there is no terminal:
+/// the listener HOLDS the hook and the Fleet / Planner offer Approve / Deny
+/// ([`FleetShared::resolve_gate`]). Cleared when the session moves on (a
+/// tool runs, the turn stops, a prompt is submitted) or the gate resolves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingGate {
     /// Hobbes-generated id (the hook payload carries no `tool_use_id` for
@@ -268,7 +272,7 @@ pub struct FleetSession {
 }
 
 impl FleetSession {
-    fn new(id: &str, cwd: &str, now: DateTime<Utc>) -> Self {
+    pub(crate) fn new(id: &str, cwd: &str, now: DateTime<Utc>) -> Self {
         Self {
             id: id.to_string(),
             cwd: cwd.to_string(),
@@ -294,6 +298,33 @@ impl FleetSession {
             wake_at: None,
             terminal: None,
         }
+    }
+
+    /// A headless `claude -p` run started by `HOBBES_DISPATCH` (its row was
+    /// pre-created with `dispatched_todo`). It has no terminal to show a
+    /// permission prompt in, so its `PermissionRequest`s are held for an
+    /// in-app Approve / Deny instead of passed through.
+    pub fn is_headless_dispatch(&self) -> bool {
+        // A dispatched run later resumed in a real terminal reports that
+        // terminal (TERM_PROGRAM or a tab/pane id); its prompts are answered
+        // there, so it is no longer held. A headless `claude -p` launched by
+        // Hobbes reports none (at most Hobbes's own bundle id).
+        let in_a_terminal = self.terminal.as_ref().is_some_and(|h| {
+            h.term_program.is_some()
+                || h.iterm_session.is_some()
+                || h.wezterm_pane.is_some()
+                || h.kitty_window.is_some()
+                || h.tmux_pane.is_some()
+                || h.wt_session.is_some()
+        });
+        self.origin == FleetOrigin::External && self.dispatched_todo.is_some() && !in_a_terminal
+    }
+
+    /// The pending gate when it is held for an in-app Approve / Deny (a
+    /// headless dispatched run). `None` for an interactive session, whose
+    /// prompt is answered in its terminal.
+    pub fn held_gate(&self) -> Option<&PendingGate> {
+        self.pending_gate.as_ref().filter(|_| self.is_headless_dispatch())
     }
 
     /// What to call this session: the Claude Code title when known, else the
@@ -762,6 +793,52 @@ pub fn note_transcript_and_dirty(
     }
 }
 
+/// How a held gate (a headless dispatched run's permission request) was
+/// resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateOutcome {
+    Allow,
+    Deny,
+    /// No answer before the hold ran out (or the row was dismissed): the hook
+    /// gets an empty 2xx body — "no decision". A headless run has no prompt
+    /// to fall back to, so Claude Code treats the tool as not permitted and
+    /// carries on without it.
+    Passthrough,
+}
+
+impl GateOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GateOutcome::Allow => "allow",
+            GateOutcome::Deny => "deny",
+            GateOutcome::Passthrough => "passthrough",
+        }
+    }
+}
+
+/// Pure state transition for a resolved held gate: the pending gate clears
+/// and the run resumes (a fresh Working span opens) whatever the outcome —
+/// allowed, denied, or timed out (headless, so a timeout is a refusal the
+/// run carries on from, not a prompt still waiting on the user).
+pub fn resolve_gate_in_state(
+    state: &mut FleetState,
+    request_id: &str,
+    _outcome: GateOutcome,
+    now: DateTime<Utc>,
+) -> Option<FleetSession> {
+    let session = state.sessions.values_mut().find(|s| {
+        s.pending_gate
+            .as_ref()
+            .is_some_and(|g| g.request_id == request_id)
+    })?;
+    session.pending_gate = None;
+    session.status = FleetStatus::Working;
+    session.attention_at = None;
+    session.working_since = Some(now);
+    session.last_event_at = now;
+    Some(session.clone())
+}
+
 /// Fold a terminal hint captured from hook headers into the session — the
 /// live-map entry and its persisted clone in `changed` in lockstep. An empty
 /// hint (variables unset or stripped by policy) changes nothing. When the
@@ -1174,6 +1251,9 @@ pub fn agent_lane_minutes(pro: bool, in_app_agent: u32, fleet: u32) -> u32 {
 /// `.await`.
 pub struct FleetShared {
     pub state: Mutex<FleetState>,
+    /// Held PermissionRequest responders (headless dispatched runs only),
+    /// keyed by request id.
+    gates: Mutex<HashMap<String, tokio::sync::oneshot::Sender<GateOutcome>>>,
     /// Bumped after every state change; the UI drain loop subscribes.
     notify: tokio::sync::watch::Sender<u64>,
     /// Finished dispatched runs whose parent chats are owed a continuation.
@@ -1192,6 +1272,7 @@ impl FleetShared {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(FleetState::default()),
+            gates: Mutex::new(HashMap::new()),
             notify: tokio::sync::watch::channel(0).0,
             continuations: Mutex::new(Vec::new()),
         }
@@ -1236,14 +1317,67 @@ impl FleetShared {
         )
     }
 
-    /// Hide a session from the board (UI). Persists the ended row, logs a
+    pub(crate) fn register_gate(
+        &self,
+        request_id: &str,
+    ) -> tokio::sync::oneshot::Receiver<GateOutcome> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.gates
+            .lock()
+            .expect("fleet gates lock poisoned")
+            .insert(request_id.to_string(), tx);
+        rx
+    }
+
+    pub(crate) fn take_gate(
+        &self,
+        request_id: &str,
+    ) -> Option<tokio::sync::oneshot::Sender<GateOutcome>> {
+        self.gates
+            .lock()
+            .expect("fleet gates lock poisoned")
+            .remove(request_id)
+    }
+
+    /// Is a held gate waiting on the person (its responder still alive)?
+    #[cfg(test)]
+    pub fn gate_is_held(&self, request_id: &str) -> bool {
+        self.gates
+            .lock()
+            .expect("fleet gates lock poisoned")
+            .contains_key(request_id)
+    }
+
+    /// UI Approve / Deny of a held gate (a headless dispatched run's
+    /// permission request). Returns `false` when nothing is held under that
+    /// id any more (it timed out, or it was an interactive session's prompt,
+    /// which is never held). The server task owns all follow-up state
+    /// changes and event logging.
+    pub fn resolve_gate(&self, request_id: &str, allow: bool) -> bool {
+        match self.take_gate(request_id) {
+            Some(tx) => tx
+                .send(if allow { GateOutcome::Allow } else { GateOutcome::Deny })
+                .is_ok(),
+            None => false,
+        }
+    }
+
+    /// Hide a session from the board (UI). Any held gate is released as a
+    /// passthrough so the hook never hangs. Persists the ended row, logs a
     /// `Dismissed` ledger event, and pokes.
     pub fn dismiss_session(&self, session_id: &str) {
-        let row = {
+        let (row, gate_id) = {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
-            dismiss_in_state(&mut state, session_id)
+            let gate_id = state
+                .sessions
+                .get(session_id)
+                .and_then(|s| s.pending_gate.as_ref().map(|g| g.request_id.clone()));
+            (dismiss_in_state(&mut state, session_id), gate_id)
         };
         let Some(row) = row else { return };
+        if let Some(tx) = gate_id.as_deref().and_then(|id| self.take_gate(id)) {
+            let _ = tx.send(GateOutcome::Passthrough);
+        }
         store::persist_sessions(std::slice::from_ref(&row));
         store::append_event(session_id, "Dismissed", "{}");
         self.poke();
