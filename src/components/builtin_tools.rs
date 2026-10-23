@@ -239,6 +239,46 @@ pub fn agent_time_gate(
     }
 }
 
+/// **The Heartbeat scope gate**, run by BOTH tool-call sites right after
+/// [`agent_time_gate`] (when that says `Proceed`) and before built-in
+/// dispatch and `use_mcp_tool`'s permission check. A no-op for every
+/// session but the dedicated Heartbeat session; there, the agent-time scope
+/// rules apply (`heartbeat::trust`): Allow proceeds, NeedsApproval is held
+/// as a `PermissionRequest` without consulting trust rules or always-allow
+/// (`ForceApproval`; runs once the user approves), Deny is refused.
+pub fn heartbeat_gate(
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+    user_approved: bool,
+) -> AgentTimeGate {
+    let is_heartbeat = crate::heartbeat::HEARTBEAT.peek().session_id.as_deref() == Some(session_id);
+    match crate::heartbeat::trust::gate_verdict(is_heartbeat, &tool_call.tool_name, args_json, user_approved) {
+        crate::heartbeat::trust::HeartbeatVerdict::Proceed => AgentTimeGate::Proceed,
+        crate::heartbeat::trust::HeartbeatVerdict::ForceApproval => AgentTimeGate::ForceApproval,
+        crate::heartbeat::trust::HeartbeatVerdict::Refuse(message) => {
+            tracing::info!(session_id, tool = %tool_call.tool_name, "Heartbeat gate refused a tool call");
+            AgentTimeGate::Refuse(message)
+        }
+    }
+}
+
+/// Both scope gates in order: agent time first, then (when it proceeds) the
+/// Heartbeat's. The one entry point the two tool-call sites use, so neither
+/// can run one gate without the other.
+pub fn scope_gates(
+    deps: BuiltinToolCtx,
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+    user_approved: bool,
+) -> AgentTimeGate {
+    match agent_time_gate(deps, tool_call, args_json, session_id, user_approved) {
+        AgentTimeGate::Proceed => heartbeat_gate(tool_call, args_json, session_id, user_approved),
+        other => other,
+    }
+}
+
 /// The app-state signals a built-in handler may need.
 #[derive(Clone, Copy)]
 pub struct BuiltinToolCtx {

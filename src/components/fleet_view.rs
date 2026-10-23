@@ -263,6 +263,10 @@ pub fn FleetView() -> Element {
                 }
             }
 
+            if crate::heartbeat::heartbeat_available() {
+                crate::components::heartbeat_card::HeartbeatCard { now }
+            }
+
             ReviewBand { now, today }
 
             if sessions.is_empty() {

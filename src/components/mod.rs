@@ -34,6 +34,7 @@ pub mod hotkey_recorder;
 pub mod mcp_marketplace;
 pub mod mcp_search_form;
 pub mod fleet_view;
+pub mod heartbeat_card;
 pub mod pixel_icons;
 pub mod project_chip;
 pub mod onboarding;

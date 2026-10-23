@@ -59,6 +59,7 @@ mod tab_tidy;
 mod test_support;
 mod timers;
 mod handoff;
+mod heartbeat;
 mod todo;
 mod usage_log;
 mod settings;
@@ -909,9 +910,15 @@ fn app() -> Element {
                     // visible tab to show its activity in. `open_tabs` isn't
                     // reachable from this task (see `PENDING_TAB_REOPEN`), so
                     // park the id for the ChatCommand handler to reopen.
-                    PENDING_TAB_REOPEN
-                        .write()
-                        .insert(c.parent_session_id.clone());
+                    // The Heartbeat's own session stays out of the tab
+                    // strip: its turn runs in the background like a wake.
+                    if heartbeat::HEARTBEAT.peek().session_id.as_deref()
+                        != Some(c.parent_session_id.as_str())
+                    {
+                        PENDING_TAB_REOPEN
+                            .write()
+                            .insert(c.parent_session_id.clone());
+                    }
                     let parent_tab_name = session_state
                         .peek()
                         .sessions
@@ -2188,6 +2195,23 @@ fn app() -> Element {
                     }
                 }
             }
+        });
+    }
+
+    // ── Heartbeat runtime ────────────────────────────────────────────────────
+    // Polls every 30 s while the Heartbeat is on: perception → salience →
+    // wake its dedicated session through the background chat queue, within
+    // the budget (heartbeat::runtime). Idles cheaply while it's off.
+    {
+        let deps = heartbeat::runtime::HeartbeatDeps {
+            session_state,
+            settings,
+            planner: planner_state,
+            fleet: fleet_state,
+            usage_log: usage_log_sig,
+        };
+        use_future(move || async move {
+            heartbeat::runtime::run(deps, || STREAMING_SESSIONS.peek().clone()).await;
         });
     }
 

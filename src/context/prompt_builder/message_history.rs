@@ -401,7 +401,12 @@ impl<'a> PromptBuilder<'a> {
                     .and_then(|a| session_messages.iter().position(|m| m.id == a.id))
                     .unwrap_or(session_messages.len())
             };
-            super::briefing::turn_briefing(self.session, &session_messages[..turn_start], now)
+            super::briefing::turn_briefing(
+                self.session,
+                &session_messages[..turn_start],
+                &self.heartbeat_events,
+                now,
+            )
         } else {
             String::new()
         };

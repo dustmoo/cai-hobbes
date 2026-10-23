@@ -4,7 +4,8 @@
 //! the thread. At a user-turn boundary that follows a gap (or a timer firing),
 //! the request tail opens with a short briefing: how long since the previous
 //! turn, which of this chat's timers fired meanwhile (and why the model set
-//! them), and the model's own handoff note with its age.
+//! them), changes the Heartbeat noticed to work this chat dispatched, and
+//! the model's own handoff note with its age.
 //!
 //! The briefing is computed once, when the boundary tail is created, from the
 //! session and the tail's own clock, and is persisted inside that tail's body
@@ -14,6 +15,7 @@
 use chrono::{DateTime, Local, Utc};
 
 use crate::components::chat::Message;
+use crate::heartbeat::HeartbeatEvent;
 use crate::session::Session;
 use crate::timers::TimerStatus;
 
@@ -29,6 +31,8 @@ const STALE_NOTE_HOURS: i64 = 24;
 const MAX_TIMERS: usize = 5;
 /// Cap on a timer's label / cause / reason as shown in the briefing.
 const MAX_TIMER_FIELD_CHARS: usize = 300;
+/// At most this many dispatched-work changes are listed (most recent last).
+const MAX_DISPATCHED: usize = 5;
 
 /// When the model last acted in this chat: the latest timestamp among the
 /// non-user messages before the current turn (replies and tool calls).
@@ -78,9 +82,19 @@ fn clip(text: &str, max: usize) -> String {
 }
 
 /// The briefing for a turn whose user message follows `prior` (the session's
-/// messages before it), at `now` (the tail's clock). Empty when there is
-/// nothing to say: no previous turn, or a short gap with no fired timer.
-pub(crate) fn turn_briefing(session: &Session, prior: &[Message], now: DateTime<Local>) -> String {
+/// messages before it), at `now` (the tail's clock). `heartbeat_events` are
+/// the Heartbeat's events about this chat's work; those after the previous
+/// turn about work it dispatched become "Work you dispatched" lines (events
+/// about the chat's own to-do, with no dispatch from it, are left out: that
+/// is its own work, not work it handed off). Empty when there is nothing to
+/// say: no previous turn, or a short gap with no fired timer and no
+/// dispatched-work change.
+pub(crate) fn turn_briefing(
+    session: &Session,
+    prior: &[Message],
+    heartbeat_events: &[HeartbeatEvent],
+    now: DateTime<Local>,
+) -> String {
     let Some(last) = previous_turn_at(prior) else {
         return String::new();
     };
@@ -104,7 +118,17 @@ pub(crate) fn turn_briefing(session: &Session, prior: &[Message], now: DateTime<
     let skip = fired.len().saturating_sub(MAX_TIMERS);
     let fired = &fired[skip..];
 
-    if !long_gap && fired.is_empty() {
+    let mut dispatched: Vec<&HeartbeatEvent> = heartbeat_events
+        .iter()
+        .filter(|e| e.at > last && e.at <= now_utc)
+        .filter(|e| e.dispatched_from.as_deref() == Some(session.id.as_str())
+            || e.session_id.as_deref() != Some(session.id.as_str()))
+        .collect();
+    dispatched.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
+    let skip = dispatched.len().saturating_sub(MAX_DISPATCHED);
+    let dispatched = &dispatched[skip..];
+
+    if !long_gap && fired.is_empty() && dispatched.is_empty() {
         return String::new();
     }
 
@@ -127,6 +151,13 @@ pub(crate) fn turn_briefing(session: &Session, prior: &[Message], now: DateTime<
             line.push_str(&format!(" Why you set it: {}", clip(reason, MAX_TIMER_FIELD_CHARS)));
         }
         lines.push(line);
+    }
+    for e in dispatched {
+        lines.push(format!(
+            "Work you dispatched: {} ({}).",
+            clip(&e.summary, MAX_TIMER_FIELD_CHARS),
+            clock_label(e.at, now)
+        ));
     }
     if let Some(note) = &session.handoff {
         let age = now_utc - note.written_at;
