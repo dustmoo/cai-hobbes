@@ -82,6 +82,10 @@ pub enum MessageContent {
     Error {
         message: String,
     },
+    /// A dispatch relay between a parent chat and one of its chat workers
+    /// (`todo::relay`). Visible in both chats; the model sees only incoming
+    /// copies, framed as information from another agent.
+    Relay(crate::todo::relay::RelayNote),
 }
 
 impl MessageContent {
@@ -106,6 +110,7 @@ impl MessageContent {
                 format!("[Permission Request for Skill: {}]", sc.skill_name)
             }
             MessageContent::Error { message } => format!("[Error: {}]", message),
+            MessageContent::Relay(note) => crate::todo::relay::summary_line(note),
         }
     }
 }

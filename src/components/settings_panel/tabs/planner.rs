@@ -199,6 +199,29 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                         }
                                     }
 
+                                    // Dispatch relay (todo::relay): how a chat and the chat
+                                    // workers it dispatches may message each other.
+                                    {
+                                        use crate::settings::DispatchRelayMode;
+                                        let mode = local_settings.read().dispatch_relay_mode;
+                                        rsx! {
+                                            div {
+                                                class: "mt-4 mb-1",
+                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "Worker Messages" }
+                                                p { class: "text-xs text-fg-muted mb-1", "A chat worker you dispatch reports back to the chat that sent it. Two-way also lets that chat message its workers." }
+                                                select {
+                                                    class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+                                                    onchange: move |e| {
+                                                        local_settings.write().dispatch_relay_mode = DispatchRelayMode::from_str_lossy(&e.value());
+                                                    },
+                                                    option { value: DispatchRelayMode::Off.as_str(), selected: mode == DispatchRelayMode::Off, "Off" }
+                                                    option { value: DispatchRelayMode::Report.as_str(), selected: mode == DispatchRelayMode::Report, "Report back" }
+                                                    option { value: DispatchRelayMode::TwoWay.as_str(), selected: mode == DispatchRelayMode::TwoWay, "Two-way" }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     if crate::heartbeat::heartbeat_available() {
                                         {
                                             let hb = local_settings.read().clone();

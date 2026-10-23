@@ -40,6 +40,11 @@ fn chat_worker_note(todo_id: &str, decisions_on: bool) -> String {
     )
 }
 
+/// The line a chat worker linked to its parent chat gets (`todo::relay`).
+const RELAY_WORKER_NOTE: &str = "\nYou were dispatched from another chat. To ask it a question or hand it a \
+     result, call HOBBES_MESSAGE_PARENT; a short completion report goes to it automatically \
+     when you finish.";
+
 /// What the spawner is asked to launch. Separated behind a trait so the
 /// handler is testable without running `claude`.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,7 +203,8 @@ pub struct ChatDispatchOpts<'a> {
     /// A validated model choice to pin the new tab to (`None` = the user's
     /// default).
     pub choice: Option<ModelChoice>,
-    /// The chat that asked: its Composio profile is inherited.
+    /// The chat that asked: its Composio profile is inherited, and the new
+    /// worker is linked to it for the dispatch relay (`todo::relay`).
     pub parent_session_id: Option<&'a str>,
     /// Switch to the new tab (the model's dispatch does). `false` leaves the
     /// user where they are; the caller opens the tab in the background.
@@ -266,6 +272,10 @@ pub fn dispatch_to_chat(
     if let Some(c) = &opts.choice {
         log_pin(&new_id, Some(c));
     }
+    // The parent ↔ worker link the dispatch relay travels along.
+    let linked = opts
+        .parent_session_id
+        .is_some_and(|parent| crate::todo::relay::record_link(deps.session_state, parent, &new_id, todo_id));
     crate::session::SessionState::save_signal(&deps.session_state, None);
     let model = {
         let settings = deps.settings.peek();
@@ -285,6 +295,9 @@ pub fn dispatch_to_chat(
     }
     let decisions_on = deps.settings.peek().agent_time_enabled();
     prompt.push_str(&chat_worker_note(todo_id, decisions_on));
+    if linked && deps.settings.peek().dispatch_relay_mode != crate::settings::DispatchRelayMode::Off {
+        prompt.push_str(RELAY_WORKER_NOTE);
+    }
     if let Some(t) = deps.planner.peek().todo(todo_id) {
         let _ = crate::todo::store::save_todo(t);
     }

@@ -128,6 +128,12 @@ fn drain_cancel_stream_requests() -> Vec<String> {
 static PENDING_TAB_REOPEN: GlobalSignal<std::collections::HashSet<String>> =
     Signal::global(std::collections::HashSet::new);
 
+/// Ask the `ChatCommand` handler to reopen `session_id` in the tab strip
+/// (a dispatch relay waking a chat whose tab was closed — `todo::relay`).
+pub(crate) fn request_tab_reopen(session_id: &str) {
+    PENDING_TAB_REOPEN.write().insert(session_id.to_string());
+}
+
 /// Drain `PENDING_TAB_REOPEN`, subscribing the caller to it. Same idiom as
 /// `drain_cancel_stream_requests`: the read (not the write) is what makes a
 /// later insert re-run the subscribed effect.
@@ -2032,6 +2038,29 @@ fn app() -> Element {
                 if due {
                     chat_command.set(Some(ChatCommand::AgentTimeStart));
                 }
+            }
+        });
+    }
+
+    // Dispatch relay: a chat worker's to-do can finish after its last turn
+    // (a brief lands later and marks it Done / Review). This sweep hands
+    // those completion reports to the parent chat; the worker's turn end
+    // covers the rest. Latched per worker, so a report goes out once.
+    {
+        let planner_state = planner_state;
+        let session_state = session_state;
+        use_future(move || async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                let streaming = STREAMING_SESSIONS.peek().clone();
+                crate::todo::relay::sweep_completion_reports(
+                    crate::todo::relay::RelaySignals {
+                        session_state,
+                        planner: planner_state,
+                        settings,
+                    },
+                    &streaming,
+                );
             }
         });
     }

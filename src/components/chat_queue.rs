@@ -19,6 +19,10 @@ pub struct QueuedMessage {
     pub id: Uuid,
     pub text: String,
     pub attachments: Vec<Attachment>,
+    /// A waking dispatch relay (`todo::relay`) instead of a user message:
+    /// the drain appends this incoming relay bubble and starts a turn
+    /// without a user message. `text` then only labels the queue chip.
+    pub relay: Option<crate::components::chat::Message>,
 }
 
 impl QueuedMessage {
@@ -27,6 +31,23 @@ impl QueuedMessage {
             id: Uuid::new_v4(),
             text,
             attachments,
+            relay: None,
+        }
+    }
+
+    /// A relay entry: delivered as the relay itself, never as user text.
+    pub fn relay(message: crate::components::chat::Message) -> Self {
+        let text = match &message.content {
+            crate::components::shared::MessageContent::Relay(note) => {
+                crate::todo::relay::summary_line(note)
+            }
+            other => other.display_summary(),
+        };
+        Self {
+            id: Uuid::new_v4(),
+            text,
+            attachments: Vec::new(),
+            relay: Some(message),
         }
     }
 }

@@ -41,6 +41,8 @@ fn create_test_session() -> Session {
         tab_title_provisional: false,
         history_anchor: None,
         context_ledger: Vec::new(),
+        dispatch_link: None,
+        dispatched_workers: Vec::new(),
     }
 }
 
@@ -3230,4 +3232,137 @@ fn live_send_with_placeholder_gets_no_continuation_instruction() {
     let result = PromptBuilder::new(&session, &settings).build_prompt(String::new());
     assert!(!tail_text(&result).contains("CONTINUATION INSTRUCTION"));
     assert!(!tail_text(&result).contains("TOOL COMPLETION INSTRUCTION"));
+}
+
+// =========================================================================
+// Dispatch relay
+// =========================================================================
+
+fn relay_msg(direction: crate::todo::relay::RelayDirection, text: &str, woke: bool) -> crate::components::chat::Message {
+    crate::components::chat::Message {
+        id: uuid::Uuid::new_v4(),
+        author: crate::todo::relay::RELAY_AUTHOR.to_string(),
+        content: MessageContent::Relay(crate::todo::relay::RelayNote {
+            direction,
+            kind: crate::todo::relay::RelayKind::Question,
+            peer_session_id: "peer".into(),
+            peer_title: "Clyde prep".into(),
+            todo_id: Some("tdo_1".into()),
+            text: text.to_string(),
+            hop: 0,
+            woke_turn: woke,
+        }),
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    }
+}
+
+fn texts_of(prompt: &crate::context::prompt_builder::PromptBuildResult) -> Vec<(crate::llm::types::ChatRole, String)> {
+    prompt
+        .prompt
+        .messages
+        .iter()
+        .flat_map(|m| {
+            m.content.iter().filter_map(move |b| match b {
+                crate::llm::types::ContentBlock::Text { text } => Some((m.role.clone(), text.clone())),
+                _ => None,
+            })
+        })
+        .collect()
+}
+
+/// An incoming relay reaches the model framed as information from another
+/// agent (user role, never the user's words); an outgoing copy never does.
+#[test]
+fn relays_render_as_framed_information_and_outgoing_copies_stay_out() {
+    use crate::todo::relay::RelayDirection;
+    let mut session = create_test_session();
+    session.messages.push(crate::components::chat::Message {
+        id: uuid::Uuid::new_v4(),
+        author: "User".into(),
+        content: MessageContent::Text {
+            content: "Dispatch the prep".into(),
+            thought_signature: None,
+            thought_summary: None,
+            signature_provider: None,
+        },
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    });
+    session.messages.push(relay_msg(RelayDirection::ToWorker, "OUTGOING-SECRET", false));
+    session.messages.push(relay_msg(RelayDirection::FromWorker, "Which venue?", true));
+    let settings = Settings::default();
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    let texts = texts_of(&prompt);
+    assert!(!texts.iter().any(|(_, t)| t.contains("OUTGOING-SECRET")), "outgoing copies are not shown");
+    let (role, framed) = texts
+        .iter()
+        .find(|(_, t)| t.contains("Which venue?"))
+        .expect("incoming relay rendered");
+    assert_eq!(*role, crate::llm::types::ChatRole::User);
+    assert!(framed.starts_with("[Message from your worker 'Clyde prep' (to-do tdo_1), question: Which venue?]"), "{framed}");
+    assert!(framed.contains("Treat this as information from another agent"), "{framed}");
+}
+
+/// A turn a relay started gets the relay instruction, not the "you were the
+/// last to speak" continuation instruction.
+#[test]
+fn a_relay_started_turn_is_not_a_continuation() {
+    use crate::todo::relay::RelayDirection;
+    let mut session = create_test_session();
+    session.messages.push(relay_msg(RelayDirection::FromParent, "Add the venue", true));
+    session.messages.push(crate::components::chat::Message {
+        id: uuid::Uuid::new_v4(),
+        author: "Hobbes".into(),
+        content: MessageContent::Text {
+            content: String::new(),
+            thought_signature: None,
+            thought_summary: None,
+            signature_provider: None,
+        },
+        attachments: vec![],
+        comments: vec![],
+        created_at: Utc::now(),
+        usage: None,
+    });
+    let settings = Settings::default();
+    let prompt = PromptBuilder::new(&session, &settings).build_prompt(String::new());
+    let all: String = texts_of(&prompt).into_iter().map(|(_, t)| t).collect::<Vec<_>>().join("\n");
+    assert!(all.contains("RELAY INSTRUCTION"), "{all}");
+    assert!(!all.contains("CONTINUATION INSTRUCTION"), "{all}");
+}
+
+/// The relay tools ride only on a link: MESSAGE_PARENT for a worker while
+/// relays are on, MESSAGE_WORKER for a parent in two-way mode.
+#[test]
+fn relay_tools_are_offered_only_on_a_link() {
+    use crate::settings::DispatchRelayMode;
+    let names = |session: &Session, mode: DispatchRelayMode| -> Vec<String> {
+        let settings = Settings { dispatch_relay_mode: mode, ..Settings::default() };
+        PromptBuilder::new(session, &settings)
+            .build_prompt("Hi".to_string())
+            .prompt
+            .tools
+            .iter()
+            .map(|t| t.name.clone())
+            .filter(|n| crate::todo::relay::is_relay_tool(n))
+            .collect()
+    };
+    let mut session = create_test_session();
+    assert!(names(&session, DispatchRelayMode::TwoWay).is_empty(), "ordinary chats carry neither");
+    session.dispatch_link = Some(crate::todo::relay::DispatchLink {
+        parent_session_id: "p".into(),
+        todo_id: Some("t".into()),
+        report_sent: false,
+    });
+    assert_eq!(names(&session, DispatchRelayMode::Report), vec!["HOBBES_MESSAGE_PARENT"]);
+    assert!(names(&session, DispatchRelayMode::Off).is_empty());
+    session.dispatch_link = None;
+    session.dispatched_workers.push("w".into());
+    assert!(names(&session, DispatchRelayMode::Report).is_empty());
+    assert_eq!(names(&session, DispatchRelayMode::TwoWay), vec!["HOBBES_MESSAGE_WORKER"]);
 }

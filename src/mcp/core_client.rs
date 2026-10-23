@@ -273,4 +273,68 @@ impl CoreClient {
             },
         ]
     }
+
+    /// The dispatch relay tools (`todo::relay`). Deliberately NOT in
+    /// [`list_tools`](Self::list_tools): the prompt builder offers each only
+    /// to a session on a parent ↔ worker link (`relay::relay_tools_offered`),
+    /// so ordinary chats never carry them. Descriptions are fixed strings,
+    /// so the cached tool prefix holds.
+    pub fn relay_tools() -> Vec<Tool> {
+        use std::sync::Arc;
+        vec![
+            Tool {
+                name: "HOBBES_MESSAGE_PARENT".into(),
+                description: Some(
+                    "Send a message to the chat that dispatched you (your parent). kind \
+                    'question' asks it something and starts a turn there; 'result' hands back \
+                    what you produced; 'progress' is a quiet note that starts nothing. The \
+                    parent reads it as information from another agent. Only while your to-do is \
+                    open (plus one final 'result'); a short completion report is sent \
+                    automatically when you finish, so don't repeat it."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "text": { "type": "string", "description": "The message, self-contained and short." },
+                            "kind": { "type": "string", "enum": ["progress", "question", "result"], "description": "Defaults to progress." }
+                        },
+                        "required": ["text"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Message Parent".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+            Tool {
+                name: "HOBBES_MESSAGE_WORKER".into(),
+                description: Some(
+                    "Send a message to one of the chat workers you dispatched; it starts a turn \
+                    in that worker's chat, which reads it as information from another agent. \
+                    Only your own workers, only while their to-do is open."
+                        .into(),
+                ),
+                input_schema: Arc::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "worker": { "type": "string", "description": "The worker's to-do id or title, or its chat session id." },
+                            "text": { "type": "string", "description": "The message, self-contained and short." }
+                        },
+                        "required": ["worker", "text"]
+                    }))
+                    .unwrap_or_default(),
+                ),
+                title: Some("Message Worker".to_string()),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
+            },
+        ]
+    }
 }

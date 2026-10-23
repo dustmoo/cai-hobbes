@@ -64,6 +64,7 @@ fn item_caption<'a>(
         MessageContent::ToolCall(_) | MessageContent::Error { .. } => message.author.as_str(),
         MessageContent::PermissionRequest(_) => "System",
         MessageContent::SkillCall(_) | MessageContent::SkillPermissionRequest(_) => "User",
+        MessageContent::Relay(_) => message.author.as_str(),
     };
     Some((label, message.created_at))
 }
@@ -495,6 +496,15 @@ pub fn MessageList(
                                                         }
                                                     }
                                                 }
+                                                MessageContent::Relay(note) => {
+                                                    rsx! {
+                                                        RelayBubble {
+                                                            note: note.clone(),
+                                                            created_at: message.created_at,
+                                                            show_time: stamp.show_time,
+                                                        }
+                                                    }
+                                                }
                                                 MessageContent::SkillCall(skill_call) => {
                                                     let container_classes = "flex justify-end text-fg";
                                                     rsx! {
@@ -708,6 +718,91 @@ pub fn MessageList(
                             icon: fi_icons::FiChevronDown
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// A relay longer than this (chars or lines) starts collapsed.
+const RELAY_COLLAPSE_CHARS: usize = 600;
+const RELAY_COLLAPSE_LINES: usize = 8;
+
+/// A dispatch relay (`todo::relay`): the AI bubble in a slightly lighter
+/// grey, under a small header naming the other chat. Clicking the header
+/// switches to that chat; a long relay starts collapsed.
+#[component]
+fn RelayBubble(
+    note: crate::todo::relay::RelayNote,
+    created_at: chrono::DateTime<chrono::Utc>,
+    show_time: bool,
+) -> Element {
+    use crate::todo::relay::{RelayDirection, RelayKind};
+    let mut chat_command =
+        use_context::<Signal<Option<crate::components::chat_input::ChatCommand>>>();
+    let long = note.text.chars().count() > RELAY_COLLAPSE_CHARS
+        || note.text.lines().count() > RELAY_COLLAPSE_LINES;
+    let mut expanded = use_signal(|| false);
+    let collapsed = long && !expanded();
+    // Parent → worker points down-right, worker → parent up-left.
+    let down = matches!(note.direction, RelayDirection::ToWorker | RelayDirection::FromParent);
+    let kind = match note.kind {
+        RelayKind::Question => Some("question"),
+        RelayKind::Result => Some("result"),
+        RelayKind::Report => Some("finished"),
+        RelayKind::Progress | RelayKind::Message => None,
+    };
+    let header = format!("{} · {}", note.direction.label(), note.peer_title);
+    let peer = note.peer_session_id.clone();
+    rsx! {
+        div {
+            class: "flex justify-start w-full",
+            div {
+                class: "flex flex-col max-w-[calc(100%-2.5rem)] lg:max-w-[90%] min-w-0",
+                div {
+                    class: "rounded-2xl bg-card text-fg self-start mr-auto max-w-full",
+                    div {
+                        class: "rounded-2xl bg-white/5 px-4 py-2.5 text-sm leading-relaxed break-words",
+                        button {
+                            class: "flex items-center gap-1.5 text-xs text-fg-muted hover:text-fg transition-colors focus:outline-none mb-1 max-w-full",
+                            title: "Open this chat",
+                            onclick: move |_| {
+                                chat_command.set(Some(
+                                    crate::components::chat_input::ChatCommand::SwitchToSession(peer.clone()),
+                                ));
+                            },
+                            if down {
+                                Icon { width: 12, height: 12, icon: fi_icons::FiCornerDownRight }
+                            } else {
+                                Icon { width: 12, height: 12, icon: fi_icons::FiCornerUpLeft }
+                            }
+                            span { class: "truncate", "{header}" }
+                            if let Some(k) = kind {
+                                span { class: "shrink-0", "· {k}" }
+                            }
+                        }
+                        div {
+                            class: if collapsed { "max-h-24 overflow-hidden" } else { "" },
+                            crate::components::markdown_renderer::MarkdownRenderer {
+                                id: None,
+                                content: note.text.clone(),
+                                comments: None,
+                                pending_highlight: None,
+                            }
+                        }
+                        if long {
+                            button {
+                                class: "mt-1 text-xs text-fg-muted hover:text-fg focus:outline-none",
+                                onclick: move |_| expanded.toggle(),
+                                if collapsed { "Show more" } else { "Show less" }
+                            }
+                        }
+                    }
+                }
+                MessageCaption {
+                    label: "Relay".to_string(),
+                    created_at: created_at,
+                    show_time: show_time,
                 }
             }
         }

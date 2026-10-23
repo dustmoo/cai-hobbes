@@ -3714,6 +3714,8 @@ mod tests {
                 tab_title_provisional: false,
                 history_anchor: None,
                 context_ledger: Vec::new(),
+                dispatch_link: None,
+                dispatched_workers: Vec::new(),
             }
         }
 

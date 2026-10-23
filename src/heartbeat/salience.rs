@@ -72,6 +72,10 @@ pub struct SalienceCtx {
     /// `dispatch_auto_continue`: a finished run already hands its result
     /// back to the chat that dispatched it, the Heartbeat session included.
     pub dispatch_auto_continue: bool,
+    /// To-dos whose Hobbes chat workers report back into the Heartbeat
+    /// session by dispatch relay (`todo::relay::relayed_todo_ids`): their
+    /// completion report already starts a turn there.
+    pub relayed_todo_ids: HashSet<String>,
 }
 
 impl SalienceCtx {
@@ -106,6 +110,13 @@ impl SalienceCtx {
         self.dispatch_auto_continue
             && self.heartbeat_session_id.is_some()
             && ev.dispatched_from == self.heartbeat_session_id
+    }
+
+    /// A chat worker the Heartbeat session dispatched, whose completion the
+    /// dispatch relay already reports to it: a wake on top would be a
+    /// second, unbudgeted turn.
+    fn relayed_into_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
+        ev.todo_id.as_ref().is_some_and(|t| self.relayed_todo_ids.contains(t))
     }
 
     /// Work the Heartbeat is waiting on or launched itself.
@@ -157,6 +168,7 @@ pub trait Salience {
 /// | 3 | `ci_failed` on a project with open agent work | WakeNow  |
 /// | 4 | `ci_failed` elsewhere                         | Queue    |
 /// | 4b | `run_ended` from the Heartbeat session while auto-continue hands the result back | Note |
+/// | 4c | `worker_done` / `worker_review` for a chat worker that reports into the Heartbeat session by dispatch relay | Note |
 /// | 5 | `worker_done` / `worker_review` / `run_ended` / `session_needs_attention` the Heartbeat awaits (pending intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
 /// | 6 | `worker_done`, `worker_review`, `session_needs_attention` | Queue |
 /// | 7 | `run_ended` (the dispatching chat is continued anyway) | Note |
@@ -184,6 +196,7 @@ impl RulesSalience {
                 if agent_work { Choice::WakeNow } else { Choice::Queue }
             }
             KIND_RUN_ENDED if ctx.continued_into_heartbeat(ev) => Choice::Note,
+            KIND_WORKER_DONE | KIND_WORKER_REVIEW if ctx.relayed_into_heartbeat(ev) => Choice::Note,
             KIND_WORKER_DONE | KIND_WORKER_REVIEW | KIND_RUN_ENDED | KIND_SESSION_NEEDS_ATTENTION
                 if ctx.awaited(ev) =>
             {
@@ -349,6 +362,29 @@ mod tests {
         r.dispatched_from = None;
         ctx.heartbeat_session_id = None;
         assert_eq!(choice(&r, &ctx), Choice::Note);
+    }
+
+    #[test]
+    fn a_relayed_worker_s_completion_is_noted_not_woken() {
+        // The Heartbeat dispatched a chat worker; its completion report
+        // reaches the Heartbeat session by relay, so worker_done must not
+        // wake it a second time. A worker that needs the person still wakes.
+        let mut ctx = SalienceCtx::default();
+        ctx.heartbeat_todo_ids.insert("t".into());
+        ctx.relayed_todo_ids.insert("t".into());
+        for kind in [KIND_WORKER_DONE, KIND_WORKER_REVIEW] {
+            let mut e = ev(EventSource::Planner, kind, Urgency::Normal);
+            e.todo_id = Some("t".into());
+            assert_eq!(choice(&e, &ctx), Choice::Note, "{kind}");
+        }
+        let mut stuck = ev(EventSource::Planner, KIND_WORKER_STUCK, Urgency::High);
+        stuck.todo_id = Some("t".into());
+        assert_eq!(choice(&stuck, &ctx), Choice::WakeNow);
+        // Relays off (the set is empty): the old wake stands.
+        ctx.relayed_todo_ids.clear();
+        let mut e = ev(EventSource::Planner, KIND_WORKER_DONE, Urgency::Normal);
+        e.todo_id = Some("t".into());
+        assert_eq!(choice(&e, &ctx), Choice::WakeNow);
     }
 
     #[test]

@@ -196,6 +196,9 @@ pub fn ChatInput(
     // Streaming state + skill permissions, hoisted to render scope so the
     // shared `submit` callback and the queue-drain effect can use them.
     let stream_manager = consume_context::<StreamManagerContext>();
+    let mut continuation_controller = consume_context::<
+        Signal<crate::components::continuation_controller::ContinuationController>,
+    >();
     let permission_manager =
         use_context::<Signal<crate::context::permissions::PermissionManager>>();
 
@@ -877,7 +880,25 @@ pub fn ChatInput(
             let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
             if let Some(qm) = popped {
                 dispatching.write().insert(session_id.clone());
-                submit.call((qm.text, qm.attachments, session_id.clone()));
+                match qm.relay {
+                    // A waking dispatch relay: append it and start a turn
+                    // with no user message (todo::relay). Never resets the
+                    // turn count, and never runs a call awaiting approval.
+                    Some(relay) => {
+                        let start = crate::todo::relay::deliver_queued_relay(
+                            session_state,
+                            &_planner_state.peek(),
+                            &session_id,
+                            relay,
+                        );
+                        if start {
+                            continuation_controller
+                                .write()
+                                .trigger_continuation(session_id.clone());
+                        }
+                    }
+                    None => submit.call((qm.text, qm.attachments, session_id.clone())),
+                }
                 // Failsafe: a queued no-op (e.g. a command that starts no stream)
                 // must not wedge the queue. Real turns clear the guard sooner via
                 // the is_streaming branch above; this only fires if nothing ever

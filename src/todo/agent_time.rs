@@ -2165,6 +2165,8 @@ pub fn agent_time_scope_allows(tool: &str, args: &serde_json::Value) -> ScopeVer
 ///      `HOBBES_FLEET_STATUS`,
 ///      `HOBBES_LIST_TIMERS`, `HOBBES_PAGE_RESULT`,
 ///      `HOBBES_UPDATE_SCRATCHPAD` (the session's own memory),
+///      `HOBBES_MESSAGE_PARENT` / `HOBBES_MESSAGE_WORKER` (the dispatch
+///      relay, along a parent ↔ worker link only),
 ///      `HOBBES_INVOKE_SKILL` / `HOBBES_UNLOAD_SKILL` (capability loading;
 ///      the skill's tools are gated one by one), `MCP_LOAD_SERVER_TOOLS` /
 ///      `MCP_UNLOAD_SERVER_TOOLS`, `HOBBES_DECISIONS action=list`,
@@ -2192,7 +2194,11 @@ pub fn agent_time_scope(tool: &str, args: &serde_json::Value) -> (ScopeVerdict, 
         "HOBBES_AGENT_TIME" | "HOBBES_TODO_LIST" | "HOBBES_CALENDAR_LIST" | "HOBBES_PROJECT_LIST"
         | "HOBBES_FLEET_STATUS" | "HOBBES_LIST_TIMERS" | "HOBBES_PAGE_RESULT"
         | "HOBBES_UPDATE_SCRATCHPAD" | "HOBBES_WRITE_HANDOFF" | "HOBBES_INVOKE_SKILL"
-        | "HOBBES_UNLOAD_SKILL" | "MCP_LOAD_SERVER_TOOLS" | "MCP_UNLOAD_SERVER_TOOLS" => return (Allow, R::HobbesAllowed),
+        | "HOBBES_UNLOAD_SKILL" | "MCP_LOAD_SERVER_TOOLS" | "MCP_UNLOAD_SERVER_TOOLS"
+        // Dispatch relay: stays inside Hobbes, along a parent ↔ worker link
+        // only (todo::relay refuses anything else); whatever the receiver
+        // then does passes its own gates.
+        | "HOBBES_MESSAGE_PARENT" | "HOBBES_MESSAGE_WORKER" => return (Allow, R::HobbesAllowed),
         // A write to the person's projects that always asks anyway: held
         // for their approval rather than refused outright.
         "HOBBES_PROJECT_MERGE" => return (NeedsApproval, R::OutsideEffect),

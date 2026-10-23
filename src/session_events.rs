@@ -143,6 +143,15 @@ pub enum SessionEvent {
     LedgerEntryAdded { entry: crate::session::LedgerEntry },
     /// HOBBES_WRITE_HANDOFF replaced the session's handoff note.
     HandoffWritten { note: crate::handoff::HandoffNote },
+    /// A dispatch relay bubble (`MessageContent::Relay`) landed in this
+    /// chat — its outgoing copy in the sender, its incoming copy in the
+    /// receiver (`todo::relay`).
+    Relay { message: Message },
+    /// This worker tab's parent link was set or updated (its completion
+    /// report latch included).
+    DispatchLinked { link: Option<crate::todo::relay::DispatchLink> },
+    /// A chat worker was dispatched from this chat.
+    WorkerAdded { worker_session_id: String },
 }
 
 impl SessionEvent {
@@ -175,6 +184,9 @@ impl SessionEvent {
             SessionEvent::MessageEdited { .. } => "MessageEdited",
             SessionEvent::LedgerEntryAdded { .. } => "LedgerEntryAdded",
             SessionEvent::HandoffWritten { .. } => "HandoffWritten",
+            SessionEvent::Relay { .. } => "Relay",
+            SessionEvent::DispatchLinked { .. } => "DispatchLinked",
+            SessionEvent::WorkerAdded { .. } => "WorkerAdded",
         }
     }
 }
@@ -236,6 +248,8 @@ fn blank_session() -> Session {
         tab_title_provisional: false,
         history_anchor: None,
         context_ledger: Vec::new(),
+        dispatch_link: None,
+        dispatched_workers: Vec::new(),
     }
 }
 
@@ -292,7 +306,14 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         E::UserMessage { message }
         | E::AssistantMessage { message }
         | E::ToolCall { message }
-        | E::ToolResult { message } => upsert_message(session, message),
+        | E::ToolResult { message }
+        | E::Relay { message } => upsert_message(session, message),
+        E::DispatchLinked { link } => session.dispatch_link = link.clone(),
+        E::WorkerAdded { worker_session_id } => {
+            if !session.dispatched_workers.contains(worker_session_id) {
+                session.dispatched_workers.push(worker_session_id.clone());
+            }
+        }
         E::ScratchpadSet { content } => session.scratchpad = content.clone(),
         E::HandoffWritten { note } => session.handoff = Some(note.clone()),
         E::SkillLoaded { name, payload } => {
@@ -1364,5 +1385,40 @@ mod tests {
             r#"{"kind":"FromTheFuture","payload":123}"#,
         );
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn project_replays_relays_and_dispatch_links() {
+        use crate::todo::relay::{DispatchLink, RelayDirection, RelayKind, RelayNote};
+        let user = text_message("User", "do the prep", 1);
+        let mut relay = text_message(crate::todo::relay::RELAY_AUTHOR, "", 2);
+        relay.content = MessageContent::Relay(RelayNote {
+            direction: RelayDirection::FromParent,
+            kind: RelayKind::Message,
+            peer_session_id: "parent".into(),
+            peer_title: "Planning".into(),
+            todo_id: Some("tdo_1".into()),
+            text: "add the venue".into(),
+            hop: 0,
+            woke_turn: true,
+        });
+        let link = DispatchLink { parent_session_id: "parent".into(), todo_id: Some("tdo_1".into()), report_sent: false };
+        let events = loaded(vec![
+            SessionEvent::SessionCreated { id: "w".into(), name: "Worker".into() },
+            SessionEvent::DispatchLinked { link: Some(link.clone()) },
+            SessionEvent::UserMessage { message: user.clone() },
+            SessionEvent::Relay { message: relay.clone() },
+            SessionEvent::DispatchLinked { link: Some(DispatchLink { report_sent: true, ..link.clone() }) },
+            SessionEvent::WorkerAdded { worker_session_id: "grandchild".into() },
+            SessionEvent::WorkerAdded { worker_session_id: "grandchild".into() },
+        ]);
+        let s = project(None, &events);
+        assert_eq!(s.messages, vec![user, relay]);
+        assert_eq!(s.dispatch_link, Some(DispatchLink { report_sent: true, ..link }));
+        assert_eq!(s.dispatched_workers, vec!["grandchild".to_string()]);
+        // The kind tags are stable column values.
+        assert_eq!(SessionEvent::WorkerAdded { worker_session_id: String::new() }.kind(), "WorkerAdded");
+        let row = serde_json::to_string(&SessionEvent::DispatchLinked { link: None }).unwrap();
+        assert!(row.contains("\"kind\":\"DispatchLinked\""), "{row}");
     }
 }

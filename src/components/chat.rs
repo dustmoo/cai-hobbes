@@ -670,6 +670,8 @@ pub fn ChatWindow(
                     if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
                         session.reset_turn_count();
                     }
+                    // The user has the floor: a relay no longer started this turn.
+                    crate::todo::relay::clear_turn_origin(&target_id);
 
                     // Clear the target session's tool call history to ensure a
                     // fresh start for the new turn (never other tabs').
