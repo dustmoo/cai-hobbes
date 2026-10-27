@@ -6,6 +6,7 @@
 use chrono::{DateTime, Duration, Utc};
 use dioxus::prelude::*;
 
+use crate::heartbeat::housekeeping::HousekeepingNote;
 use crate::heartbeat::state::{Reaction, ReactionKind, ReactionTarget, WakeRecord};
 use crate::heartbeat::{budget, HeartbeatState, HEARTBEAT};
 use crate::settings::{Settings, SettingsManager};
@@ -94,6 +95,23 @@ pub fn mute_kind(muted: &mut Vec<String>, kind: &str) {
     if !muted.iter().any(|k| k == kind) {
         muted.push(kind.to_string());
     }
+}
+
+/// Housekeeping notes worth showing: newest first, within the last 24h,
+/// after any "Clear trail", at most `n`.
+pub fn recent_notes(
+    notes: &[HousekeepingNote],
+    cleared_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    n: usize,
+) -> Vec<&HousekeepingNote> {
+    notes
+        .iter()
+        .rev()
+        .filter(|h| now - h.at <= Duration::hours(24))
+        .filter(|h| cleared_at.is_none_or(|c| h.at > c))
+        .take(n)
+        .collect()
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -328,6 +346,8 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
             (w, evs)
         })
         .collect();
+    let notes: Vec<HousekeepingNote> =
+        recent_notes(&hb.housekeeping, hb.trail_cleared_at, now, 5).into_iter().cloned().collect();
     drop(hb);
 
     let react = move |event_id: String, kind: ReactionKind| {
@@ -430,6 +450,41 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
                             }
                         }
                     }
+            if !notes.is_empty() {
+                div {
+                    class: "mt-3 space-y-1",
+                    h3 { class: "text-xs font-semibold", "Handled" }
+                    for note in notes {
+                        {
+                            let nid = note.id.clone();
+                            let can_restore = note.focus_row.is_some() && !note.restored;
+                            rsx! {
+                                div {
+                                    key: "{note.id}",
+                                    class: "flex items-baseline gap-2 text-xs",
+                                    span { class: "text-fg-muted tabular-nums shrink-0", { age_label(note.at, now) } }
+                                    span {
+                                        class: "min-w-0 flex-1 truncate",
+                                        title: "{note.text}",
+                                        { truncate(&note.text, 140) }
+                                        if note.restored {
+                                            span { class: "text-fg-muted", " · real time kept" }
+                                        }
+                                    }
+                                    if can_restore {
+                                        button {
+                                            class: "text-xs px-2 py-1 rounded border border-subtle text-fg-muted hover:text-fg hover:bg-card shrink-0",
+                                            title: "Bank the full elapsed time instead of the estimate",
+                                            onclick: move |_| crate::heartbeat::runtime::restore_runaway(planner, &nid),
+                                            "Keep real time"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if rows.is_empty() {
                 p {
                     class: "mt-2 text-xs text-fg-muted",
@@ -546,6 +601,25 @@ mod tests {
 
     fn deferred(at: DateTime<Utc>) -> WakeRecord {
         WakeRecord::deferred(at, "t", vec![], "hourly cap")
+    }
+
+    #[test]
+    fn recent_notes_newest_first_windowed_and_cleared() {
+        let now = Utc::now();
+        let note = |id: &str, mins: i64| HousekeepingNote {
+            id: id.into(),
+            at: now - Duration::minutes(mins),
+            text: id.into(),
+            focus_row: None,
+            restored: false,
+            briefed: false,
+        };
+        let notes = vec![note("old", 25 * 60), note("a", 120), note("b", 60), note("c", 5)];
+        let ids = |v: Vec<&HousekeepingNote>| v.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(recent_notes(&notes, None, now, 5)), ["c", "b", "a"]);
+        assert_eq!(ids(recent_notes(&notes, None, now, 2)), ["c", "b"]);
+        let cleared = Some(now - Duration::minutes(90));
+        assert_eq!(ids(recent_notes(&notes, cleared, now, 5)), ["c", "b"]);
     }
 
     #[test]

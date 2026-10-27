@@ -83,6 +83,12 @@ pub struct DayView {
     pub agent_counts: Option<String>,
     /// Agent to-dos that need the person: needs you, stuck, to review.
     pub agent_attention: Vec<String>,
+    /// The Fleet in one line plus its real decisions
+    /// (`housekeeping::fleet_digest`; filled by the runtime, which has the
+    /// Fleet).
+    pub fleet: super::housekeeping::FleetDigest,
+    /// Agent to-dos done but still open (`housekeeping::ready_to_close`).
+    pub ready_to_close: Vec<String>,
 }
 
 impl DayView {
@@ -155,6 +161,8 @@ impl DayView {
             overdue: crate::todo::views::overdue(&planner.todos, today).len(),
             agent_counts,
             agent_attention,
+            fleet: Default::default(),
+            ready_to_close: super::housekeeping::ready_to_close(planner),
         }
     }
 }
@@ -174,7 +182,7 @@ fn attention_line(t: &Todo) -> Option<String> {
         },
         AgentState::Review => match open(t.open_item.as_deref()) {
             Some(o) => format!("\"{title}\" finished with an open item: {o}"),
-            None => format!("\"{title}\" finished with an open item"),
+            None => format!("\"{title}\" stopped and is waiting for your review"),
         },
         _ => return None,
     };
@@ -195,6 +203,16 @@ pub fn workday_minutes(start: &str, end: &str) -> (u32, u32) {
         (Some(s), Some(e)) if e > s => (s, e),
         _ => (9 * 60, 17 * 60),
     }
+}
+
+/// Today's workday end, or `None` on a weekend (no workday to end).
+pub fn workday_end_today(settings: &crate::settings::Settings, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let today = now.with_timezone(&Local).date_naive();
+    if matches!(today.weekday(), Weekday::Sat | Weekday::Sun) {
+        return None;
+    }
+    let (_, end_min) = workday_minutes(&settings.planner_workday_start, &settings.planner_workday_end);
+    local_instant(today, end_min)
 }
 
 fn local_instant(day: NaiveDate, minutes: u32) -> Option<DateTime<Utc>> {
@@ -379,6 +397,14 @@ pub fn look_ahead_section(day: Option<&DayView>, now: DateTime<Local>) -> Vec<St
         }
         None => out.push("- Agent lane: empty.".to_string()),
     }
+    if !day.ready_to_close.is_empty() {
+        out.push(format!("- Done, waiting for the person to accept: {}", day.ready_to_close.join(", ")));
+    }
+    if let Some(line) = day.fleet.line() {
+        // Parked sessions finished their turn and asked nothing: not owed.
+        out.push(format!("- Fleet: {line} (parked = finished, nothing asked)"));
+        out.extend(day.fleet.decisions.iter().map(|l| format!("  - {l}")));
+    }
     out
 }
 
@@ -410,6 +436,8 @@ pub(crate) mod tests {
             overdue: 0,
             agent_counts: None,
             agent_attention: vec![],
+            fleet: Default::default(),
+            ready_to_close: vec![],
         }
     }
 

@@ -69,7 +69,16 @@ pub struct WorkerSignal {
     pub brief: Option<Brief>,
     /// Display name for the decision card.
     pub worker_name: String,
+    /// Idle (not ended) for at least [`IDLE_SETTLE_MINUTES`]: the worker
+    /// finished its turn and nothing has moved since. A Hobbes chat worker
+    /// never "ends" while its tab exists, so this is how its run finishes.
+    pub idle_settled: bool,
 }
+
+/// An idle, live worker counts as finished once it has been quiet this long
+/// (short enough to catch a run that stopped, long enough that the pause
+/// between a turn ending and the next prompt never flaps the state).
+pub const IDLE_SETTLE_MINUTES: i64 = 15;
 
 /// The explicit agent state a signal implies, or `None` to leave the state
 /// as it is. First match wins:
@@ -82,7 +91,9 @@ pub struct WorkerSignal {
 /// 6. the session ended with a `blocked` open item → `Review` (finished, but
 ///    there is something for the person to look at)
 /// 7. the session ended cleanly → `Done`
-/// 8. otherwise → `None`
+/// 8. the worker has sat idle past [`IDLE_SETTLE_MINUTES`] → `Review` (its
+///    turn finished and it's waiting on the person to look, not working)
+/// 9. otherwise → `None`
 pub fn derive_agent_state(todo: &Todo, signal: Option<&WorkerSignal>) -> Option<AgentState> {
     if todo.status == TodoStatus::Completed {
         return Some(AgentState::Done);
@@ -109,6 +120,9 @@ pub fn derive_agent_state(todo: &Todo, signal: Option<&WorkerSignal>) -> Option<
     }
     if blocked {
         return Some(AgentState::Stuck);
+    }
+    if s.idle_settled {
+        return Some(AgentState::Review);
     }
     None
 }
@@ -503,6 +517,7 @@ mod tests {
             attention_at: None,
             brief: None,
             worker_name: "puget-app-packs".into(),
+            idle_settled: false,
         }
     }
 
@@ -521,7 +536,10 @@ mod tests {
     fn derivation_maps_only_explicit_states() {
         let t = agent_todo();
         assert_eq!(derive_agent_state(&t, None), None, "no signal, nothing to say");
-        assert_eq!(derive_agent_state(&t, Some(&signal(WorkerStatus::Idle))), None, "idle is not judged");
+        assert_eq!(derive_agent_state(&t, Some(&signal(WorkerStatus::Idle))), None, "a fresh idle is not judged");
+        let mut settled = signal(WorkerStatus::Idle);
+        settled.idle_settled = true;
+        assert_eq!(derive_agent_state(&t, Some(&settled)), Some(AgentState::Review), "a long idle has finished");
         assert_eq!(
             derive_agent_state(&t, Some(&signal(WorkerStatus::Working))),
             Some(AgentState::Working)

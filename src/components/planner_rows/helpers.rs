@@ -85,7 +85,7 @@ pub(super) fn who_state(
     if todo.status.is_closed() {
         return WhoState::Done;
     }
-    if fleet.is_some_and(|f| f.status.needs_attention()) {
+    if fleet.is_some_and(|f| f.asks_person()) {
         return WhoState::NeedsYou;
     }
 

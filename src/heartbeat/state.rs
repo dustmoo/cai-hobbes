@@ -12,6 +12,7 @@ use super::perception::{
     ci_events, fleet_events, is_fleet_noise, merge_ci_snapshot, planner_events, FleetSnapshot,
     PlannerSnapshot,
 };
+use super::housekeeping::{HousekeepingNote, MAX_NOTES, NOTE_KEEP_DAYS};
 use super::salience::{Choice, Decision};
 use super::{CiRun, HeartbeatEvent};
 
@@ -183,6 +184,10 @@ pub struct HeartbeatState {
     /// Day anchors already fired, so each fires at most once per local day.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fired_anchors: Vec<FiredAnchor>,
+    /// What housekeeping did by itself (paused a runaway timer, …), oldest
+    /// first. Shown on the card and told to the next wake.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub housekeeping: Vec<HousekeepingNote>,
 }
 
 impl HeartbeatState {
@@ -425,6 +430,51 @@ impl HeartbeatState {
         cap_front(&mut self.reactions, MAX_REACTIONS);
         let anchor_cutoff = now - Duration::days(FIRED_ANCHOR_KEEP_DAYS);
         self.fired_anchors.retain(|a| a.at >= anchor_cutoff);
+        let note_cutoff = now - Duration::days(NOTE_KEEP_DAYS);
+        self.housekeeping.retain(|n| n.at >= note_cutoff);
+        cap_front(&mut self.housekeeping, MAX_NOTES);
+    }
+
+    // ── Housekeeping ──
+
+    pub fn record_housekeeping(&mut self, note: HousekeepingNote) {
+        self.housekeeping.push(note);
+        cap_front(&mut self.housekeeping, MAX_NOTES);
+    }
+
+    /// The notes no wake has been told about yet, marking them told.
+    pub fn take_unbriefed_housekeeping(&mut self) -> Vec<String> {
+        self.housekeeping
+            .iter_mut()
+            .filter(|n| !n.briefed)
+            .map(|n| {
+                n.briefed = true;
+                n.text.clone()
+            })
+            .collect()
+    }
+
+    /// The focus row a runaway-timer note can still restore ("Keep real
+    /// time"), or `None` when there is nothing to restore.
+    pub fn restorable_focus_row(&self, note_id: &str) -> Option<String> {
+        self.housekeeping
+            .iter()
+            .find(|n| n.id == note_id && !n.restored)?
+            .focus_row
+            .clone()
+    }
+
+    /// Record how a "Keep real time" went: restored, or (the row was edited
+    /// or deleted since) no longer restorable, so the card drops the button
+    /// instead of claiming the time was kept.
+    pub fn settle_housekeeping_restore(&mut self, note_id: &str, restored: bool) {
+        if let Some(note) = self.housekeeping.iter_mut().find(|n| n.id == note_id) {
+            if restored {
+                note.restored = true;
+            } else {
+                note.focus_row = None;
+            }
+        }
     }
 
     /// Hide the current wake trail from the card ("Clear trail").

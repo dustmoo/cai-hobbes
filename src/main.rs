@@ -864,9 +864,9 @@ fn app() -> Element {
                         let was = prev
                             .sessions
                             .get(id)
-                            .map(|p| p.status.needs_attention())
+                            .map(|p| p.asks_person())
                             .unwrap_or(false);
-                        if s.status.needs_attention() && !was {
+                        if s.asks_person() && !was {
                             flash_timer_toast(format!("🛰 {} needs your attention", s.name));
                         }
                     }

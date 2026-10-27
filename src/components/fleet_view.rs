@@ -1053,8 +1053,14 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                 .map(str::to_string)
         })
     };
-    let (chip_label, chip_color) = status_chip(&session.status);
-    let attention = session.status.needs_attention();
+    // A finished turn at Claude Code's idle prompt asks nothing: it reads
+    // as idle, not "needs you" (`FleetSession::asks_person`).
+    let attention = session.asks_person();
+    let (chip_label, chip_color) = if session.status.needs_attention() && !attention {
+        status_chip(&FleetStatus::Idle)
+    } else {
+        status_chip(&session.status)
+    };
     // Attention rows get a loud left edge; computed color → inline style.
     let row_style = if attention {
         format!("border-left: 3px solid {chip_color}; background: {chip_color}14;")

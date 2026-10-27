@@ -18,6 +18,7 @@ use dioxus::prelude::*;
 
 use super::anchors::{due_anchors, Anchor, DayView};
 use super::diagnose::{self, Diagnosis, DiagnosisTarget};
+use super::housekeeping::{self, HousekeepingNote};
 use super::wake::{self, TodoInfo, WakeBrief, WakeTrigger, WakeVerdict};
 use super::{
     agent_project_ids, check_wake, ci, intention_todo_ids, local_day_start, spent_since, Budget,
@@ -32,12 +33,17 @@ use crate::settings::Settings;
 pub const TICK_SECS: u64 = 30;
 /// Title of the dedicated session.
 pub const SESSION_TITLE: &str = "Heartbeat";
+/// Its tab icon (the tab components draw a metal heart in its place).
+pub const SESSION_EMOJI: &str = "🫀";
 /// At most this many projects are polled for CI per round (projects with
 /// open agent work first), to stay gentle on `gh`'s rate limits.
 const MAX_CI_PROJECTS: usize = 12;
 /// Persist at least this often even when nothing happened, so a restart
 /// diffs against recent snapshots.
 const SAVE_EVERY_MINUTES: i64 = 10;
+/// Agent states are re-derived from the Fleet this often (the Planner's own
+/// sync only runs while the Planner is on screen).
+const AGENT_SYNC_MINUTES: i64 = 2;
 
 /// The app state the runtime reads and writes.
 #[derive(Clone, Copy)]
@@ -56,6 +62,8 @@ struct Pacer {
     last_ci: Option<DateTime<Utc>>,
     ci_task: Option<tokio::task::JoinHandle<Vec<CiRun>>>,
     last_save: Option<DateTime<Utc>>,
+    last_agent_sync: Option<DateTime<Utc>>,
+    ended_rows: crate::components::planner_view::agent_lane::EndedRowCache,
 }
 
 /// Run forever. `streaming` reports the sessions mid-turn (main.rs's
@@ -132,6 +140,9 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
     if settings.heartbeat_source_ci {
         maybe_start_ci_poll(deps, pacer, now);
     }
+    if settings.planner_enabled && settings.heartbeat_source_planner {
+        dirty |= housekeep(deps, &settings, pacer, now);
+    }
 
     // ── Salience + journal ──
     if !events.is_empty() {
@@ -169,11 +180,22 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
         return None;
     }
     if let Some(id) = HEARTBEAT.peek().session_id.clone() {
-        if session_state.peek().sessions.contains_key(&id) {
-            return Some(id);
+        let has_icon = session_state.peek().sessions.get(&id).map(|s| s.tab_emoji.is_some());
+        match has_icon {
+            Some(true) => return Some(id),
+            // Sessions from before the icon: give them one, once.
+            Some(false) => {
+                if let Some(s) = session_state.write().sessions.get_mut(&id) {
+                    s.tab_emoji = Some(SESSION_EMOJI.to_string());
+                }
+                SessionState::save_signal(&session_state, None);
+                return Some(id);
+            }
+            None => {}
         }
         // One indexed row: fine on the UI thread (P-017).
-        if let Some(session) = crate::session_store::load_session(&id) {
+        if let Some(mut session) = crate::session_store::load_session(&id) {
+            session.tab_emoji.get_or_insert_with(|| SESSION_EMOJI.to_string());
             session_state.write().sessions.insert(id.clone(), session);
             return Some(id);
         }
@@ -189,8 +211,11 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
         if !previous_active.is_empty() {
             state.active_session_id = previous_active;
         }
-        // A user-set name, so auto-titling never renames it.
+        // A user-set name, so auto-titling never renames it (nor its icon).
         state.update_session_name_raw(&id, SESSION_TITLE.to_string());
+        if let Some(s) = state.sessions.get_mut(&id) {
+            s.tab_emoji = Some(SESSION_EMOJI.to_string());
+        }
         id
     };
     SessionState::save_signal(&session_state, None);
@@ -315,8 +340,67 @@ fn maybe_wake(
 /// Today's [`DayView`] when the planner is on and the Heartbeat watches it;
 /// `None` turns day anchors and the look-ahead off.
 fn day_view(deps: HeartbeatDeps, settings: &Settings, now: DateTime<Utc>) -> Option<DayView> {
-    (settings.planner_enabled && settings.heartbeat_source_planner)
-        .then(|| DayView::capture(&deps.planner.peek(), settings, now))
+    (settings.planner_enabled && settings.heartbeat_source_planner).then(|| {
+        let mut day = DayView::capture(&deps.planner.peek(), settings, now);
+        let heartbeat_session = HEARTBEAT.peek().session_id.clone();
+        day.fleet =
+            housekeeping::fleet_digest(&deps.fleet.peek(), &deps.planner.peek(), heartbeat_session.as_deref(), now);
+        day
+    })
+}
+
+// ── Housekeeping ────────────────────────────────────────────────────────────
+
+/// What the Heartbeat fixes without a wake (`housekeeping.rs`): re-derive
+/// agent states from the Fleet, and pause a runaway focus timer. True when
+/// the Heartbeat state changed.
+fn housekeep(deps: HeartbeatDeps, settings: &Settings, pacer: &mut Pacer, now: DateTime<Utc>) -> bool {
+    use crate::components::planner_view::{agent_lane, persist_focus_sessions, persist_todo};
+    let mut planner = deps.planner;
+    if pacer.last_agent_sync.is_none_or(|t| now - t >= Duration::minutes(AGENT_SYNC_MINUTES)) {
+        pacer.last_agent_sync = Some(now);
+        let live = deps.fleet.peek().clone();
+        let changed = agent_lane::sync_agent_states_cached(&mut planner, &live, &mut pacer.ended_rows, now);
+        if changed > 0 {
+            tracing::info!("heartbeat: re-synced {changed} agent to-do state(s)");
+        }
+    }
+
+    let workday_end = super::anchors::workday_end_today(settings, now);
+    let Some(runaway) = housekeeping::runaway_focus(&planner.peek(), workday_end, now) else {
+        return false;
+    };
+    let paused = planner.write().pause_runaway_focus(&runaway.todo_id, runaway.bank_minutes, now);
+    persist_todo(&planner, &runaway.todo_id);
+    persist_focus_sessions(&mut planner);
+    let Some((row_id, clamped)) = paused else {
+        return false;
+    };
+    tracing::info!(
+        "heartbeat: paused a runaway focus timer ({}m real, {}m banked)",
+        runaway.real_minutes,
+        runaway.bank_minutes
+    );
+    // "Keep real time" only when there's real time to keep.
+    let focus_row = clamped.then_some(row_id);
+    HEARTBEAT.write().record_housekeeping(HousekeepingNote::new(now, runaway.text, focus_row));
+    true
+}
+
+/// "Keep real time" on a runaway-timer note: bank the real elapsed after
+/// all. Called from the card.
+pub fn restore_runaway(mut planner: Signal<crate::todo::PlannerState>, note_id: &str) {
+    use crate::components::planner_view::{persist_focus_sessions, persist_todo};
+    let Some(row_id) = HEARTBEAT.peek().restorable_focus_row(note_id) else {
+        return;
+    };
+    let todo_id = planner.write().restore_unclamped_focus(&row_id, Utc::now());
+    if let Some(id) = &todo_id {
+        persist_todo(&planner, id);
+        persist_focus_sessions(&mut planner);
+    }
+    HEARTBEAT.write().settle_housekeeping_restore(note_id, todo_id.is_some());
+    super::save_signal();
 }
 
 /// Tails for the workers a wake's events point at. A Hobbes chat worker
@@ -422,6 +506,7 @@ fn fire_wake(
         let last_wake = wake::last_fired_at(&hb.trail);
         let budget_line = wake::budget_line(&hb.trail, budget, spent, now);
         let events = hb.drain_queue();
+        let housekeeping = hb.take_unbriefed_housekeeping();
         let text = wake::build_wake_message(&WakeBrief {
             ahead: day,
             why: why.clone(),
@@ -434,6 +519,7 @@ fn fire_wake(
             trust: &trust,
             budget_line,
             now: now.with_timezone(&chrono::Local),
+            housekeeping: &housekeeping,
         });
         hb.record_wake(WakeRecord::fired(now, why, ids, choices));
         if let Some(d) = day {

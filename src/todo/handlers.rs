@@ -2543,7 +2543,7 @@ pub fn apply_brief_progress(
         .cloned()
         .or_else(|| crate::fleet::store::load_session(session_id));
     if let Some(row) = row {
-        let signal = worker_signal_from_fleet(&row);
+        let signal = worker_signal_from_fleet(&row, now);
         for id in apply_signal_to_linked(state, session_id, &signal, now) {
             if !changed.contains(&id) {
                 changed.push(id);
@@ -2556,7 +2556,7 @@ pub fn apply_brief_progress(
 /// Reduce a fleet row to the explicit fields `lanes::derive_agent_state`
 /// may use: status, a held gate, the attention message, the brief's
 /// headline/`blocked_on`, and whether the session ended.
-pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession) -> super::lanes::WorkerSignal {
+pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession, now: DateTime<Utc>) -> super::lanes::WorkerSignal {
     use super::lanes::{GateSignal, WorkerSignal, WorkerStatus};
     use crate::fleet::{AttentionKind, FleetStatus};
     let (status, attention_message) = match &row.status {
@@ -2565,9 +2565,17 @@ pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession) -> super::lane
             (WorkerStatus::Working, None)
         }
         FleetStatus::Idle => (WorkerStatus::Idle, None),
-        FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) => {
-            (WorkerStatus::WaitingOnUser, Some(message.clone()).filter(|m| !m.trim().is_empty()))
+        // A finished turn with nothing asked (Claude Code's idle prompt) is
+        // parked: idle, not waiting on the person.
+        FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) if !row.asks_person() => {
+            (WorkerStatus::Idle, None)
         }
+        // What it asks (the prompt's own message, or the brief's question
+        // for a parked turn) beats "Claude is waiting for your input".
+        FleetStatus::NeedsAttention(AttentionKind::Notification { message, .. }) => (
+            WorkerStatus::WaitingOnUser,
+            row.question().or_else(|| Some(message.clone()).filter(|m| !m.trim().is_empty())),
+        ),
         FleetStatus::NeedsAttention(AttentionKind::Gate) => (WorkerStatus::WaitingOnUser, None),
     };
     WorkerSignal {
@@ -2587,6 +2595,10 @@ pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession) -> super::lane
             next: None,
         }),
         worker_name: row.display_name().to_string(),
+        idle_settled: status == WorkerStatus::Idle
+            && row.ended_at.is_none()
+            && now - row.attention_at.unwrap_or(row.last_event_at)
+                >= chrono::Duration::minutes(super::lanes::IDLE_SETTLE_MINUTES),
     }
 }
 
@@ -2634,7 +2646,7 @@ pub fn sync_agent_states(
             .get(&sid)
             .or_else(|| ended_rows.iter().find(|r| r.id == sid));
         if let Some(row) = row {
-            let signal = worker_signal_from_fleet(row);
+            let signal = worker_signal_from_fleet(row, now);
             for id in apply_signal_to_linked(state, &sid, &signal, now) {
                 if !changed.contains(&id) {
                     changed.push(id);
@@ -2643,6 +2655,42 @@ pub fn sync_agent_states(
         }
     }
     changed
+}
+
+/// [`sync_agent_states`] for a caller holding the planner *signal*: works on
+/// a scratch planner of only the open, linked agent to-dos, so the real
+/// signal's write guard (and the Planner re-render it causes) is taken only
+/// when something changed. `load_ended` supplies the stored row of a linked
+/// session that isn't live. Returns the changed to-dos to copy back and
+/// persist.
+pub fn sync_linked_agent_todos(
+    planner: &PlannerState,
+    live: &crate::fleet::FleetState,
+    mut load_ended: impl FnMut(&str) -> Option<crate::fleet::FleetSession>,
+    now: DateTime<Utc>,
+) -> Vec<Todo> {
+    let linked: Vec<Todo> = planner
+        .todos
+        .iter()
+        .filter(|t| t.lane == Lane::Agent && !t.status.is_closed() && t.linked_fleet_session.is_some())
+        .cloned()
+        .collect();
+    if linked.is_empty() {
+        return Vec::new();
+    }
+    let mut ended: Vec<crate::fleet::FleetSession> = Vec::new();
+    for sid in linked.iter().filter_map(|t| t.linked_fleet_session.as_deref()) {
+        if live.sessions.contains_key(sid) || ended.iter().any(|r| r.id == sid) {
+            continue;
+        }
+        if let Some(row) = load_ended(sid) {
+            ended.push(row);
+        }
+    }
+    let mut scratch = PlannerState { todos: linked, ..Default::default() };
+    let changed = sync_agent_states(&mut scratch, live, &ended, now);
+    scratch.todos.retain(|t| changed.contains(&t.id));
+    scratch.todos
 }
 
 // ── HOBBES_DECISIONS ────────────────────────────────────────────────────────
@@ -3429,10 +3477,12 @@ pub fn planner_today_context_with_events(
 
     let now = Utc::now();
     let focus = planner.focused().map(|t| {
+        let today_minutes = (planner.focus_seconds_today(&t.id, now) / 60) as u32;
         format!(
-            "[{}] {} — {} elapsed{}",
+            "[{}] {} — {} today, {} elapsed in total{}",
             t.id,
             truncate_title(&t.title),
+            model::format_minutes(today_minutes / step * step),
             model::format_minutes(t.elapsed_minutes(now) / step * step),
             t.estimate_minutes
                 .map(|m| format!(" of {} estimated", model::format_minutes(m)))
@@ -3448,7 +3498,7 @@ pub fn planner_today_context_with_events(
         "blocks": blocks,
         "all_day": all_day,
         "overdue": overdue,
-        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Projects: look them up with HOBBES_PROJECT_LIST (ids, titles, aliases) and file to-dos into an existing one by id; create a project only when none fits. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days). When present, `fleet` lists today's external Claude Code coding-agent sessions (name — active time — latest summary); read-only observations, not managed by any tool.",
+        "instruction": "The user's shared to-do list for today. Manage it with the HOBBES_TODO_* / HOBBES_PLAN_DAY / HOBBES_TIME_BLOCK tools. Projects: look them up with HOBBES_PROJECT_LIST (ids, titles, aliases) and file to-dos into an existing one by id; create a project only when none fits. Setting a todo's status to in_progress starts focus mode on it (only one at a time); completing or reopening it ends the session. Blocks marked (meeting) and the all_day list mirror the user's external calendar — fixed commitments that cannot be moved or deleted; plan around them (HOBBES_CALENDAR_LIST shows more days). The `capacity` line's \"done\" credits each planned to-do completed today at the larger of its estimate and the time spent (plan consumed); `person_done_minutes` is focus time actually logged today, on any to-do. They differ by design. When present, `fleet` lists today's external Claude Code coding-agent sessions (name — active time — latest summary); read-only observations, not managed by any tool.",
     });
     // Per-actor focus minutes for today, so the model can reason about person
     // vs agent load. Only when nonzero — an untouched day stays compact.
@@ -5954,6 +6004,45 @@ mod tests {
     }
 
     #[test]
+    fn a_long_idle_worker_moves_from_working_to_review() {
+        let mut state = PlannerState::default();
+        let id = agent_todo(&mut state, "SLA check");
+        state.todo_mut(&id).unwrap().linked_fleet_session = Some("chat-1".into());
+        state.todo_mut(&id).unwrap().agent_state = Some(model::AgentState::Working);
+        let idle_at: DateTime<Utc> = "2026-08-12T16:00:00Z".parse().unwrap();
+        let mut live = crate::fleet::FleetState::default();
+        live.sessions.insert("chat-1".into(), fleet_row("chat-1", json!("Idle"), json!({})));
+
+        let fresh = idle_at + chrono::Duration::minutes(super::super::lanes::IDLE_SETTLE_MINUTES - 1);
+        assert!(sync_agent_states(&mut state, &live, &[], fresh).is_empty(), "a turn just ended");
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Working));
+
+        let settled = idle_at + chrono::Duration::minutes(super::super::lanes::IDLE_SETTLE_MINUTES);
+        assert_eq!(sync_agent_states(&mut state, &live, &[], settled), vec![id.clone()]);
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Review));
+
+        // A Claude Code worker at a bare idle prompt is parked the same way,
+        // with no "waiting for your input" decision made up for it.
+        let cc = agent_todo(&mut state, "Staff GPT review");
+        state.todo_mut(&cc).unwrap().linked_fleet_session = Some("cc-1".into());
+        state.todo_mut(&cc).unwrap().agent_state = Some(model::AgentState::Working);
+        live.sessions.insert(
+            "cc-1".into(),
+            fleet_row("cc-1", json!({"NeedsAttention": {"Notification": {"kind": "idle_prompt", "message": "Claude is waiting for your input"}}}), json!({"attention_at": "2026-08-12T16:00:00Z"})),
+        );
+        sync_agent_states(&mut state, &live, &[], settled);
+        let t = state.todo(&cc).unwrap();
+        assert_eq!(t.agent_state, Some(model::AgentState::Review));
+        assert!(t.decision.is_none(), "a finished turn is not a question");
+
+        // The scratch helper hands back only the changed to-do.
+        state.todo_mut(&id).unwrap().agent_state = Some(model::AgentState::Working);
+        let changed = sync_linked_agent_todos(&state, &live, |_| None, settled);
+        assert_eq!(changed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec![id.as_str()]);
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Working), "the input is untouched");
+    }
+
+    #[test]
     fn fleet_state_drives_agent_state() {
         let mut state = PlannerState::default();
         let id = agent_todo(&mut state, "Ship release");
@@ -5996,7 +6085,7 @@ mod tests {
             "ended_at": "2026-08-12T17:00:00Z",
             "brief": {"headline": "Built 4 of 5 images", "blocked_on": "Llama 4 driver check fails", "generated_at": "2026-08-12T17:00:00Z"}
         }));
-        let signal = worker_signal_from_fleet(&ended);
+        let signal = worker_signal_from_fleet(&ended, now);
         assert_eq!(signal.brief.as_ref().unwrap().did, "Built 4 of 5 images");
         sync_agent_states(&mut state, &live, &[ended], now);
         let t = state.todo(&id).unwrap();

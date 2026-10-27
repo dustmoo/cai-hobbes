@@ -279,6 +279,8 @@ pub struct WakeBrief<'a> {
     pub trust: &'a [String],
     pub budget_line: String,
     pub now: DateTime<Local>,
+    /// What housekeeping did since the last wake, one line each.
+    pub housekeeping: &'a [String],
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -388,6 +390,12 @@ pub fn build_wake_message(b: &WakeBrief<'_>) -> String {
         out.push(String::new());
         out.push("Still queued from before:".to_string());
         out.extend(event_section(&carried, b.todos, b.now));
+    }
+
+    if !b.housekeeping.is_empty() {
+        out.push(String::new());
+        out.push("Already handled by housekeeping (tell the person only if it matters to them):".to_string());
+        out.extend(b.housekeeping.iter().map(|l| format!("- {l}")));
     }
 
     if !b.diagnoses.is_empty() {
@@ -853,6 +861,13 @@ mod tests {
         let mut day = crate::heartbeat::anchors::tests::day();
         day.agent_counts = Some("1 working · 1 stuck".into());
         day.agent_attention = vec!["\"Ship v0.13\" is stuck: no API key".into()];
+        day.ready_to_close = vec!["\"SMTP DOTENV\"".into()];
+        day.fleet = crate::heartbeat::housekeeping::FleetDigest {
+            decisions: vec!["app-pack-dev: go-ahead on the hotfix (6h 30m)".into()],
+            active: 4,
+            parked: 31,
+        };
+        let housekeeping = vec!["Paused the focus timer on \"Zeblok\": it ran 7h 15m against a 30m estimate. Banked 30m.".to_string()];
         let anchors = crate::heartbeat::anchors::due_anchors(&HeartbeatState::default(), &day, day.meetings[0].start - Duration::minutes(30));
         let diagnoses = vec![Diagnosis {
             subject: "Ship v0.13".into(),
@@ -874,6 +889,7 @@ mod tests {
             budget_line: "wake 1 of 2 this hour · $0.00 of $5.00 today".into(),
             // Look-ahead from 14:00 (UTC) on the anchors fixture's day.
             now: crate::heartbeat::anchors::tests::t(14, 0).with_timezone(&Local),
+            housekeeping: &housekeeping,
         };
         let msg = build_wake_message(&brief);
         let hm = |e: &HeartbeatEvent| clock(e.at, brief.now);
@@ -884,7 +900,10 @@ mod tests {
              \x20 - {m_start}–{m_end} Clyde sync\n\
              - Today's plan: 10h 35m planned — over by 4h 35m\n\
              - Agent lane: 1 working · 1 stuck\n\
-             \x20 - \"Ship v0.13\" is stuck: no API key\n\n\
+             \x20 - \"Ship v0.13\" is stuck: no API key\n\
+             - Done, waiting for the person to accept: \"SMTP DOTENV\"\n\
+             - Fleet: 1 decision · 4 active · 31 parked (parked = finished, nothing asked)\n\
+             \x20 - app-pack-dev: go-ahead on the hotfix (6h 30m)\n\n\
              Why: worker_stuck: x\nRule: stuck → wake now\n\
              Day anchors due: Today's plan is over capacity (over by 4h 35m); Meeting \"Clyde sync\" at {m_start}\n\n\
              What changed since your last wake:\n\
@@ -899,6 +918,8 @@ mod tests {
              Still queued from before:\n\
              - To-do t3:\n\
              \x20 - {} todo_overdue happened [planner]\n\n\
+             Already handled by housekeeping (tell the person only if it matters to them):\n\
+             - Paused the focus timer on \"Zeblok\": it ran 7h 15m against a 30m estimate. Banked 30m.\n\n\
              Workers to diagnose (the end of each one's record):\n\
              - \"Ship v0.13\" (stuck) — Claude Code transcript tail:\n\
              \x20   | USER: ship it\n\
@@ -934,6 +955,7 @@ mod tests {
             trust: &[],
             budget_line: String::new(),
             now: local_now(),
+            housekeeping: &[],
         };
         let msg = build_wake_message(&brief);
         assert!(msg.contains("\nWhat changed:\n"), "{msg}");

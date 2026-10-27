@@ -74,6 +74,9 @@ pub fn tray_should_exist(show_tray_icon: bool, focus_active: bool) -> bool {
 pub struct FocusTraySnapshot {
     pub todo_id: String,
     pub title: String,
+    /// Minutes on this todo during today's local day.
+    pub today_minutes: u32,
+    /// All-time minutes on this todo, earlier days included.
     pub elapsed_minutes: u32,
     pub estimate_minutes: Option<u32>,
     /// Whether the live focus session is agent-driven (started by the
@@ -82,12 +85,14 @@ pub struct FocusTraySnapshot {
 }
 
 /// The focus decision: mirrors the FocusBar exactly — a snapshot exists iff
-/// one todo is `InProgress`. Elapsed math is `Todo::elapsed_minutes`, the
-/// same helper the FocusBar's readout uses.
+/// one todo is `InProgress`. The all-time figure is `Todo::elapsed_minutes`
+/// and today's is `PlannerState::focus_seconds_today`, the same helpers the
+/// FocusBar's readout uses.
 pub fn focus_snapshot(state: &PlannerState, now: DateTime<Utc>) -> Option<FocusTraySnapshot> {
     state.focused().map(|t| FocusTraySnapshot {
         todo_id: t.id.clone(),
         title: t.title.clone(),
+        today_minutes: (state.focus_seconds_today(&t.id, now) / 60) as u32,
         elapsed_minutes: t.elapsed_minutes(now),
         estimate_minutes: t.estimate_minutes,
         agent: state
@@ -109,16 +114,29 @@ pub fn compact_minutes(minutes: u32) -> String {
     }
 }
 
+/// Whether earlier days hold time on this todo, so today and the all-time
+/// total read differently.
+fn has_earlier_days(snapshot: &FocusTraySnapshot) -> bool {
+    snapshot.elapsed_minutes > snapshot.today_minutes
+}
+
 /// The menu-bar title (macOS): `"25m"`, or `"25m/15m"` when an estimate
-/// exists — elapsed first, the contract second.
+/// exists — elapsed first, the contract second. When earlier days hold time,
+/// today leads and the all-time total follows: `"25m · 7h30m/30m"`. The
+/// estimate covers the whole task, so it sits with the total.
 pub fn timer_title(snapshot: &FocusTraySnapshot) -> String {
-    match snapshot.estimate_minutes {
+    let total = match snapshot.estimate_minutes {
         Some(est) => format!(
             "{}/{}",
             compact_minutes(snapshot.elapsed_minutes),
             compact_minutes(est)
         ),
         None => compact_minutes(snapshot.elapsed_minutes),
+    };
+    if has_earlier_days(snapshot) {
+        format!("{} \u{b7} {}", compact_minutes(snapshot.today_minutes), total)
+    } else {
+        total
     }
 }
 
@@ -142,14 +160,23 @@ pub fn tooltip_text(snapshot: &FocusTraySnapshot) -> String {
     if snapshot.agent {
         title.push_str(" (agent)");
     }
-    match snapshot.estimate_minutes {
+    let total = match snapshot.estimate_minutes {
         Some(est) => format!(
-            "{} — {} of {}",
-            title,
+            "{} of {}",
             format_minutes(snapshot.elapsed_minutes),
             format_minutes(est)
         ),
-        None => format!("{} — {}", title, format_minutes(snapshot.elapsed_minutes)),
+        None => format_minutes(snapshot.elapsed_minutes),
+    };
+    if has_earlier_days(snapshot) {
+        format!(
+            "{} — {} today \u{b7} {} total",
+            title,
+            format_minutes(snapshot.today_minutes),
+            total
+        )
+    } else {
+        format!("{} — {}", title, total)
     }
 }
 
@@ -267,6 +294,7 @@ mod tests {
 
         let snap = focus_snapshot(&state, now).unwrap();
         assert_eq!(snap.elapsed_minutes, 40, "30 banked + 10 live");
+        assert_eq!(snap.today_minutes, 10, "rowless banked time is not today's");
     }
 
     #[test]
@@ -284,6 +312,7 @@ mod tests {
         FocusTraySnapshot {
             todo_id: "td_1".into(),
             title: "Write the report".into(),
+            today_minutes: elapsed,
             elapsed_minutes: elapsed,
             estimate_minutes: estimate,
             agent: false,
@@ -296,6 +325,20 @@ mod tests {
         assert_eq!(timer_title(&snap(25, Some(15))), "25m/15m");
         assert_eq!(timer_title(&snap(65, Some(120))), "1h05m/2h");
         assert_eq!(timer_title(&snap(0, Some(30))), "0m/30m");
+    }
+
+    #[test]
+    fn earlier_days_split_today_from_the_total() {
+        let mut s = snap(450, Some(30));
+        s.today_minutes = 25;
+        assert_eq!(timer_title(&s), "25m \u{b7} 7h30m/30m");
+        assert_eq!(
+            tooltip_text(&s),
+            "Write the report — 25m today \u{b7} 7h 30m of 30m total"
+        );
+        s.estimate_minutes = None;
+        assert_eq!(timer_title(&s), "25m \u{b7} 7h30m");
+        assert_eq!(tooltip_text(&s), "Write the report — 25m today \u{b7} 7h 30m total");
     }
 
     #[test]
@@ -360,6 +403,7 @@ mod tests {
         let tip = tooltip_text(&FocusTraySnapshot {
             todo_id: "td".into(),
             title: "A very long task title that certainly exceeds forty characters in total".into(),
+            today_minutes: 5,
             elapsed_minutes: 5,
             estimate_minutes: None,
             agent: false,

@@ -253,16 +253,28 @@ fn FocusBar() -> Element {
         .unwrap_or(false);
     let now = Utc::now();
     let elapsed = focus.elapsed_minutes(now);
-    // Seconds resolution for the clock: banked minutes plus the live tail.
-    let elapsed_secs = i64::from(focus.actual_minutes) * 60
-        + focus
-            .started_at
-            .map(|s| (now - s).num_seconds().max(0))
-            .unwrap_or(0);
-    let clock = fmt_elapsed_clock(elapsed_secs);
-    let of_label = match focus.estimate_minutes {
-        Some(est) => format!("of {} \u{b7} {}", model::format_minutes(est), focus.title),
-        None => focus.title.clone(),
+    // The clock is today's time on the task (seconds resolution); the
+    // all-time total sits beside it once earlier days hold time, and the
+    // estimate (which covers the whole task) goes with the total.
+    let today_secs = planner.read().focus_seconds_today(&focus.id, now);
+    let clock = fmt_elapsed_clock(today_secs);
+    let earlier_days = elapsed > (today_secs / 60) as u32;
+    let of_label = match (earlier_days, focus.estimate_minutes) {
+        (true, Some(est)) => format!(
+            "today \u{b7} {} of {} total \u{b7} {}",
+            model::format_minutes(elapsed),
+            model::format_minutes(est),
+            focus.title
+        ),
+        (true, None) => format!(
+            "today \u{b7} {} total \u{b7} {}",
+            model::format_minutes(elapsed),
+            focus.title
+        ),
+        (false, Some(est)) => {
+            format!("of {} \u{b7} {}", model::format_minutes(est), focus.title)
+        }
+        (false, None) => focus.title.clone(),
     };
     let over = focus.estimate_minutes.is_some_and(|est| elapsed > est);
     let focus_id = focus.id.clone();

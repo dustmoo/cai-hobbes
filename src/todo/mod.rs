@@ -285,6 +285,45 @@ impl PlannerState {
             .find(|s| s.is_open() && s.todo_id == todo_id)
     }
 
+    /// Seconds spent on `todo_id` during `now`'s local day: each closed row's
+    /// banked time in proportion to how much of its span fell after local
+    /// midnight, plus the live sitting clipped to midnight. Clipping both the
+    /// same way keeps today's clock steady when a sitting that crossed
+    /// midnight is paused. The all-time figure stays `Todo::elapsed_minutes`;
+    /// this is the "today" half the focus timers show beside it.
+    pub fn focus_seconds_today(&self, todo_id: &str, now: chrono::DateTime<chrono::Utc>) -> i64 {
+        let day = now.with_timezone(&chrono::Local).date_naive();
+        // `local_midnight` steps past a DST gap at 00:00 to the day's first
+        // valid instant.
+        let midnight = ics::local_midnight(day).unwrap_or(now - chrono::Duration::hours(24));
+        let banked: i64 = self
+            .focus_sessions
+            .iter()
+            .filter(|s| s.todo_id == todo_id)
+            .filter_map(|s| {
+                let ended = s.ended_at?;
+                let secs = i64::from(s.minutes) * 60;
+                if s.started_at >= midnight {
+                    return Some(secs);
+                }
+                if ended <= midnight {
+                    return None;
+                }
+                let span = (ended - s.started_at).num_seconds().max(1);
+                let after = (ended - midnight).num_seconds();
+                Some(secs * after / span)
+            })
+            .sum();
+        let live = self
+            .todos
+            .iter()
+            .find(|t| t.id == todo_id)
+            .and_then(|t| t.started_at)
+            .map(|s| (now - s.max(midnight)).num_seconds().max(0))
+            .unwrap_or(0);
+        banked + live
+    }
+
     /// Drain the ids of session rows touched since the last drain, returning
     /// the rows to persist. Every mutation path calls this after the operation
     /// (handlers gate the actual store write on their `persist` flag).
@@ -372,6 +411,64 @@ impl PlannerState {
         let todo_clone = t.clone();
 
         Some((session_clone, todo_clone))
+    }
+
+    /// The Heartbeat's runaway-timer pause: leave focus on `todo_id` (it
+    /// must be the focused todo), bank at most `bank_minutes`, and keep the
+    /// real elapsed on the row as `unclamped_minutes` so it can be restored
+    /// ([`Self::restore_unclamped_focus`]). The row keeps its real
+    /// `started_at`/`ended_at` bounds, like `sanitize_stale_focus`'s clamp.
+    /// Returns the closed row's id and whether anything was clamped (false
+    /// when the real elapsed fit within the cap), or `None` when `todo_id`
+    /// isn't in focus. Changed
+    /// todo and row are left for the caller to persist (the row via
+    /// [`Self::take_dirty_focus_sessions`]).
+    pub fn pause_runaway_focus(
+        &mut self,
+        todo_id: &str,
+        bank_minutes: u32,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<(String, bool)> {
+        if self.focused().map(|t| t.id.as_str()) != Some(todo_id) {
+            return None;
+        }
+        let row_id = self.open_focus_session_for(todo_id).map(|s| s.id.clone());
+        self.stop_focus(now)?;
+        let Some(row_id) = row_id else {
+            // Row-less focus (pre-migration): nothing to clamp on the record.
+            return None;
+        };
+        let (real, ended_at) = self
+            .focus_sessions
+            .iter()
+            .find(|s| s.id == row_id)
+            .map(|s| (s.minutes, s.ended_at))?;
+        let clamped = bank_minutes < real;
+        if clamped {
+            self.set_focus_session_minutes(&row_id, bank_minutes, now)?;
+            if let Some(s) = self.focus_sessions.iter_mut().find(|s| s.id == row_id) {
+                s.ended_at = ended_at;
+                s.unclamped_minutes = Some(real);
+            }
+        }
+        Some((row_id, clamped))
+    }
+
+    /// Undo a clamp: bank a row's `unclamped_minutes` after all ("Keep the
+    /// real time"). Returns the owning todo's id, or `None` when the row is
+    /// missing, live, or was never clamped.
+    pub fn restore_unclamped_focus(
+        &mut self,
+        session_id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<String> {
+        let real = self
+            .focus_sessions
+            .iter()
+            .find(|s| s.id == session_id && !s.is_open())?
+            .unclamped_minutes?;
+        let (_, todo) = self.set_focus_session_minutes(session_id, real, now)?;
+        Some(todo.id)
     }
 
     /// Delete a closed session row entirely (e.g. an accidental timer that
@@ -1118,6 +1215,87 @@ mod tests {
         let dirty = state.take_dirty_focus_sessions();
         assert_eq!(dirty.len(), 1, "opened and closed the same row: one persist");
         assert!(state.take_dirty_focus_sessions().is_empty());
+    }
+
+    #[test]
+    fn a_runaway_pause_banks_the_cap_and_restores_the_real_time() {
+        let start: chrono::DateTime<chrono::Utc> = "2026-10-23T13:00:00Z".parse().unwrap();
+        let later = start + chrono::Duration::minutes(435);
+        let mut state = PlannerState::default();
+        let t = Todo::new("Zeblok node check", 0.0);
+        let id = t.id.clone();
+        state.upsert_todo(t);
+        assert!(state.pause_runaway_focus(&id, 30, later).is_none(), "not in focus");
+
+        state.start_focus(&id, start, model::FocusActor::Person);
+        let (row_id, clamped) = state.pause_runaway_focus(&id, 30, later).expect("paused");
+        assert_focus_invariant(&state);
+        assert!(clamped);
+        let row = state.focus_sessions.iter().find(|s| s.id == row_id).unwrap();
+        assert_eq!((row.minutes, row.unclamped_minutes), (30, Some(435)));
+        assert_eq!((row.started_at, row.ended_at), (start, Some(later)), "real bounds kept");
+        assert_eq!(row.end_reason, Some(model::FocusEndReason::Paused));
+        assert_eq!(state.todo(&id).unwrap().actual_minutes, 30, "aggregate follows the cap");
+        assert!(!state.take_dirty_focus_sessions().is_empty());
+
+        assert_eq!(state.restore_unclamped_focus(&row_id, later), Some(id.clone()));
+        let row = state.focus_sessions.iter().find(|s| s.id == row_id).unwrap();
+        assert_eq!((row.minutes, row.unclamped_minutes), (435, None));
+        assert_eq!(state.todo(&id).unwrap().actual_minutes, 435);
+        assert_eq!(state.restore_unclamped_focus(&row_id, later), None, "nothing left to restore");
+
+        // A cap at or above the real elapsed pauses without clamping.
+        state.start_focus(&id, later, model::FocusActor::Person);
+        let (row_id, clamped) = state.pause_runaway_focus(&id, 120, later + chrono::Duration::minutes(90)).expect("paused");
+        assert!(!clamped);
+        let row = state.focus_sessions.iter().find(|s| s.id == row_id).unwrap();
+        assert_eq!((row.minutes, row.unclamped_minutes), (90, None));
+        assert_eq!(state.restore_unclamped_focus(&row_id, later), None);
+    }
+
+    #[test]
+    fn today_counts_only_todays_sittings_and_the_live_tail_since_midnight() {
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let mut state = PlannerState::default();
+        let t = Todo::new("long-running task", 0.0);
+        let id = t.id.clone();
+        state.upsert_todo(t);
+
+        // Yesterday: a long sitting that ran past midnight into today.
+        state.start_focus(&id, local_instant(yesterday, 9), model::FocusActor::Person);
+        state.stop_focus(local_instant(yesterday, 16));
+        state.start_focus(&id, local_instant(yesterday, 23), model::FocusActor::Person);
+        // Today: one closed hour, then a live sitting 30 minutes in.
+        let morning = local_instant(today, 9);
+        state.stop_focus(local_instant(today, 1));
+        state.start_focus(&id, morning, model::FocusActor::Person);
+        state.stop_focus(morning + chrono::Duration::minutes(60));
+        let afternoon = local_instant(today, 14);
+        state.start_focus(&id, afternoon, model::FocusActor::Person);
+        let now = afternoon + chrono::Duration::minutes(30);
+
+        // The 23:00–01:00 sitting counts its hour after midnight.
+        assert_eq!(state.focus_seconds_today(&id, now), (60 + 60 + 30) * 60);
+        assert_eq!(state.todo(&id).unwrap().elapsed_minutes(now), 420 + 120 + 60 + 30);
+        assert_eq!(state.focus_seconds_today("missing", now), 0);
+    }
+
+    #[test]
+    fn a_live_sitting_from_yesterday_counts_from_midnight() {
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let mut state = PlannerState::default();
+        let t = Todo::new("left running overnight", 0.0);
+        let id = t.id.clone();
+        state.upsert_todo(t);
+        state.start_focus(&id, local_instant(yesterday, 22), model::FocusActor::Person);
+        let now = local_instant(today, 2);
+        assert_eq!(state.focus_seconds_today(&id, now), 2 * 3600);
+        // Pausing it doesn't move today's clock: the closed row is clipped
+        // to midnight the same way.
+        state.stop_focus(now);
+        assert_eq!(state.focus_seconds_today(&id, now), 2 * 3600);
     }
 
     #[test]

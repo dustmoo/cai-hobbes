@@ -17,7 +17,7 @@ use crate::components::chat_input::ChatCommand;
 use crate::fleet::{FleetOrigin, FleetSession, FleetState};
 use crate::session::SessionState;
 use crate::todo::lanes::{self, AgentLane};
-use crate::todo::model::{self, AgentState, DecisionSource, Lane, Todo};
+use crate::todo::model::{self, AgentState, DecisionSource, Todo};
 use crate::todo::{handlers, PlannerState};
 
 use super::{persist_todo, today, DecisionsDrawerContext};
@@ -1081,6 +1081,48 @@ fn LaneCard(
 /// re-read (late briefs can still land on an ended session).
 const ENDED_ROW_TTL_SECS: i64 = 60;
 
+/// Stored rows of linked fleet sessions that left the live map, by id, with
+/// when each was read (trusted for [`ENDED_ROW_TTL_SECS`]).
+pub(crate) type EndedRowCache = HashMap<String, (DateTime<Utc>, Option<FleetSession>)>;
+
+/// Re-derive `agent_state` for the linked agent to-dos from the fleet,
+/// reading ended rows through `cache`, then copy the changed to-dos into
+/// the planner signal and persist them. The signal is written only when
+/// something changed. Returns how many to-dos changed. Shared by
+/// [`AgentStateSync`] and the Heartbeat's housekeeping.
+pub(crate) fn sync_agent_states_cached(
+    planner: &mut Signal<PlannerState>,
+    live: &FleetState,
+    cache: &mut EndedRowCache,
+    now: DateTime<Utc>,
+) -> usize {
+    let load_ended = |sid: &str| {
+        let fresh = cache
+            .get(sid)
+            .is_some_and(|(at, _)| (now - *at).num_seconds() < ENDED_ROW_TTL_SECS);
+        if !fresh {
+            cache.insert(sid.to_string(), (now, crate::fleet::store::load_session(sid)));
+        }
+        cache.get(sid).and_then(|(_, row)| row.clone())
+    };
+    let changed = handlers::sync_linked_agent_todos(&planner.peek(), live, load_ended, now);
+    if changed.is_empty() {
+        return 0;
+    }
+    {
+        let mut state = planner.write();
+        for t in &changed {
+            if let Some(slot) = state.todo_mut(&t.id) {
+                *slot = t.clone();
+            }
+        }
+    }
+    for t in &changed {
+        persist_todo(planner, &t.id);
+    }
+    changed.len()
+}
+
 /// Re-derive `agent_state` (and synthesized decisions) for linked agent
 /// to-dos whenever the fleet mirror changes. Renders nothing. Mounted once
 /// at the Planner root; the effect subscribes only to the fleet signal, so
@@ -1091,64 +1133,11 @@ pub(crate) fn AgentStateSync() -> Element {
     let mut planner = use_context::<Signal<PlannerState>>();
     let fleet_state = use_context::<Signal<FleetState>>();
     // Ended rows (they leave the live map on SessionEnd) cached by id.
-    let mut ended_cache = use_signal(HashMap::<String, (DateTime<Utc>, Option<FleetSession>)>::new);
+    let mut ended_cache = use_signal(EndedRowCache::new);
 
     use_effect(move || {
         let live = fleet_state.read().clone();
-        let now = Utc::now();
-        // Work on a scratch planner holding only the linked, open agent
-        // to-dos: `sync_agent_states` needs `&mut PlannerState`, and taking
-        // the real signal's write guard would re-render the Planner on every
-        // fleet poke even when nothing changed.
-        let linked: Vec<Todo> = planner
-            .peek()
-            .todos
-            .iter()
-            .filter(|t| t.lane == Lane::Agent && !t.status.is_closed() && t.linked_fleet_session.is_some())
-            .cloned()
-            .collect();
-        if linked.is_empty() {
-            return;
-        }
-        let mut ended: Vec<FleetSession> = Vec::new();
-        {
-            let mut cache = ended_cache.write();
-            for sid in linked.iter().filter_map(|t| t.linked_fleet_session.as_deref()) {
-                if live.sessions.contains_key(sid) {
-                    continue;
-                }
-                let fresh = cache
-                    .get(sid)
-                    .is_some_and(|(at, _)| (now - *at).num_seconds() < ENDED_ROW_TTL_SECS);
-                if !fresh {
-                    cache.insert(sid.to_string(), (now, crate::fleet::store::load_session(sid)));
-                }
-                if let Some((_, Some(row))) = cache.get(sid) {
-                    if !ended.iter().any(|r| r.id == row.id) {
-                        ended.push(row.clone());
-                    }
-                }
-            }
-        }
-        let mut scratch = PlannerState::default();
-        scratch.todos = linked;
-        let changed = handlers::sync_agent_states(&mut scratch, &live, &ended, now);
-        if changed.is_empty() {
-            return;
-        }
-        {
-            let mut state = planner.write();
-            for id in &changed {
-                if let Some(t) = scratch.todos.iter().find(|t| &t.id == id) {
-                    if let Some(slot) = state.todo_mut(id) {
-                        *slot = t.clone();
-                    }
-                }
-            }
-        }
-        for id in &changed {
-            persist_todo(&planner, id);
-        }
+        sync_agent_states_cached(&mut planner, &live, &mut ended_cache.write(), Utc::now());
     });
 
     rsx! {}
@@ -1157,6 +1146,7 @@ pub(crate) fn AgentStateSync() -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::todo::model::Lane;
 
     #[test]
     fn a_card_opens_its_worker_or_falls_back_to_details() {

@@ -22,6 +22,7 @@ use crate::tab_list::{arrange_tabs, tab_group_options, TabFacts, TabListOrder, T
 use crate::todo::PlannerState;
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
+use crate::components::metal_heart::{use_heartbeat_session_id, MetalHeart};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// What a tab shows in the 48px rail: its emoji, else the first letter of
@@ -107,6 +108,7 @@ const RAIL_CLOSE: &str = "absolute top-0 right-0.5 p-px rounded-sm text-fg-muted
 const CLOSE_BTN: &str = "p-0.5 rounded-md shrink-0 text-fg-muted hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity";
 
 pub fn TabSidebar(props: TabSidebarProps) -> Element {
+    let heartbeat_id = use_heartbeat_session_id();
     let mut session_state = use_context::<Signal<SessionState>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut ui_state = use_context::<Signal<UiState>>();
@@ -290,6 +292,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     onclick: move |_| on_select.call(idx),
                                     onmouseup: move |evt| if is_middle_click(&evt) { on_close.call(idx) },
                                     match glyph {
+                                        RailGlyph::Emoji(_) if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalHeart { size: 15 } },
                                         RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
                                         RailGlyph::Letter(l) => rsx! {
                                             span {
@@ -569,7 +572,11 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                                 }
                                             }
                                             if let Some(e) = &tab.emoji {
-                                                span { class: "text-[13px] leading-none shrink-0", "{e}" }
+                                                if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) {
+                                                    MetalHeart {}
+                                                } else {
+                                                    span { class: "text-[13px] leading-none shrink-0", "{e}" }
+                                                }
                                             }
                                             span {
                                                 class: if is_active { "flex-1 min-w-0 truncate text-xs text-fg font-medium" } else { "flex-1 min-w-0 truncate text-xs text-fg-muted" },

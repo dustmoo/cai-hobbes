@@ -215,7 +215,7 @@ pub struct ChatDispatchOpts<'a> {
     /// (`Settings::resolve_dispatch_profile`).
     pub profile: Option<String>,
     /// Switch to the new tab (the model's dispatch does). `false` leaves the
-    /// user where they are; the caller opens the tab in the background.
+    /// user where they are; the tab opens in the background either way.
     pub focus: bool,
 }
 
@@ -317,6 +317,11 @@ pub fn dispatch_to_chat(
         &new_id,
         crate::components::chat_queue::QueuedMessage::new(prompt, vec![]),
     );
+    // Every worker gets a tab, through the reopen set rather than the
+    // single `chat_command` slot: a turn that dispatches twice would
+    // otherwise overwrite the first SwitchToSession before the handler ran,
+    // leaving that worker running with no tab.
+    crate::request_tab_reopen(&new_id);
     if opts.focus {
         deps.chat_command.set(Some(
             crate::components::chat_input::ChatCommand::SwitchToSession(new_id.clone()),
