@@ -110,6 +110,23 @@ pub fn queue_remove(
     }
 }
 
+/// Take a session's queued user messages back out (Esc puts them in the input
+/// box), oldest first. Queued relays stay: they aren't the person's words.
+pub fn queue_take_user_messages(
+    map: &mut HashMap<String, VecDeque<QueuedMessage>>,
+    session_id: &str,
+) -> Vec<QueuedMessage> {
+    let Some(q) = map.get_mut(session_id) else {
+        return Vec::new();
+    };
+    let (relays, mine): (VecDeque<_>, VecDeque<_>) = q.drain(..).partition(|m| m.relay.is_some());
+    *q = relays;
+    if q.is_empty() {
+        map.remove(session_id);
+    }
+    mine.into()
+}
+
 /// Drop a session's entire queue ("clear all", and on session delete / tab close).
 pub fn queue_clear(map: &mut HashMap<String, VecDeque<QueuedMessage>>, session_id: &str) {
     map.remove(session_id);
@@ -127,6 +144,33 @@ mod tests {
         map.get(sid)
             .map(|q| q.iter().map(|m| m.text.clone()).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn taking_user_messages_back_leaves_relays_queued() {
+        let mut map = HashMap::new();
+        let relay = QueuedMessage::relay(crate::components::chat::Message {
+            id: Uuid::new_v4(),
+            author: "Relay".into(),
+            content: crate::components::shared::MessageContent::Text {
+                content: "from the worker".into(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        });
+        queue_push(&mut map, "s", msg("a"));
+        queue_push(&mut map, "s", relay);
+        queue_push(&mut map, "s", msg("b"));
+        let taken: Vec<String> = queue_take_user_messages(&mut map, "s").into_iter().map(|m| m.text).collect();
+        assert_eq!(taken, ["a", "b"]);
+        assert_eq!(map["s"].len(), 1, "the relay stays");
+        assert!(queue_take_user_messages(&mut map, "s").is_empty());
+        assert!(queue_take_user_messages(&mut map, "missing").is_empty());
     }
 
     #[test]

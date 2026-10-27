@@ -136,6 +136,38 @@ pub struct HotkeySettings {
     /// Jump to the first tab of the previous group, wrapping.
     #[serde(default = "default_prev_tab_group")]
     pub prev_tab_group: String,
+    // ── Chat input (Claude Code's keys). Handled by the chat box itself, so
+    // they apply on save without a restart. An empty string turns one off.
+    /// Stop this tab's running turn and put the prompt back in the box.
+    /// Pressed twice quickly on an idle tab, it clears the box.
+    #[serde(default = "default_interrupt_turn")]
+    pub interrupt_turn: String,
+    /// Recall the previous sent prompt (from an empty box).
+    #[serde(default = "default_history_prev")]
+    pub history_prev: String,
+    /// Step forward through recalled prompts.
+    #[serde(default = "default_history_next")]
+    pub history_next: String,
+    /// Search sent prompts.
+    #[serde(default = "default_history_search")]
+    pub history_search: String,
+    /// Clear the box (the text is kept in prompt history).
+    #[serde(default = "default_clear_input")]
+    pub clear_input: String,
+}
+
+impl HotkeySettings {
+    /// Whether moving from `saved` to these bindings needs a restart: any
+    /// change outside the chat-box keys, which the chat box reads live.
+    pub fn needs_restart_from(&self, saved: &HotkeySettings) -> bool {
+        let mut global = self.clone();
+        global.interrupt_turn = saved.interrupt_turn.clone();
+        global.history_prev = saved.history_prev.clone();
+        global.history_next = saved.history_next.clone();
+        global.history_search = saved.history_search.clone();
+        global.clear_input = saved.clear_input.clone();
+        global != *saved
+    }
 }
 
 impl Default for HotkeySettings {
@@ -170,6 +202,11 @@ impl Default for HotkeySettings {
             prev_tab: default_prev_tab(),
             next_tab_group: default_next_tab_group(),
             prev_tab_group: default_prev_tab_group(),
+            interrupt_turn: default_interrupt_turn(),
+            history_prev: default_history_prev(),
+            history_next: default_history_next(),
+            history_search: default_history_search(),
+            clear_input: default_clear_input(),
         }
     }
 }
@@ -229,6 +266,29 @@ fn default_submit_chat() -> String {
 }
 fn default_cancel_generation() -> String {
     "CmdOrCtrl+.".to_string()
+}
+// Chat-input defaults follow Claude Code. `Control` is the Control key only
+// (never Cmd), so Ctrl+C clears while Cmd+C still copies.
+pub fn default_interrupt_turn() -> String {
+    "Escape".to_string()
+}
+pub fn default_history_prev() -> String {
+    "ArrowUp".to_string()
+}
+pub fn default_history_next() -> String {
+    "ArrowDown".to_string()
+}
+pub fn default_history_search() -> String {
+    "Control+R".to_string()
+}
+/// Off by default outside macOS, where Control+C is copy (Esc twice still
+/// clears there).
+pub fn default_clear_input() -> String {
+    if cfg!(target_os = "macos") {
+        "Control+C".to_string()
+    } else {
+        String::new()
+    }
 }
 
 macro_rules! default_switch_tab {
@@ -3522,6 +3582,8 @@ mod tests {
         let restored: HotkeySettings = serde_json::from_value(legacy).unwrap();
         assert_eq!(restored.toggle_fleet, default_toggle_fleet());
         assert_eq!(restored.quick_capture, "CmdOrCtrl+K");
+        assert_eq!(restored.interrupt_turn, "Escape");
+        assert_eq!(restored.history_search, "Control+R");
     }
 }
 

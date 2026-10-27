@@ -1126,6 +1126,25 @@ pub fn ChatWindow(
         )));
     };
 
+    // Delete a message and everything after it. Journal-complete sessions
+    // rewind by replay (RewoundTo + project); pre-journal sessions take the
+    // legacy in-place path. Shared by delete and Esc's interrupt.
+    let mut rewind_from = move |message_id: Uuid| {
+        let mut trigger = stream_update_trigger;
+        let message_id_str = message_id.to_string();
+        let active_session_id = current_target_id.read().clone();
+        {
+            let mut state = session_state.write();
+            crate::session_events::rewind_session_state(
+                &mut state,
+                &active_session_id,
+                &message_id_str,
+            );
+        }
+        trigger.set(trigger() + 1);
+        crate::session::SessionState::save_async(&session_state.read(), None);
+    };
+
     let delete_message = move |message_id: Uuid| {
         let confirm = settings.read().confirm_on_message_edit;
         if confirm {
@@ -1148,22 +1167,7 @@ pub fn ChatWindow(
             }
         } else {
             restore_message_to_draft(message_id);
-
-            // Delete the message and everything after. Journal-complete
-            // sessions rewind by replay (RewoundTo + project); pre-journal
-            // sessions take the legacy in-place path.
-            let message_id_str = message_id.to_string();
-            let active_session_id = current_target_id.read().clone();
-            {
-                let mut state = session_state.write();
-                crate::session_events::rewind_session_state(
-                    &mut state,
-                    &active_session_id,
-                    &message_id_str,
-                );
-            }
-            stream_update_trigger.set(stream_update_trigger() + 1);
-            crate::session::SessionState::save_async(&session_state.read(), None);
+            rewind_from(message_id);
         }
     };
 
@@ -1419,6 +1423,7 @@ pub fn ChatWindow(
                         move |(msg, attachments, target)| send_message((msg, attachments, target))
                     },
                     on_cancel: move |_| cancel_message(),
+                    on_rewind: rewind_from,
                     on_interaction: on_interaction,
                     on_new_chat_with_memory: move |_| {
                         if let Some(session) = session_state.read().sessions.get(&*current_target_id.read()) {

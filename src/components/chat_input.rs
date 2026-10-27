@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Cursor;
 use std::time::SystemTime;
+use uuid::Uuid;
 
 #[cfg(debug_assertions)]
 use crate::context::prompt_builder::PromptBuilder;
@@ -19,6 +20,7 @@ use hobbes_core::models::Attachment;
 
 use crate::components::chat_queue::{self, QueuedMessage, CHAT_QUEUE};
 use crate::components::focus_context::FocusContext;
+use crate::components::prompt_history;
 use crate::components::shared::{DraftContext, SessionIdContext};
 use crate::components::skill_autocomplete::SkillAutocomplete;
 use crate::components::stream_manager::StreamManagerContext;
@@ -158,6 +160,9 @@ fn profile_border_class(bg_class: &str) -> String {
     }
 }
 
+/// Two presses of the interrupt key within this window clear an idle box.
+const DOUBLE_PRESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(600);
+
 #[component]
 pub fn ChatInput(
     is_sending: Signal<bool>,
@@ -169,6 +174,8 @@ pub fn ChatInput(
     /// queued message can drain into a background session.
     on_send: EventHandler<(String, Vec<Attachment>, String)>,
     on_cancel: EventHandler<()>,
+    /// Take back an interrupted turn: rewind from this user message.
+    on_rewind: EventHandler<Uuid>,
     on_interaction: EventHandler<()>,
     on_new_chat_with_memory: EventHandler<()>,
 ) -> Element {
@@ -201,6 +208,58 @@ pub fn ChatInput(
     >();
     let permission_manager =
         use_context::<Signal<crate::context::permissions::PermissionManager>>();
+
+    // Prompt history (Up/Down), shared across tabs; `history_cursor` counts
+    // back from the newest prompt while browsing.
+    let mut prompt_log = use_signal(prompt_history::load);
+    let mut history_cursor = use_signal(|| Option::<usize>::None);
+
+    // Esc while this tab's turn runs (Claude Code's interrupt): stop it, take
+    // the turn back when it only wrote text, and put that prompt, plus any
+    // messages queued behind it, back in the box ahead of the current draft.
+    let mut interrupt_turn = move |session_id: String| {
+        let rewind = session_state
+            .peek()
+            .sessions
+            .get(&session_id)
+            .and_then(|s| prompt_history::rewindable_prompt(&s.messages, &prompt_log.peek()).cloned());
+        on_cancel.call(());
+        let mut texts: Vec<String> = Vec::new();
+        let mut restored: Vec<Attachment> = Vec::new();
+        if let Some(m) = rewind {
+            on_rewind.call(m.id);
+            texts.push(m.content.get_text_content().unwrap_or_default());
+            restored.extend(m.attachments);
+        }
+        for q in chat_queue::queue_take_user_messages(&mut CHAT_QUEUE.write(), &session_id) {
+            texts.push(q.text);
+            restored.extend(q.attachments);
+        }
+        if texts.is_empty() && restored.is_empty() {
+            return;
+        }
+        texts.push(draft.peek().clone());
+        let text = texts.into_iter().filter(|t| !t.trim().is_empty()).collect::<Vec<_>>().join("\n\n");
+        let caret = crate::skills::invocation::byte_to_utf16_offset(&text, text.len());
+        crate::components::shared::set_chat_draft(draft, text, Some(caret), true);
+        restored.extend(attachments.peek().iter().cloned());
+        attachments.set(restored);
+        history_cursor.set(None);
+    };
+
+    // The interrupt key's last press, for "twice quickly clears the box".
+    let mut last_interrupt_press = use_signal(|| Option::<std::time::Instant>::None);
+    let mut show_prompt_search = use_signal(|| false);
+
+    // Clear the box; its text stays reachable with the history keys.
+    let mut clear_input = move || {
+        let text = draft.peek().clone();
+        if prompt_history::push(&mut prompt_log.write(), &text) {
+            prompt_history::save(prompt_log.peek().clone());
+        }
+        history_cursor.set(None);
+        crate::components::shared::set_chat_draft(draft, String::new(), None, true);
+    };
 
     // Skill Autocomplete State
     let skill_registry = use_context::<Signal<SkillRegistry>>();
@@ -808,6 +867,10 @@ pub fn ChatInput(
         {
             return;
         }
+        history_cursor.set(None);
+        if prompt_history::push(&mut prompt_log.write(), &user_message) {
+            prompt_history::save(prompt_log.peek().clone());
+        }
 
         // If this session's turn is still in flight, queue the message instead of
         // sending. The turn drains it on completion (see the drain effect below).
@@ -1255,6 +1318,61 @@ pub fn ChatInput(
                                 return;
                             }
 
+                            // 1b. Chat-box keys (Claude Code's, all remappable in Settings →
+                            // Hotkeys). Checked before the modifier filter so a binding like
+                            // Control+R works; an open autocomplete keeps its own keys.
+                            if !*show_skill_autocomplete.read() {
+                                if matches_hotkey(&event, &hotkeys.interrupt_turn) {
+                                    let session_id = current_session_id.read().clone();
+                                    let now = std::time::Instant::now();
+                                    let double = last_interrupt_press
+                                        .replace(Some(now))
+                                        .is_some_and(|t| now.duration_since(t) <= DOUBLE_PRESS_WINDOW);
+                                    if stream_manager.is_session_streaming(&session_id) {
+                                        event.prevent_default();
+                                        last_interrupt_press.set(None);
+                                        interrupt_turn(session_id);
+                                        return;
+                                    }
+                                    // Pressed twice on an idle tab: clear the box.
+                                    if double && !draft.read().is_empty() {
+                                        event.prevent_default();
+                                        last_interrupt_press.set(None);
+                                        clear_input();
+                                        return;
+                                    }
+                                }
+                                if matches_hotkey(&event, &hotkeys.clear_input) && !draft.read().is_empty() {
+                                    event.prevent_default();
+                                    clear_input();
+                                    return;
+                                }
+                                if matches_hotkey(&event, &hotkeys.history_search) {
+                                    event.prevent_default();
+                                    show_prompt_search.set(true);
+                                    return;
+                                }
+                                let dir = if matches_hotkey(&event, &hotkeys.history_prev) {
+                                    Some(prompt_history::Direction::Older)
+                                } else if matches_hotkey(&event, &hotkeys.history_next) {
+                                    Some(prompt_history::Direction::Newer)
+                                } else {
+                                    None
+                                };
+                                // Recalls only from an empty box (or while it still holds a
+                                // recalled prompt); otherwise the arrows move the caret.
+                                if let Some(dir) = dir {
+                                    let step = prompt_history::step(&prompt_log.read(), *history_cursor.read(), &draft.read(), dir);
+                                    if let Some(step) = step {
+                                        event.prevent_default();
+                                        let caret = crate::skills::invocation::byte_to_utf16_offset(&step.text, step.text.len());
+                                        history_cursor.set(step.cursor);
+                                        crate::components::shared::set_chat_draft(draft, step.text, Some(caret), true);
+                                        return;
+                                    }
+                                }
+                            }
+
                             let is_force_submit = matches_hotkey(&event, &hotkeys.submit_chat);
 
                             // 2. Filter Global Modifiers
@@ -1264,45 +1382,8 @@ pub fn ChatInput(
                                 return;
                             }
 
-                            // 3. Tab Handling (Indentation)
-                            if event.key() == Key::Tab {
-                                event.prevent_default();
-                                let script = if modifiers.contains(Modifiers::SHIFT) {
-                                    r#"
-                                    const el = document.getElementById('chat-textarea');
-                                    if (el) {
-                                        const start = el.selectionStart;
-                                        const value = el.value;
-                                        let line_start = value.lastIndexOf('\n', start - 1) + 1;
-                                        if (value.substring(line_start, line_start + 1) === '\t') {
-                                            el.value = value.substring(0, line_start) + value.substring(line_start + 1);
-                                            el.selectionStart = el.selectionEnd = Math.max(start - 1, line_start);
-                                        }
-                                    }
-                                    "#
-                                } else {
-                                    r#"
-                                    const el = document.getElementById('chat-textarea');
-                                    if (el) {
-                                        const start = el.selectionStart;
-                                        const end = el.selectionEnd;
-                                        el.value = el.value.substring(0, start) + '\t' + el.value.substring(end);
-                                        el.selectionStart = el.selectionEnd = start + 1;
-                                    }
-                                    "#
-                                };
-                                let _ = document::eval(script);
-                                let _ = document::eval(r#"
-                                    const el = document.getElementById('chat-textarea');
-                                    if (el) {
-                                        var event = new Event('input', { bubbles: true, cancelable: true });
-                                        el.dispatchEvent(event);
-                                    }
-                                "#);
-                                return;
-                            }
-
-                            // 4. Skill Autocomplete Navigation
+                            // 3. Autocomplete Navigation (before indentation, so Tab accepts a
+                            // suggestion exactly like Enter — the convention everywhere)
                             if *show_skill_autocomplete.read() {
                                 let skills = filtered_skills.read();
                                 let current_idx = *skill_autocomplete_index.read();
@@ -1327,7 +1408,10 @@ pub fn ChatInput(
                                         show_skill_autocomplete.set(false);
                                         return;
                                     }
-                                    Key::Enter | Key::Tab => {
+                                    // Shift+Tab stays an outdent, never an accept.
+                                    Key::Enter | Key::Tab
+                                        if !(event.key() == Key::Tab && modifiers.contains(Modifiers::SHIFT)) =>
+                                    {
                                         if !skills.is_empty() {
                                             event.prevent_default();
                                             let selected = skills.get(current_idx).cloned();
@@ -1398,6 +1482,44 @@ pub fn ChatInput(
                                 }
                             }
 
+                            // 4. Tab Handling (Indentation) — only when no suggestion took it
+                            if event.key() == Key::Tab {
+                                event.prevent_default();
+                                let script = if modifiers.contains(Modifiers::SHIFT) {
+                                    r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    if (el) {
+                                        const start = el.selectionStart;
+                                        const value = el.value;
+                                        let line_start = value.lastIndexOf('\n', start - 1) + 1;
+                                        if (value.substring(line_start, line_start + 1) === '\t') {
+                                            el.value = value.substring(0, line_start) + value.substring(line_start + 1);
+                                            el.selectionStart = el.selectionEnd = Math.max(start - 1, line_start);
+                                        }
+                                    }
+                                    "#
+                                } else {
+                                    r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    if (el) {
+                                        const start = el.selectionStart;
+                                        const end = el.selectionEnd;
+                                        el.value = el.value.substring(0, start) + '\t' + el.value.substring(end);
+                                        el.selectionStart = el.selectionEnd = start + 1;
+                                    }
+                                    "#
+                                };
+                                let _ = document::eval(script);
+                                let _ = document::eval(r#"
+                                    const el = document.getElementById('chat-textarea');
+                                    if (el) {
+                                        var event = new Event('input', { bubbles: true, cancelable: true });
+                                        el.dispatchEvent(event);
+                                    }
+                                "#);
+                                return;
+                            }
+
                             // 5. Submit Handling
                             let is_standard_submit = event.key() == Key::Enter && !modifiers.contains(Modifiers::SHIFT);
 
@@ -1430,6 +1552,26 @@ pub fn ChatInput(
                         },
                     }
 
+
+                    if *show_prompt_search.read() {
+                        crate::components::prompt_search::PromptSearch {
+                            history: prompt_log.read().clone(),
+                            on_pick: move |text: String| {
+                                show_prompt_search.set(false);
+                                history_cursor.set(None);
+                                let caret = crate::skills::invocation::byte_to_utf16_offset(&text, text.len());
+                                crate::components::shared::set_chat_draft(draft, text, Some(caret), true);
+                            },
+                            on_close: move |_| {
+                                show_prompt_search.set(false);
+                                if let Some(m) = textarea_mounted.peek().clone() {
+                                    spawn(async move {
+                                        let _ = m.set_focus(true).await;
+                                    });
+                                }
+                            },
+                        }
+                    }
 
                     // Skill Autocomplete Component
                     if *show_skill_autocomplete.read() {
