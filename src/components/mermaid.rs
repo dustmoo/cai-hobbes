@@ -96,6 +96,10 @@ async fn ensure_mermaid_loaded() -> Result<(), String> {
                             window.mermaid.initialize({{
                                 startOnLoad: false,
                                 securityLevel: 'strict',
+                                // Keys a diagram's %%{{init}}%% directive may not
+                                // change: mermaid's defaults plus dompurifyConfig, so
+                                // model-written diagrams can't loosen the sanitizer.
+                                secure: ['secure', 'securityLevel', 'startOnLoad', 'maxTextSize', 'suppressErrorRendering', 'maxEdges', 'dompurifyConfig'],
                                 theme: 'dark',
                                 themeVariables: {{
                                     background: '#1A1A1A',
