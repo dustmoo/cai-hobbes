@@ -31,7 +31,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use portable_pty::{CommandBuilder, PtySize};
-use rmcp::model::Tool;
+use rmcp::model::{JsonObject, Tool};
 
 pub const HOBBES_TERMINAL_SERVER: &str = "hobbes-terminal";
 
@@ -912,12 +912,7 @@ impl TerminalClient {
             }
             other => return Err(format!("unknown terminal tool '{other}'")),
         };
-        Ok(rmcp::model::CallToolResult {
-            content: vec![rmcp::model::Content::text(text)],
-            is_error: Some(false),
-            structured_content: None,
-            meta: None,
-        })
+        Ok(rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(text)]))
     }
 
     async fn exec(&self, ctx: &TerminalCtx, args: &serde_json::Value) -> Result<String, String> {
@@ -1167,23 +1162,18 @@ impl TerminalClient {
     }
 
     pub fn list_tools(&self) -> Vec<Tool> {
-        use std::sync::Arc;
         vec![
-            Tool {
-                name: "HOBBES_TERMINAL_EXEC".into(),
-                description: Some(
-                    "Run a shell command in this chat's persistent terminal (zsh, login \
+            Tool::new(
+                "HOBBES_TERMINAL_EXEC",
+                "Run a shell command in this chat's persistent terminal (zsh, login \
                      PATH). The shell survives between calls — cd, exports, and \
                      virtualenvs persist. Starts in the session's project directory. \
                      Returns output and exit code; long commands return partial state \
                      with guidance to HOBBES_TERMINAL_TAIL. To start a long-lived background \
                      process that must outlive the shell and HOBBES_TERMINAL_RESET, use \
                      `hobbes_detach LOGFILE cmd args…` (own session, no tty, stdin from \
-                     /dev/null) instead of `nohup … &`."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                     /dev/null) instead of `nohup … &`.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "command": { "type": "string", "description": "The shell command to run." },
@@ -1191,58 +1181,29 @@ impl TerminalClient {
                             "cwd": { "type": "string", "description": "Run in this directory via a subshell without changing the session's cwd." }
                         },
                         "required": ["command"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Run Terminal Command".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_TERMINAL_TAIL".into(),
-                description: Some(
-                    "Read more output from a command that was still running when \
+                    })).unwrap_or_default(),
+            ).with_title("Run Terminal Command"),
+            Tool::new(
+                "HOBBES_TERMINAL_TAIL",
+                "Read more output from a command that was still running when \
                      HOBBES_TERMINAL_EXEC returned. Reports the exit code once it \
-                     finishes."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                     finishes.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "timeout_secs": { "type": "integer", "description": "Seconds to wait for more output (default 5, max 60)." }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Read Terminal Output".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_TERMINAL_RESET".into(),
-                description: Some(
-                    "Kill this chat's terminal shell (and any running command). The next \
-                     exec starts a fresh shell in the project directory."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                    })).unwrap_or_default(),
+            ).with_title("Read Terminal Output"),
+            Tool::new(
+                "HOBBES_TERMINAL_RESET",
+                "Kill this chat's terminal shell (and any running command). The next \
+                     exec starts a fresh shell in the project directory.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {}
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Reset Terminal".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
+                    })).unwrap_or_default(),
+            ).with_title("Reset Terminal"),
         ]
     }
 }

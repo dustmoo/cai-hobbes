@@ -886,7 +886,7 @@ impl StreamManagerContext {
                             let (status, response_str, is_permission_request, image_path) =
                                 match result_receiver {
                                     Ok(mut receiver) => {
-                                        let mut aggregated_content: Vec<rmcp::model::Content> =
+                                        let mut aggregated_content: Vec<rmcp::model::ContentBlock> =
                                             Vec::new();
                                         let mut final_status = ToolCallStatus::Completed;
                                         let mut error_string = None;
@@ -2356,6 +2356,19 @@ mod tests {
     use crate::settings::Settings;
     use dioxus_signals::Signal;
     use std::path::PathBuf;
+
+    #[test]
+    fn rmcp_content_block_wire_shape_is_pinned() {
+        use rmcp::model::ContentBlock;
+        assert_eq!(
+            serde_json::to_value(ContentBlock::image("QUJD", "image/png")).unwrap(),
+            serde_json::json!({"type": "image", "data": "QUJD", "mimeType": "image/png"})
+        );
+        assert_eq!(
+            serde_json::to_value(ContentBlock::text("hi")).unwrap(),
+            serde_json::json!({"type": "text", "text": "hi"})
+        );
+    }
 
     /// Build the message pair a turn starts with: the user prompt and the
     /// assistant placeholder that the stream writes into.

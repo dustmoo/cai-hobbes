@@ -8,7 +8,9 @@ use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use crate::SecretManagerTrait;
 use dioxus::prelude::spawn;
 use dioxus_signals::Readable;
-use rmcp::model::{CallToolRequestParam, CallToolResult, Tool};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ContentBlock, JsonObject, MetaObject, Tool,
+};
 use std::collections::HashSet;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 
@@ -19,15 +21,12 @@ const GEMINI_TOOL_LIMIT: usize = 128;
 /// These allow the AI to load/unload tools from servers set to "On-demand" mode.
 pub(super) fn get_local_meta_tools() -> Vec<Tool> {
     vec![
-        Tool {
-            name: "MCP_LOAD_SERVER_TOOLS".into(),
-            description: Some(
-                "Load all tools from a local MCP server that is in on-demand mode. \
+        Tool::new(
+            "MCP_LOAD_SERVER_TOOLS",
+            "Load all tools from a local MCP server that is in on-demand mode. \
                 After calling this, the server's tools become available as native function calls \
-                on the next turn. Use this when you need to use tools from a server marked [ON-DEMAND]."
-                    .into(),
-            ),
-            input_schema: serde_json::from_value(serde_json::json!({
+                on the next turn. Use this when you need to use tools from a server marked [ON-DEMAND].",
+            serde_json::from_value::<JsonObject>(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -38,20 +37,12 @@ pub(super) fn get_local_meta_tools() -> Vec<Tool> {
                 "required": ["server_name"]
             }))
             .unwrap_or_default(),
-            title: None,
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
-        Tool {
-            name: "MCP_UNLOAD_SERVER_TOOLS".into(),
-            description: Some(
-                "Unload dynamically loaded tools from a local MCP server to free up context space. \
-                Use this when you no longer need tools from a server you previously loaded."
-                    .into(),
-            ),
-            input_schema: serde_json::from_value(serde_json::json!({
+        ),
+        Tool::new(
+            "MCP_UNLOAD_SERVER_TOOLS",
+            "Unload dynamically loaded tools from a local MCP server to free up context space. \
+                Use this when you no longer need tools from a server you previously loaded.",
+            serde_json::from_value::<JsonObject>(serde_json::json!({
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -62,12 +53,7 @@ pub(super) fn get_local_meta_tools() -> Vec<Tool> {
                 "required": ["server_name"]
             }))
             .unwrap_or_default(),
-            title: None,
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        },
+        ),
     ]
 }
 
@@ -170,14 +156,9 @@ async fn try_auth_recovery(
                 // would return a 401 -> is_error: Some(true) -> causing the LLM to autonomously
                 // retry -> triggering ANOTHER prune and ANOTHER browser popup in an infinite loop!
                 // Returning `is_error: Some(false)` breaks the LLM's panic loop and allows token propagation.
-                Some(CallToolResult {
-                    content: vec![rmcp::model::Content::text(
-                        "Authentication successful! Please try the tool again.".to_string(),
-                    )],
-                    is_error: Some(false),
-                    structured_content: None,
-                    meta: None,
-                })
+                Some(CallToolResult::success(vec![ContentBlock::text(
+                    "Authentication successful! Please try the tool again.".to_string(),
+                )]))
             } else {
                 let url = result_msg
                     .split_whitespace()
@@ -188,12 +169,7 @@ async fn try_auth_recovery(
                     "Authentication required. Please connect your account: {}",
                     url
                 );
-                Some(CallToolResult {
-                    content: vec![rmcp::model::Content::text(auth_msg)],
-                    is_error: Some(true),
-                    structured_content: None,
-                    meta: None,
-                })
+                Some(CallToolResult::error(vec![ContentBlock::text(auth_msg)]))
             }
         }
         Err(e) => {
@@ -259,15 +235,10 @@ impl McpManager {
                 };
 
                 if !is_on_demand {
-                    let _ = tx.send(Ok(CallToolResult {
-                        content: vec![rmcp::model::Content::text(format!(
+                    let _ = tx.send(Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "Server '{}' is not in on-demand mode. Its tools are already available.",
                             target_server
-                        ))],
-                        is_error: Some(false),
-                        structured_content: None,
-                        meta: None,
-                    }));
+                        ))])));
                     return Ok(rx);
                 }
 
@@ -303,15 +274,10 @@ impl McpManager {
                         injected, target_server, dynamic.len(), sources.len()
                     );
 
-                    let _ = tx.send(Ok(CallToolResult {
-                        content: vec![rmcp::model::Content::text(format!(
+                    let _ = tx.send(Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                             "Loaded {} tools from '{}'. They are now available as native function calls on the next turn.\n\nTools: {}",
                             tool_count, target_server, tool_names.join(", ")
-                        ))],
-                        is_error: Some(false),
-                        structured_content: None,
-                        meta: None,
-                    }));
+                        ))])));
                 } else {
                     let _ = tx.send(Err(format!("Server '{}' not found", target_server)));
                 }
@@ -346,15 +312,12 @@ impl McpManager {
                         removed, target_server, dynamic.len()
                     );
 
-                    let _ = tx.send(Ok(CallToolResult {
-                        content: vec![rmcp::model::Content::text(format!(
+                    let _ = tx.send(Ok(CallToolResult::success(vec![ContentBlock::text(
+                        format!(
                             "Unloaded {} tools from '{}'. Context space freed.",
                             removed, target_server
-                        ))],
-                        is_error: Some(false),
-                        structured_content: None,
-                        meta: None,
-                    }));
+                        ),
+                    )])));
                 } else {
                     let _ = tx.send(Err(format!("Server '{}' not found", target_server)));
                 }
@@ -661,17 +624,17 @@ impl McpManager {
                             tracing::error!("StreamManager receiver dropped");
                         };
                     };
-                    let request = CallToolRequestParam {
-                        name: tool.name.clone(),
-                        arguments: Some(arguments.clone()),
-                    };
+                    let request = CallToolRequestParams::new(tool.name.clone())
+                        .with_arguments(arguments.clone());
                     match service_arc.call_tool(request).await {
                         Ok(result) => Ok(result),
                         Err(e) => {
-                            let error_str = format!("{}", e);
                             // AUTO-RECONNECT: If the transport closed (child process died),
                             // attempt to restart the server and retry the tool call once.
-                            if error_str.contains("Transport closed") {
+                            // Stdio only: a remote (HTTP) server has no process to restart.
+                            if matches!(e, rmcp::ServiceError::TransportClosed)
+                                && reconnect_config.uri.is_none()
+                            {
                                 tracing::warn!(
                                     "[RECONNECT] call_tool returned TransportClosed for '{}' — attempting reconnect + retry",
                                     reconnect_server_name
@@ -684,18 +647,22 @@ impl McpManager {
                                     .await
                                 {
                                     Ok(()) => {
-                                        // Retry once with the fresh service
-                                        let servers = reconnect_manager.servers.lock().await;
-                                        if let Some(fresh_client) =
-                                            servers.get(&reconnect_server_name)
-                                        {
-                                            if let McpClientType::Service(ref fresh_svc) =
-                                                fresh_client.service
-                                            {
-                                                let retry_request = CallToolRequestParam {
-                                                    name: tool.name.clone(),
-                                                    arguments: Some(arguments),
-                                                };
+                                        // Clone the fresh service out and release the
+                                        // `servers` lock before the network await.
+                                        let fresh = {
+                                            let servers = reconnect_manager.servers.lock().await;
+                                            servers.get(&reconnect_server_name).map(|c| {
+                                                match &c.service {
+                                                    McpClientType::Service(svc) => Some(svc.clone()),
+                                                    _ => None,
+                                                }
+                                            })
+                                        };
+                                        match fresh {
+                                            Some(Some(fresh_svc)) => {
+                                                let retry_request =
+                                                    CallToolRequestParams::new(tool.name.clone())
+                                                        .with_arguments(arguments);
                                                 match fresh_svc.call_tool(retry_request).await {
                                                     Ok(result) => {
                                                         tracing::info!(
@@ -710,17 +677,15 @@ impl McpManager {
                                                         retry_e
                                                     )),
                                                 }
-                                            } else {
-                                                Err(format!(
-                                                    "Server '{}' is not a stdio service after reconnect",
-                                                    reconnect_server_name
-                                                ))
                                             }
-                                        } else {
-                                            Err(format!(
+                                            Some(None) => Err(format!(
+                                                "Server '{}' is not a stdio service after reconnect",
+                                                reconnect_server_name
+                                            )),
+                                            None => Err(format!(
                                                 "Server '{}' not found after reconnect",
                                                 reconnect_server_name
-                                            ))
+                                            )),
                                         }
                                     }
                                     Err(reconnect_err) => Err(format!(
@@ -830,12 +795,9 @@ impl McpManager {
                                     "hint": "To use tools from an app, call COMPOSIO_GET_APP_TOOLS with the app's name or slug."
                                 })).unwrap_or_default();
 
-                                Ok(CallToolResult {
-                                    content: vec![rmcp::model::Content::text(content_text)],
-                                    is_error: Some(false),
-                                    structured_content: None,
-                                    meta: None,
-                                })
+                                Ok(CallToolResult::success(vec![ContentBlock::text(
+                                    content_text,
+                                )]))
                             }
                             Err(e) => Err(format!("App discovery failed: {}", e)),
                         }
@@ -979,12 +941,9 @@ impl McpManager {
                                         format!("{{\"error\": \"Failed to format tool list for '{}'\"}}", app_name)
                                     });
 
-                                    Ok(CallToolResult {
-                                        content: vec![rmcp::model::Content::text(content_text)],
-                                        is_error: Some(false),
-                                        structured_content: None,
-                                        meta: None,
-                                    })
+                                    Ok(CallToolResult::success(vec![ContentBlock::text(
+                                        content_text,
+                                    )]))
                                 }
                                 Err(e) => Err(format!(
                                     "Failed to get tools for app '{}': {}",
@@ -1005,15 +964,10 @@ impl McpManager {
                             dyn_profile_key
                         );
 
-                        Ok(CallToolResult {
-                            content: vec![rmcp::model::Content::text(format!(
-                                "Cleared {} dynamically discovered tools from the session.",
-                                cleared_count
-                            ))],
-                            is_error: Some(false),
-                            structured_content: None,
-                            meta: None,
-                        })
+                        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+                            "Cleared {} dynamically discovered tools from the session.",
+                            cleared_count
+                        ))]))
                     } else if tool.name == "COMPOSIO_EXECUTE_TOOL" {
                         // Extract tool_name and arguments - handle missing tool_name as error
                         match args.get("tool_name").and_then(|v| v.as_str()) {
@@ -1057,12 +1011,14 @@ impl McpManager {
                                                 .unwrap_or_else(|| "Unknown error".to_string())
                                         };
 
-                                        Ok(CallToolResult {
-                                            content: vec![rmcp::model::Content::text(content_text)],
-                                            is_error: Some(!response.successful),
-                                            structured_content: Some(response.data),
-                                            meta: None,
-                                        })
+                                        let content = vec![ContentBlock::text(content_text)];
+                                        let mut result = if response.successful {
+                                            CallToolResult::success(content)
+                                        } else {
+                                            CallToolResult::error(content)
+                                        };
+                                        result.structured_content = Some(response.data);
+                                        Ok(result)
                                     }
                                     Err(e) => Err(format!("Tool execution failed: {}", e)),
                                 }
@@ -1095,48 +1051,36 @@ impl McpManager {
                                         .unwrap_or_else(|| "Unknown error".to_string())
                                 };
 
-                                let content = rmcp::model::Content::text(content_text);
+                                let content = vec![ContentBlock::text(content_text)];
 
-                                // Create metadata with log_id and session_info if available
-                                let mut meta_map = serde_json::Map::new();
+                                // Create metadata with log_id and session_info if available.
+                                // Values are stored as strings (non-string session_info is
+                                // stringified), matching what the result carried before.
+                                let mut meta = MetaObject::new();
                                 if let Some(log_id) = response.log_id {
-                                    meta_map.insert(
+                                    meta.insert(
                                         "log_id".to_string(),
                                         serde_json::Value::String(log_id),
                                     );
                                 }
                                 if let Some(session_info) = response.session_info {
-                                    meta_map.insert("session_info".to_string(), session_info);
+                                    let session_info = match session_info {
+                                        serde_json::Value::String(s) => s,
+                                        other => other.to_string(),
+                                    };
+                                    meta.insert(
+                                        "session_info".to_string(),
+                                        serde_json::Value::String(session_info),
+                                    );
                                 }
 
-                                // Create metadata with log_id and session_info if available
-                                let meta = if !meta_map.is_empty() {
-                                    // Convert our map to a HashMap<String, String> for Meta
-                                    let mut string_map = std::collections::HashMap::new();
-                                    for (key, value) in meta_map {
-                                        let string_value = match value {
-                                            serde_json::Value::String(s) => s,
-                                            _ => value.to_string(),
-                                        };
-                                        string_map.insert(key, string_value);
-                                    }
-
-                                    // Create a Meta object from our HashMap
-                                    let mut meta_obj = rmcp::model::Meta::new();
-                                    for (key, value) in string_map {
-                                        meta_obj.insert(key, serde_json::Value::String(value));
-                                    }
-                                    Some(meta_obj)
+                                let mut result = if response.successful {
+                                    CallToolResult::success(content)
                                 } else {
-                                    None
+                                    CallToolResult::error(content)
                                 };
-
-                                Ok(CallToolResult {
-                                    content: vec![content],
-                                    is_error: Some(!response.successful),
-                                    structured_content: Some(response.data),
-                                    meta,
-                                })
+                                result.structured_content = Some(response.data);
+                                Ok(result.with_meta((!meta.is_empty()).then_some(meta)))
                             }
                             Err(e) => Err(format!("Composio tool execution failed: {}", e)),
                         }
@@ -1157,7 +1101,7 @@ impl McpManager {
     pub async fn process_tool_output(
         mut receiver: UnboundedReceiver<Result<CallToolResult, String>>,
     ) -> (ToolCallStatus, String, bool) {
-        let mut aggregated_content: Vec<rmcp::model::Content> = Vec::new();
+        let mut aggregated_content: Vec<ContentBlock> = Vec::new();
         let mut final_status = ToolCallStatus::Completed;
         let mut error_string = None;
 
@@ -1210,5 +1154,62 @@ impl McpManager {
                 )
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_meta_tools_keep_names_and_required_fields() {
+        let tools = get_local_meta_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        assert_eq!(names, ["MCP_LOAD_SERVER_TOOLS", "MCP_UNLOAD_SERVER_TOOLS"]);
+        for tool in &tools {
+            assert!(tool.title.is_none());
+            assert!(tool.description.as_deref().is_some_and(|d| !d.is_empty()));
+            assert_eq!(
+                tool.input_schema.get("type"),
+                Some(&serde_json::json!("object"))
+            );
+            assert_eq!(
+                tool.input_schema.get("required"),
+                Some(&serde_json::json!(["server_name"]))
+            );
+            assert!(tool.input_schema["properties"]["server_name"].is_object());
+        }
+    }
+
+    async fn process(result: CallToolResult) -> (ToolCallStatus, String, bool) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Ok(result)).unwrap();
+        drop(tx);
+        McpManager::process_tool_output(rx).await
+    }
+
+    #[tokio::test]
+    async fn process_tool_output_detects_auth_url() {
+        let (status, response, is_permission) =
+            process(CallToolResult::success(vec![ContentBlock::text(
+                "Authentication required. Please connect your account: https://x",
+            )]))
+            .await;
+        assert_eq!(status, ToolCallStatus::AuthRequired);
+        assert_eq!(response, "https://x");
+        assert!(!is_permission);
+    }
+
+    #[tokio::test]
+    async fn process_tool_output_serializes_plain_text() {
+        let (status, response, is_permission) =
+            process(CallToolResult::success(vec![ContentBlock::text("hello")])).await;
+        assert_eq!(status, ToolCallStatus::Completed);
+        assert!(!is_permission);
+        let parsed: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([{ "type": "text", "text": "hello" }])
+        );
     }
 }

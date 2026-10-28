@@ -670,4 +670,47 @@ mod tests {
             Some(vec!["open".to_string(), "closed".to_string()])
         );
     }
+
+    #[test]
+    fn test_mcp_tool_to_gemini_from_rmcp3_tool_json() {
+        // A server-style tool as rmcp 3.x deserializes it: anyOf + $schema in the input schema.
+        let tool: rmcp::model::Tool = serde_json::from_value(json!({
+            "name": "do.thing",
+            "description": "Does a thing",
+            "inputSchema": {
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "anyOf": [{ "type": "string" }, { "type": "null" }],
+                        "description": "A value"
+                    },
+                    "count": { "type": "integer" }
+                },
+                "required": ["count"]
+            }
+        }))
+        .unwrap();
+
+        let decl = mcp_tool_to_gemini(&tool, "My Server").unwrap();
+        assert_eq!(decl.name, get_prefixed_tool_name("My Server", "do.thing"));
+        assert!(
+            decl.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'),
+            "{}",
+            decl.name
+        );
+        assert_eq!(decl.description.as_deref(), Some("Does a thing"));
+
+        let params = decl.parameters.unwrap();
+        assert_eq!(params.schema_type, SchemaType::Object);
+        let props = params.properties.clone().unwrap();
+        assert_eq!(props.get("value").unwrap().schema_type, SchemaType::String);
+        assert_eq!(props.get("count").unwrap().schema_type, SchemaType::Integer);
+
+        let wire = serde_json::to_value(&params).unwrap();
+        assert_eq!(wire["type"], "OBJECT");
+        assert_eq!(wire["properties"]["value"]["type"], "STRING");
+        assert_eq!(wire["properties"]["count"]["type"], "INTEGER");
+        assert!(wire.get("$schema").is_none());
+    }
 }

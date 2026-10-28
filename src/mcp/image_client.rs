@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content, Tool};
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Tool};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,7 +14,6 @@ impl ImageClient {
     }
 
     pub fn list_tools(&self) -> Vec<Tool> {
-        use std::sync::Arc;
         
         let schema_val = serde_json::json!({
             "type": "object",
@@ -31,16 +30,11 @@ impl ImageClient {
             "required": ["prompt"]
         });
         
-        vec![Tool {
-            name: "generate_image".into(),
-            description: Some("Generate or edit an image. Use with just a prompt for new images, or include a reference_image path to modify a previously generated image.".into()),
-            input_schema: Arc::new(serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(schema_val).unwrap()),
-            title: Some("generate_image".to_string()),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        }]
+        vec![Tool::new(
+            "generate_image",
+            "Generate or edit an image. Use with just a prompt for new images, or include a reference_image path to modify a previously generated image.",
+            serde_json::from_value::<JsonObject>(schema_val).unwrap(),
+        ).with_title("generate_image")]
     }
 
     /// Execute the generate_image tool via the Gemini REST API.
@@ -163,11 +157,11 @@ impl ImageClient {
             .and_then(|p| p.as_array())
             .ok_or_else(|| "Unexpected response format from Gemini image API".to_string())?;
 
-        let mut result_contents: Vec<Content> = Vec::new();
+        let mut result_contents: Vec<ContentBlock> = Vec::new();
 
         for part in parts {
             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                result_contents.push(Content::text(text.to_string()));
+                result_contents.push(ContentBlock::text(text.to_string()));
             } else if let Some(inline_data) = part.get("inlineData") {
                 let mime_type = inline_data.get("mimeType").and_then(|m| m.as_str()).unwrap_or("image/png");
                 let data_b64 = inline_data.get("data").and_then(|d| d.as_str()).unwrap_or_default();
@@ -195,11 +189,11 @@ impl ImageClient {
                         // URL-encode the path (spaces in 'Application Support' break markdown URL parsing)
                         let encoded_path = path.to_string_lossy().replace(' ', "%20");
                         let markdown = format!("![Generated Image](file://{})", encoded_path);
-                        result_contents.push(Content::text(markdown));
+                        result_contents.push(ContentBlock::text(markdown));
                     }
                     Err(e) => {
                         tracing::warn!("Failed to decode/save generated image: {}", e);
-                        result_contents.push(Content::text(format!("Image generated but failed to save: {}", e)));
+                        result_contents.push(ContentBlock::text(format!("Image generated but failed to save: {}", e)));
                     }
                 }
             }
@@ -209,12 +203,7 @@ impl ImageClient {
             return Err("Gemini API returned no image or text content".to_string());
         }
 
-        Ok(CallToolResult {
-            content: result_contents,
-            is_error: Some(false),
-            structured_content: None,
-            meta: None,
-        })
+        Ok(CallToolResult::success(result_contents))
     }
 }
 

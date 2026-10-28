@@ -14,7 +14,7 @@ The architecture is designed to integrate both external long-term memory and int
 
 ```mermaid
 graph TD
-    subgraph "MCP Servers (Launched as Child Processes)"
+    subgraph "MCP Servers (Child Processes or Streamable HTTP Endpoints)"
         A[ConPort/Graphiti MCP] -- "Provides strategic context" --> L;
         B[Composio Embedded MCP] -- "Provides access to tools defined by Admins in platform.composio.com" --> L;
         C[Filesystem MCP] -- "Provides workspace data" --> L;
@@ -85,6 +85,7 @@ graph TD
 
 -   **`LlmConnector`**: A trait that defines a generic interface for interacting with different LLM providers. The application initializes a concrete implementation (e.g., `GeminiConnector`) based on user settings and provides it to the application context.
 -   **`McpManager`**: A central service responsible for managing the lifecycle of all MCP servers. It manages both local child processes (standard MCP) and remote **Composio Integration (custom MCP)**.
+    -   **Remote Transport**: Network servers connect over Streamable HTTP only (rmcp 3.8, client side). `mcp/client_transport.rs` owns the connection: `plan_remote_endpoint` decides headers per host, and a legacy `/sse` URL is retried once at `/mcp`. Legacy HTTP+SSE is unsupported. `mcp/redirect_policy.rs` owns same-origin redirects for credentialed reqwest clients (see P-018).
     -   **Composio Integration**: Implements an "Explicit Configuration" pattern. Instead of auto-provisioning shared servers, it respects the specific `MCP_CONFIG_ID` embedded in the user's connection URL.
     -   **Auth Flow**: It strictly separates Auth Config creation (POST) from Server Association (PATCH). A crucial step is explicitly patching the MCP server with `auth_config_ids` and `allowed_tools` to enable functionality.
     -   **Tool Loading**: It handles tool enumeration via the MCP Protocol (`tools/list`). It implements smart prefix matching (e.g., matching `NEWS_API_*` to `news_api` toolkit) to correctly associate tools with their parent toolkits, ensuring correct counts even when metadata is sparse.

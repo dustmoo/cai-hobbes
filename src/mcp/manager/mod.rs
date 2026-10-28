@@ -1,10 +1,10 @@
 use crate::context::permissions::PermissionManager;
+use crate::mcp::client_transport::McpService;
 use crate::mcp::composio_client::ComposioClient;
 use crate::SecretManagerTrait;
 use dioxus::prelude::Signal;
 use dioxus_signals::Readable;
 use rmcp::model::Tool;
-use rmcp::service::{RoleClient, RunningService};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -218,7 +218,7 @@ impl McpServerStatus {
 
 #[derive(Clone)]
 pub enum McpClientType {
-    Service(Arc<RunningService<RoleClient, ()>>),
+    Service(Arc<McpService>),
     NativeComposio(Arc<crate::mcp::composio_client::ComposioClient>),
     NativeImage(Arc<crate::mcp::image_client::ImageClient>),
     /// Built-in Hobbes session tools (HOBBES_PAGE_RESULT, HOBBES_UPDATE_SCRATCHPAD).

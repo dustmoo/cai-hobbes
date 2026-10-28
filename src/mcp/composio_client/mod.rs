@@ -65,6 +65,8 @@ impl ComposioClient {
     ) -> Self {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            // Every request carries x-api-key; never let a redirect carry it off-origin.
+            .redirect(crate::mcp::redirect_policy::same_origin_redirect_policy())
             .build()
             .unwrap_or_default();
 

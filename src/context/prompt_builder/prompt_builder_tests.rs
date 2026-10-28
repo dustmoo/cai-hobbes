@@ -488,16 +488,7 @@ fn historical_tool_result_uses_summary_when_available() {
 // =========================================================================
 
 fn invoke_skill_tool() -> rmcp::model::Tool {
-    rmcp::model::Tool {
-        name: "HOBBES_INVOKE_SKILL".into(),
-        description: Some("Load a skill".into()),
-        input_schema: std::sync::Arc::new(serde_json::Map::new()),
-        title: None,
-        output_schema: None,
-        annotations: None,
-        icons: None,
-        meta: None,
-    }
+    rmcp::model::Tool::new("HOBBES_INVOKE_SKILL", "Load a skill", serde_json::Map::new())
 }
 
 fn session_with_core_tools() -> Session {

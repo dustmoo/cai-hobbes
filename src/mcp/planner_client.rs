@@ -1,4 +1,4 @@
-use rmcp::model::Tool;
+use rmcp::model::{JsonObject, Tool};
 
 /// Native virtual MCP client for the built-in planner (`hobbes-planner`).
 ///
@@ -87,19 +87,17 @@ impl PlannerClient {
     }
 
     pub fn list_tools(&self) -> Vec<Tool> {
-        use std::sync::Arc;
 
         vec![
-            Tool {
-                name: "HOBBES_TODO_CREATE".into(),
-                description: Some(format!(
+            Tool::new(
+                "HOBBES_TODO_CREATE",
+                format!(
                     "Create one or more todos in the user's planner. Pass an array so a \
                     whole capture session is one call. Dates are YYYY-MM-DD (or the \
                     literal strings 'today' / 'tomorrow'). {} {}",
                     LANE_NOTE, SHARED_NOTE
-                ).into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                ),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "todos": {
@@ -130,27 +128,19 @@ impl PlannerClient {
                             }
                         },
                         "required": ["todos"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Create Todos".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_TODO_UPDATE".into(),
-                description: Some(format!(
+                    })).unwrap_or_default(),
+            ).with_title("Create Todos"),
+            Tool::new(
+                "HOBBES_TODO_UPDATE",
+                format!(
                     "Update one or more todos: patch any mutable field, or set 'status' to \
                     complete, cancel, or reopen them. Setting status to in_progress starts focus mode: only one todo is ever in focus, the previous one is paused automatically with its elapsed time banked. Setting status back to 'open' on an in-progress todo pauses its timer and banks the elapsed time — this is how you stop a focus timer you started. Pass an explicit JSON null to CLEAR an \
                     optional field (scheduled_for, time_of_day, deadline, estimate_minutes, \
                     priority, project_id, kind, time_category, outcome) — omitted fields are left \
                     untouched. Replacing 'checklist' resets item completion. {} {}",
                     LANE_NOTE, SHARED_NOTE
-                ).into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                ),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "updates": {
@@ -183,25 +173,17 @@ impl PlannerClient {
                             }
                         },
                         "required": ["updates"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Update Todos".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_TODO_LIST".into(),
-                description: Some(format!(
+                    })).unwrap_or_default(),
+            ).with_title("Update Todos"),
+            Tool::new(
+                "HOBBES_TODO_LIST",
+                format!(
                     "List todos. Either pass 'view' (today, inbox, upcoming, anytime, \
                     someday, logbook) or any combination of the filters; with no arguments \
                     it shows today. Output is capped at 50 lines. {}",
                     SHARED_NOTE
-                ).into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                ),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "view": { "type": "string", "enum": ["today", "inbox", "upcoming", "anytime", "someday", "logbook"], "description": "Named list to show. Ignored when filters are given." },
@@ -211,18 +193,11 @@ impl PlannerClient {
                             "date_from": { "type": "string", "description": "Earliest scheduled_for to include (YYYY-MM-DD, 'today' or 'tomorrow')." },
                             "date_to": { "type": "string", "description": "Latest scheduled_for to include (YYYY-MM-DD, 'today' or 'tomorrow')." }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("List Todos".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_PLAN_DAY".into(),
-                description: Some(format!(
+                    })).unwrap_or_default(),
+            ).with_title("List Todos"),
+            Tool::new(
+                "HOBBES_PLAN_DAY",
+                format!(
                     "Plan a day, Sunsama-style: schedule the given human to-dos onto the date \
                     in the given order, apply estimate overrides, and return the capacity \
                     arithmetic (planned vs available). The response leads with the user's \
@@ -233,9 +208,8 @@ impl PlannerClient {
                     overcommits the day the response says so explicitly — surface that warning \
                     to the user instead of silently accepting it. {}",
                     SHARED_NOTE
-                ).into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                ),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "date": { "type": "string", "description": "The day to plan (YYYY-MM-DD, 'today' or 'tomorrow'). Defaults to today." },
@@ -268,18 +242,11 @@ impl PlannerClient {
                             }
                         },
                         "required": ["items"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Plan Day".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_TIME_BLOCK".into(),
-                description: Some(format!(
+                    })).unwrap_or_default(),
+            ).with_title("Plan Day"),
+            Tool::new(
+                "HOBBES_TIME_BLOCK",
+                format!(
                     "List, create, move, or delete blocks on the day timeline. To change an \
                     existing block (reschedule, shorten, push to tomorrow) MOVE it by id — list \
                     first if you don't have the id; never create a replacement and leave the \
@@ -295,9 +262,8 @@ impl PlannerClient {
                     planner_today.your_time.week) unless the user named another; any other name is \
                     tracked with no target and the response says so. {}",
                     SHARED_NOTE
-                ).into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                ),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "action": { "type": "string", "enum": ["list", "create", "move", "delete"], "description": "list: the blocks (with ids) for 'date' (default today) and 'days' (default 1, max 14). move: change an existing block's date, start, end, or title; unspecified parts are kept." },
@@ -314,48 +280,30 @@ impl PlannerClient {
                             "user_confirmed": { "type": "boolean", "description": "Move/delete of a protected your-time block: true ONLY after the user explicitly agreed in this conversation." }
                         },
                         "required": ["action"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Time Block".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_CALENDAR_LIST".into(),
-                description: Some(
+                    })).unwrap_or_default(),
+            ).with_title("Time Block"),
+            Tool::new(
+                "HOBBES_CALENDAR_LIST",
+                
                     "List the user's external calendar events (meetings and all-day events) \
                     for a range of local dates. This is READ-ONLY mirrored data from the \
                     user's calendar subscriptions, synced periodically — Hobbes cannot \
                     create, edit, or RSVP to calendar events, and the mirror may lag the \
                     real calendar by a few minutes. Use it to check availability or see \
                     commitments beyond today before planning or timeboxing work."
-                        .to_string()
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                        .to_string(),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "start_date": { "type": "string", "description": "First day to list (YYYY-MM-DD, 'today' or 'tomorrow'). Defaults to today." },
                             "days": { "type": "integer", "description": "How many days to list, starting at start_date. Default 1, max 14 (larger values are clamped)." }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("List Calendar Events".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_DISPATCH".into(),
-                description: Some(DISPATCH_DESCRIPTION.into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                    })).unwrap_or_default(),
+            ).with_title("List Calendar Events"),
+            Tool::new(
+                "HOBBES_DISPATCH",
+                DISPATCH_DESCRIPTION,
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "todo_id": { "type": "string", "description": "The todo to dispatch." },
@@ -366,18 +314,11 @@ impl PlannerClient {
                             "profile": { "type": "string", "description": "chat only: the Composio profile (whose connected accounts the worker uses) by name from the profiles list. Omit to use this tab's profile." }
                         },
                         "required": ["todo_id", "target"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Dispatch Todo".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_PROJECT_LIST".into(),
-                description: Some(
+                    })).unwrap_or_default(),
+            ).with_title("Dispatch Todo"),
+            Tool::new(
+                "HOBBES_PROJECT_LIST",
+                
                     "List the user's projects with their ids: title, aliases (other names \
                     the project answers to), area, path, status, open to-do count and last \
                     activity. 'query' filters by name (title or alias, case/punctuation \
@@ -387,56 +328,36 @@ impl PlannerClient {
                     listed first with their ids (set a project's area_id to file it). Possible \
                     duplicates are flagged: suggest merging them with HOBBES_PROJECT_MERGE (the \
                     user approves every merge), or the user can merge them in Planner \u{25b8} \
-                    Manage projects."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                    Manage projects.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "query": { "type": "string", "description": "A project name or part of one, e.g. 'hobbes'." },
                             "include_closed": { "type": "boolean", "description": "Also list completed and archived projects. Defaults to false." }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("List Projects".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_PROJECT_MERGE".into(),
-                description: Some(
+                    })).unwrap_or_default(),
+            ).with_title("List Projects"),
+            Tool::new(
+                "HOBBES_PROJECT_MERGE",
+                
                     "Merge duplicate projects: fold the projects in merge_ids into keep_id. Their \
                     to-dos and tagged chats move to keep_id, their names become its aliases, and \
                     they are removed. It can't be undone, so the user is asked to approve every \
                     merge (the prompt states what moves). Look the ids up with \
                     HOBBES_PROJECT_LIST first, and talk it through with the user before calling: \
-                    suggest which to merge and which to keep separate."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                    suggest which to merge and which to keep separate.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "keep_id": { "type": "string", "description": "The project to keep (from HOBBES_PROJECT_LIST)." },
                             "merge_ids": { "type": "array", "items": { "type": "string" }, "description": "Projects to fold into keep_id. At least one; not keep_id itself." }
                         },
                         "required": ["keep_id", "merge_ids"]
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Merge Projects".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_PROJECT_UPSERT".into(),
-                description: Some(format!(
+                    })).unwrap_or_default(),
+            ).with_title("Merge Projects"),
+            Tool::new(
+                "HOBBES_PROJECT_UPSERT",
+                format!(
                     "Create or update projects and areas. Call HOBBES_PROJECT_LIST before \
                     creating a project; prefer an existing one and pass its id. Items with an \
                     'id' patch that record. A project item without an 'id' is matched by name \
@@ -448,9 +369,8 @@ impl PlannerClient {
                     'id' that names an existing area (same name, ignoring case and punctuation) \
                     updates that area; areas are never deleted here. {}",
                     SHARED_NOTE
-                ).into()),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                ),
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "projects": {
@@ -481,18 +401,11 @@ impl PlannerClient {
                                 }
                             }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Upsert Projects & Areas".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_DECISIONS".into(),
-                description: Some(
+                    })).unwrap_or_default(),
+            ).with_title("Upsert Projects & Areas"),
+            Tool::new(
+                "HOBBES_DECISIONS",
+                
                     "The decision queue: agent to-dos waiting on the user's judgment. \
                     'list' (default) shows each question with its options, estimated decision \
                     time, worker and brief. 'resolve' records the user's answer (todo_id, \
@@ -501,11 +414,8 @@ impl PlannerClient {
                     gave. Permission gates cannot be resolved here — the user approves those in \
                     the Fleet. 'ask' is for a worker (a Hobbes chat working an agent to-do) to \
                     raise a decision: todo_id, a one-line question, options, est_minutes, and \
-                    did/blocked/next; then stop and wait for the answer."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                    did/blocked/next; then stop and wait for the answer.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "action": { "type": "string", "enum": ["list", "resolve", "ask"], "description": "Defaults to list." },
@@ -519,18 +429,11 @@ impl PlannerClient {
                             "blocked": { "type": "string", "description": "ask: what you are blocked on." },
                             "next": { "type": "string", "description": "ask: what you will do once answered." }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Decision Queue".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
-            Tool {
-                name: "HOBBES_TIME_GOALS".into(),
-                description: Some(
+                    })).unwrap_or_default(),
+            ).with_title("Decision Queue"),
+            Tool::new(
+                "HOBBES_TIME_GOALS",
+                
                     "The user's your-time goals: weekly targets for what their time is FOR \
                     (reading, gaming, getting outside…), and this week's progress against \
                     them (protected your-time blocks plus time logged on your-time to-dos). \
@@ -538,11 +441,8 @@ impl PlannerClient {
                     no goal; 'set' upserts goals by category, renames categories in 'rename' \
                     (blocks and to-dos move along; renaming into an existing goal merges into it), \
                     and removes goals listed in 'remove' (their blocks stay). Only set goals the \
-                    user stated."
-                        .into(),
-                ),
-                input_schema: Arc::new(
-                    serde_json::from_value(serde_json::json!({
+                    user stated.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
                         "type": "object",
                         "properties": {
                             "action": { "type": "string", "enum": ["get", "set"], "description": "Defaults to get." },
@@ -570,15 +470,8 @@ impl PlannerClient {
                             },
                             "remove": { "type": "array", "items": { "type": "string" }, "description": "set: goals to delete (their blocks stay, tracked without a target)." }
                         }
-                    }))
-                    .unwrap_or_default(),
-                ),
-                title: Some("Your-Time Goals".to_string()),
-                output_schema: None,
-                annotations: None,
-                icons: None,
-                meta: None,
-            },
+                    })).unwrap_or_default(),
+            ).with_title("Your-Time Goals"),
         ]
     }
 
@@ -589,10 +482,9 @@ impl PlannerClient {
     /// other session regardless.
     #[cfg_attr(not(test), allow(dead_code))] // consumer: the agent-time runtime (wave 2)
     pub fn agent_time_tools() -> Vec<Tool> {
-        use std::sync::Arc;
-        vec![Tool {
-            name: "HOBBES_AGENT_TIME".into(),
-            description: Some(
+        vec![Tool::new(
+            "HOBBES_AGENT_TIME",
+            
                 "Your granted agent time: a window in which you do finished work in the open, \
                 ending in one review the user reads later. start(intent, todo_id?) first — \
                 declare what you will do and why, in one or two lines; pass todo_id only for a \
@@ -614,11 +506,8 @@ impl PlannerClient {
                 automatically; log(summary) is an optional note on your next step. Never \
                 change the user's to-dos, plan or anything outside Hobbes directly. \
                 end(summary) closes the session. Refused when the grant, day, minutes or \
-                spend cap don't allow it."
-                    .into(),
-            ),
-            input_schema: Arc::new(
-                serde_json::from_value(serde_json::json!({
+                spend cap don't allow it.",
+            serde_json::from_value::<JsonObject>(serde_json::json!({
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "enum": ["start", "log", "deliver", "propose", "ask", "end"] },
@@ -635,15 +524,8 @@ impl PlannerClient {
                         "options": { "type": "array", "items": { "type": "string" }, "description": "ask: suggested answers (up to 6)." }
                     },
                     "required": ["action"]
-                }))
-                .unwrap_or_default(),
-            ),
-            title: Some("Agent Time".to_string()),
-            output_schema: None,
-            annotations: None,
-            icons: None,
-            meta: None,
-        }]
+                })).unwrap_or_default(),
+        ).with_title("Agent Time")]
     }
 }
 

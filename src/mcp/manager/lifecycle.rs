@@ -6,18 +6,39 @@ use super::{
     HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER, HOBBES_TERMINAL_SERVER,
 };
 use crate::components::smithery_registry::SmitheryServerDetail;
-use crate::mcp::authenticated_sse::AuthenticatedClientError;
+use crate::mcp::client_transport::{self, McpService, MCP_INIT_TIMEOUT};
 use crate::mcp::composio_client::{composio_to_rmcp_tool, ComposioClient};
 use dioxus::prelude::spawn;
 use dioxus_signals::{Readable, Writable};
-use rmcp::model::PaginatedRequestParam;
+use rmcp::model::{PaginatedRequestParams, Tool};
 use rmcp::service::ServiceExt;
 use rmcp::transport::child_process::TokioChildProcess;
-use rmcp::transport::sse_client::SseTransportError;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc::{self};
+
+/// Fetch every page of a server's tool list.
+///
+/// Stops when `nextCursor` is missing OR empty: some servers send
+/// `"nextCursor": ""` on the last page, and treating that as "more pages"
+/// would re-request the first page forever (which is why rmcp's
+/// `list_all_tools()` is not used here — it only stops on a missing cursor).
+async fn fetch_all_tools(service: &McpService) -> Result<Vec<Tool>, rmcp::ServiceError> {
+    let mut all_tools = Vec::new();
+    let mut params: Option<PaginatedRequestParams> = None;
+    loop {
+        let result = service.list_tools(params.take()).await?;
+        all_tools.extend(result.tools);
+        match result.next_cursor {
+            Some(cursor) if !cursor.is_empty() => {
+                params = Some(PaginatedRequestParams::default().with_cursor(Some(cursor)));
+            }
+            _ => break,
+        }
+    }
+    Ok(all_tools)
+}
 
 impl McpManager {
     /// Remove dynamically loaded tools belonging to `server_name` from the
@@ -223,7 +244,9 @@ impl McpManager {
                     .await;
 
                 // Get the full, updated context and set the signal
-                let new_context = self_clone_for_receiver.get_active_profile_mcp_context().await;
+                let new_context = self_clone_for_receiver
+                    .get_active_profile_mcp_context()
+                    .await;
                 mcp_context_signal_clone_for_receiver.set(new_context);
                 tracing::info!(
                     "Successfully added '{}' and updated MCP context atomically.",
@@ -570,115 +593,61 @@ impl McpManager {
                             }
                         });
                     }
-                    // Network-based server (SSE)
+                    // Network-based server (Streamable HTTP)
                     tracing::info!(
                         "Connecting to network MCP server '{}' at {}",
                         server_name,
                         crate::log_utils::redact_url(&uri)
                     );
-                    // For SSE servers, auth tokens should be provided via env vars by the CLI
-                    // or directly in the server config as needed
-
-                    // Use authenticated transport for Bearer token support (API keys, etc.)
-                    // Check if there is a COMPOSIO_API_KEY in the env and use it
-                    let auth_token = server_config_clone.env.get("COMPOSIO_API_KEY").cloned();
-
-                    // If connecting to Composio, ensure transport=sse param is present
-                    // Using POST as confirmed by manual curl test
-                    let mut final_uri = uri.clone();
-                    let use_post = if uri.contains("composio.dev") {
-                        if !final_uri.contains("transport=sse") {
-                            let separator = if final_uri.contains('?') { "&" } else { "?" };
-                            final_uri = format!("{}{}transport=sse", final_uri, separator);
-                        }
-                        true // Use POST for Composio
-                    } else {
-                        false
-                    };
-
-                    // For Composio POST requests, we need both POST method AND correct headers/body
-                    // authenticated_sse handles the headers/body logic when use_post is true
-                    let auth_header = if uri.contains("composio.dev") {
-                        Some("x-api-key".to_string())
-                    } else {
-                        None
-                    };
-                    let auth_prefix = if uri.contains("composio.dev") {
-                        Some("".to_string())
-                    } else {
-                        None
-                    };
-
-                    let transport =
-                        match crate::mcp::authenticated_sse::create_authenticated_transport(
-                            &final_uri,
-                            auth_token,
-                            use_post,
-                            auth_header,
-                            auth_prefix,
-                        )
-                        .await
-                        {
-                            Ok(t) => t,
-                            Err(e) => {
-                                let mut auth_url = None;
-                                let mut is_auth_error = false;
-
-                                // Check specific error type
-                                if let SseTransportError::Client(
-                                    AuthenticatedClientError::AuthRequired(url),
-                                ) = &e
-                                {
-                                    auth_url = Some(url.clone());
-                                    is_auth_error = true;
-                                }
-
-                                let error_msg = format!("Failed to start SSE transport: {}", e);
-                                if !is_auth_error {
-                                    is_auth_error = Self::is_auth_error(&error_msg);
-                                }
-
-                                tracing::error!("{}", error_msg);
-
-                                if is_auth_error {
-                                    auth_required_servers_clone.lock().await.insert(
-                                        server_name.clone(),
-                                        AuthRequiredInfo {
-                                            config: server_config_clone,
-                                            auth_url,
-                                            error_message: error_msg,
-                                            profile: None,
-                                        },
-                                    );
-                                } else {
-                                    failed_servers_clone
-                                        .lock()
-                                        .await
-                                        .insert(server_name, (server_config_clone, error_msg));
-                                }
-                                return;
-                            }
-                        };
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(300),
-                        ().serve(transport),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
+                    // Credentials are host-scoped: the COMPOSIO_API_KEY env value is
+                    // only ever sent (as x-api-key) to *.composio.dev hosts.
+                    let endpoint = match client_transport::plan_remote_endpoint(
+                        &uri,
+                        None,
+                        server_config_clone
+                            .env
+                            .get("COMPOSIO_API_KEY")
+                            .map(String::as_str),
+                    ) {
+                        Ok(endpoint) => endpoint,
+                        Err(error_msg) => {
                             tracing::error!(
-                                "Timeout waiting for MCP server '{}' to initialize",
-                                server_name
+                                "Invalid URI for MCP server '{}': {}",
+                                server_name,
+                                error_msg
                             );
-                            // Return a compatible error type or handle failure.
-                            // Since serve returns Result<RunningService, InitializeError>, we need to match that.
-                            // initialize error for RoleClient is likely ServiceError or similar.
-                            // We'll return Err(rmcp::service::ServiceError::Timeout { timeout: std::time::Duration::from_secs(300) }.into()) if convertible,
-                            // or just log and essentially fail.
-                            // actually 'serve' returns Result<RunningService<RoleClient, ()>, ...>
-                            // RoleClient::InitializeError is likely Infallible or ServiceError.
-                            // Let's check matching. For now, assuming standard error flow.
+                            failed_servers_clone
+                                .lock()
+                                .await
+                                .insert(server_name, (server_config_clone, error_msg));
+                            return;
+                        }
+                    };
+                    match client_transport::connect_remote(&endpoint, MCP_INIT_TIMEOUT).await {
+                        Ok(service) => Ok(service),
+                        Err(err) => {
+                            tracing::error!(
+                                "Failed to connect to MCP server '{}': {}",
+                                server_name,
+                                err.message
+                            );
+                            if err.auth_required || Self::is_auth_error(&err.message) {
+                                tracing::info!("Server '{}' requires authentication", server_name);
+                                auth_required_servers_clone.lock().await.insert(
+                                    server_name.clone(),
+                                    AuthRequiredInfo {
+                                        config: server_config_clone,
+                                        auth_url: None,
+                                        error_message: err.message,
+                                        profile: None,
+                                    },
+                                );
+                            } else {
+                                failed_servers_clone
+                                    .lock()
+                                    .await
+                                    .insert(server_name, (server_config_clone, err.message));
+                            }
                             return;
                         }
                     }
@@ -738,8 +707,8 @@ impl McpManager {
                     match TokioChildProcess::new(cmd) {
                         Ok(transport) => {
                             match tokio::time::timeout(
-                                std::time::Duration::from_secs(300),
-                                ().serve(transport),
+                                MCP_INIT_TIMEOUT,
+                                client_transport::hobbes_client_config().serve(transport),
                             )
                             .await
                             {
@@ -769,58 +738,39 @@ impl McpManager {
                         tracing::trace!("Connected to MCP server: {}", server_name);
 
                         // Fetch all pages of tools
-                        let mut all_tools = Vec::new();
-                        let mut next_cursor: Option<String> = None;
-
-                        loop {
-                            let cursor = next_cursor.clone();
-                            let request_param =
-                                cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
-
-                            match service.list_tools(request_param).await {
-                                Ok(result) => {
-                                    all_tools.extend(result.tools);
-
-                                    if let Some(cursor) = result.next_cursor {
-                                        if !cursor.is_empty() {
-                                            next_cursor = Some(cursor);
-                                            continue;
-                                        }
-                                    }
-                                    break;
-                                }
-                                Err(e) => {
-                                    let error_msg = format!("Failed to list tools: {}", e);
-                                    tracing::error!(
-                                        "Failed to list tools for '{}': {}",
-                                        server_name,
-                                        e
+                        let all_tools = match fetch_all_tools(&service).await {
+                            Ok(tools) => tools,
+                            Err(e) => {
+                                let error_msg = format!("Failed to list tools: {}", e);
+                                tracing::error!(
+                                    "Failed to list tools for '{}': {}",
+                                    server_name,
+                                    e
+                                );
+                                // Check if this is an auth error
+                                if Self::is_auth_error(&error_msg) {
+                                    tracing::info!(
+                                        "Server '{}' requires authentication",
+                                        server_name
                                     );
-                                    // Check if this is an auth error
-                                    if Self::is_auth_error(&error_msg) {
-                                        tracing::info!(
-                                            "Server '{}' requires authentication",
-                                            server_name
-                                        );
-                                        auth_required_servers_clone.lock().await.insert(
-                                            server_name.clone(),
-                                            AuthRequiredInfo {
-                                                config: server_config_clone,
-                                                auth_url: None, // TODO: Extract from error if available
-                                                error_message: error_msg,
-                                                profile: None,
-                                            },
-                                        );
-                                    } else {
-                                        failed_servers_clone.lock().await.insert(
-                                            server_name.clone(),
-                                            (server_config_clone, error_msg),
-                                        );
-                                    }
-                                    return;
+                                    auth_required_servers_clone.lock().await.insert(
+                                        server_name.clone(),
+                                        AuthRequiredInfo {
+                                            config: server_config_clone,
+                                            auth_url: None, // TODO: Extract from error if available
+                                            error_message: error_msg,
+                                            profile: None,
+                                        },
+                                    );
+                                } else {
+                                    failed_servers_clone.lock().await.insert(
+                                        server_name.clone(),
+                                        (server_config_clone, error_msg),
+                                    );
                                 }
+                                return;
                             }
-                        }
+                        };
 
                         tracing::trace!(
                             "Discovered {} capabilities for MCP server: {}",
@@ -845,7 +795,9 @@ impl McpManager {
                         let error_msg = format!("Failed to serve: {}", e);
                         tracing::error!("Failed to serve MCP server '{}': {}", server_name, e);
                         // Check if this is an auth error
-                        if Self::is_auth_error(&error_msg) {
+                        let is_auth =
+                            e.is_authorization_required() || Self::is_auth_error(&error_msg);
+                        if is_auth {
                             tracing::info!("Server '{}' requires authentication", server_name);
                             auth_required_servers_clone.lock().await.insert(
                                 server_name,
@@ -1170,7 +1122,7 @@ impl McpManager {
             }
 
             let service_result = if let Some(uri) = effective_config.uri.clone() {
-                // Network-based server (SSE)
+                // Network-based server (Streamable HTTP)
                 if let Some(command_string) = effective_config.command.clone() {
                     let server_name_clone = server_name.clone();
                     let server_config_clone_for_spawn = effective_config.clone();
@@ -1209,85 +1161,48 @@ impl McpManager {
                     server_name,
                     crate::log_utils::redact_url(&uri)
                 );
-                // For SSE servers, auth tokens should be provided via env vars
-                // or directly in the server config as needed
-
-                // Use authenticated transport for Bearer token support (API keys, etc.)
-                // Priority: Explicit access_token > COMPOSIO_API_KEY from env
-                let token_to_use = access_token_clone
-                    .clone()
-                    .or_else(|| effective_config.env.get("COMPOSIO_API_KEY").cloned());
-
-                // If connecting to Composio, ensure transport=sse param is present
-                // Using POST as confirmed by manual curl test
-                let mut final_uri = uri.clone();
-                let use_post = if uri.contains("composio.dev") {
-                    if !final_uri.contains("transport=sse") {
-                        let separator = if final_uri.contains('?') { "&" } else { "?" };
-                        final_uri = format!("{}{}transport=sse", final_uri, separator);
+                // Credentials are host-scoped: an explicit access token goes as a
+                // Bearer token; the COMPOSIO_API_KEY env value is only ever sent
+                // (as x-api-key) to *.composio.dev hosts.
+                let endpoint = match client_transport::plan_remote_endpoint(
+                    &uri,
+                    access_token_clone.as_deref(),
+                    effective_config
+                        .env
+                        .get("COMPOSIO_API_KEY")
+                        .map(String::as_str),
+                ) {
+                    Ok(endpoint) => endpoint,
+                    Err(error_msg) => {
+                        tracing::error!(
+                            "Invalid URI for MCP server '{}': {}",
+                            server_name,
+                            error_msg
+                        );
+                        failed_servers_clone
+                            .lock()
+                            .await
+                            .insert(server_name, (server_config_clone, error_msg));
+                        self_clone.invalidate_status_cache_async().await;
+                        return;
                     }
-                    true // Use POST for Composio
-                } else {
-                    false
                 };
-
-                // Debug log for URI
-                tracing::debug!(
-                    "Final Composio URI (use_post={}): {}",
-                    use_post,
-                    crate::log_utils::redact_url(&final_uri)
-                );
-
-                // For Composio POST requests, we need both POST method AND correct headers/body
-                // authenticated_sse handles the headers/body logic when use_post is true
-                let auth_header = if uri.contains("composio.dev") {
-                    Some("x-api-key".to_string())
-                } else {
-                    None
-                };
-                let auth_prefix = if uri.contains("composio.dev") {
-                    Some("".to_string())
-                } else {
-                    None
-                };
-                let transport = match crate::mcp::authenticated_sse::create_authenticated_transport(
-                    &final_uri,
-                    token_to_use,
-                    use_post,
-                    auth_header,
-                    auth_prefix,
-                )
-                .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let mut auth_url = None;
-                        let mut is_auth_error = false;
-
-                        // Check specific error type
-                        if let SseTransportError::Client(AuthenticatedClientError::AuthRequired(
-                            url,
-                        )) = &e
-                        {
-                            auth_url = Some(url.clone());
-
-                            is_auth_error = true;
-                        }
-
-                        let error_msg = format!("Failed to start SSE transport: {}", e);
-                        if !is_auth_error {
-                            is_auth_error = Self::is_auth_error(&error_msg);
-                        }
-
-                        tracing::error!("{}", error_msg);
-
-                        if is_auth_error {
+                match client_transport::connect_remote(&endpoint, MCP_INIT_TIMEOUT).await {
+                    Ok(service) => Ok(service),
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to connect to MCP server '{}': {}",
+                            server_name,
+                            err.message
+                        );
+                        if err.auth_required || Self::is_auth_error(&err.message) {
+                            tracing::info!("Server '{}' requires authentication", server_name);
                             auth_required_servers_clone.lock().await.insert(
                                 server_name.clone(),
                                 AuthRequiredInfo {
                                     config: server_config_clone,
-                                    auth_url,
-                                    error_message: error_msg,
+                                    auth_url: None,
+                                    error_message: err.message,
                                     profile: None,
                                 },
                             );
@@ -1295,13 +1210,12 @@ impl McpManager {
                             failed_servers_clone
                                 .lock()
                                 .await
-                                .insert(server_name, (server_config_clone, error_msg));
+                                .insert(server_name, (server_config_clone, err.message));
                         }
                         self_clone.invalidate_status_cache_async().await;
                         return;
                     }
-                };
-                ().serve(transport).await
+                }
             } else {
                 // Stdio-based server
                 tracing::trace!("Launching stdio MCP server: {}", server_name);
@@ -1352,7 +1266,11 @@ impl McpManager {
                 }
 
                 match TokioChildProcess::new(cmd) {
-                    Ok(transport) => ().serve(transport).await,
+                    Ok(transport) => {
+                        client_transport::hobbes_client_config()
+                            .serve(transport)
+                            .await
+                    }
                     Err(e) => {
                         tracing::error!(
                             "Failed to launch stdio MCP server '{}': {}",
@@ -1369,60 +1287,33 @@ impl McpManager {
                     tracing::trace!("Connected to MCP server: {}", server_name);
 
                     // Fetch all pages of tools
-                    let mut all_tools = Vec::new();
-                    let mut next_cursor: Option<String> = None;
-
-                    loop {
-                        let cursor = next_cursor.clone();
-                        // Same here for the retry_server function
-                        let request_param =
-                            cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
-
-                        match service.list_tools(request_param).await {
-                            Ok(result) => {
-                                all_tools.extend(result.tools);
-
-                                if let Some(cursor) = result.next_cursor {
-                                    if !cursor.is_empty() {
-                                        next_cursor = Some(cursor);
-                                        continue;
-                                    }
-                                }
-                                break;
-                            }
-                            Err(e) => {
-                                let error_msg = format!("Failed to list tools: {}", e);
-                                tracing::error!(
-                                    "Failed to list tools for '{}': {}",
-                                    server_name,
-                                    e
+                    let all_tools = match fetch_all_tools(&service).await {
+                        Ok(tools) => tools,
+                        Err(e) => {
+                            let error_msg = format!("Failed to list tools: {}", e);
+                            tracing::error!("Failed to list tools for '{}': {}", server_name, e);
+                            // Check if this is an auth error
+                            if Self::is_auth_error(&error_msg) {
+                                tracing::info!("Server '{}' requires authentication", server_name);
+                                auth_required_servers_clone.lock().await.insert(
+                                    server_name.clone(),
+                                    AuthRequiredInfo {
+                                        config: server_config_clone,
+                                        auth_url: None, // TODO: Extract from error if available
+                                        error_message: error_msg,
+                                        profile: None,
+                                    },
                                 );
-                                // Check if this is an auth error
-                                if Self::is_auth_error(&error_msg) {
-                                    tracing::info!(
-                                        "Server '{}' requires authentication",
-                                        server_name
-                                    );
-                                    auth_required_servers_clone.lock().await.insert(
-                                        server_name.clone(),
-                                        AuthRequiredInfo {
-                                            config: server_config_clone,
-                                            auth_url: None, // TODO: Extract from error if available
-                                            error_message: error_msg,
-                                            profile: None,
-                                        },
-                                    );
-                                } else {
-                                    failed_servers_clone.lock().await.insert(
-                                        server_name.clone(),
-                                        (server_config_clone, error_msg),
-                                    );
-                                }
-                                self_clone.invalidate_status_cache_async().await;
-                                return;
+                            } else {
+                                failed_servers_clone
+                                    .lock()
+                                    .await
+                                    .insert(server_name.clone(), (server_config_clone, error_msg));
                             }
+                            self_clone.invalidate_status_cache_async().await;
+                            return;
                         }
-                    }
+                    };
 
                     tracing::trace!(
                         "Discovered {} capabilities for MCP server: {}",
@@ -1452,7 +1343,8 @@ impl McpManager {
                 Err(e) => {
                     let error_msg = format!("Failed to serve: {}", e);
                     tracing::error!("Failed to serve MCP server '{}': {}", server_name, e);
-                    if Self::is_auth_error(&error_msg) {
+                    let is_auth = e.is_authorization_required() || Self::is_auth_error(&error_msg);
+                    if is_auth {
                         tracing::info!("Server '{}' requires authentication", server_name);
                         auth_required_servers_clone.lock().await.insert(
                             server_name,
@@ -1488,6 +1380,15 @@ impl McpManager {
     ) -> Result<(), String> {
         tracing::info!("[RECONNECT] Restarting stdio MCP server '{}'", server_name);
 
+        // Remote servers have no child process to restart; refuse before
+        // touching the servers map so a live remote entry is never dropped.
+        if config.uri.is_some() {
+            return Err(format!(
+                "Cannot reconnect '{}': remote (HTTP) servers cannot be reconnected this way",
+                server_name
+            ));
+        }
+
         // 1. Remove the dead server entry
         {
             let mut servers = self.servers.lock().await;
@@ -1500,7 +1401,7 @@ impl McpManager {
             .as_deref()
             .ok_or_else(|| {
                 format!(
-                    "Cannot reconnect '{}': no command configured (SSE servers cannot be reconnected this way)",
+                    "Cannot reconnect '{}': no command configured (remote (HTTP) servers cannot be reconnected this way)",
                     server_name
                 )
             })?;
@@ -1550,44 +1451,26 @@ impl McpManager {
         let transport = TokioChildProcess::new(cmd)
             .map_err(|e| format!("Failed to launch stdio MCP server '{}': {}", server_name, e))?;
 
-        let service =
-            tokio::time::timeout(std::time::Duration::from_secs(300), ().serve(transport))
-                .await
-                .map_err(|_| {
-                    format!(
-                        "Timeout waiting for stdio MCP server '{}' to initialize",
-                        server_name
-                    )
-                })?
-                .map_err(|e| format!("Failed to serve MCP server '{}': {}", server_name, e))?;
+        let service = tokio::time::timeout(
+            MCP_INIT_TIMEOUT,
+            client_transport::hobbes_client_config().serve(transport),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "Timeout waiting for stdio MCP server '{}' to initialize",
+                server_name
+            )
+        })?
+        .map_err(|e| format!("Failed to serve MCP server '{}': {}", server_name, e))?;
 
         // 4. Discover tools from the new server
-        let mut all_tools = Vec::new();
-        let mut next_cursor: Option<String> = None;
-
-        loop {
-            let cursor = next_cursor.clone();
-            let request_param = cursor.map(|c| PaginatedRequestParam { cursor: Some(c) });
-
-            match service.list_tools(request_param).await {
-                Ok(result) => {
-                    all_tools.extend(result.tools);
-                    if let Some(cursor) = result.next_cursor {
-                        if !cursor.is_empty() {
-                            next_cursor = Some(cursor);
-                            continue;
-                        }
-                    }
-                    break;
-                }
-                Err(e) => {
-                    return Err(format!(
-                        "Failed to list tools after reconnecting '{}': {}",
-                        server_name, e
-                    ));
-                }
-            }
-        }
+        let all_tools = fetch_all_tools(&service).await.map_err(|e| {
+            format!(
+                "Failed to list tools after reconnecting '{}': {}",
+                server_name, e
+            )
+        })?;
 
         tracing::info!(
             "[RECONNECT] Discovered {} tools for reconnected server '{}'",
