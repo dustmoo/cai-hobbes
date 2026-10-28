@@ -19,7 +19,7 @@ pub(in super::super) fn HotkeysTab(ctx: SettingsCtx) -> Element {
                                     code { class: "bg-black/30 px-1 rounded", "CmdOrCtrl+Shift+Key" }
                                 ". Changes apply immediately after saving."
                                 }
-                                if local_settings.read().hotkeys != settings.read().hotkeys {
+                                if local_settings.read().hotkeys.needs_restart_from(&settings.read().hotkeys) {
                                     div {
                                         class: "mb-4 p-3 bg-yellow-900/30 border border-yellow-700/50 rounded-md flex items-center gap-3",
                                         Icon {
@@ -282,6 +282,33 @@ pub(in super::super) fn HotkeysTab(ctx: SettingsCtx) -> Element {
                                         }
                                     }
 
+                                    // Chat box: Claude Code's keys, applied on save (no restart).
+                                    div {
+                                        class: "pt-4 border-t border-gray-800 space-y-4",
+                                        h4 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "Chat box" }
+                                        p { class: "text-xs text-fg-muted",
+                                            "These work while typing in the chat box and apply as soon as you save. "
+                                            code { class: "bg-black/30 px-1 rounded", "Control" }
+                                            " means the Control key only, so Cmd shortcuts like copy keep working. Turn off any you don't want."
+                                        }
+                                        for (label, help, field, default) in chat_box_rows() {
+                                            div {
+                                                key: "{label}",
+                                                class: "grid grid-cols-2 items-center gap-4",
+                                                div {
+                                                    label { class: "text-sm text-fg-muted", "{label}" }
+                                                    p { class: "text-[10px] text-fg-muted", "{help}" }
+                                                }
+                                                HotkeyRecorder {
+                                                    value: field(&local_settings.read().hotkeys).clone(),
+                                                    default_value: default,
+                                                    can_turn_off: true,
+                                                    onchange: move |v: String| *field_mut(&mut local_settings.write().hotkeys, label) = v,
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Reset to Defaults button
                                     div {
                                         class: "pt-4 border-t border-gray-800",
@@ -307,5 +334,29 @@ pub(in super::super) fn HotkeysTab(ctx: SettingsCtx) -> Element {
                                 }
                             }
                         }
+    }
+}
+
+type ChatBoxRow = (&'static str, &'static str, fn(&HotkeySettings) -> &String, String);
+
+/// The chat box's remappable keys: label, help, field, default.
+fn chat_box_rows() -> Vec<ChatBoxRow> {
+    use crate::settings as s;
+    vec![
+        ("Stop & take back prompt", "Stops the running reply and puts your prompt back. Twice quickly clears the box.", |h| &h.interrupt_turn, s::default_interrupt_turn()),
+        ("Previous prompt", "From an empty box, recalls what you sent before.", |h| &h.history_prev, s::default_history_prev()),
+        ("Next prompt", "Steps forward through recalled prompts.", |h| &h.history_next, s::default_history_next()),
+        ("Search prompts", "Find and reuse something you sent.", |h| &h.history_search, s::default_history_search()),
+        ("Clear the box", "The text stays in your prompt history.", |h| &h.clear_input, s::default_clear_input()),
+    ]
+}
+
+fn field_mut<'a>(h: &'a mut HotkeySettings, label: &str) -> &'a mut String {
+    match label {
+        "Stop & take back prompt" => &mut h.interrupt_turn,
+        "Previous prompt" => &mut h.history_prev,
+        "Next prompt" => &mut h.history_next,
+        "Search prompts" => &mut h.history_search,
+        _ => &mut h.clear_input,
     }
 }

@@ -353,9 +353,10 @@ pub struct FocusSession {
     pub minutes: u32,
     #[serde(default)]
     pub end_reason: Option<FocusEndReason>,
-    /// Recovery honesty: when `sanitize_stale_focus` clamped the banked
-    /// minutes, the real wall-clock elapsed it was clamped down from. The
-    /// row keeps its real `started_at`/`ended_at` bounds either way.
+    /// Recovery honesty: when `sanitize_stale_focus` (or the Heartbeat's
+    /// runaway-timer pause, `PlannerState::pause_runaway_focus`) clamped the
+    /// banked minutes, the real wall-clock elapsed it was clamped down from.
+    /// The row keeps its real `started_at`/`ended_at` bounds either way.
     #[serde(default)]
     pub unclamped_minutes: Option<u32>,
 }

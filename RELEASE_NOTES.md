@@ -1,3 +1,50 @@
+# Hobbes v0.13.0 — The Heartbeat
+
+## ✨ New Features
+
+### The Heartbeat
+- **Hobbes keeps watch between chats.** Turn it on from the Fleet or Settings → Planner. It watches your planner, the Fleet and your projects' CI, and wakes its own chat when something needs attention: a worker that's stuck or waiting on you, a failing build, an overdue to-do.
+- **Works from your day, not just from changes.** It checks in at the start of your workday, about 45 minutes before each meeting, when the plan is over capacity, and near the end of the day. Each wake starts with the next few hours (calendar, plan, deadlines, agents) and does the single most useful thing: prep for a meeting, propose what to defer, or unblock a worker.
+- **Diagnoses stuck work.** A wake about a stuck worker reads the end of its transcript, names the actual blocker, and fixes it within the rules or asks you one clear question.
+- **Within a budget, and visible.** Two wakes an hour and $5 a day by default, both adjustable. Wakes with nothing to do are skipped. The Fleet card shows what each wake did ("Dispatched 'Clyde prep'") and what it cost, with the full trail behind Details and a Clear trail button. Its tools follow agent time's rules: outside effects wait for your approval.
+- **Handles the small things itself.** Without spending a wake, it keeps agent to-dos in step with their workers (a finished run moves to review) and pauses a focus timer left running for hours, banking your estimate. The card lists what it handled, with **Keep real time** if the full time was right after all. The Heartbeat's tab gets its own metal heart.
+- **Only real questions count as "needs you."** A Claude Code session that simply finished its turn is shown as idle, not waiting on you, across the Fleet badge, notifications, the planner and the Heartbeat. Permission prompts and other questions still flag, and an old question from a previous turn no longer lingers.
+
+### Chat box keys
+- **The Claude Code keys you know.** **Esc** stops a reply and puts your prompt back in the box (along with anything you'd queued); press it twice on an idle chat to clear the box. **↑/↓** bring back what you've sent, **⌃R** searches it, and **⌃C** clears the box without losing the text.
+- **All remappable.** A new Chat box section in Settings → Hotkeys lets you re-record, reset or turn off each one, effective on save. Shortcut fields can be set from the keyboard and are labelled for screen readers. Control now means just the Control key, so ⌘C keeps copying.
+
+### Continuity
+- **Handoff notes.** The AI can leave itself a note in a chat: what it's doing, what it expects next, what would change its plan.
+- **Turn briefings.** Coming back to a chat after a gap, the AI is told how long it's been, which timers fired and why, its own handoff note, and what changed in work it dispatched.
+- **Timers with a purpose.** A timer can carry a reason and fire as soon as a dispatched worker finishes instead of waiting for its deadline. A tab waiting on its own timer shows a hollow dot and stays "working" in the planner.
+
+### The Fleet (Pro)
+- **Redesigned around one question: what needs you.** One summary line, then a single list grouped by Needs you, Working and Idle, one line per session with details a click away. Wide windows show three columns. Day in review moves to the bottom.
+- **Click to reach a session's terminal.** Clicking a Claude Code session focuses its exact iTerm2 or Terminal.app tab (macOS asks once for permission). Other terminals are brought forward; ended sessions can be resumed in a new tab or their resume command copied.
+- **Answer Claude in Claude.** Claude Code's permission prompts and questions are answered in the terminal, where all their choices are, via "Answer in iTerm2". Headless runs that Hobbes dispatched keep Approve / Deny in the app.
+- **Hobbes tabs show their current name and emoji,** and idle sessions waiting on you keep their "blocked" line.
+
+### Delegation
+- **Workers report back.** A chat dispatched from another chat now reports its result to that chat when it finishes, in a lighter relay bubble you can click to jump between them. Choose Off, Report back or Two-way in Settings → Planner; two-way lets the parent send its worker corrections.
+- **Pick the right accounts.** Dispatch can run a chat under a different Composio profile (say, a client's accounts) when the work belongs there. Turn it off in Settings → Planner to always use the dispatching tab's profile.
+- **A clearer agent lane.** Compact cards with one action each, colours that match the Fleet, and a new **To review** section for runs that finished with something left for you, instead of leaving them "stuck" forever.
+
+### Planner & tabs
+- **Today's time on a task.** When a to-do has time from earlier days, the focus bar and menu-bar timer show today's time beside the total.
+- **More room on the timeline.** A taller timeline, a five-hour default view, and calendar events in their own lane so their titles are readable. "Not on the timeline" shows six to-dos with Show more.
+- **Tidy every tab.** The tab tidy sheet now lists every closable tab, oldest first, not only the ones it has a suggestion for.
+
+## 🐛 Fixes
+- **Every message was told "the user has not replied."** Since v0.12.2 a normal send also carried a continuation instruction meant for turns the AI starts itself. Replies should feel more responsive.
+- **Gemini keeps working after a tool call.** Gemini 4 Argon read the post-tool instruction as an order to stop; it now continues when the task needs more steps.
+- **Large tool sets on Gemini.** Over Gemini's 128-tool limit, Hobbes now keeps its own tools and the ones you're using, drops bulk Composio tools first, and tells the AI what was left out.
+- **No more raw JSON as progress** on agent-lane cards, and long dispatch briefs no longer become giant to-do titles.
+- **Tab picks the suggestion.** Tab accepts the highlighted skill or toolkit suggestion instead of indenting; Shift+Tab always outdents or moves back.
+
+## 🛡️ Security
+- Updated `ammonia` (4.2.4), `rustls-webpki` (0.103.16), `webpki-roots` (1.0.11) and `zip` (9.0.5) for recent RustSec advisories.
+
 # Hobbes v0.12.3 — Gemini 4 Argon
 
 ## ✨ New Features

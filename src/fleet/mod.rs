@@ -271,7 +271,118 @@ pub struct FleetSession {
     pub terminal: Option<terminal_focus::TerminalHint>,
 }
 
+/// What a session asks of the person right now. The raw status can't say:
+/// Claude Code sends `idle_prompt` about a minute after *every* finished
+/// turn, so `NeedsAttention` covers both "wrapped, prompt still open" and a
+/// real question. [`FleetSession::disposition`] tells them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Working now (foreground, background, or on its own timer).
+    Active,
+    /// Waiting on an answer: a permission gate, or a finished turn whose
+    /// brief names what it's blocked on.
+    Decision,
+    /// Finished its turn, prompt open, nothing asked.
+    Parked,
+    /// Ended, or parked past [`PARKED_ENDS_AFTER_HOURS`].
+    Ended,
+}
+
+/// A parked session quiet this long reads as ended.
+pub const PARKED_ENDS_AFTER_HOURS: i64 = 12;
+
+/// Notification kinds that ask nothing of the person: Claude Code's
+/// `idle_prompt` (a finished turn, prompt open) and `auth_success`. Every
+/// other kind (`permission_prompt`, `elicitation_dialog`, …) is a question.
+/// A notification without a kind (older Claude Code) asks only when its
+/// message is about permission.
+fn is_parked_notification(kind: &str, message: &str) -> bool {
+    match kind {
+        "idle_prompt" | "auth_success" => true,
+        "" => !message.to_lowercase().contains("permission"),
+        _ => false,
+    }
+}
+
 impl FleetSession {
+    /// The open question in the latest brief, if any. Only a brief that
+    /// covers the latest finished turn counts: once a later turn has stopped
+    /// (`brief_dirty_at` past the brief), its question was overtaken.
+    pub fn blocked_on(&self) -> Option<&str> {
+        self.brief
+            .as_ref()
+            .filter(|b| self.brief_dirty_at.is_none_or(|d| b.generated_at >= d))
+            .and_then(|b| b.blocked_on.as_deref())
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+    }
+
+    /// Waiting on an answer from the person: a pending gate, a notification
+    /// that asks something (permission, an input dialog, …), or a finished
+    /// turn whose brief says what it's blocked on. A bare idle prompt is not
+    /// a question.
+    pub fn asks_person(&self) -> bool {
+        if self.ended_at.is_some() {
+            return false;
+        }
+        if self.pending_gate.is_some() {
+            return true;
+        }
+        match &self.status {
+            FleetStatus::NeedsAttention(AttentionKind::Gate) => true,
+            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message })
+                if !is_parked_notification(kind, message) =>
+            {
+                true
+            }
+            FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) | FleetStatus::Idle => {
+                self.blocked_on().is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// What the session asks, in words, when [`Self::asks_person`]: the
+    /// notification's own message (a permission prompt names its tool), or
+    /// the brief's question for a turn that parked on one.
+    pub fn question(&self) -> Option<String> {
+        if !self.asks_person() {
+            return None;
+        }
+        if let Some(g) = &self.pending_gate {
+            return Some(format!("permission for {}", g.tool_name));
+        }
+        match &self.status {
+            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message })
+                if !is_parked_notification(kind, message) =>
+            {
+                let m = message.trim();
+                Some(if m.is_empty() { kind.clone() } else { m.to_string() })
+            }
+            FleetStatus::NeedsAttention(AttentionKind::Gate) => Some("a permission prompt".to_string()),
+            _ => self.blocked_on().map(str::to_string),
+        }
+    }
+
+    pub fn disposition(&self, now: DateTime<Utc>) -> Disposition {
+        if self.ended_at.is_some() {
+            return Disposition::Ended;
+        }
+        if matches!(
+            self.status,
+            FleetStatus::Working | FleetStatus::WorkingBackground | FleetStatus::Waiting
+        ) {
+            return Disposition::Active;
+        }
+        if self.asks_person() {
+            return Disposition::Decision;
+        }
+        if now - self.last_event_at >= chrono::Duration::hours(PARKED_ENDS_AFTER_HOURS) {
+            return Disposition::Ended;
+        }
+        Disposition::Parked
+    }
+
     pub(crate) fn new(id: &str, cwd: &str, now: DateTime<Utc>) -> Self {
         Self {
             id: id.to_string(),
@@ -398,10 +509,7 @@ pub struct FleetState {
 
 impl FleetState {
     pub fn attention_count(&self) -> usize {
-        self.sessions
-            .values()
-            .filter(|s| s.status.needs_attention())
-            .count()
+        self.sessions.values().filter(|s| s.asks_person()).count()
     }
 }
 
@@ -1561,6 +1669,62 @@ mod tests {
             cwd: "/Users/x/dev/hobbes".into(),
             background_tasks: 0,
         }
+    }
+
+    // ── Disposition ────────────────────────────────────────────────────────
+
+    fn row(status: serde_json::Value, blocked_on: Option<&str>) -> FleetSession {
+        let mut v = serde_json::json!({
+            "id": "s", "cwd": "/x/repo", "name": "repo", "status": status,
+            "last_event_at": "2026-10-23T08:00:00Z"
+        });
+        if let Some(b) = blocked_on {
+            v["brief"] = serde_json::json!({"headline": "h", "blocked_on": b, "generated_at": "2026-10-23T08:00:00Z"});
+        }
+        serde_json::from_value(v).unwrap()
+    }
+
+    #[test]
+    fn an_idle_prompt_is_parked_unless_the_brief_asks_something() {
+        let now = utc("2026-10-23T12:00:00Z");
+        let idle_prompt = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "idle_prompt", "message": "Claude is waiting for your input"}}});
+        assert_eq!(row(idle_prompt.clone(), None).disposition(now), Disposition::Parked);
+        assert_eq!(row(idle_prompt.clone(), Some("  ")).disposition(now), Disposition::Parked, "blank isn't a question");
+        assert_eq!(row(idle_prompt.clone(), Some("go-ahead on the hotfix")).disposition(now), Disposition::Decision);
+        let permission = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "permission_prompt", "message": "Allow Bash?"}}});
+        assert_eq!(row(permission, None).disposition(now), Disposition::Decision);
+        assert_eq!(row(serde_json::json!({"NeedsAttention": "Gate"}), None).disposition(now), Disposition::Decision);
+        assert_eq!(row(serde_json::json!("Working"), Some("x")).disposition(now), Disposition::Active);
+        assert_eq!(row(serde_json::json!("Idle"), None).disposition(now), Disposition::Parked);
+
+        // Parked past the cutoff reads as ended; a question never does.
+        let later = utc("2026-10-23T20:00:00Z");
+        assert_eq!(row(idle_prompt.clone(), None).disposition(later), Disposition::Ended);
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(later), Disposition::Decision);
+        let mut ended = row(idle_prompt.clone(), Some("pick one"));
+        ended.ended_at = Some(now);
+        assert_eq!(ended.disposition(now), Disposition::Ended);
+        assert!(!ended.asks_person());
+
+        // Any notification kind that isn't a bare idle prompt asks something.
+        let dialog = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "elicitation_dialog", "message": "Pick a branch"}}});
+        let r = row(dialog, None);
+        assert_eq!(r.disposition(now), Disposition::Decision);
+        assert_eq!(r.question().as_deref(), Some("Pick a branch"));
+        let kindless = |m: &str| row(serde_json::json!({"NeedsAttention": {"Notification": {"kind": "", "message": m}}}), None);
+        assert_eq!(kindless("Claude is waiting for your input").disposition(now), Disposition::Parked);
+        assert_eq!(kindless("Claude needs your permission to use Bash").disposition(now), Disposition::Decision);
+
+        // A permission prompt names itself, whatever an old brief asked.
+        let permission = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "permission_prompt", "message": "Allow Bash?"}}});
+        assert_eq!(row(permission, Some("go-ahead on the hotfix")).question().as_deref(), Some("Allow Bash?"));
+
+        // A brief from before the latest finished turn no longer asks.
+        let mut stale = row(idle_prompt, Some("go-ahead on the hotfix"));
+        stale.brief_dirty_at = Some(utc("2026-10-23T09:00:00Z"));
+        assert!(stale.blocked_on().is_none());
+        assert_eq!(stale.disposition(now), Disposition::Parked);
+        assert!(stale.question().is_none());
     }
 
     // ── Dispatch continuations ─────────────────────────────────────────────

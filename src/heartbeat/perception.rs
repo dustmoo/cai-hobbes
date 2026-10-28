@@ -270,15 +270,28 @@ impl FleetSessionSnap {
                 Some(g) => format!("waiting on permission for {}", g.tool_name),
                 None => "waiting on a permission prompt".to_string(),
             }),
+            // What it asks (a permission prompt's own message, or the
+            // brief's question for a parked turn) says more than "waiting
+            // for your input".
             FleetStatus::NeedsAttention(AttentionKind::Notification { message, kind }) => {
                 let m = message.trim();
-                Some(if m.is_empty() { kind.clone() } else { crate::fleet::truncate_summary(m, 120) })
+                Some(crate::fleet::truncate_summary(
+                    &s.question().unwrap_or_else(|| if m.is_empty() { kind.clone() } else { m.to_string() }),
+                    120,
+                ))
             }
             _ => None,
         };
+        // A finished turn with nothing asked (Claude Code's idle prompt) is
+        // parked, not a call for the person: it reads as idle, so a
+        // dispatched run that parks reports `run_ended`, not attention.
+        let phase = match FleetPhase::from_status(&s.status) {
+            FleetPhase::NeedsAttention if !s.asks_person() => FleetPhase::Idle,
+            phase => phase,
+        };
         Self {
             name: s.display_name().to_string(),
-            phase: FleetPhase::from_status(&s.status),
+            phase,
             attention,
             ended: s.ended_at.is_some(),
             dispatched_todo: s.dispatched_todo.clone(),
@@ -733,9 +746,22 @@ mod tests {
         live.sessions.insert("s".into(), s);
         let snap = FleetSnapshot::capture(&live);
         let c = &snap.sessions["s"];
-        assert_eq!(c.phase, FleetPhase::NeedsAttention);
-        assert_eq!(c.attention.as_deref(), Some("Waiting for input"));
+        assert_eq!(c.phase, FleetPhase::Idle, "a bare idle prompt is parked");
         assert_eq!(c.dispatched_todo.as_deref(), Some("todo-1"));
+
+        // With a question in its brief it does need the person.
+        let s = live.sessions.get_mut("s").unwrap();
+        s.brief = Some(crate::fleet::SessionBrief {
+            headline: "Built the hotfix".into(),
+            bullets: vec![],
+            blocked_on: Some("go-ahead to ship the eager-mode hotfix".into()),
+            generated_at: t0(),
+            final_brief: false,
+        });
+        let snap = FleetSnapshot::capture(&live);
+        let c = &snap.sessions["s"];
+        assert_eq!(c.phase, FleetPhase::NeedsAttention);
+        assert_eq!(c.attention.as_deref(), Some("go-ahead to ship the eager-mode hotfix"));
     }
 
     // ── CI ──

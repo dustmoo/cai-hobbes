@@ -2172,6 +2172,10 @@ video {
   width: 2.25rem;
 }
 
+.w-96 {
+  width: 24rem;
+}
+
 .w-\[120px\] {
   width: 120px;
 }

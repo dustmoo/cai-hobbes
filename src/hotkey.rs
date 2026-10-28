@@ -435,15 +435,22 @@ pub fn matches_hotkey(evt: &KeyboardEvent, hotkey_str: &str) -> bool {
 
 /// Internal logic for hotkey matching, decoupled from Event wrapper for testing.
 pub fn matches_hotkey_internal(modifiers: Modifiers, key: &Key, hotkey_str: &str) -> bool {
-    let parts: Vec<&str> = hotkey_str.split('+').collect();
-    if parts.is_empty() {
+    // An empty binding is a shortcut turned off.
+    if hotkey_str.trim().is_empty() {
         return false;
     }
+    let parts: Vec<&str> = hotkey_str.split('+').collect();
 
-    // Parsing Config
+    // Parsing Config. `CmdOrCtrl` (and Cmd/Meta) is the primary modifier:
+    // Command or Control. A bare `Control`/`Ctrl` is the Control key only,
+    // so Control+C can clear the chat box while Cmd+C still copies.
     let has_cmd_or_ctrl = parts.iter().any(|p| {
         let s = p.to_lowercase();
-        s == "cmdorctrl" || s == "cmd" || s == "ctrl" || s == "meta" || s == "control"
+        s == "cmdorctrl" || s == "cmd" || s == "meta"
+    });
+    let has_control = parts.iter().any(|p| {
+        let s = p.to_lowercase();
+        s == "ctrl" || s == "control"
     });
     let has_shift = parts.iter().any(|p| p.to_lowercase() == "shift");
     let has_alt = parts.iter().any(|p| {
@@ -460,7 +467,13 @@ pub fn matches_hotkey_internal(modifiers: Modifiers, key: &Key, hotkey_str: &str
     // 1. Modifier Check
     // The presence of the modifier in config must match the presence in event.
     // "CmdOrCtrl" conflates Command and Control into a single "Primary" modifier.
-    if has_cmd_or_ctrl != (evt_cmd || evt_ctrl) {
+    let primary_ok = match (has_cmd_or_ctrl, has_control) {
+        (true, false) => evt_cmd || evt_ctrl,
+        (false, true) => evt_ctrl && !evt_cmd,
+        (true, true) => evt_cmd && evt_ctrl,
+        (false, false) => !evt_cmd && !evt_ctrl,
+    };
+    if !primary_ok {
         return false;
     }
     if has_shift != evt_shift {
@@ -504,6 +517,19 @@ pub fn matches_hotkey_internal(modifiers: Modifiers, key: &Key, hotkey_str: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_is_the_control_key_only_and_empty_is_off() {
+        let c = Key::Character("c".into());
+        assert!(matches_hotkey_internal(Modifiers::CONTROL, &c, "Control+C"));
+        assert!(!matches_hotkey_internal(Modifiers::SUPER, &c, "Control+C"), "Cmd+C stays copy");
+        assert!(!matches_hotkey_internal(Modifiers::CONTROL | Modifiers::SUPER, &c, "Control+C"));
+        assert!(matches_hotkey_internal(Modifiers::CONTROL | Modifiers::SUPER, &c, "CmdOrCtrl+Control+C"));
+        assert!(matches_hotkey_internal(Modifiers::empty(), &Key::Escape, "Escape"));
+        assert!(!matches_hotkey_internal(Modifiers::SHIFT, &Key::Escape, "Escape"));
+        assert!(!matches_hotkey_internal(Modifiers::CONTROL, &Key::ArrowUp, "ArrowUp"));
+        assert!(!matches_hotkey_internal(Modifiers::empty(), &Key::Escape, ""));
+    }
 
     #[test]
     fn test_simple_hotkeys() {

@@ -32,6 +32,7 @@ pub mod anchors;
 pub mod budget;
 pub mod ci;
 pub mod diagnose;
+pub mod housekeeping;
 pub mod perception;
 pub mod runtime;
 pub mod salience;

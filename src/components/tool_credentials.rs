@@ -367,7 +367,14 @@ pub fn ToolCredentials() -> Element {
                                                 highlighted_index.set(if current == 0 { list_len - 1 } else { current - 1 });
                                             }
                                         }
-                                        Key::Enter => {
+                                        // Tab accepts the highlighted toolkit like Enter
+                                        // while the list is open; otherwise (and always
+                                        // with Shift) it moves focus.
+                                        Key::Tab
+                                            if !*dropdown_open.read()
+                                                || list_len == 0
+                                                || e.modifiers().contains(Modifiers::SHIFT) => {}
+                                        Key::Enter | Key::Tab => {
                                             e.prevent_default();
                                             if list_len > 0 {
                                                 let idx = *highlighted_index.read();

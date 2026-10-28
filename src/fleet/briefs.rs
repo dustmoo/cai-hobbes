@@ -345,9 +345,8 @@ pub fn status_report(
         .collect();
     // Attention first, then live-before-ended, then most recent.
     rows.sort_by(|a, b| {
-        b.status
-            .needs_attention()
-            .cmp(&a.status.needs_attention())
+        b.asks_person()
+            .cmp(&a.asks_person())
             .then(a.ended_at.is_some().cmp(&b.ended_at.is_some()))
             .then(b.last_event_at.cmp(&a.last_event_at))
     });
