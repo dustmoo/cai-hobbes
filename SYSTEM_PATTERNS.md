@@ -610,3 +610,32 @@ The app beach-balled.
 
 **If broken**: the app freezes on a click whose cost grows with the size of
 the chat history — invisible on a test database, minutes on a real one.
+
+---
+
+### 18. Remote MCP Credentials Are Host-Scoped
+
+> **Pattern ID**: P-018
+
+Credentials for a remote MCP server go only where they belong. The Composio
+key is sent as `x-api-key` only to `*.composio.dev` (matched on the parsed
+host, never a substring). A bearer token comes only from an explicit token,
+never from a server-wide key. Any reqwest client that sends custom credential
+headers follows redirects with `same_origin_redirect_policy`, because reqwest
+strips `Authorization`/`Cookie` across origins but not custom headers.
+
+**Rules**:
+- Plan the endpoint with `client_transport::plan_remote_endpoint`; do not
+  build headers by hand at a call site.
+- Never attach the Composio key to a non-Composio host.
+- A new credentialed `reqwest` client gets `redirect_policy::same_origin_redirect_policy()`.
+
+**Location**: `src/mcp/client_transport.rs` (`is_composio_host`,
+`plan_remote_endpoint`, `connect_remote`), `src/mcp/redirect_policy.rs`.
+
+**Tests**: the `plan_remote_endpoint` table in `client_transport.rs`
+(Composio key not attached to `example.com`, `composio.dev.evil.example` is not
+Composio), and the cross-origin redirect test in `redirect_policy.rs`.
+
+**If broken**: a Composio or user token leaks to a third-party MCP server, or
+a redirect carries `x-api-key` to another origin.

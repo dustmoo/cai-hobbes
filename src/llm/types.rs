@@ -496,3 +496,57 @@ mod tool_cap_tests {
         assert!(!cap.note.contains("COMPOSIO_CLEAR_TOOLS"));
     }
 }
+
+#[cfg(test)]
+mod mcp_tool_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn from_mcp_copies_name_description_and_schema() {
+        let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
+        let schema_obj = schema.as_object().unwrap().clone();
+        let tool = rmcp::model::Tool::new("SEARCH", "Search things", schema_obj.clone());
+        let def = ToolDefinition::from_mcp(&tool, "srv");
+        assert_eq!(def.name, "SEARCH");
+        assert_eq!(def.server_name, "srv");
+        assert_eq!(def.description, "Search things");
+        assert_eq!(def.parameters, serde_json::Value::Object(schema_obj));
+    }
+
+    #[test]
+    fn from_mcp_accepts_server_style_tool_json() {
+        let input = json!({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]});
+        let tool: rmcp::model::Tool = serde_json::from_value(json!({
+            "name": "add",
+            "description": "Add",
+            "inputSchema": input,
+            "outputSchema": {"type": "object", "properties": {"sum": {"type": "integer"}}},
+            "annotations": {"readOnlyHint": true},
+            "_meta": {"origin": "test"}
+        }))
+        .unwrap();
+        let def = ToolDefinition::from_mcp(&tool, "math");
+        assert_eq!(def.name, "add");
+        assert_eq!(def.parameters, input);
+    }
+
+    #[test]
+    fn persisted_server_context_with_title_and_meta_still_deserializes() {
+        let ctx: crate::mcp::manager::McpServerContext = serde_json::from_value(json!({
+            "name": "srv",
+            "description": "d",
+            "tools": [{
+                "name": "t",
+                "title": "Tool T",
+                "description": "does t",
+                "inputSchema": {"type": "object"},
+                "_meta": {"toolkit_slug": "x"}
+            }]
+        }))
+        .unwrap();
+        assert_eq!(ctx.tools.len(), 1);
+        assert_eq!(ctx.tools[0].title.as_deref(), Some("Tool T"));
+        assert_eq!(ctx.tools[0].name, "t");
+    }
+}

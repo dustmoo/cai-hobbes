@@ -1,5 +1,5 @@
 use super::{McpClientType, McpManager};
-use rmcp::model::CallToolRequestParam;
+use rmcp::model::CallToolRequestParams;
 
 impl McpManager {
     /// Start OAuth flow for a server that requires authentication
@@ -44,23 +44,20 @@ impl McpManager {
             let mut oauth_url = None;
 
             for tool_name in tool_names {
-                let request = CallToolRequestParam {
-                    name: tool_name.into(),
-                    arguments: Some(
-                        serde_json::json!({
-                            "redirect_uri": redirect_uri
-                        })
-                        .as_object()
-                        .cloned()
-                        .expect("static JSON is always an object"),
-                    ),
-                };
+                let request = CallToolRequestParams::new(tool_name).with_arguments(
+                    serde_json::json!({
+                        "redirect_uri": redirect_uri
+                    })
+                    .as_object()
+                    .cloned()
+                    .expect("static JSON is always an object"),
+                );
 
                 if let McpClientType::Service(service_arc) = &service {
                     if let Ok(result) = service_arc.call_tool(request).await {
                         // Extract URL from result
                         if let Some(content) = result.content.first() {
-                            if let Some(text) = content.raw.as_text() {
+                            if let Some(text) = content.as_text() {
                                 // The result might be a URL directly or JSON containing a URL
                                 if text.text.starts_with("http") {
                                     oauth_url = Some(text.text.clone());
@@ -118,24 +115,21 @@ impl McpManager {
             let tool_names = ["exchange_auth_code", "EXCHANGE_AUTH_CODE", "exchange_code"];
 
             for tool_name in tool_names {
-                let request = CallToolRequestParam {
-                    name: tool_name.into(),
-                    arguments: Some(
-                        serde_json::json!({
-                            "code": auth_code
-                        })
-                        .as_object()
-                        .cloned()
-                        .expect("static JSON is always an object"),
-                    ),
-                };
+                let request = CallToolRequestParams::new(tool_name).with_arguments(
+                    serde_json::json!({
+                        "code": auth_code
+                    })
+                    .as_object()
+                    .cloned()
+                    .expect("static JSON is always an object"),
+                );
 
                 if let McpClientType::Service(service_arc) = &service {
                     if let Ok(result) = service_arc.call_tool(request).await {
                         // Check if exchange was successful
                         if result.is_error.unwrap_or(false) {
                             if let Some(content) = result.content.first() {
-                                if let Some(text) = content.raw.as_text() {
+                                if let Some(text) = content.as_text() {
                                     return Err(format!("Token exchange failed: {}", text.text));
                                 }
                             }

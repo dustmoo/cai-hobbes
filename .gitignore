@@ -39,7 +39,8 @@ src/repro_*.rs
 RooFlow_temp_*archive/
 
 # Node
-node_modules/
+# No trailing slash: also matches a node_modules symlink in a worktree.
+node_modules
 npm-debug.log
 
 # Generated: build.rs copies this from node_modules/mermaid/dist at compile
