@@ -43,6 +43,9 @@
 - **Tab picks the suggestion.** Tab accepts the highlighted skill or toolkit suggestion instead of indenting; Shift+Tab always outdents or moves back.
 
 ## 🛡️ Security
+- **New MCP client.** Hobbes now uses `rmcp` 3.8, which fixes a RustSec advisory in the old version. Remote MCP servers connect over Streamable HTTP; a saved `/sse` URL falls back to `/mcp` automatically.
+- **Your Composio key stays with Composio.** It was also sent to other remote MCP servers you'd added. It now goes only to Composio's own hosts, and Composio requests no longer follow redirects to other sites.
+- **Diagrams.** Updated `mermaid` (12.2, with KaTeX 0.18) and patched `dompurify` and `postcss-selector-parser`, and locked the diagram sanitizer's settings so a chart can't change them.
 - Updated `ammonia` (4.2.4), `rustls-webpki` (0.103.16), `webpki-roots` (1.0.11) and `zip` (9.0.5) for recent RustSec advisories.
 
 # Hobbes v0.12.3 — Gemini 4 Argon
