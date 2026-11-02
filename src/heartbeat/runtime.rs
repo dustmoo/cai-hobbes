@@ -486,7 +486,7 @@ fn fire_wake(
     };
     let diagnoses = diagnoses(deps, &targets, &todos);
     let trust = super::trust::trust_summary(settings.planner_enabled, settings.agent_time_enabled());
-    let text = {
+    let (text, voice_alert) = {
         let mut hb = HEARTBEAT.write();
         let spent = spent_since(&hb.trail, local_day_start(now));
         // decide_wake already checked; re-checking here keeps the invariant
@@ -503,6 +503,8 @@ fn fire_wake(
         let anchors: Vec<Anchor> = day.map(|d| due_anchors(&hb, d, now)).unwrap_or_default();
         let ids = hb.queue.clone();
         let choices = wake::choice_summary(&hb, &ids);
+        // Spoken if a voice conversation is live (voice::controller).
+        let voice_alert = format!("{why}. {choices}");
         let last_wake = wake::last_fired_at(&hb.trail);
         let budget_line = wake::budget_line(&hb.trail, budget, spent, now);
         let events = hb.drain_queue();
@@ -525,7 +527,7 @@ fn fire_wake(
         if let Some(d) = day {
             hb.mark_anchors_fired(anchors.iter().map(|a| a.key.as_str()), d.today, now);
         }
-        text
+        (text, voice_alert)
     };
     // The background chat queue sends it: its drain runs for any hydrated
     // session, focused or not (see todo::dispatch::dispatch_to_chat).
@@ -536,6 +538,7 @@ fn fire_wake(
     );
     chat_queue::request_drain();
     tracing::info!("heartbeat: woke session {session_id}");
+    crate::voice::controller::heartbeat_alert(voice_alert);
 }
 
 /// Fill in cost and outcome for fired wakes whose turn has finished. True

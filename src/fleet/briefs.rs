@@ -480,8 +480,7 @@ pub async fn generate_day_rollup(
         .filter(|i| settings.is_connector_configured(i))
         .or_else(|| {
             settings
-                .llm_connectors
-                .iter()
+                .chat_connectors()
                 .find(|i| settings.is_connector_configured(i))
         })
         .cloned()

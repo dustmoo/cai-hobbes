@@ -3672,6 +3672,8 @@ mod tests {
                 llm_connectors: vec![ProviderInstance {
                     id: CONNECTOR_ID.into(),
                     name: "Claude".into(),
+                    roles: Default::default(),
+                    voice: None,
                     config: ProviderInstanceConfig::Claude(ClaudeConfig {
                         model: "claude-opus-5-5".into(),
                         max_tokens: Some(4096),

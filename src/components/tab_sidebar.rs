@@ -23,6 +23,7 @@ use crate::todo::PlannerState;
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
 use crate::components::metal_heart::{use_heartbeat_session_id, MetalHeart};
+use crate::components::metal_mouth::{use_voice_session_id, MetalMouth};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// What a tab shows in the 48px rail: its emoji, else the first letter of
@@ -109,6 +110,7 @@ const CLOSE_BTN: &str = "p-0.5 rounded-md shrink-0 text-fg-muted hover:bg-red-50
 
 pub fn TabSidebar(props: TabSidebarProps) -> Element {
     let heartbeat_id = use_heartbeat_session_id();
+    let voice_id = use_voice_session_id();
     let mut session_state = use_context::<Signal<SessionState>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut ui_state = use_context::<Signal<UiState>>();
@@ -293,6 +295,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     onmouseup: move |evt| if is_middle_click(&evt) { on_close.call(idx) },
                                     match glyph {
                                         RailGlyph::Emoji(_) if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalHeart { size: 15 } },
+                                        RailGlyph::Emoji(_) if voice_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalMouth { size: 15 } },
                                         RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
                                         RailGlyph::Letter(l) => rsx! {
                                             span {
@@ -574,6 +577,8 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                             if let Some(e) = &tab.emoji {
                                                 if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) {
                                                     MetalHeart {}
+                                                } else if voice_id.read().as_deref() == Some(tab.session_id.as_str()) {
+                                                    MetalMouth {}
                                                 } else {
                                                     span { class: "text-[13px] leading-none shrink-0", "{e}" }
                                                 }

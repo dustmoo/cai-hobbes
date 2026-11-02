@@ -585,6 +585,9 @@ pub struct Settings {
     /// also applies the availability gate.
     #[serde(default)]
     pub heartbeat_enabled: bool,
+    /// Voice: a realtime speech layer that orchestrates through the harness.
+    #[serde(default)]
+    pub voice: VoiceSettings,
     /// Wake cap: at most this many wakes in any rolling 60 minutes. Over the
     /// cap a wake is deferred and its events stay queued.
     #[serde(default = "default_heartbeat_wakes_per_hour")]
@@ -908,7 +911,114 @@ pub struct ProviderInstance {
     /// Unique display name shown in the chat-bar selector and settings list.
     pub name: String,
     pub config: ProviderInstanceConfig,
+    /// What this profile is used for. Existing profiles load as chat-only.
+    #[serde(default)]
+    pub roles: ConnectorRoles,
+    /// Realtime voice settings, used when `roles.voice` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceProfile>,
 }
+
+/// The jobs a connector profile does. Chat profiles are the brain (the
+/// chat-bar picker); voice profiles are offered in the voice picker. One
+/// profile may do both, sharing its credentials.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorRoles {
+    #[serde(default = "default_true")]
+    pub chat: bool,
+    #[serde(default)]
+    pub voice: bool,
+}
+
+impl Default for ConnectorRoles {
+    fn default() -> Self {
+        Self { chat: true, voice: false }
+    }
+}
+
+/// A profile's realtime voice settings.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct VoiceProfile {
+    /// Realtime model id (Gemini: `gemini-3.8-live`). Empty = provider default.
+    #[serde(default)]
+    pub model: String,
+    /// Provider voice name (Gemini: "Kore", "Puck", ...). `None` = default.
+    #[serde(default)]
+    pub voice_name: Option<String>,
+    /// BCP-47 language hint. `None` = automatic.
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+/// Global voice settings (Settings → Voice).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct VoiceSettings {
+    /// Master switch. Off by default; read through `voice::voice_active`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The voice profile in use — independent of `active_connector_id`
+    /// (the brain). Must name a profile with `roles.voice`.
+    #[serde(default)]
+    pub connector_id: Option<String>,
+    /// Global hotkey: tap toggles a conversation, hold is push-to-talk.
+    #[serde(default = "default_voice_hotkey")]
+    pub hotkey: String,
+    /// A press shorter than this is a tap; longer is a hold.
+    #[serde(default = "default_voice_hold_threshold_ms")]
+    pub hold_threshold_ms: u64,
+    /// A conversation ends after this long with nobody speaking.
+    #[serde(default = "default_voice_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// While a conversation is live, urgent Heartbeat events are spoken.
+    #[serde(default = "default_true")]
+    pub speak_heartbeat: bool,
+    /// Microphone to listen on (a CoreAudio device UID on macOS, the device
+    /// name elsewhere). `None`, or a device that is gone, = system default.
+    #[serde(default)]
+    pub input_device_uid: Option<String>,
+}
+
+fn default_voice_hotkey() -> String {
+    "Alt+Space".to_string()
+}
+fn default_voice_hold_threshold_ms() -> u64 {
+    300
+}
+fn default_voice_idle_timeout_secs() -> u64 {
+    120
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            connector_id: None,
+            hotkey: default_voice_hotkey(),
+            hold_threshold_ms: default_voice_hold_threshold_ms(),
+            idle_timeout_secs: default_voice_idle_timeout_secs(),
+            speak_heartbeat: true,
+            input_device_uid: None,
+        }
+    }
+}
+
+/// Whether a profile's provider has a realtime speech API Hobbes supports.
+/// Gemini only for now; Claude has no realtime API.
+pub fn realtime_capable(instance: &ProviderInstance) -> bool {
+    matches!(instance.provider(), LlmProvider::Gemini)
+}
+
+/// The realtime model a voice profile uses when none is set.
+pub fn default_realtime_model(provider: LlmProvider) -> Option<&'static str> {
+    match provider {
+        LlmProvider::Gemini => Some("gemini-3.8-live"),
+        _ => None,
+    }
+}
+
+/// Shown wherever a non-realtime profile is picked for voice.
+pub const VOICE_NEEDS_REALTIME: &str =
+    "Voice needs a realtime model for the best experience. Gemini Live is supported today.";
 
 impl ProviderInstance {
     /// The provider kind of this connector.
@@ -1131,6 +1241,7 @@ impl Default for Settings {
             dispatch_relay_mode: DispatchRelayMode::default(),
             terminal_enabled: false,
             heartbeat_enabled: false,
+            voice: VoiceSettings::default(),
             heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
             heartbeat_daily_usd: default_heartbeat_daily_usd(),
             heartbeat_source_planner: true,
@@ -1424,6 +1535,22 @@ impl Settings {
 
     /// The globally active connector: `active_connector_id` when it resolves,
     /// else the first connector (stale-id fallback, mirrors get_active_profile_mut).
+    /// The voice profile in use, if it names an existing voice-role profile.
+    pub fn voice_connector(&self) -> Option<&ProviderInstance> {
+        let id = self.voice.connector_id.as_deref()?;
+        self.connector_by_id(id).filter(|c| c.roles.voice)
+    }
+
+    /// Profiles offered in the chat-bar picker (`roles.chat`).
+    pub fn chat_connectors(&self) -> impl Iterator<Item = &ProviderInstance> {
+        self.llm_connectors.iter().filter(|c| c.roles.chat)
+    }
+
+    /// Profiles offered in the voice picker (`roles.voice`).
+    pub fn voice_connectors(&self) -> impl Iterator<Item = &ProviderInstance> {
+        self.llm_connectors.iter().filter(|c| c.roles.voice)
+    }
+
     pub fn active_connector(&self) -> Option<&ProviderInstance> {
         self.active_connector_id
             .as_deref()
@@ -1467,6 +1594,8 @@ impl Settings {
             id: Uuid::new_v4().to_string(),
             name: unique_name,
             config,
+            roles: ConnectorRoles::default(),
+            voice: None,
         };
         let id = instance.id.clone();
         self.llm_connectors.push(instance);
@@ -1895,6 +2024,8 @@ impl Settings {
                 id: Uuid::new_v4().to_string(),
                 name,
                 config,
+                roles: ConnectorRoles::default(),
+                voice: None,
             });
         };
 
@@ -2907,6 +3038,80 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 
 #[cfg(test)]
 mod tests {
+    fn settings_with_connector() -> Settings {
+        let mut s = Settings::default();
+        if s.llm_connectors.is_empty() {
+            s.add_connector("Gemini", ProviderInstanceConfig::default_for(LlmProvider::Gemini))
+                .unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn voice_roles_legacy_json_is_chat_only() {
+        let s0 = settings_with_connector();
+        let mut v = serde_json::to_value(&s0.llm_connectors[0]).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("roles");
+        o.remove("voice");
+        let inst: ProviderInstance = serde_json::from_value(v).unwrap();
+        assert!(inst.roles.chat && !inst.roles.voice);
+        assert!(inst.voice.is_none());
+
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("voice");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.voice, VoiceSettings::default());
+    }
+
+    #[test]
+    fn voice_connector_ignores_non_voice_role() {
+        let mut s = settings_with_connector();
+        let id = s.llm_connectors[0].id.clone();
+        s.voice.connector_id = Some(id.clone());
+        assert!(s.voice_connector().is_none());
+        s.connector_by_id_mut(&id).unwrap().roles.voice = true;
+        assert_eq!(s.voice_connector().map(|c| c.id.clone()), Some(id));
+        s.voice.connector_id = Some("missing".into());
+        assert!(s.voice_connector().is_none());
+    }
+
+    #[test]
+    fn chat_and_voice_connectors_filter_by_role() {
+        let mut s = settings_with_connector();
+        let id = s.llm_connectors[0].id.clone();
+        assert_eq!(s.chat_connectors().count(), s.llm_connectors.len());
+        assert_eq!(s.voice_connectors().count(), 0);
+        {
+            let c = s.connector_by_id_mut(&id).unwrap();
+            c.roles.chat = false;
+            c.roles.voice = true;
+        }
+        assert!(s.chat_connectors().all(|c| c.id != id));
+        assert_eq!(s.voice_connectors().count(), 1);
+    }
+
+    #[test]
+    fn voice_settings_round_trip() {
+        let mut s = settings_with_connector();
+        s.voice.enabled = true;
+        s.voice.hotkey = "Ctrl+Space".into();
+        s.voice.connector_id = Some("x".into());
+        {
+            let c = &mut s.llm_connectors[0];
+            c.roles.voice = true;
+            c.voice = Some(VoiceProfile {
+                model: "m".into(),
+                voice_name: Some("Puck".into()),
+                language: Some("en-US".into()),
+            });
+        }
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.voice, s.voice);
+        assert_eq!(back.llm_connectors[0].roles, s.llm_connectors[0].roles);
+        assert_eq!(back.llm_connectors[0].voice, s.llm_connectors[0].voice);
+    }
+
     use super::*;
 
     #[test]

@@ -591,8 +591,7 @@ fn ReviewBand(
                     .active_connector()
                     .filter(|i| s.is_connector_configured(i))
                     .or_else(|| {
-                        s.llm_connectors
-                            .iter()
+                        s.chat_connectors()
                             .find(|i| s.is_connector_configured(i))
                     })
                     .cloned()

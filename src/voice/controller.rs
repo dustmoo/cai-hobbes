@@ -1,0 +1,583 @@
+//! The voice controller: one live conversation at a time, driven by the
+//! hotkey (press / release) and by the realtime session's events.
+//!
+//! **Activation.** A press opens the mic at once (speech before the
+//! connection is ready is buffered by the channel). A short press (a tap)
+//! starts — or ends — a hands-free conversation; a long press (a hold) is
+//! push-to-talk: the mic closes on release and the provider's turn
+//! detection takes it from there. Both use the provider's own voice-activity
+//! detection, so one session setup serves both.
+//!
+//! **Barge-in.** The provider reports `Interrupted` when the person talks
+//! over the voice; playback is flushed immediately. Without platform echo
+//! cancellation (non-macOS), the mic is muted while the voice speaks.
+//!
+//! **The brain.** `VOICE_ASK_BRAIN` runs in the background (`brain.rs`); its
+//! result goes back as the tool response (`WHEN_IDLE`), or as injected
+//! context when the model already abandoned the call.
+//!
+//! Runs on the Dioxus runtime: signals are only peeked/written between
+//! awaits, never held across one.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use dioxus::prelude::*;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+
+use crate::components::builtin_tools::BuiltinToolCtx;
+use crate::voice::audio::{self, AudioIo, MicPermission};
+use crate::voice::brain::{self, BrainHandle, BrainOutcome};
+use crate::voice::realtime::{
+    RealtimeControl, RealtimeEvent, RealtimeSetup, RealtimeVoice, Scheduling,
+};
+use crate::voice::{session, tools};
+
+/// What the voice is doing (drives the indicator).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Phase {
+    #[default]
+    Idle,
+    Connecting,
+    Listening,
+    Speaking,
+}
+
+/// Hands-free conversation or push-to-talk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    Conversation,
+    PushToTalk,
+}
+
+/// Indicator state.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct VoiceUi {
+    pub phase: Phase,
+    pub mode: Option<Mode>,
+    /// The push-to-talk key is down (mic open).
+    pub held: bool,
+    /// Brain requests in flight.
+    pub brain_busy: usize,
+    /// What the person is saying right now (live transcript tail).
+    pub heard: String,
+    pub echo_cancelled: bool,
+    /// Last problem worth showing (cleared on the next successful start).
+    pub error: Option<String>,
+}
+
+pub static VOICE_UI: GlobalSignal<VoiceUi> = Signal::global(VoiceUi::default);
+
+/// Inputs to the controller.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VoiceCmd {
+    /// Hotkey (or button) went down.
+    Press,
+    /// Hotkey went up after `held_ms`.
+    Release { held_ms: u64 },
+    /// End any live conversation.
+    Stop,
+    /// A Heartbeat alert to speak while a conversation is live.
+    HeartbeatAlert(String),
+}
+
+/// The running controller's inbox (replaced if the root remounts).
+static CMD_TX: Mutex<Option<mpsc::UnboundedSender<VoiceCmd>>> = Mutex::new(None);
+
+/// Send a command to the controller (no-op before it starts).
+pub fn send(cmd: VoiceCmd) {
+    if let Some(tx) = CMD_TX.lock().ok().and_then(|g| g.clone()) {
+        let _ = tx.send(cmd);
+    }
+}
+
+/// Whether a conversation is live (connecting counts).
+pub fn is_live() -> bool {
+    VOICE_UI.peek().phase != Phase::Idle
+}
+
+/// Speak a Heartbeat alert if a conversation is live and the setting allows.
+pub fn heartbeat_alert(text: String) {
+    if is_live() {
+        send(VoiceCmd::HeartbeatAlert(text));
+    }
+}
+
+/// Start the controller (once, from the app root).
+pub fn use_voice(ctx: BuiltinToolCtx) {
+    use_hook(move || {
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Ok(mut slot) = CMD_TX.lock() {
+            *slot = Some(tx);
+        }
+        spawn(controller_loop(ctx, rx));
+    });
+}
+
+async fn controller_loop(ctx: BuiltinToolCtx, mut rx: mpsc::UnboundedReceiver<VoiceCmd>) {
+    while let Some(cmd) = rx.recv().await {
+        if cmd == VoiceCmd::Press {
+            run_session(ctx, &mut rx).await;
+            // Keep the last error (read before the write: one borrow at a time).
+            let error = VOICE_UI.peek().error.clone();
+            *VOICE_UI.write() = VoiceUi { error, ..VoiceUi::default() };
+        }
+        // Release / Stop / alerts while idle: nothing to do.
+    }
+}
+
+/// Mic / speaker problems and provider failures end up here.
+fn fail(msg: impl Into<String>) {
+    let msg = msg.into();
+    tracing::warn!("voice: {msg}");
+    VOICE_UI.write().error = Some(msg);
+}
+
+/// What a session needs from settings, resolved up front.
+struct Resolved {
+    provider: Box<dyn RealtimeVoice>,
+    setup: RealtimeSetup,
+    threshold_ms: u64,
+    idle: Duration,
+    speak_heartbeat: bool,
+    profile: Option<String>,
+    input_device: Option<String>,
+}
+
+fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
+    let settings = ctx.settings.peek();
+    if !crate::voice::voice_active(&settings) {
+        return Err("Voice is off. Turn it on in Settings → Voice.".into());
+    }
+    let Some(conn) = settings.voice_connector() else {
+        return Err("Pick a voice profile in Settings → Voice.".into());
+    };
+    if !crate::settings::realtime_capable(conn) {
+        return Err(crate::settings::VOICE_NEEDS_REALTIME.into());
+    }
+    let key = match &conn.config {
+        crate::settings::ProviderInstanceConfig::Gemini(g) => g.api_key.clone().filter(|k| !k.trim().is_empty()),
+        _ => None,
+    };
+    let Some(key) = key else {
+        return Err(format!("The voice profile \"{}\" has no API key.", conn.name));
+    };
+    let vp = conn.voice.clone().unwrap_or_default();
+    let model = if vp.model.trim().is_empty() {
+        crate::settings::default_realtime_model(conn.provider()).unwrap_or_default().to_string()
+    } else {
+        vp.model.trim().to_string()
+    };
+    let setup = RealtimeSetup {
+        model,
+        system_instruction: String::new(), // filled once the session is known
+        voice_name: vp.voice_name.filter(|v| !v.trim().is_empty()),
+        language: vp.language.filter(|v| !v.trim().is_empty()),
+        tools: tools::voice_tool_decls(settings.planner_enabled),
+        manual_activity: false,
+    };
+    Ok(Resolved {
+        provider: Box::new(crate::voice::gemini_live::GeminiLive::new(key)),
+        setup,
+        threshold_ms: settings.voice.hold_threshold_ms.max(100),
+        idle: Duration::from_secs(settings.voice.idle_timeout_secs.max(15)),
+        speak_heartbeat: settings.voice.speak_heartbeat,
+        profile: settings.get_active_profile().map(|p| p.id.clone()),
+        input_device: settings.voice.input_device_uid.clone(),
+    })
+}
+
+/// The voice tier's instructions, with recent context from both sessions.
+pub fn system_instruction(now: chrono::DateTime<chrono::Local>, voice_tail: &str, heartbeat_tail: &str) -> String {
+    let mut s = format!(
+        "You are Hobbes, the person's chief-of-staff assistant, talking with them by voice. \
+         Keep replies short and conversational: one to three spoken sentences, no lists, no \
+         markdown. If they interrupt, stop and listen.\n\n\
+         You are the voice layer. You can check their coding-agent Fleet, their planner and \
+         calendar, timers, and the Heartbeat's notes yourself with your tools. For anything \
+         else — doing or changing things, email, files, code, dispatching work, or questions \
+         that need careful thought — call {brain} with a complete request (the brain cannot \
+         hear the conversation), tell them briefly that you're on it, and keep talking with \
+         them. When the result comes back, summarise it naturally. Never read out code, URLs \
+         or long ids; say it's in the Voice tab. When they say goodbye, call {end}.\n\n\
+         It is {time}.",
+        brain = tools::ASK_BRAIN,
+        end = tools::END_CONVERSATION,
+        time = now.format("%A %-d %B %Y, %H:%M"),
+    );
+    if !heartbeat_tail.trim().is_empty() {
+        s.push_str("\n\nRecent Heartbeat notes (background monitoring):\n");
+        s.push_str(heartbeat_tail.trim());
+    }
+    if !voice_tail.trim().is_empty() {
+        s.push_str("\n\nThe end of your previous voice conversation:\n");
+        s.push_str(voice_tail.trim());
+    }
+    s
+}
+
+fn tail_of(session_state: Signal<crate::session::SessionState>, peer: session::Peer, limit: usize) -> String {
+    session::peer_tail(session_state, peer, limit).unwrap_or_default()
+}
+
+/// One live conversation, from the press that opened it to its end.
+async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<VoiceCmd>) {
+    let pressed_at = Instant::now();
+    let mut ui = VoiceUi { phase: Phase::Connecting, held: true, ..VoiceUi::default() };
+    *VOICE_UI.write() = ui.clone();
+
+    let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, input_device } = match resolve(ctx) {
+        Ok(r) => r,
+        Err(e) => {
+            fail(e);
+            return;
+        }
+    };
+
+    // Microphone permission (prompts the first time).
+    match audio::mic_permission() {
+        MicPermission::Granted => {}
+        MicPermission::Undetermined => {
+            if audio::request_mic_permission().await != MicPermission::Granted {
+                fail("Hobbes needs microphone access for voice (System Settings → Privacy & Security → Microphone).");
+                return;
+            }
+        }
+        MicPermission::Denied => {
+            fail("Microphone access is off for Hobbes (System Settings → Privacy & Security → Microphone).");
+            return;
+        }
+    }
+
+    let Some(voice_session) = session::ensure_session(ctx.session_state, profile) else {
+        fail("The Voice session couldn't be created.");
+        return;
+    };
+
+    // Audio first, so speech during the connect is captured.
+    let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
+    // Opening and starting the engine blocks for a second or two (VPIO
+    // setup): off the UI thread.
+    let started = tokio::task::spawn_blocking(move || -> Result<Box<dyn AudioIo>, String> {
+        let mut io = audio::open(input_device.as_deref()).map_err(|e| format!("Couldn't open the microphone: {e}"))?;
+        io.start(mic_tx).map_err(|e| format!("Couldn't start audio: {e}"))?;
+        Ok(io)
+    })
+    .await;
+    let mut audio_io: Box<dyn AudioIo> = match started {
+        Ok(Ok(a)) => a,
+        Ok(Err(e)) => {
+            fail(e);
+            return;
+        }
+        Err(e) => {
+            fail(format!("Audio setup crashed: {e}"));
+            return;
+        }
+    };
+    audio_io.set_mic_enabled(true);
+    ui.echo_cancelled = audio_io.echo_cancelled();
+
+    setup.system_instruction = system_instruction(
+        chrono::Local::now(),
+        &tail_of(ctx.session_state, session::Peer::Voice, 6),
+        &tail_of(ctx.session_state, session::Peer::Heartbeat, 4),
+    );
+    let mut rt = match provider.connect(setup).await {
+        Ok(s) => s,
+        Err(e) => {
+            audio_io.stop();
+            fail(format!("Couldn't reach the voice model: {e}"));
+            return;
+        }
+    };
+    tracing::info!("voice: conversation started (echo cancellation: {})", ui.echo_cancelled);
+
+    // Until the key comes up we don't know tap vs hold; treat as held.
+    let mut mode: Option<Mode> = None;
+    let mut held = true;
+    let mut last_activity = Instant::now();
+    let mut heard_buf = String::new();
+    let mut spoke_buf = String::new();
+    let mut pending_lines: Vec<(bool, String)> = Vec::new();
+    let mut brain_cancel: HashMap<String, BrainHandle> = HashMap::new();
+    let mut abandoned: HashSet<String> = HashSet::new();
+    let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<(String, BrainOutcome)>();
+    let mut ending_at: Option<Instant> = None;
+    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    ui.phase = Phase::Listening;
+    ui.error = None;
+    *VOICE_UI.write() = ui.clone();
+
+    let close_reason = loop {
+        tokio::select! {
+            frame = mic_rx.recv() => {
+                let Some(frame) = frame else { break "audio stopped".to_string() };
+                let mic_open = held || mode == Some(Mode::Conversation);
+                // Without echo cancellation the model would hear itself.
+                let echo_risk = !ui.echo_cancelled && audio_io.is_playing() && !held;
+                if mic_open && !echo_risk {
+                    let _ = rt.control.send(RealtimeControl::Audio(frame));
+                }
+            }
+            ev = rt.events.recv() => {
+                let Some(ev) = ev else { break "connection ended".to_string() };
+                match ev {
+                    RealtimeEvent::Ready | RealtimeEvent::Reconnected => {}
+                    RealtimeEvent::Audio { pcm, sample_rate } => {
+                        if !heard_buf.trim().is_empty() {
+                            pending_lines.push((true, std::mem::take(&mut heard_buf)));
+                        }
+                        audio_io.play(&pcm, sample_rate);
+                        last_activity = Instant::now();
+                        ui.phase = Phase::Speaking;
+                        ui.heard.clear();
+                    }
+                    RealtimeEvent::InputTranscript(t) => {
+                        heard_buf.push_str(&t);
+                        last_activity = Instant::now();
+                        ui.heard = live_tail(&heard_buf);
+                        ui.phase = Phase::Listening;
+                    }
+                    RealtimeEvent::OutputTranscript(t) => spoke_buf.push_str(&t),
+                    RealtimeEvent::Interrupted => {
+                        audio_io.flush();
+                        if !spoke_buf.trim().is_empty() {
+                            pending_lines.push((false, format!("{} —", std::mem::take(&mut spoke_buf).trim_end())));
+                        }
+                        ui.phase = Phase::Listening;
+                        last_activity = Instant::now();
+                    }
+                    RealtimeEvent::TurnComplete => {
+                        if !heard_buf.trim().is_empty() {
+                            pending_lines.push((true, std::mem::take(&mut heard_buf)));
+                        }
+                        if !spoke_buf.trim().is_empty() {
+                            pending_lines.push((false, std::mem::take(&mut spoke_buf)));
+                        }
+                        ui.heard.clear();
+                        last_activity = Instant::now();
+                    }
+                    RealtimeEvent::ToolCall { id, name, args } => {
+                        last_activity = Instant::now();
+                        match name.as_str() {
+                            tools::ASK_BRAIN => {
+                                let request = args.get("request").and_then(Value::as_str).unwrap_or_default().to_string();
+                                if request.trim().is_empty() {
+                                    respond(&rt.control, &id, &name, json!({"error": "request is empty"}), None);
+                                } else {
+                                    // Transcript so far goes in before the brain's turn
+                                    // (unless an earlier request's turn is in flight).
+                                    if brain_cancel.is_empty() {
+                                        flush_lines(ctx, &voice_session, &mut pending_lines, false);
+                                    }
+                                    let handle = BrainHandle::default();
+                                    brain_cancel.insert(id.clone(), handle.clone());
+                                    ui.brain_busy = brain_cancel.len();
+                                    let tx = brain_tx.clone();
+                                    let sid = voice_session.clone();
+                                    let st = ctx.session_state;
+                                    spawn(async move {
+                                        let outcome = brain::run(st, sid, request, handle, crate::session_streaming).await;
+                                        let _ = tx.send((id, outcome));
+                                    });
+                                }
+                            }
+                            tools::CANCEL_BRAIN => {
+                                for h in brain_cancel.values() {
+                                    h.cancel.store(true, Ordering::SeqCst);
+                                }
+                                respond(&rt.control, &id, &name, json!({"result": "cancelled"}), None);
+                            }
+                            tools::END_CONVERSATION => {
+                                respond(&rt.control, &id, &name, json!({"result": "ending"}), None);
+                                ending_at = Some(Instant::now());
+                            }
+                            _ => {
+                                let result = tools::dispatch(ctx, &voice_session, &name, &args).await;
+                                respond(&rt.control, &id, &name, result, None);
+                            }
+                        }
+                    }
+                    RealtimeEvent::ToolCallCancelled(ids) => {
+                        // Brain work keeps going; its result is injected instead.
+                        abandoned.extend(ids);
+                    }
+                    RealtimeEvent::Warning(w) => tracing::warn!("voice: provider warning: {}", crate::log_utils::truncate_for_log(&w, 200)),
+                    RealtimeEvent::Closed { reason } => break reason,
+                }
+            }
+            done = brain_rx.recv() => {
+                if let Some((id, outcome)) = done {
+                    brain_cancel.remove(&id);
+                    ui.brain_busy = brain_cancel.len();
+                    last_activity = Instant::now();
+                    let text = match outcome {
+                        BrainOutcome::Done(t) => t,
+                        BrainOutcome::NeedsApproval(t) | BrainOutcome::Failed(t) => t,
+                        BrainOutcome::Cancelled => "Cancelled.".to_string(),
+                    };
+                    if abandoned.remove(&id) {
+                        let _ = rt.control.send(RealtimeControl::InjectContext {
+                            text: format!("[Result of your earlier request to the brain] {text}"),
+                            respond: true,
+                        });
+                    } else {
+                        respond(&rt.control, &id, tools::ASK_BRAIN, json!({"result": text}), Some(Scheduling::WhenIdle));
+                    }
+                }
+            }
+            cmd = rx.recv() => {
+                let Some(cmd) = cmd else { break "app closing".to_string() };
+                match cmd {
+                    // In a conversation a press is decided on release.
+                    VoiceCmd::Press => held = true,
+                    VoiceCmd::Release { held_ms } => {
+                        // Speech captured while the key was down (including
+                        // during the connect) goes out before the release.
+                        while let Ok(frame) = mic_rx.try_recv() {
+                            let _ = rt.control.send(RealtimeControl::Audio(frame));
+                        }
+                        held = false;
+                        let tap = held_ms < threshold_ms;
+                        match (mode, tap) {
+                            // First release: decides the mode.
+                            (None, true) => mode = Some(Mode::Conversation),
+                            (None, false) => {
+                                mode = Some(Mode::PushToTalk);
+                                let _ = rt.control.send(RealtimeControl::AudioStreamEnd);
+                            }
+                            (Some(Mode::Conversation), true) => break "ended".to_string(),
+                            (Some(Mode::Conversation), false) => {}
+                            (Some(Mode::PushToTalk), true) => {
+                                // Tap during push-to-talk: become a conversation.
+                                mode = Some(Mode::Conversation);
+                            }
+                            (Some(Mode::PushToTalk), false) => {
+                                let _ = rt.control.send(RealtimeControl::AudioStreamEnd);
+                            }
+                        }
+                        last_activity = Instant::now();
+                    }
+                    VoiceCmd::Stop => break "stopped".to_string(),
+                    VoiceCmd::HeartbeatAlert(text) => {
+                        if speak_heartbeat {
+                            let _ = rt.control.send(RealtimeControl::InjectContext {
+                                text: format!("[Heartbeat alert — tell the person briefly] {text}"),
+                                respond: true,
+                            });
+                        }
+                    }
+                }
+            }
+            _ = tick.tick() => {
+                if ui.phase == Phase::Speaking && !audio_io.is_playing() {
+                    ui.phase = Phase::Listening;
+                }
+                if let Some(at) = ending_at {
+                    // Let the goodbye arrive and play out (it may come after
+                    // the tool response).
+                    let grace = at.elapsed() >= Duration::from_millis(1500) && !audio_io.is_playing();
+                    if grace || at.elapsed() > Duration::from_secs(8) {
+                        break "goodbye".to_string();
+                    }
+                }
+                let busy = !brain_cancel.is_empty() || audio_io.is_playing() || held;
+                if !busy && last_activity.elapsed() > idle {
+                    break "idle".to_string();
+                }
+                // The press that started a push-to-talk still down past the
+                // threshold: show it as push-to-talk right away.
+                if mode.is_none() && pressed_at.elapsed() >= Duration::from_millis(threshold_ms) && held {
+                    ui.mode = Some(Mode::PushToTalk);
+                }
+                // Transcript lines wait while the brain's turn is running.
+                if brain_cancel.is_empty() {
+                    flush_lines(ctx, &voice_session, &mut pending_lines, false);
+                }
+            }
+        }
+        ui.mode = mode.or(ui.mode);
+        ui.held = held;
+        if *VOICE_UI.peek() != ui {
+            *VOICE_UI.write() = ui.clone();
+        }
+    };
+
+    // Wind down: stop the brain waits (their turns keep running in the tab).
+    for h in brain_cancel.values() {
+        h.detach.store(true, Ordering::SeqCst);
+    }
+    let _ = rt.control.send(RealtimeControl::Close);
+    audio_io.flush();
+    audio_io.stop();
+    if !heard_buf.trim().is_empty() {
+        pending_lines.push((true, heard_buf));
+    }
+    if !spoke_buf.trim().is_empty() {
+        pending_lines.push((false, spoke_buf));
+    }
+    flush_lines(ctx, &voice_session, &mut pending_lines, true);
+    tracing::info!("voice: conversation ended ({close_reason})");
+    if !matches!(close_reason.as_str(), "ended" | "stopped" | "goodbye" | "idle" | "app closing") {
+        fail(format!("The voice conversation ended: {close_reason}"));
+    }
+}
+
+fn respond(control: &mpsc::UnboundedSender<RealtimeControl>, id: &str, name: &str, response: Value, scheduling: Option<Scheduling>) {
+    let _ = control.send(RealtimeControl::ToolResponse {
+        id: id.to_string(),
+        name: name.to_string(),
+        response,
+        scheduling,
+    });
+}
+
+/// Write buffered transcript lines into the Voice session, unless its turn
+/// is streaming (appending mid-turn would interleave with the brain's
+/// messages) — `force` writes regardless (session end).
+fn flush_lines(ctx: BuiltinToolCtx, session_id: &str, lines: &mut Vec<(bool, String)>, force: bool) {
+    if lines.is_empty() || (!force && crate::session_streaming(session_id)) {
+        return;
+    }
+    for (heard, text) in lines.drain(..) {
+        session::append_transcript(ctx.session_state, session_id, heard, &text);
+    }
+}
+
+/// The last ~80 characters of the live transcript, for the indicator.
+fn live_tail(s: &str) -> String {
+    let t = s.trim();
+    let n = t.chars().count();
+    if n <= 80 {
+        t.to_string()
+    } else {
+        format!("…{}", t.chars().skip(n - 80).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instruction_names_the_tools_and_context() {
+        let now = chrono::Local::now();
+        let s = system_instruction(now, "User: 🎙 hi", "Hobbes: CI is red");
+        assert!(s.contains(tools::ASK_BRAIN) && s.contains(tools::END_CONVERSATION));
+        assert!(s.contains("CI is red") && s.contains("🎙 hi"));
+        let bare = system_instruction(now, "", "");
+        assert!(!bare.contains("Heartbeat notes"));
+    }
+
+    #[test]
+    fn live_tail_keeps_the_end() {
+        let long = "a".repeat(100) + "END";
+        let t = live_tail(&long);
+        assert!(t.starts_with('…') && t.ends_with("END"));
+        assert_eq!(live_tail(" short "), "short");
+    }
+}

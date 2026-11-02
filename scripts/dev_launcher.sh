@@ -97,6 +97,8 @@ while true; do
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>10.15</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Hobbes listens while you talk to it in a voice conversation.</string>
     <key>NSFaceIDUsageDescription</key>
     <string>Hobbes uses Touch ID to securely access your API keys in the Keychain.</string>
 </dict>

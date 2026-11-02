@@ -51,6 +51,7 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_LIST_TIMERS",
     "HOBBES_CANCEL_TIMER",
     "HOBBES_FLEET_STATUS",
+    "HOBBES_PEER_READ",
     "HOBBES_MESSAGE_PARENT",
     "HOBBES_MESSAGE_WORKER",
     "HOBBES_TODO_CREATE",
@@ -566,6 +567,23 @@ pub async fn dispatch_builtin_tool(
                 response,
                 persist: true,
             })
+        }
+
+        // Read-only view of the Voice or Heartbeat session (voice::session).
+        "HOBBES_PEER_READ" => {
+            let peer = args_json
+                .get("session")
+                .and_then(serde_json::Value::as_str)
+                .and_then(crate::voice::session::Peer::parse);
+            let limit = args_json.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(12) as usize;
+            let (status, response) = match peer {
+                Some(p) => match crate::voice::session::peer_tail(session_state, p, limit) {
+                    Ok(text) => (ToolCallStatus::Completed, text),
+                    Err(e) => (ToolCallStatus::Error, e),
+                },
+                None => (ToolCallStatus::Error, "session must be 'voice' or 'heartbeat'".to_string()),
+            };
+            Some(BuiltinOutcome { status, response, persist: false })
         }
 
         "HOBBES_FLEET_STATUS" => {

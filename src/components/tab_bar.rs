@@ -5,6 +5,7 @@ use crate::session::SessionState;
 use crate::settings::UiState;
 use dioxus::prelude::*;
 use crate::components::metal_heart::{use_heartbeat_session_id, MetalHeart};
+use crate::components::metal_mouth::{use_voice_session_id, MetalMouth};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// How far (in negative px) the hover marquee should slide a tab's date +
@@ -68,6 +69,7 @@ pub struct TabBarProps {
 
 pub fn TabBar(props: TabBarProps) -> Element {
     let heartbeat_id = use_heartbeat_session_id();
+    let voice_id = use_voice_session_id();
     // Write-only: used only for update_session_name in editing handlers
     let mut session_state = use_context::<Signal<SessionState>>();
     let stream_manager = consume_context::<StreamManagerContext>();
@@ -291,6 +293,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                     if show_emoji {
                                         if heartbeat_id.read().as_deref() == Some(session_id.as_str()) {
                                             MetalHeart {}
+                                        } else if voice_id.read().as_deref() == Some(session_id.as_str()) {
+                                            MetalMouth {}
                                         } else {
                                             span {
                                                 class: "text-[13px] leading-none shrink-0",

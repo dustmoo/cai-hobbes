@@ -62,6 +62,7 @@ mod handoff;
 mod heartbeat;
 mod todo;
 mod usage_log;
+mod voice;
 mod settings;
 mod skills;
 mod theme;
@@ -98,6 +99,12 @@ static CANCEL_STREAM_REQUEST: GlobalSignal<std::collections::HashSet<String>> =
 /// Pause / Stop / budget stop). No-op when nothing is streaming there.
 pub(crate) fn request_stream_cancel(session_id: &str) {
     CANCEL_STREAM_REQUEST.write().insert(session_id.to_string());
+}
+
+/// Whether `session_id` is mid-turn (no subscription: a peek), for code
+/// outside the component tree (the voice brain bridge).
+pub(crate) fn session_streaming(session_id: &str) -> bool {
+    STREAMING_SESSIONS.peek().contains(session_id)
 }
 
 /// Drain `CANCEL_STREAM_REQUEST`, subscribing the caller to it.
@@ -1036,8 +1043,7 @@ fn app() -> Element {
                     .active_connector()
                     .filter(|i| s.is_connector_configured(i))
                     .or_else(|| {
-                        s.llm_connectors
-                            .iter()
+                        s.chat_connectors()
                             .find(|i| s.is_connector_configured(i))
                     })
                     .cloned()
@@ -2252,6 +2258,23 @@ fn app() -> Element {
         use_future(move || async move {
             heartbeat::runtime::run(deps, || STREAMING_SESSIONS.peek().clone()).await;
         });
+    }
+
+    // ── Voice ────────────────────────────────────────────────────────────────
+    // The realtime voice layer (voice::controller) and its global tap / hold
+    // hotkey. Both idle until voice is on and a conversation is started.
+    {
+        let voice_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+            session_state,
+            settings,
+            skill_registry,
+            permission_manager,
+            mcp_context,
+            planner: planner_state,
+            chat_command,
+        };
+        voice::controller::use_voice(voice_ctx);
+        voice::hotkey::use_voice_hotkey();
     }
 
     // Persist tab state to UiState (Pattern 12 & 13)
@@ -3573,6 +3596,8 @@ fn app() -> Element {
                                     }
                                 }
                             }
+                            // Live voice conversation / voice problems
+                            crate::components::voice_indicator::VoiceIndicator {}
                             // Main content area
                             div {
                                 class: "flex flex-row flex-1 min-h-0 overflow-hidden", // This will contain the sidebars and chat

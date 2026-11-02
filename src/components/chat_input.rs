@@ -1777,13 +1777,12 @@ pub fn ChatInput(
                                     .or_else(|| settings_read.active_connector().cloned())
                             };
                             let active_id = active_instance.as_ref().map(|c| c.id.clone());
-                            // Every connector, in canonical order — the index drives the
+                            // Every chat-role connector, in canonical order — the index drives the
                             // ⇧⌥⌘{n} hotkey hint. The session's current connector is shown
                             // highlighted rather than hidden.
                             let all_connectors: Vec<(usize, crate::settings::ProviderInstance)> = settings
                                 .read()
-                                .llm_connectors
-                                .iter()
+                                .chat_connectors()
                                 .cloned()
                                 .enumerate()
                                 .collect();

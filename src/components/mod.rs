@@ -9,6 +9,8 @@ pub mod conflict_modal;
 pub mod inline_comment_popover;
 pub mod markdown_renderer;
 pub mod metal_heart;
+pub mod metal_mouth;
+pub mod voice_indicator;
 pub mod mermaid;
 pub mod message_list;
 pub mod new_chat_memory_modal;

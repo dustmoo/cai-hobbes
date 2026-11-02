@@ -7,6 +7,7 @@ mod mcp;
 mod permissions;
 mod planner;
 mod skills;
+mod voice;
 
 pub(super) use about::AboutTab;
 pub(super) use behavior::BehaviorTab;
@@ -17,3 +18,4 @@ pub(super) use mcp::McpTab;
 pub(super) use permissions::PermissionsTab;
 pub(super) use planner::PlannerTab;
 pub(super) use skills::SkillsTab;
+pub(super) use voice::{ConnectorRoles, VoiceCard};

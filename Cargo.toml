@@ -106,6 +106,9 @@ sublime_fuzzy = "0.7.0"
 json2markdown = "0.2.1"
 notify = "8.2.0"
 unicode-segmentation = "1.13"
+# Voice (src/voice/): realtime speech WebSocket + cross-platform audio fallback.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+cpal = "0.15"
 [target.'cfg(target_os = "macos")'.dependencies]
 macos-accessibility-client = { workspace = true }
 security-framework = "2.11.0"
@@ -114,6 +117,11 @@ objc2 = "0.6"
 objc2-local-authentication = "0.3"
 objc2-foundation = "0.3"
 block2 = "0.6"
+# Voice: AVAudioEngine with voice processing (echo cancellation) for the mic + speaker.
+objc2-avf-audio = "0.3"
+# Voice: mic device enumeration (CoreAudio HAL) and selecting it on the VPIO unit.
+objc2-core-audio = "0.3"
+objc2-audio-toolbox = "0.3"
 # Low-level FFI for keychain operations with auth context
 core-foundation = "0.10"
 security-framework-sys = "2.11.0"
@@ -124,6 +132,7 @@ name = "Hobbes"
 identifier = "ai.clearmirror.cai-hobbes"
 icon = ["assets/icon.icns"]
 [package.metadata.bundle.plist]
+NSMicrophoneUsageDescription = "Hobbes listens while you talk to it in a voice conversation."
 NSAppleEventsUsageDescription = "Hobbes Pro switches to the terminal tab where a Claude Code session is running."
 
 [features]
