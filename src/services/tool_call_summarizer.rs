@@ -98,6 +98,7 @@ mod tests {
                     round_id: None,
                     cancelled: None,
                     hold_reason: None,
+                    hold_rule_key: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -181,6 +182,7 @@ mod tests {
                 round_id: None,
                 cancelled: None,
                 hold_reason: None,
+                hold_rule_key: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,

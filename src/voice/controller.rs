@@ -289,10 +289,10 @@ fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
         idle: Duration::from_secs(settings.voice.idle_timeout_secs.max(15)),
         speak_heartbeat: settings.voice.speak_heartbeat,
         profile: settings
-            .home_composio_profile
-            .clone()
+            .home_profile_id()
+            .map(str::to_string)
             .or_else(|| settings.get_active_profile().map(|p| p.id.clone())),
-        home: settings.home_composio_profile.clone(),
+        home: settings.home_profile_id().map(str::to_string),
         input_device: settings.voice.input_device_uid.clone(),
         echo: settings.voice.echo,
     })

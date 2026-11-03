@@ -340,6 +340,7 @@ fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<Strin
             round_id: None,
             cancelled: None,
             hold_reason: None,
+            hold_rule_key: None,
         }),
         attachments: vec![],
         comments: vec![],

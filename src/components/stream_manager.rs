@@ -619,37 +619,41 @@ impl StreamManagerContext {
                         tool_call.round_id = Some(message_id.to_string());
 
                         // Multi-profile reach (profile_reach): route a Composio
-                        // call to the profile it names, restamping it before it
-                        // is stored, and hold a write that crosses companies
-                        // unless a trust rule already allows it.
+                        // call to the profile it names (restamped before it is
+                        // stored), and in a session with reach, hold any write
+                        // that crosses companies unless a trust rule for that
+                        // flow already allows it.
                         let route = {
+                            use crate::mcp::manager::profile_reach as reach_mod;
                             let settings_read = self.settings.peek();
-                            let reach = crate::mcp::manager::profile_reach::reach_for_session(
-                                &settings_read,
-                                &session_id,
-                                profile_id.as_deref(),
-                            );
-                            let route = crate::mcp::manager::profile_reach::route_tool_call(&reach, &mut tool_call);
-                            if let crate::mcp::manager::profile_reach::Route::To(target) = &route {
-                                let args: serde_json::Value =
+                            let home = reach_mod::home_profile(&settings_read, profile_id.as_deref());
+                            let reach = reach_mod::reach_for_session(&settings_read, &session_id, home.as_deref());
+                            let route = reach_mod::route_tool_call(&reach, &mut tool_call);
+                            if reach.len() >= 2 && !matches!(route, reach_mod::Route::Refused(_)) {
+                                let target = match &route {
+                                    reach_mod::Route::To(t) => Some(t),
+                                    _ => None,
+                                };
+                                let mut args: serde_json::Value =
                                     serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+                                reach_mod::strip_profile_arg(&tool_call.tool_name, &mut args);
                                 let state = self.session_state.peek();
                                 let session = state.sessions.get(&session_id);
                                 let read_from = session
-                                    .map(|s| crate::mcp::manager::profile_reach::turn_read_profiles(&settings_read, &s.messages))
+                                    .map(|s| reach_mod::session_read_profiles(&settings_read, &s.messages))
                                     .unwrap_or_default();
-                                let reason = crate::mcp::manager::profile_reach::cross_company_reason(
+                                let hold = reach_mod::cross_company_hold(
                                     target,
                                     &reach[0],
                                     &read_from,
                                     &reach,
-                                    crate::mcp::manager::profile_reach::is_write(&tool_call.tool_name, &args),
+                                    reach_mod::is_write(&tool_call.tool_name, &args),
                                 );
-                                if let Some(reason) = reason {
+                                if let Some(hold) = hold {
                                     let project_id = session.and_then(|s| s.project_id.clone());
                                     let rule = crate::context::trust::evaluate(
                                         &settings_read.permission_settings.trust_rules,
-                                        &tool_call.server_name,
+                                        &hold.rule_key,
                                         &tool_call.tool_name,
                                         &args,
                                         &crate::context::trust::TrustCtx { project_id: project_id.as_deref() },
@@ -659,7 +663,7 @@ impl StreamManagerContext {
                                         Some(rule_id) => crate::context::trust_store::log_decision(
                                             crate::context::trust_store::TrustDecision::new(
                                                 crate::context::trust_store::DecisionKind::RuleHit,
-                                                &tool_call.server_name,
+                                                &hold.rule_key,
                                                 &tool_call.tool_name,
                                                 crate::context::trust_store::arg_summary(&args),
                                                 Some(session_id.clone()),
@@ -667,7 +671,10 @@ impl StreamManagerContext {
                                                 Some(rule_id),
                                             ),
                                         ),
-                                        None => tool_call.hold_reason = Some(reason),
+                                        None => {
+                                            tool_call.hold_reason = Some(hold.reason);
+                                            tool_call.hold_rule_key = Some(hold.rule_key);
+                                        }
                                     }
                                 }
                             }
@@ -743,9 +750,14 @@ impl StreamManagerContext {
                         let profile_id_inner = profile_id.clone();
                         let session_id_inner = session_id.clone();
                         let _handle = spawn(async move {
-                            let args_json: serde_json::Value =
+                            let mut args_json: serde_json::Value =
                                 serde_json::from_str(&tool_call.arguments)
                                     .unwrap_or(serde_json::Value::Null);
+                            // `profile` stays in the stored call (history) but
+                            // never reaches Composio.
+                            if crate::mcp::manager::is_composio_native(&tool_call.server_name) {
+                                crate::mcp::manager::profile_reach::strip_profile_arg(&tool_call.tool_name, &mut args_json);
+                            }
                             // A routed call runs in its target profile.
                             let profile_id = match &route {
                                 crate::mcp::manager::profile_reach::Route::To(p) => Some(p.id.clone()),
@@ -944,17 +956,36 @@ impl StreamManagerContext {
                                     }
                                 })
                             };
-                            let result_receiver = mcp_manager
-                                .read()
-                                .use_mcp_tool(
-                                    &tool_call.server_name,
-                                    &tool_call.tool_name,
-                                    args_json,
-                                    false,
-                                    profile_id.clone(),
-                                    session_ctx,
-                                )
-                                .await;
+                            // A call routed to another profile needs that
+                            // profile's client: connect it, and fail rather than
+                            // fall back to another company's account.
+                            let ensured: Result<(), String> = match &route {
+                                crate::mcp::manager::profile_reach::Route::To(t) => {
+                                    let settings_snapshot = self.settings.peek().clone();
+                                    mcp_manager
+                                        .read()
+                                        .ensure_native_client_for_profile(&t.id, &settings_snapshot)
+                                        .await
+                                        .map_err(|e| format!("Couldn't connect the {} Composio account, so this wasn't run: {e}", t.name))
+                                }
+                                _ => Ok(()),
+                            };
+                            let result_receiver = match ensured {
+                                Err(e) => Err(e),
+                                Ok(()) => {
+                                    mcp_manager
+                                        .read()
+                                        .use_mcp_tool(
+                                            &tool_call.server_name,
+                                            &tool_call.tool_name,
+                                            args_json,
+                                            false,
+                                            profile_id.clone(),
+                                            session_ctx,
+                                        )
+                                        .await
+                                }
+                            };
 
                             let (status, response_str, is_permission_request, image_path) =
                                 match result_receiver {
@@ -1155,6 +1186,13 @@ impl StreamManagerContext {
                                     {
                                         if let crate::components::shared::MessageContent::ToolCall(orig) = &msg.content {
                                             tc.round_id = orig.round_id.clone();
+                                            // Keep the routing: target profile,
+                                            // stored arguments (with `profile`)
+                                            // and any cross-company hold.
+                                            tc.profile_id = orig.profile_id.clone();
+                                            tc.arguments = orig.arguments.clone();
+                                            tc.hold_reason = orig.hold_reason.clone();
+                                            tc.hold_rule_key = orig.hold_rule_key.clone();
                                         }
                                         msg.content = crate::components::shared::MessageContent::PermissionRequest(tc);
                                     }

@@ -7,14 +7,17 @@
 //!   once: the home profile's tools plus any only another reachable profile
 //!   has, each with a `profile` argument listing the profiles that have it
 //!   ([`merge_reach`]).
-//! - **Routing.** [`route_tool_call`] reads and strips `profile`, and stamps
-//!   the call with its target (`server_name` = `composio-native:{name}`,
-//!   `profile_id`), so dispatch, held approvals, the resume path, trust
-//!   rules and the result card all follow the target profile.
+//! - **Routing.** [`route_tool_call`] reads `profile` and stamps the call
+//!   with its target (`server_name` = `composio-native:{name}`,
+//!   `profile_id`); the argument stays in the stored call (history shows
+//!   which company a call hit) and is stripped only on its way to Composio
+//!   ([`strip_profile_arg`]).
 //! - **Company boundary.** Each profile is a company (Clearmirror, and the
-//!   clients it works for). [`cross_company_reason`] asks before a write
-//!   lands outside home, or lands in one company after this turn read
-//!   another's data; the trust rules can remember the answer, per project.
+//!   clients it works for). [`cross_company_hold`] holds a write that lands
+//!   outside home, or that follows reading another company's data anywhere
+//!   in the session (it stays in the model's context and summary). The hold
+//!   is remembered under its own trust key — the direction of the flow — so
+//!   ordinary "always allow" rules never wave it through.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -27,15 +30,28 @@ use crate::components::shared::{MessageContent, ToolCallStatus};
 use crate::settings::Settings;
 
 /// The per-call argument naming the target profile.
-pub const PROFILE_ARG: &str = "profile";
+/// Named so it can't collide with a tool's own parameter (some Composio
+/// tools take a `profile`).
+pub const PROFILE_ARG: &str = "hobbes_profile";
 
 /// The meta tool that runs another Composio tool by name.
 const EXECUTE_TOOL: &str = "COMPOSIO_EXECUTE_TOOL";
+
+/// Trust-rule server key prefix for cross-company holds.
+pub const FLOW_KEY_PREFIX: &str = "profile-flow:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReachProfile {
     pub id: String,
     pub name: String,
+}
+
+/// The home profile a session acts in: its pin, else the global active
+/// profile (the same fallback the tool list and the prompt use).
+pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<String> {
+    session_pin
+        .map(str::to_string)
+        .or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
 }
 
 /// The profiles `session_id` can act in, home first. Only system sessions
@@ -61,8 +77,8 @@ pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<
 /// The system-prompt instruction for a session with reach.
 pub fn reach_instruction(home: &str, others: &[&str]) -> String {
     format!(
-        "Your home profile is '{home}': Composio tools act there unless you pass `profile`. You can \
-         also act in {}: pass `profile` with that name on the tool call (its options list who has \
+        "Your home profile is '{home}': Composio tools act there unless you pass `hobbes_profile`. You can \
+         also act in {}: pass `hobbes_profile` with that name on the tool call (its options list who has \
          the app connected). Each profile is a different company. Keep each company's content in \
          its own accounts — never copy one company's documents, emails or data into another's \
          tools unless the person explicitly asks; such writes are held for their approval.",
@@ -81,18 +97,37 @@ pub fn profile_for_server_name<'a>(settings: &'a Settings, server_name: &str) ->
     settings
         .composio_profiles
         .iter()
-        .find(|p| p.id == suffix || p.name == suffix)
+        .find(|p| p.id == suffix)
+        .or_else(|| settings.composio_profiles.iter().find(|p| p.name == suffix))
         .map(|p| p.id.as_str())
 }
 
-fn native_entry(ctx: &McpContext) -> Option<&McpServerContext> {
-    ctx.servers.iter().find(|s| is_composio_native(&s.name))
+/// Every Composio tool in `ctx`, across all its Composio entries (force-
+/// loaded and on-demand tools are separate entries with the same name).
+fn native_tools(ctx: &McpContext) -> impl Iterator<Item = &rmcp::model::Tool> {
+    ctx.servers.iter().filter(|s| is_composio_native(&s.name)).flat_map(|s| s.tools.iter())
 }
 
-/// The session's tool set across its reach: the home context, with tools
-/// only another profile has added to the home Composio entry, and every
-/// Composio tool given a `profile` argument naming the profiles that have
-/// it. `others` are the other reachable profiles' contexts.
+fn has_profile_arg(t: &rmcp::model::Tool) -> bool {
+    t.input_schema.get("properties").and_then(|p| p.get(PROFILE_ARG)).is_some()
+}
+
+/// Replace all Composio entries of `ctx` with one entry holding `tools`.
+fn set_native_tools(ctx: &mut McpContext, name: String, description: String, tools: Vec<rmcp::model::Tool>) {
+    let at = ctx.servers.iter().position(|s| is_composio_native(&s.name));
+    ctx.servers.retain(|s| !is_composio_native(&s.name));
+    let entry = McpServerContext { name, description, tools };
+    match at {
+        Some(i) => ctx.servers.insert(i.min(ctx.servers.len()), entry),
+        None => ctx.servers.push(entry),
+    }
+}
+
+/// The session's tool set across its reach: the home context, its Composio
+/// entries folded into one that also carries the tools only another profile
+/// has, and every Composio tool given a `profile` argument naming the
+/// profiles that have it. `others` are the other reachable profiles'
+/// contexts.
 pub fn merge_reach(mut home_ctx: McpContext, home: &ReachProfile, others: &[(ReachProfile, McpContext)]) -> McpContext {
     // Tool name → (tool, profiles that have it), home first.
     let mut order: Vec<String> = Vec::new();
@@ -111,17 +146,13 @@ pub fn merge_reach(mut home_ctx: McpContext, home: &ReachProfile, others: &[(Rea
             }
         }
     };
-    if let Some(entry) = native_entry(&home_ctx) {
-        for t in &entry.tools {
-            add(t, &home.name);
-        }
+    for t in native_tools(&home_ctx) {
+        add(t, &home.name);
     }
     let mut slugs: BTreeSet<String> = home_ctx.connected_toolkit_slugs.iter().cloned().collect();
     for (profile, ctx) in others {
-        if let Some(entry) = native_entry(ctx) {
-            for t in &entry.tools {
-                add(t, &profile.name);
-            }
+        for t in native_tools(ctx) {
+            add(t, &profile.name);
         }
         slugs.extend(ctx.connected_toolkit_slugs.iter().cloned());
     }
@@ -133,14 +164,7 @@ pub fn merge_reach(mut home_ctx: McpContext, home: &ReachProfile, others: &[(Rea
         .filter_map(|n| tools.remove(&n))
         .map(|(tool, have)| with_profile_arg(tool, &have, &home.name))
         .collect();
-    match home_ctx.servers.iter_mut().find(|s| is_composio_native(&s.name)) {
-        Some(entry) => entry.tools = merged,
-        None => home_ctx.servers.push(McpServerContext {
-            name: server_name_for(home),
-            description: "Composio tools across your profiles".into(),
-            tools: merged,
-        }),
-    }
+    set_native_tools(&mut home_ctx, server_name_for(home), "Composio tools across your profiles".into(), merged);
     home_ctx.connected_toolkit_slugs = slugs.into_iter().collect();
     home_ctx
 }
@@ -173,59 +197,71 @@ fn with_profile_arg(mut tool: rmcp::model::Tool, have: &[String], home: &str) ->
     tool
 }
 
-/// Keep reach tools a context refresh would drop: `scoped` (the home
-/// profile's tools from a background refresh) takes any tool `previous`
-/// had in its Composio entry that it lacks, and `previous`'s
-/// `profile`-annotated schema for the ones it has.
-pub fn carry_reach(mut scoped: McpContext, previous: Option<&McpContext>) -> McpContext {
-    let Some(prev_entry) = previous.and_then(native_entry) else {
-        return scoped;
-    };
-    let annotated = |t: &rmcp::model::Tool| {
-        t.input_schema
-            .get("properties")
-            .and_then(|p| p.get(PROFILE_ARG))
-            .is_some()
-    };
-    if !prev_entry.tools.iter().any(annotated) {
+/// Keep reach tools a context refresh would drop. Only for sessions that
+/// still have reach (`reach_names`, home first; empty = none): `scoped` (the
+/// home profile's tools from a background refresh) is folded into one
+/// Composio entry and takes `previous`'s `profile`-annotated tools, keeping
+/// only profile options still in reach.
+pub fn carry_reach(mut scoped: McpContext, previous: Option<&McpContext>, reach_names: &[String]) -> McpContext {
+    if reach_names.len() < 2 {
         return scoped;
     }
-    match scoped.servers.iter_mut().find(|s| is_composio_native(&s.name)) {
-        Some(entry) => {
-            for t in prev_entry.tools.iter().filter(|t| annotated(t)) {
-                match entry.tools.iter_mut().find(|e| e.name == t.name) {
-                    Some(existing) => *existing = t.clone(),
-                    None => entry.tools.push(t.clone()),
-                }
-            }
+    let Some(prev) = previous else { return scoped };
+    let carried: Vec<rmcp::model::Tool> = native_tools(prev).filter(|t| has_profile_arg(t)).cloned().collect();
+    if carried.is_empty() {
+        return scoped;
+    }
+    let mut out: Vec<rmcp::model::Tool> = Vec::new();
+    for t in native_tools(&scoped) {
+        if !out.iter().any(|o| o.name == t.name) {
+            out.push(t.clone());
         }
-        None => scoped.servers.push(prev_entry.clone()),
     }
+    for t in carried {
+        let have: Vec<String> = t.input_schema["properties"][PROFILE_ARG]["enum"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).filter(|n| reach_names.iter().any(|r| r == n)).map(str::to_string).collect())
+            .unwrap_or_default();
+        if have.is_empty() {
+            continue;
+        }
+        let t = with_profile_arg(t, &have, &reach_names[0]);
+        match out.iter_mut().find(|o| o.name == t.name) {
+            Some(existing) => *existing = t,
+            None => out.push(t),
+        }
+    }
+    let name = scoped
+        .servers
+        .iter()
+        .find(|s| is_composio_native(&s.name))
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| format!("{COMPOSIO_NATIVE_PREFIX}:{}", reach_names[0]));
+    set_native_tools(&mut scoped, name, "Composio tools across your profiles".into(), out);
     scoped
 }
 
-/// The profile a held (then approved) call runs in on the resume path: its
-/// routed target when that is in the session's reach, else the session's.
-pub fn resume_profile(
-    settings: &Settings,
-    session_id: &str,
-    session_profile: Option<&str>,
-    tool_call: &crate::components::shared::ToolCall,
-) -> Option<String> {
-    let home = session_profile
-        .map(str::to_string)
-        .or_else(|| settings.get_active_profile().map(|p| p.id.clone()));
-    if !is_composio_native(&tool_call.server_name) {
-        return home;
-    }
-    let reach = reach_for_session(settings, session_id, home.as_deref());
-    let target = tool_call
-        .profile_id
-        .clone()
-        .or_else(|| profile_for_server_name(settings, &tool_call.server_name).map(str::to_string));
-    match target {
-        Some(t) if reach.iter().any(|p| p.id == t) => Some(t),
-        _ => home,
+/// The `profile` the model asked for: top level, or (for the execute meta
+/// tool) inside its `arguments`.
+fn asked_profile(tool_name: &str, args: &Value) -> Option<String> {
+    let top = args.get(PROFILE_ARG);
+    let nested = (tool_name == EXECUTE_TOOL).then(|| args.get("arguments").and_then(|a| a.get(PROFILE_ARG))).flatten();
+    top.or(nested)
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Remove `profile` before a call goes to Composio (top level, and inside
+/// the execute meta tool's `arguments`).
+pub fn strip_profile_arg(tool_name: &str, args: &mut Value) {
+    if let Some(m) = args.as_object_mut() {
+        m.remove(PROFILE_ARG);
+        if tool_name == EXECUTE_TOOL {
+            if let Some(inner) = m.get_mut("arguments").and_then(Value::as_object_mut) {
+                inner.remove(PROFILE_ARG);
+            }
+        }
     }
 }
 
@@ -240,19 +276,25 @@ pub enum Route {
     Refused(String),
 }
 
-/// Resolve the call's `profile` argument against `reach` (home first),
-/// strip it, and restamp `server_name` / `arguments` / `profile_id` with the
-/// target. No `profile` = home.
+/// Resolve the call's `profile` against `reach` (home first) and restamp
+/// `server_name` / `profile_id` with the target. No `profile` = home. The
+/// stored arguments keep `profile`; strip it before dispatch.
 pub fn route_tool_call(reach: &[ReachProfile], tool_call: &mut crate::components::shared::ToolCall) -> Route {
-    if reach.len() < 2 || !is_composio_native(&tool_call.server_name) {
+    if !is_composio_native(&tool_call.server_name) {
         return Route::Unchanged;
     }
-    let mut args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
-    let asked = args
-        .as_object_mut()
-        .and_then(|m| m.remove(PROFILE_ARG))
-        .and_then(|v| v.as_str().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty());
+    let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+    let asked = asked_profile(&tool_call.tool_name, &args);
+    if reach.len() < 2 {
+        // No reach (or it shrank since the tools were listed): a call naming
+        // another profile must not quietly run here.
+        return match asked {
+            Some(want) if !reach.first().is_some_and(|h| h.id == want || h.name.eq_ignore_ascii_case(&want)) => {
+                Route::Refused(format!("Profile \"{want}\" isn't available here."))
+            }
+            _ => Route::Unchanged,
+        };
+    }
     let target = match asked {
         None => reach[0].clone(),
         Some(want) => match reach.iter().find(|p| p.id == want || p.name.eq_ignore_ascii_case(&want)) {
@@ -266,19 +308,50 @@ pub fn route_tool_call(reach: &[ReachProfile], tool_call: &mut crate::components
             }
         },
     };
-    if let Ok(s) = serde_json::to_string(&args) {
-        tool_call.arguments = s;
-    }
     tool_call.server_name = server_name_for(&target);
     tool_call.profile_id = Some(target.id.clone());
     Route::To(target)
 }
 
-/// Profiles this turn has read Composio results from: completed Composio
-/// calls since the last message the person (or a relay) sent.
-pub fn turn_read_profiles(settings: &Settings, messages: &[Message]) -> BTreeSet<String> {
-    let start = messages.iter().rposition(|m| m.author == "User").map(|i| i + 1).unwrap_or(0);
-    messages[start..]
+/// The profile a held (then approved) call runs in on the resume path.
+/// Sessions without reach keep the old behaviour exactly (the session's own
+/// pin, `None` included). With reach, the call's routed target — refused if
+/// that profile is no longer reachable, never silently moved to home.
+pub fn resume_profile(
+    settings: &Settings,
+    session_id: &str,
+    session_profile: Option<&str>,
+    tool_call: &crate::components::shared::ToolCall,
+) -> Result<Option<String>, String> {
+    if !is_composio_native(&tool_call.server_name) {
+        return Ok(session_profile.map(str::to_string));
+    }
+    // Only system sessions route; everything else keeps its own pin. (Not
+    // `reach.len()`: a system session whose other profiles dropped out must
+    // still refuse a call routed to one of them.)
+    if !crate::system_sessions::is_system(session_id) {
+        return Ok(session_profile.map(str::to_string));
+    }
+    let home = home_profile(settings, session_profile);
+    let reach = reach_for_session(settings, session_id, home.as_deref());
+    let target = tool_call
+        .profile_id
+        .clone()
+        .or_else(|| profile_for_server_name(settings, &tool_call.server_name).map(str::to_string));
+    match target {
+        None => Ok(home),
+        Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
+        Some(_) => Err(format!(
+            "Not run: the profile this was meant for ({}) is no longer available, and it won't be run in another company's account.",
+            tool_call.server_name.trim_start_matches(COMPOSIO_NATIVE_PREFIX).trim_start_matches(':')
+        )),
+    }
+}
+
+/// Profiles this session has read Composio results from — anywhere in its
+/// history, since read data stays in the model's context and summary.
+pub fn session_read_profiles(settings: &Settings, messages: &[Message]) -> BTreeSet<String> {
+    messages
         .iter()
         .filter_map(|m| match &m.content {
             MessageContent::ToolCall(tc) if tc.status == ToolCallStatus::Completed && is_composio_native(&tc.server_name) => {
@@ -291,9 +364,13 @@ pub fn turn_read_profiles(settings: &Settings, messages: &[Message]) -> BTreeSet
         .collect()
 }
 
-/// Whether a Composio call changes something outside (by its name, or for
-/// the execute meta tool, the tool it runs).
+/// Whether a call changes something outside. Composio meta tools that only
+/// discover or load tools don't; the execute meta tool is judged by the
+/// tool it runs.
 pub fn is_write(tool_name: &str, args: &Value) -> bool {
+    if tool_name.starts_with("COMPOSIO_") && tool_name != EXECUTE_TOOL {
+        return false;
+    }
     let (tool, inner) = if tool_name == EXECUTE_TOOL {
         (
             args.get("tool_name").and_then(Value::as_str).unwrap_or(tool_name),
@@ -305,30 +382,54 @@ pub fn is_write(tool_name: &str, args: &Value) -> bool {
     crate::todo::agent_time::agent_time_scope_allows(tool, &inner) != crate::todo::agent_time::ScopeVerdict::Allow
 }
 
-/// Why a write needs the person: it lands outside home, or in one company
-/// after this turn read another's data. `None` = proceed as usual.
-pub fn cross_company_reason(
-    target: &ReachProfile,
+/// A held cross-company write: why, and the trust key that remembers it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hold {
+    pub reason: String,
+    /// `profile-flow:{source ids}>{target id or "local"}` — matched by trust
+    /// rules created from this bubble only.
+    pub rule_key: String,
+}
+
+/// Hold a write that lands outside home, or after reading another company's
+/// data. `target` = the Composio profile written to; `None` = a non-Composio
+/// write (terminal, dispatch, …), which counts as home-side.
+pub fn cross_company_hold(
+    target: Option<&ReachProfile>,
     home: &ReachProfile,
     read_from: &BTreeSet<String>,
     reach: &[ReachProfile],
     write: bool,
-) -> Option<String> {
+) -> Option<Hold> {
     if !write {
         return None;
     }
+    let dest_id = target.map_or(home.id.as_str(), |t| t.id.as_str());
     let name_of = |id: &str| reach.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_string());
-    let others: Vec<String> = read_from.iter().filter(|id| **id != target.id).map(|id| name_of(id)).collect();
-    if !others.is_empty() {
-        return Some(format!(
-            "This writes to {} after reading from {} in this turn — check it doesn't carry one company's content into another's.",
-            target.name,
-            others.join(", ")
-        ));
+    let sources: Vec<&String> = read_from.iter().filter(|id| id.as_str() != dest_id).collect();
+    let to_key = target.map_or("local".to_string(), |t| t.id.clone());
+    if !sources.is_empty() {
+        let from: Vec<String> = sources.iter().map(|id| name_of(id)).collect();
+        let what = match target {
+            Some(t) => format!("This writes to {}", t.name),
+            None => "This acts outside your connected accounts".to_string(),
+        };
+        let ids: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
+        return Some(Hold {
+            reason: format!(
+                "{what} in a conversation that has read {} data — check it doesn't carry one company's content into another's.",
+                from.join(" and ")
+            ),
+            rule_key: format!("{FLOW_KEY_PREFIX}{}>{to_key}", ids.join("+")),
+        });
     }
-    (target.id != home.id).then(|| {
-        format!("This acts in {}, outside {} (Hobbes' home profile).", target.name, home.name)
-    })
+    match target {
+        Some(t) if t.id != home.id => Some(Hold {
+            reason: format!("This acts in {}, outside {} (Hobbes' home profile).", t.name, home.name),
+            rule_key: format!("{FLOW_KEY_PREFIX}{}>{}", home.id, t.id),
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -341,15 +442,19 @@ mod tests {
         rmcp::model::Tool::new(name.to_string(), "d".to_string(), Arc::new(schema.as_object().unwrap().clone()))
     }
 
+    fn entry(profile: &str, tools: &[&str]) -> McpServerContext {
+        McpServerContext {
+            name: format!("composio-native:{profile}"),
+            description: String::new(),
+            tools: tools.iter().map(|t| tool(t)).collect(),
+        }
+    }
+
     fn ctx(profile: &str, tools: &[&str]) -> McpContext {
         McpContext {
             servers: vec![
                 McpServerContext { name: "terminal".into(), description: String::new(), tools: vec![tool("RUN")] },
-                McpServerContext {
-                    name: format!("composio-native:{profile}"),
-                    description: String::new(),
-                    tools: tools.iter().map(|t| tool(t)).collect(),
-                },
+                entry(profile, tools),
             ],
             connected_toolkit_slugs: vec![profile.to_lowercase()],
         }
@@ -359,9 +464,12 @@ mod tests {
         ReachProfile { id: id.into(), name: name.into() }
     }
 
+    fn natives(ctx: &McpContext) -> Vec<&McpServerContext> {
+        ctx.servers.iter().filter(|s| is_composio_native(&s.name)).collect()
+    }
+
     fn profile_enum(ctx: &McpContext, tool_name: &str) -> Vec<String> {
-        let entry = native_entry(ctx).unwrap();
-        let t = entry.tools.iter().find(|t| t.name == tool_name).unwrap();
+        let t = native_tools(ctx).find(|t| t.name == tool_name).unwrap();
         serde_json::from_value(t.input_schema["properties"][PROFILE_ARG]["enum"].clone()).unwrap()
     }
 
@@ -373,30 +481,48 @@ mod tests {
             &home,
             &[(p("pg", "Puget"), ctx("Puget", &["GMAIL_SEND_EMAIL", "JIRA_CREATE_ISSUE"]))],
         );
-        let entry = native_entry(&merged).unwrap();
-        assert_eq!(entry.name, "composio-native:Clearmirror");
-        let names: Vec<_> = entry.tools.iter().map(|t| t.name.to_string()).collect();
+        let n = natives(&merged);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n[0].name, "composio-native:Clearmirror");
+        let names: Vec<_> = n[0].tools.iter().map(|t| t.name.to_string()).collect();
         assert_eq!(names, ["GMAIL_SEND_EMAIL", "GOOGLEDOCS_CREATE", "JIRA_CREATE_ISSUE"]);
         assert_eq!(profile_enum(&merged, "GMAIL_SEND_EMAIL"), ["Clearmirror", "Puget"]);
         assert_eq!(profile_enum(&merged, "GOOGLEDOCS_CREATE"), ["Clearmirror"]);
         assert_eq!(profile_enum(&merged, "JIRA_CREATE_ISSUE"), ["Puget"]);
-        // Non-Composio servers untouched; toolkit slugs unioned.
         assert_eq!(merged.servers[0].tools[0].name, "RUN");
         assert_eq!(merged.connected_toolkit_slugs, ["clearmirror", "puget"]);
-        // The original schema survives.
-        assert!(entry.tools[0].input_schema["properties"].get("q").is_some());
+        assert!(n[0].tools[0].input_schema["properties"].get("q").is_some());
     }
 
     #[test]
-    fn a_refresh_keeps_reach_tools() {
-        let home = p("cm", "Clearmirror");
-        let merged = merge_reach(ctx("Clearmirror", &["A"]), &home, &[(p("pg", "Puget"), ctx("Puget", &["B"]))]);
-        let refreshed = carry_reach(ctx("Clearmirror", &["A"]), Some(&merged));
+    fn on_demand_entries_fold_in_without_duplicates() {
+        // Force-loaded and discovered tools are separate entries per profile.
+        let mut home_ctx = ctx("Clearmirror", &["GMAIL_SEND_EMAIL"]);
+        home_ctx.servers.push(entry("Clearmirror", &["NOTION_CREATE_PAGE"]));
+        let mut puget = ctx("Puget", &["NOTION_CREATE_PAGE"]);
+        puget.servers.push(entry("Puget", &["JIRA_CREATE_ISSUE"]));
+        let merged = merge_reach(home_ctx, &p("cm", "Clearmirror"), &[(p("pg", "Puget"), puget)]);
+        assert_eq!(natives(&merged).len(), 1, "one Composio entry, so no duplicate declarations");
+        assert_eq!(profile_enum(&merged, "NOTION_CREATE_PAGE"), ["Clearmirror", "Puget"]);
+        assert_eq!(profile_enum(&merged, "JIRA_CREATE_ISSUE"), ["Puget"]);
+    }
+
+    #[test]
+    fn a_refresh_keeps_reach_tools_only_while_reach_lasts() {
+        let reach = vec!["Clearmirror".to_string(), "Puget".to_string()];
+        let merged = merge_reach(ctx("Clearmirror", &["A"]), &p("cm", "Clearmirror"), &[(p("pg", "Puget"), ctx("Puget", &["A", "B"]))]);
+        let mut refreshed_ctx = ctx("Clearmirror", &["A"]);
+        refreshed_ctx.servers.push(entry("Clearmirror", &["A"])); // a dynamic duplicate
+        let refreshed = carry_reach(refreshed_ctx, Some(&merged), &reach);
+        assert_eq!(natives(&refreshed).len(), 1);
         assert_eq!(profile_enum(&refreshed, "B"), ["Puget"]);
-        assert_eq!(profile_enum(&refreshed, "A"), ["Clearmirror"]);
-        // Nothing annotated before: nothing carried.
-        let plain = carry_reach(ctx("Clearmirror", &["A"]), Some(&ctx("Clearmirror", &["Z"])));
-        assert_eq!(native_entry(&plain).unwrap().tools.len(), 1);
+        assert_eq!(profile_enum(&refreshed, "A"), ["Clearmirror", "Puget"]);
+        // Puget left the reach: its options and its own tools go.
+        let shrunk = carry_reach(ctx("Clearmirror", &["A"]), Some(&merged), &["Clearmirror".to_string(), "Acme".to_string()]);
+        assert!(native_tools(&shrunk).all(|t| t.name != "B"));
+        // No reach: never touched.
+        let plain = carry_reach(ctx("Clearmirror", &["A"]), Some(&merged), &["Clearmirror".to_string()]);
+        assert_eq!(plain, ctx("Clearmirror", &["A"]));
     }
 
     fn call(args: Value) -> ToolCall {
@@ -406,52 +532,99 @@ mod tests {
     #[test]
     fn calls_route_to_the_named_profile_and_default_home() {
         let reach = vec![p("cm", "Clearmirror"), p("pg", "Puget")];
-        let mut c = call(json!({"to": "a@b.c", "profile": "puget"}));
+        let mut c = call(json!({"to": "a@b.c", "hobbes_profile": "puget"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("pg", "Puget")));
         assert_eq!(c.server_name, "composio-native:Puget");
         assert_eq!(c.profile_id.as_deref(), Some("pg"));
-        let args: Value = serde_json::from_str(&c.arguments).unwrap();
-        assert!(args.get("profile").is_none(), "profile must not reach Composio");
+        // History keeps the profile; dispatch strips it.
+        let mut args: Value = serde_json::from_str(&c.arguments).unwrap();
+        assert_eq!(args[PROFILE_ARG], "puget");
+        strip_profile_arg(&c.tool_name, &mut args);
+        assert!(args.get(PROFILE_ARG).is_none());
 
         let mut c = call(json!({"to": "a@b.c"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("cm", "Clearmirror")));
 
-        let mut c = call(json!({"profile": "Acme"}));
+        let mut c = call(json!({"hobbes_profile": "Acme"}));
         assert!(matches!(route_tool_call(&reach, &mut c), Route::Refused(m) if m.contains("Clearmirror, Puget")));
 
-        // No reach, or not Composio: untouched.
-        let mut c = call(json!({"profile": "Puget"}));
+        // Reach shrank to home: naming another profile is refused, naming home is fine.
+        let mut c = call(json!({"hobbes_profile": "Puget"}));
+        assert!(matches!(route_tool_call(&reach[..1], &mut c), Route::Refused(_)));
+        let mut c = call(json!({"hobbes_profile": "Clearmirror"}));
         assert_eq!(route_tool_call(&reach[..1], &mut c), Route::Unchanged);
+        // A tool's own `profile` parameter is left alone.
+        let mut c = call(json!({"profile": "linkedin-handle"}));
+        assert_eq!(route_tool_call(&reach[..1], &mut c), Route::Unchanged);
+        let mut c = call(json!({"profile": "linkedin-handle"}));
+        assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("cm", "Clearmirror")));
+        let mut a: Value = serde_json::from_str(&c.arguments).unwrap();
+        strip_profile_arg(&c.tool_name, &mut a);
+        assert_eq!(a["profile"], "linkedin-handle");
         let mut t = ToolCall::new("terminal".into(), "RUN".into(), json!({}), None, None);
         assert_eq!(route_tool_call(&reach, &mut t), Route::Unchanged);
     }
 
     #[test]
-    fn writes_across_companies_ask_reads_do_not() {
+    fn the_execute_tool_routes_and_strips_a_nested_profile() {
+        let reach = vec![p("cm", "Clearmirror"), p("pg", "Puget")];
+        let mut c = ToolCall::new(
+            "composio-native:Clearmirror".into(),
+            EXECUTE_TOOL.into(),
+            json!({"tool_name": "JIRA_CREATE_ISSUE", "arguments": {"hobbes_profile": "Puget", "title": "x"}}),
+            None,
+            None,
+        );
+        assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("pg", "Puget")));
+        let mut args: Value = serde_json::from_str(&c.arguments).unwrap();
+        strip_profile_arg(EXECUTE_TOOL, &mut args);
+        assert!(args["arguments"].get(PROFILE_ARG).is_none());
+        assert_eq!(args["arguments"]["title"], "x");
+    }
+
+    #[test]
+    fn writes_across_companies_hold_under_their_own_trust_key() {
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
         let reach = vec![cm.clone(), pg.clone()];
         let none = BTreeSet::new();
         let read_cm: BTreeSet<String> = ["cm".to_string()].into();
         let read_pg: BTreeSet<String> = ["pg".to_string()].into();
-        // Reads never ask.
-        assert_eq!(cross_company_reason(&pg, &cm, &read_cm, &reach, false), None);
+        // Reads never hold.
+        assert_eq!(cross_company_hold(Some(&pg), &cm, &read_cm, &reach, false), None);
         // A write at home with only home data: as today.
-        assert_eq!(cross_company_reason(&cm, &cm, &read_cm, &reach, true), None);
-        // Clearmirror content into Puget's tools: ask, naming both.
-        let r = cross_company_reason(&pg, &cm, &read_cm, &reach, true).unwrap();
-        assert!(r.contains("writes to Puget after reading from Clearmirror"));
-        // Puget content into Clearmirror's tools: ask too.
-        assert!(cross_company_reason(&cm, &cm, &read_pg, &reach, true).unwrap().contains("reading from Puget"));
-        // Any write outside home asks.
-        assert!(cross_company_reason(&pg, &cm, &none, &reach, true).unwrap().contains("outside Clearmirror"));
+        assert_eq!(cross_company_hold(Some(&cm), &cm, &read_cm, &reach, true), None);
+        // Clearmirror content into Puget's tools.
+        let h = cross_company_hold(Some(&pg), &cm, &read_cm, &reach, true).unwrap();
+        assert!(h.reason.contains("writes to Puget") && h.reason.contains("read Clearmirror data"));
+        assert_eq!(h.rule_key, "profile-flow:cm>pg");
+        // Puget content into Clearmirror's tools.
+        let h = cross_company_hold(Some(&cm), &cm, &read_pg, &reach, true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+        // Puget content out through a non-Composio write (terminal, dispatch).
+        let h = cross_company_hold(None, &cm, &read_pg, &reach, true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:pg>local");
+        // Home data out through a non-Composio write: as today.
+        assert_eq!(cross_company_hold(None, &cm, &read_cm, &reach, true), None);
+        // Any write outside home holds.
+        let h = cross_company_hold(Some(&pg), &cm, &none, &reach, true).unwrap();
+        assert!(h.reason.contains("outside Clearmirror"));
+        assert_eq!(h.rule_key, "profile-flow:cm>pg");
     }
 
     #[test]
-    fn the_prompt_names_home_and_the_boundary() {
-        let i = reach_instruction("Clearmirror", &["Puget", "Acme"]);
-        assert!(i.contains("home profile is 'Clearmirror'"));
-        assert!(i.contains("Puget, Acme"));
-        assert!(i.contains("different company"));
+    fn flow_keys_never_match_ordinary_rules() {
+        // An "always allow Puget GMAIL_SEND_EMAIL" rule from an ordinary tab.
+        let ordinary = crate::context::permissions::TrustRule {
+            id: "r1".into(),
+            server: "composio-native:Puget".into(),
+            tool: Some("GMAIL_SEND_EMAIL".into()),
+            command_prefix: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let ctx = crate::context::trust::TrustCtx { project_id: None };
+        let rules = [ordinary];
+        assert!(crate::context::trust::evaluate(&rules, "profile-flow:cm>pg", "GMAIL_SEND_EMAIL", &json!({}), &ctx).is_none());
     }
 
     #[test]
@@ -460,10 +633,13 @@ mod tests {
         assert!(!is_write("GMAIL_FETCH_EMAILS", &json!({})));
         assert!(is_write(EXECUTE_TOOL, &json!({"tool_name": "GOOGLEDOCS_CREATE_DOCUMENT", "arguments": {}})));
         assert!(!is_write(EXECUTE_TOOL, &json!({"tool_name": "GOOGLEDOCS_GET_DOCUMENT", "arguments": {}})));
+        // Discovery / loading meta tools are not writes.
+        assert!(!is_write("COMPOSIO_DISCOVER_APPS", &json!({})));
+        assert!(!is_write("COMPOSIO_CLEAR_TOOLS", &json!({})));
     }
 
     #[test]
-    fn the_turn_remembers_which_companies_it_read() {
+    fn reads_are_remembered_for_the_whole_session() {
         let settings = Settings::default();
         let mk = |author: &str, server: &str, pid: Option<&str>, status| {
             let mut tc = ToolCall::new(server.into(), "X_GET".into(), json!({}), None, None);
@@ -477,13 +653,64 @@ mod tests {
         let mut user = crate::voice::session::transcript_message(true, "hi");
         user.author = "User".into();
         let msgs = vec![
-            mk("Hobbes", "composio-native:Puget", Some("old"), ToolCallStatus::Completed), // before the turn
+            mk("Hobbes", "composio-native:Puget", Some("pg"), ToolCallStatus::Completed), // an earlier wake
             user,
             mk("Hobbes", "composio-native:Clearmirror", Some("cm"), ToolCallStatus::Completed),
-            mk("Hobbes", "composio-native:Puget", Some("pg"), ToolCallStatus::Running), // not read yet
-            mk("Hobbes", "terminal", Some("cm2"), ToolCallStatus::Completed), // not Composio
+            mk("Hobbes", "composio-native:Acme", Some("ac"), ToolCallStatus::Running), // not read yet
+            mk("Hobbes", "terminal", Some("x"), ToolCallStatus::Completed), // not Composio
         ];
-        let read = turn_read_profiles(&settings, &msgs);
-        assert_eq!(read.into_iter().collect::<Vec<_>>(), ["cm"]);
+        let read = session_read_profiles(&settings, &msgs);
+        assert_eq!(read.into_iter().collect::<Vec<_>>(), ["cm", "pg"]);
+    }
+
+    fn settings_with(profiles: &[(&str, &str, bool)]) -> Settings {
+        let mut s = Settings::default();
+        s.composio_profiles = profiles
+            .iter()
+            .map(|(id, name, ready)| crate::settings::ComposioProfile {
+                id: id.to_string(),
+                name: name.to_string(),
+                user_id: ready.then(|| "u".to_string()),
+                api_key: ready.then(|| "k".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        s
+    }
+
+    #[test]
+    fn approval_never_moves_a_call_to_another_company() {
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, "reach-test-voice");
+        let settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        let mut held = call(json!({"hobbes_profile": "Puget"}));
+        held.server_name = "composio-native:Puget".into();
+        held.profile_id = Some("pg".into());
+        // Still reachable: runs in Puget.
+        assert_eq!(resume_profile(&settings, "reach-test-voice", Some("cm"), &held), Ok(Some("pg".into())));
+        // Puget lost its key before the approval: refused, not run at home.
+        let broken = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", false)]);
+        assert!(resume_profile(&broken, "reach-test-voice", Some("cm"), &held).is_err());
+        // An ordinary tab: exactly as before (its own pin, even None).
+        assert_eq!(resume_profile(&settings, "a-normal-tab", None, &held), Ok(None));
+        assert_eq!(resume_profile(&settings, "a-normal-tab", Some("cm"), &held), Ok(Some("cm".into())));
+    }
+
+    #[test]
+    fn an_unpinned_system_session_still_routes() {
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "reach-test-hb");
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        settings.active_composio_profile = Some("cm".into());
+        let home = home_profile(&settings, None);
+        let reach = reach_for_session(&settings, "reach-test-hb", home.as_deref());
+        let mut c = call(json!({"hobbes_profile": "Puget"}));
+        assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("pg", "Puget")));
+    }
+
+    #[test]
+    fn the_prompt_names_home_and_the_boundary() {
+        let i = reach_instruction("Clearmirror", &["Puget", "Acme"]);
+        assert!(i.contains("home profile is 'Clearmirror'"));
+        assert!(i.contains("Puget, Acme"));
+        assert!(i.contains("different company"));
     }
 }

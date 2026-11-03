@@ -198,15 +198,15 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
             }
         }
         if hydrated {
-            adopt_session(&mut session_state, &id, settings.home_composio_profile.as_deref());
+            adopt_session(&mut session_state, &id, settings.home_profile_id());
             return Some(id);
         }
         tracing::info!("heartbeat: session {id} is gone; creating a new one");
     }
     // Like every other new tab: the active Composio profile.
     let profile = settings
-        .home_composio_profile
-        .clone()
+        .home_profile_id()
+        .map(str::to_string)
         .or_else(|| settings.get_active_profile().map(|p| p.id.clone()));
     let id = {
         let mut state = session_state.write();
@@ -220,7 +220,7 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
         state.update_session_name_raw(&id, SESSION_TITLE.to_string());
         id
     };
-    adopt_session(&mut session_state, &id, settings.home_composio_profile.as_deref());
+    adopt_session(&mut session_state, &id, settings.home_profile_id());
     SessionState::save_signal(&session_state, None);
     HEARTBEAT.write().session_id = Some(id.clone());
     *dirty = true;

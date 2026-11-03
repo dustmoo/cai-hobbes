@@ -2161,6 +2161,13 @@ impl Settings {
 
     /// Resolve a profile ID to its human-readable name.
     /// Returns None if the ID doesn't match any profile.
+    /// Hobbes' home profile, if it still names a configured profile.
+    pub fn home_profile_id(&self) -> Option<&str> {
+        self.home_composio_profile
+            .as_deref()
+            .filter(|id| self.composio_profiles.iter().any(|p| p.id == *id))
+    }
+
     pub fn profile_name_for_id(&self, id: &str) -> Option<&str> {
         self.composio_profiles
             .iter()

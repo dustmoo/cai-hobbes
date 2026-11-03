@@ -376,9 +376,15 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     .map(|t| (pid.clone(), t.to_string()))
             })
     };
-    let allow_label = match &command_prefix {
-        Some(p) => format!("Always allow `{p}`"),
-        None => format!(
+    // A cross-company hold is remembered under its flow key, not the server.
+    let rule_server = tool_call.hold_rule_key.clone().unwrap_or_else(|| tool_call.server_name.clone());
+    let allow_label = match (&command_prefix, &tool_call.hold_rule_key) {
+        (Some(p), _) => format!("Always allow `{p}`"),
+        (None, Some(_)) => format!(
+            "Always allow {} across these companies ({})",
+            tool_call.tool_name, tool_call.server_name
+        ),
+        (None, None) => format!(
             "Always allow {} on {}",
             tool_call.tool_name, tool_call.server_name
         ),
@@ -442,7 +448,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             crate::context::trust_store::log_decision(
                 crate::context::trust_store::TrustDecision::new(
                     kind,
-                    &tc.server_name,
+                    tc.hold_rule_key.as_deref().unwrap_or(&tc.server_name),
                     &tc.tool_name,
                     crate::context::trust_store::arg_summary(&args),
                     Some(session_id.clone()),
@@ -598,7 +604,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                         if *make_rule.peek() {
                             let rule = crate::context::permissions::TrustRule {
                                 id: uuid::Uuid::new_v4().to_string(),
-                                server: tool_call.server_name.clone(),
+                                server: rule_server.clone(),
                                 tool: Some(tool_call.tool_name.clone()),
                                 command_prefix: command_prefix.clone(),
                                 project_id: (*scope_to_project.peek())

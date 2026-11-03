@@ -264,9 +264,18 @@ pub fn ChatWindow(
             );
             // A refresh carries only the home profile: keep the session's
             // reach tools (no-op for single-profile sessions).
+            let reach_names: Vec<String> = crate::mcp::manager::profile_reach::reach_for_session(
+                &settings_read,
+                &target_id,
+                profile_id.as_deref(),
+            )
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
             let scoped = crate::mcp::manager::profile_reach::carry_reach(
                 scoped,
                 session.active_context.mcp_tools.as_ref(),
+                &reach_names,
             );
 
             if !scoped.servers.is_empty() {
@@ -548,16 +557,40 @@ pub fn ChatWindow(
                                     &tool_call,
                                 )
                             };
-                            let result_receiver = manager
-                                .use_mcp_tool(
-                                    &tool_call.server_name,
-                                    &tool_call.tool_name,
-                                    args_json,
-                                    true,
-                                    call_profile.clone(),
-                                    session_ctx,
-                                )
-                                .await;
+                            let routed = matches!(&call_profile, Ok(Some(p)) if composio_profile.as_deref() != Some(p.as_str()));
+                            let result_receiver = match call_profile {
+                                // Its profile is gone: refuse, never re-route.
+                                Err(e) => Err(e),
+                                Ok(call_profile) => {
+                                    let mut args_json = args_json;
+                                    crate::mcp::manager::profile_reach::strip_profile_arg(&tool_call.tool_name, &mut args_json);
+                                    let ensured = match (&call_profile, routed) {
+                                        (Some(pid), true) => {
+                                            let settings_snapshot = settings.peek().clone();
+                                            manager
+                                                .ensure_native_client_for_profile(pid, &settings_snapshot)
+                                                .await
+                                                .map_err(|e| format!("Couldn't connect that profile's Composio account, so this wasn't run: {e}"))
+                                        }
+                                        _ => Ok(()),
+                                    };
+                                    match ensured {
+                                        Err(e) => Err(e),
+                                        Ok(()) => {
+                                            manager
+                                                .use_mcp_tool(
+                                                    &tool_call.server_name,
+                                                    &tool_call.tool_name,
+                                                    args_json,
+                                                    true,
+                                                    call_profile.clone(),
+                                                    session_ctx,
+                                                )
+                                                .await
+                                        }
+                                    }
+                                }
+                            };
 
                             let (s, r, _) = match result_receiver {
                                 Ok(receiver) => {

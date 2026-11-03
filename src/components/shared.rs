@@ -186,6 +186,11 @@ pub struct ToolCall {
     /// the approval bubble.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
+    /// The trust-rule key a held call is remembered under, when it isn't the
+    /// server name (a cross-company write: `profile-flow:{from}>{to}`), so an
+    /// ordinary "always allow" for the tool never waves it through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_rule_key: Option<String>,
 }
 
 /// Stop reason for a call cut off by the user's Stop.
@@ -265,6 +270,7 @@ impl ToolCall {
             round_id: None,
             cancelled: None,
             hold_reason: None,
+            hold_rule_key: None,
         }
     }
 

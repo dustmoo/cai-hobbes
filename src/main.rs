@@ -2285,7 +2285,7 @@ fn app() -> Element {
         voice::controller::use_voice(voice_ctx);
         voice::hotkey::use_voice_hotkey();
         // Restore the Voice tab's icon / drop a stray project tag at launch.
-        use_hook(|| voice::session::repair_on_startup(session_state, settings.peek().home_composio_profile.clone()));
+        use_hook(|| voice::session::repair_on_startup(session_state, settings.peek().home_profile_id().map(str::to_string)));
     }
 
     // Persist tab state to UiState (Pattern 12 & 13)
