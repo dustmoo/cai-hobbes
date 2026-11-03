@@ -75,6 +75,102 @@ pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<
     out
 }
 
+/// The profiles a session can act in, home first, with phase 2's per-tab
+/// reach: an ordinary tab reaches its home plus the profiles ticked on its
+/// profile chip (`Session::profile_reach`) that still exist and are set up —
+/// a deleted or broken profile drops out silently. Nothing ticked is exactly
+/// [`reach_for_session`] (home only). System sessions ignore `selected` and
+/// keep their own reach.
+pub fn session_reach(
+    settings: &Settings,
+    session_id: &str,
+    home_id: Option<&str>,
+    selected: &[String],
+) -> Vec<ReachProfile> {
+    let mut out = reach_for_session(settings, session_id, home_id);
+    if selected.is_empty() || out.is_empty() || crate::system_sessions::is_system(session_id) {
+        return out;
+    }
+    let home_id = out[0].id.clone();
+    out.extend(
+        settings
+            .composio_profiles
+            .iter()
+            .filter(|p| p.id != home_id && p.is_fully_configured() && selected.iter().any(|s| s == &p.id))
+            .map(|p| ReachProfile { id: p.id.clone(), name: p.name.clone() }),
+    );
+    out
+}
+
+/// [`session_reach`] for a hydrated session: its home (pin, else the global
+/// active profile) and its reach, home first.
+pub fn reach_of(settings: &Settings, session: &crate::session::Session) -> Vec<ReachProfile> {
+    let home = home_profile(settings, session.composio_profile.as_deref());
+    session_reach(settings, &session.id, home.as_deref(), &session.profile_reach)
+}
+
+/// Every configured profile as a [`ReachProfile`] — names for a hold's
+/// wording when a profile read earlier has since left the reach.
+pub fn all_profiles(settings: &Settings) -> Vec<ReachProfile> {
+    settings
+        .composio_profiles
+        .iter()
+        .map(|p| ReachProfile { id: p.id.clone(), name: p.name.clone() })
+        .collect()
+}
+
+/// Whether `session` called a Composio tool through reach (naming a
+/// profile with [`PROFILE_ARG`]) within [`READ_WINDOW`] of `now`. Such a
+/// session stays under the cross-company hold after its reach is narrowed:
+/// taking a profile off the chip doesn't take its data out of the
+/// conversation, and doesn't reset the reads already recorded.
+pub fn used_reach(session: &crate::session::Session, now: chrono::DateTime<chrono::Utc>) -> bool {
+    session.messages.iter().any(|m| match &m.content {
+        MessageContent::ToolCall(tc) if is_composio_native(&tc.server_name) => {
+            now - tc.completed_at.unwrap_or(m.created_at) <= READ_WINDOW
+                && serde_json::from_str::<Value>(&tc.arguments)
+                    .ok()
+                    .and_then(|a| asked_profile(&tc.tool_name, &a))
+                    .is_some()
+        }
+        _ => false,
+    })
+}
+
+/// [`resume_profile`] with an ordinary tab's own reach (`selected`). A held
+/// call the model routed with [`PROFILE_ARG`] runs in the profile it was
+/// routed to — refused if that profile has since left the tab's reach (or
+/// was deleted), never moved home. Unrouted calls, and system sessions,
+/// behave exactly as before.
+pub fn resume_profile_in(
+    settings: &Settings,
+    session_id: &str,
+    session_profile: Option<&str>,
+    selected: &[String],
+    tool_call: &crate::components::shared::ToolCall,
+) -> Result<Option<String>, String> {
+    if crate::system_sessions::is_system(session_id) || !is_composio_native(&tool_call.server_name) {
+        return resume_profile(settings, session_id, session_profile, tool_call);
+    }
+    let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+    if asked_profile(&tool_call.tool_name, &args).is_none() {
+        return Ok(session_profile.map(str::to_string));
+    }
+    let home = home_profile(settings, session_profile);
+    let reach = session_reach(settings, session_id, home.as_deref(), selected);
+    let target = tool_call
+        .profile_id
+        .clone()
+        .or_else(|| profile_for_server_name(settings, &tool_call.server_name).map(str::to_string));
+    match target {
+        Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
+        _ => Err(format!(
+            "Not run: the profile this was meant for ({}) is no longer in this tab's reach, and it won't be run in another company's account.",
+            tool_call.server_name.trim_start_matches(COMPOSIO_NATIVE_PREFIX).trim_start_matches(':')
+        )),
+    }
+}
+
 /// The bubble's "always allow" wording for a flow key, in profile names.
 pub fn flow_label(settings: &Settings, rule_key: &str, tool: &str) -> Option<String> {
     let rest = rule_key.strip_prefix(FLOW_KEY_PREFIX)?;
@@ -527,7 +623,7 @@ pub fn cross_company_hold(
     }
     match target {
         Some(t) if t.id != home.id => Some(Hold {
-            reason: format!("This acts in {}, outside {} (Hobbes' home profile).", t.name, home.name),
+            reason: format!("This acts in {}, outside {} (this chat's home profile).", t.name, home.name),
             rule_key: format!("{FLOW_KEY_PREFIX}act>{}", t.id),
         }),
         _ => None,
@@ -835,6 +931,139 @@ mod tests {
         let reach = reach_for_session(&settings, "reach-test-hb", home.as_deref());
         let mut c = call(json!({"hobbes_profile": "Puget"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("pg", "Puget")));
+    }
+
+    // ── Phase 2: per-tab reach ──────────────────────────────────────────
+
+    fn reach_settings() -> Settings {
+        let mut s = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true), ("ac", "Acme", false)]);
+        s.active_composio_profile = Some("cm".into());
+        s
+    }
+
+    #[test]
+    fn an_ordinary_tab_reaches_home_plus_its_ticked_profiles() {
+        let settings = reach_settings();
+        // Nothing ticked: home only, exactly as before.
+        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &[]), vec![p("cm", "Clearmirror")]);
+        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &[]), reach_for_session(&settings, "p2-tab", Some("cm")));
+        // Deleted and not-set-up profiles drop out silently; home isn't repeated.
+        let ticked: Vec<String> = ["gone", "ac", "pg", "cm"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            session_reach(&settings, "p2-tab", Some("cm"), &ticked),
+            vec![p("cm", "Clearmirror"), p("pg", "Puget")]
+        );
+        // Only deleted profiles ticked: still single-profile.
+        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &["gone".to_string()]).len(), 1);
+        // System sessions keep their own reach; the tab list is ignored.
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "p2-hb");
+        assert_eq!(
+            session_reach(&settings, "p2-hb", Some("cm"), &["gone".to_string()]),
+            reach_for_session(&settings, "p2-hb", Some("cm"))
+        );
+    }
+
+    #[test]
+    fn nothing_ticked_changes_no_tools_and_routes_nothing() {
+        let settings = reach_settings();
+        let reach = session_reach(&settings, "p2-plain", Some("cm"), &[]);
+        // The tool refresh leaves a single-profile context untouched (no
+        // `hobbes_profile` argument added anywhere).
+        let names: Vec<String> = reach.iter().map(|p| p.name.clone()).collect();
+        let plain = carry_reach(ctx("Clearmirror", &["A"]), Some(&ctx("Clearmirror", &["A"])), &names);
+        assert_eq!(plain, ctx("Clearmirror", &["A"]));
+        assert!(native_tools(&plain).all(|t| !has_profile_arg(t)));
+        // Calls run as before; naming another company is refused.
+        let mut c = call(json!({"to": "a@b.c"}));
+        assert_eq!(route_tool_call(&reach, &mut c), Route::Unchanged);
+        let mut c = call(json!({"hobbes_profile": "Puget"}));
+        assert!(matches!(route_tool_call(&reach, &mut c), Route::Refused(_)));
+        // A held call resumes in the tab's pin, None included.
+        let held = call(json!({"to": "a@b.c"}));
+        assert_eq!(resume_profile_in(&settings, "p2-plain", Some("cm"), &[], &held), Ok(Some("cm".into())));
+        assert_eq!(resume_profile_in(&settings, "p2-plain", None, &[], &held), Ok(None));
+    }
+
+    fn read_via_reach(profile: &ReachProfile, at: chrono::DateTime<chrono::Utc>) -> Message {
+        let mut tc = ToolCall::new(
+            server_name_for(profile),
+            "GMAIL_FETCH_EMAILS".into(),
+            json!({"hobbes_profile": profile.name}),
+            None,
+            None,
+        );
+        tc.profile_id = Some(profile.id.clone());
+        tc.status = ToolCallStatus::Completed;
+        tc.completed_at = Some(at);
+        let mut m = crate::voice::session::transcript_message(true, "x");
+        m.author = "Hobbes".into();
+        m.content = MessageContent::ToolCall(tc);
+        m
+    }
+
+    #[test]
+    fn narrowing_reach_refuses_the_profile_but_keeps_its_reads() {
+        let settings = reach_settings();
+        let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
+        let now = chrono::Utc::now();
+        let mut session = crate::session_events::blank_session();
+        session.id = "p2-narrowed".into();
+        session.composio_profile = Some("cm".into());
+        session.profile_reach = vec!["pg".into()];
+        assert_eq!(reach_of(&settings, &session), vec![cm.clone(), pg.clone()]);
+        // The tab read Puget mail through reach…
+        session.messages.push(read_via_reach(&pg, now));
+        // …and a write to Puget was held, awaiting approval.
+        let mut held = call(json!({"hobbes_profile": "Puget"}));
+        assert_eq!(route_tool_call(&reach_of(&settings, &session), &mut held), Route::To(pg.clone()));
+        assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), &session.profile_reach, &held), Ok(Some("pg".into())));
+
+        // Puget is unticked.
+        session.profile_reach.clear();
+        let reach = reach_of(&settings, &session);
+        assert_eq!(reach, vec![cm.clone()]);
+        // A new call naming Puget is refused at mint…
+        let mut c = call(json!({"hobbes_profile": "Puget"}));
+        assert!(matches!(route_tool_call(&reach, &mut c), Route::Refused(_)));
+        // …and the held one is refused on approval, never moved home.
+        assert!(resume_profile_in(&settings, &session.id, Some("cm"), &session.profile_reach, &held).is_err());
+        // The Puget read still counts: a write at home is held as a flow.
+        assert!(used_reach(&session, now));
+        let read_from = session_read_profiles(&settings, &session, now);
+        assert!(read_from.contains("pg"));
+        let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+        assert!(h.reason.contains("read Puget data"), "named although Puget left the reach");
+        // Once the read window passes, the tab is back to single-profile.
+        assert!(!used_reach(&session, now + READ_WINDOW + chrono::Duration::minutes(1)));
+    }
+
+    #[test]
+    fn a_flow_allowed_in_a_project_is_allowed_only_there() {
+        let rule = crate::context::permissions::TrustRule {
+            id: "r-flow".into(),
+            server: "profile-flow:pg>cm".into(),
+            tool: Some("GMAIL_SEND_EMAIL".into()),
+            command_prefix: None,
+            project_id: Some("proj-cm".into()),
+            created_at: chrono::Utc::now(),
+        };
+        let rules = [rule];
+        let eval = |key: &str, project: Option<&str>| {
+            crate::context::trust::evaluate(
+                &rules,
+                key,
+                "GMAIL_SEND_EMAIL",
+                &json!({}),
+                &crate::context::trust::TrustCtx { project_id: project },
+            )
+            .is_some()
+        };
+        assert!(eval("profile-flow:pg>cm", Some("proj-cm")));
+        assert!(!eval("profile-flow:pg>cm", Some("proj-other")));
+        assert!(!eval("profile-flow:pg>cm", None));
+        // The other direction is its own decision.
+        assert!(!eval("profile-flow:cm>pg", Some("proj-cm")));
     }
 
     #[test]

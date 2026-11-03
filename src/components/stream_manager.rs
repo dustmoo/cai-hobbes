@@ -639,19 +639,31 @@ impl StreamManagerContext {
                         let route = {
                             use crate::mcp::manager::profile_reach as reach_mod;
                             let settings_read = self.settings.peek();
+                            let state = self.session_state.peek();
+                            let session = state.sessions.get(&session_id);
                             let home = reach_mod::home_profile(&settings_read, profile_id.as_deref());
-                            let reach = reach_mod::reach_for_session(&settings_read, &session_id, home.as_deref());
+                            // Phase 2: an ordinary tab's ticked profiles join its reach.
+                            let selected: &[String] = session.map_or(&[], |s| s.profile_reach.as_slice());
+                            let reach = reach_mod::session_reach(&settings_read, &session_id, home.as_deref(), selected);
                             let route = reach_mod::route_tool_call(&reach, &mut tool_call);
-                            if reach.len() >= 2 && !matches!(route, reach_mod::Route::Refused(_)) {
+                            // A tab that used reach stays held after its reach
+                            // is narrowed: the data it read is still in play.
+                            let flow_checked = reach.len() >= 2
+                                || (!reach.is_empty() && session.is_some_and(|s| reach_mod::used_reach(s, chrono::Utc::now())));
+                            if flow_checked && !matches!(route, reach_mod::Route::Refused(_)) {
                                 let target = match &route {
                                     reach_mod::Route::To(t) => Some(t),
+                                    // Narrowed to home: a Composio call still lands at home.
+                                    reach_mod::Route::Unchanged
+                                        if crate::mcp::manager::is_composio_native(&tool_call.server_name) =>
+                                    {
+                                        Some(&reach[0])
+                                    }
                                     _ => None,
                                 };
                                 let mut args: serde_json::Value =
                                     serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                                 reach_mod::strip_profile_arg(&tool_call.tool_name, &mut args);
-                                let state = self.session_state.peek();
-                                let session = state.sessions.get(&session_id);
                                 let read_from = session
                                     .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
                                     .unwrap_or_default();
@@ -659,7 +671,8 @@ impl StreamManagerContext {
                                     Some(_) => reach_mod::is_write(&tool_call.tool_name, &args),
                                     None => reach_mod::local_write(&tool_call.server_name, &tool_call.tool_name, &args),
                                 };
-                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &reach, write);
+                                let named = reach_mod::all_profiles(&settings_read);
+                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &named, write);
                                 if let Some(hold) = hold {
                                     let project_id = session.and_then(|s| s.project_id.clone());
                                     let rule = crate::context::trust::evaluate(

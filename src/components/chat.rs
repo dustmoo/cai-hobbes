@@ -144,12 +144,16 @@ pub fn ChatWindow(
         // A session with no pinned profile uses the global active one —
         // `get_mcp_context(None)` would return every profile's Composio
         // server, whose tools collide by name at the provider.
-        let profile_id = session_state
-            .read()
-            .sessions
-            .get(&target_id)
-            .and_then(|s| s.composio_profile.clone())
-            .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone()));
+        let (profile_id, selected_reach) = {
+            let state = session_state.read();
+            let session = state.sessions.get(&target_id);
+            (
+                session
+                    .and_then(|s| s.composio_profile.clone())
+                    .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone())),
+                session.map(|s| s.profile_reach.clone()).unwrap_or_default(),
+            )
+        };
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
@@ -160,13 +164,15 @@ pub fn ChatWindow(
         }
 
         let mut fresh = mcp_manager.read().get_mcp_context(profile_id.clone()).await;
-        // Multi-profile reach (Heartbeat / Voice): the other reachable
-        // profiles' Composio tools join the home set, each call naming its
-        // profile (mcp::manager::profile_reach).
-        let reach = crate::mcp::manager::profile_reach::reach_for_session(
+        // Multi-profile reach (Heartbeat / Voice, and ordinary tabs with
+        // profiles ticked on their chip): the other reachable profiles'
+        // Composio tools join the home set, each call naming its profile
+        // (mcp::manager::profile_reach).
+        let reach = crate::mcp::manager::profile_reach::session_reach(
             &settings_snapshot,
             &target_id,
             profile_id.as_deref(),
+            &selected_reach,
         );
         if reach.len() > 1 {
             let mut others = Vec::new();
@@ -266,10 +272,11 @@ pub fn ChatWindow(
             );
             // A refresh carries only the home profile: keep the session's
             // reach tools (no-op for single-profile sessions).
-            let reach_names: Vec<String> = crate::mcp::manager::profile_reach::reach_for_session(
+            let reach_names: Vec<String> = crate::mcp::manager::profile_reach::session_reach(
                 &settings_read,
                 &target_id,
                 profile_id.as_deref(),
+                &session.profile_reach,
             )
             .into_iter()
             .map(|p| p.name)
@@ -558,10 +565,17 @@ pub fn ChatWindow(
                             // there, not in the tab's home profile.
                             let call_profile = {
                                 let settings_read = settings.peek();
-                                crate::mcp::manager::profile_reach::resume_profile(
+                                let selected: Vec<String> = session_state
+                                    .peek()
+                                    .sessions
+                                    .get(&owning_id)
+                                    .map(|s| s.profile_reach.clone())
+                                    .unwrap_or_default();
+                                crate::mcp::manager::profile_reach::resume_profile_in(
                                     &settings_read,
                                     &owning_id,
                                     composio_profile.as_deref(),
+                                    &selected,
                                     &tool_call,
                                 )
                             };

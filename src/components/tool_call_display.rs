@@ -372,11 +372,14 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 .join(" ")
         })
         .filter(|p| !p.is_empty());
+    // The owning tab's project, so "only in {project}" scopes a rule (a
+    // cross-company flow key included) to the project of the chat it was
+    // raised in.
     let session_project: Option<(String, String)> = {
         let state = session_state.read();
         state
             .sessions
-            .get(&state.active_session_id)
+            .get(&props.session_id)
             .and_then(|s| s.project_id.clone())
             .and_then(|pid| {
                 crate::services::project_tagger::project_title(&planner.read().projects, &pid)
@@ -446,7 +449,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let decision_base = {
         let tc = tool_call.clone();
         let args = parsed_args.clone().unwrap_or(serde_json::Value::Null);
-        let session_id = session_state.peek().active_session_id.clone();
+        let session_id = props.session_id.clone();
         let project_id = session_project.as_ref().map(|(id, _)| id.clone());
         move |kind: crate::context::trust_store::DecisionKind,
               rule_id: Option<String>| {
