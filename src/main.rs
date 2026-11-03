@@ -3098,6 +3098,7 @@ fn app() -> Element {
                             != Some(&new_profile_id);
 
                         let mut session_changed = false;
+                        let mut reach_after: Option<Vec<String>> = None;
                         // Scope the write lock so it's dropped before setting signals
                         {
                             let mut state = session_state.write();
@@ -3108,6 +3109,7 @@ fn app() -> Element {
                                     session.composio_profile = Some(new_profile_id.clone());
                                     session.active_context.mcp_tools = None;
                                     session_changed = true;
+                                    reach_after = session.drop_home_from_reach();
                                 }
                             }
                         } // write lock dropped here
@@ -3133,6 +3135,12 @@ fn app() -> Element {
                                     profile: settings.peek().active_composio_profile.clone(),
                                 },
                             );
+                            if let Some(profiles) = reach_after {
+                                crate::session_events::log_event(
+                                    &current_session_id.read().clone(),
+                                    crate::session_events::SessionEvent::ProfileReachSet { profiles },
+                                );
+                            }
                             SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }

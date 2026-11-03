@@ -1661,31 +1661,29 @@ pub fn ChatInput(
                             if profiles.is_empty() {
                                 rsx!({})
                             } else {
-                                // session.composio_profile stores ID (matching settings.active_composio_profile)
-                                let active_profile = session_state.read().get_active_session()
-                                    .and_then(|s| s.composio_profile.as_ref())
-                                    .and_then(|id| profiles.iter().find(|p| &p.id == id))  // Match by ID
-                                    .or_else(|| settings_read.get_active_profile())
-                                    .cloned()
-                                    .unwrap_or_else(|| profiles[0].clone());
-
-                                // Multi-profile reach (phase 2): the profiles ticked
-                                // for this tab besides its home. System sessions keep
+                                // Home and reach come from the same resolution dispatch
+                                // uses (`profile_reach::reach_of`: the pin, else the
+                                // global active profile), so the chip never shows a
+                                // home the tab's calls don't run in. With no home
+                                // (no profile resolves) the first profile is shown
+                                // and there is no reach to edit. System sessions keep
                                 // their own reach, so they get no checkboxes.
-                                let (reach_enabled, ticked, reach_extra): (bool, Vec<String>, Vec<String>) = {
+                                let (home, reach_enabled, ticked, reach_extra) = {
                                     let state = session_state.read();
                                     match state.get_active_session() {
-                                        Some(s) if !crate::system_sessions::is_system(&s.id) => {
-                                            let reach = crate::mcp::manager::profile_reach::reach_of(&settings_read, s);
+                                        Some(s) => {
+                                            let chip = crate::mcp::manager::profile_reach::chip_reach(&settings_read, s);
                                             (
-                                                true,
-                                                s.profile_reach.clone(),
-                                                reach.into_iter().skip(1).map(|p| p.name).collect(),
+                                                chip.home.and_then(|id| profiles.iter().find(|p| p.id == id)).cloned(),
+                                                chip.editable,
+                                                if chip.editable { s.profile_reach.clone() } else { Vec::new() },
+                                                chip.extra,
                                             )
                                         }
-                                        _ => (false, Vec::new(), Vec::new()),
+                                        None => (None, false, Vec::new(), Vec::new()),
                                     }
                                 };
+                                let active_profile = home.unwrap_or_else(|| profiles[0].clone());
                                 let reach_badge = (!reach_extra.is_empty()).then(|| format!("+{}", reach_extra.len()));
                                 let reach_title = if reach_extra.is_empty() {
                                     String::new()
