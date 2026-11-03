@@ -466,6 +466,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut abandoned: HashSet<String> = HashSet::new();
     let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<(String, BrainOutcome)>();
     let mut ending_at: Option<Instant> = None;
+    // When the voice last told them it was thinking (rate-limits the phrase).
+    let mut last_holding: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     ui.phase = Phase::Listening;
     ui.error = None;
@@ -545,12 +547,17 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                     if brain_cancel.is_empty() {
                                         flush_lines(ctx, &voice_session, &mut pending_lines, false);
                                     }
-                                    // Say "one moment" now; the result follows on this call.
+                                    // Say "one moment" — once: not if it already
+                                    // spoke this turn (its own holding phrase), nor
+                                    // again within the cooldown. The result follows
+                                    // on this call either way.
+                                    let speak = holding_should_speak(!spoke_buf.trim().is_empty(), last_holding, Instant::now());
+                                    last_holding = Some(Instant::now());
                                     let _ = rt.control.send(RealtimeControl::ToolResponse {
                                         id: id.clone(),
                                         name: name.clone(),
-                                        response: brain_started_response(),
-                                        scheduling: Some(Scheduling::WhenIdle),
+                                        response: if speak { brain_started_response() } else { brain_started_quiet_response() },
+                                        scheduling: Some(if speak { Scheduling::WhenIdle } else { Scheduling::Silent }),
                                         will_continue: true,
                                     });
                                     let handle = BrainHandle::default();
@@ -802,6 +809,25 @@ fn respond(control: &mpsc::UnboundedSender<RealtimeControl>, id: &str, name: &st
 /// The interim answer to `VOICE_ASK_BRAIN`, sent the moment the brain
 /// starts: it prompts the voice to say it's thinking (instead of going
 /// quiet), and keeps the call open for the real result (`willContinue`).
+/// Don't announce "thinking" twice within this long.
+pub const HOLDING_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether the interim response should prompt a holding phrase: not if the
+/// voice already spoke this turn (it said its own), nor within the cooldown.
+pub fn holding_should_speak(spoke_this_turn: bool, last_holding: Option<Instant>, now: Instant) -> bool {
+    !spoke_this_turn && last_holding.is_none_or(|t| now.duration_since(t) >= HOLDING_COOLDOWN)
+}
+
+/// The interim response when a holding phrase was already said: absorbed
+/// silently (`SILENT`), keeping the call open for the result.
+pub fn brain_started_quiet_response() -> Value {
+    json!({
+        "status": "working",
+        "note": "The brain is working on this and they already know. Say nothing more about it \
+                 now; the result arrives later on this same call.",
+    })
+}
+
 pub fn brain_started_response() -> Value {
     json!({
         "status": "working",
@@ -895,6 +921,20 @@ mod tests {
     fn announcements_start_with_excuse_me() {
         assert!(announce_prompt("CI is green.", true).contains("Excuse me"));
         assert!(announce_prompt("CI is green.", false).ends_with("CI is green."));
+    }
+
+    #[test]
+    fn the_thinking_phrase_is_said_once() {
+        let t0 = Instant::now();
+        // First hand-off, nothing said yet: say it.
+        assert!(holding_should_speak(false, None, t0));
+        // It already said its own holding phrase this turn: stay quiet.
+        assert!(!holding_should_speak(true, None, t0));
+        // A second request ten seconds later: quiet.
+        assert!(!holding_should_speak(false, Some(t0), t0 + Duration::from_secs(10)));
+        // After the cooldown: say it again.
+        assert!(holding_should_speak(false, Some(t0), t0 + HOLDING_COOLDOWN));
+        assert_eq!(brain_started_quiet_response()["status"], "working");
     }
 
     #[test]
