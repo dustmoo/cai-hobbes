@@ -22,9 +22,7 @@ use crate::tab_list::{arrange_tabs, tab_group_options, TabFacts, TabListOrder, T
 use crate::todo::PlannerState;
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
-use crate::components::metal_heart::{system_icon, use_heartbeat_session_id, MetalHeart};
-use crate::system_sessions::SystemSession;
-use crate::components::metal_mouth::{use_voice_session_id, MetalMouth};
+use crate::components::hobbes_icon::{is_system_tab, use_hobbes_session_id, SystemTabIcon};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// What a tab shows in the 48px rail: its emoji, else the first letter of
@@ -110,8 +108,7 @@ const RAIL_CLOSE: &str = "absolute top-0 right-0.5 p-px rounded-sm text-fg-muted
 const CLOSE_BTN: &str = "p-0.5 rounded-md shrink-0 text-fg-muted hover:bg-red-500/20 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity";
 
 pub fn TabSidebar(props: TabSidebarProps) -> Element {
-    let heartbeat_id = use_heartbeat_session_id();
-    let voice_id = use_voice_session_id();
+    let hobbes_id = use_hobbes_session_id();
     let mut session_state = use_context::<Signal<SessionState>>();
     let stream_manager = consume_context::<StreamManagerContext>();
     let mut ui_state = use_context::<Signal<UiState>>();
@@ -296,8 +293,9 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     onmouseup: move |evt| if is_middle_click(&evt) { on_close.call(idx) },
                                     match glyph {
                                         // System tabs: the icon follows the id, whatever the emoji.
-                                        _ if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Heartbeat) => rsx! { MetalHeart { size: 15 } },
-                                        _ if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Voice) => rsx! { MetalMouth { size: 15 } },
+                                        _ if is_system_tab(hobbes_id, &tab.session_id) => rsx! {
+                                            SystemTabIcon { session_id: tab.session_id.clone(), emoji: tab.emoji.clone(), size: 15, overlay: true }
+                                        },
                                         RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
                                         RailGlyph::Letter(l) => rsx! {
                                             span {
@@ -576,10 +574,8 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                                     title: "{crate::timers::waiting_title(at)}",
                                                 }
                                             }
-                                            if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Heartbeat) {
-                                                MetalHeart {}
-                                            } else if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Voice) {
-                                                MetalMouth {}
+                                            if is_system_tab(hobbes_id, &tab.session_id) {
+                                                SystemTabIcon { session_id: tab.session_id.clone(), emoji: tab.emoji.clone() }
                                             } else if let Some(e) = &tab.emoji {
                                                 span { class: "text-[13px] leading-none shrink-0", "{e}" }
                                             }

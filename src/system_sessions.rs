@@ -1,58 +1,64 @@
-//! System sessions: the chat sessions Hobbes runs for itself — the
-//! Heartbeat and Voice tabs. They are a fixed part of the app, not topics:
-//! they keep their name and icon (drawn from the session id, so a lost or
-//! changed emoji can't hide them), are never filed under a project, and are
+//! System sessions: the chat session Hobbes runs for itself — the **Hobbes**
+//! tab, where Heartbeat wakes, voice conversations and typed messages share
+//! one timeline (`hobbes_session`). It is a fixed part of the app, not a
+//! topic: it keeps its name and icon (drawn from the session id, so a lost
+//! or changed emoji can't hide it), is never filed under a project, and is
 //! never retitled from a summary.
 //!
 //! A system session that grows too large is **rotated**
 //! (`session_rotation`): a fresh session takes over and the old one stays in
-//! History as a read-only archive. The registry keeps each kind's lineage —
-//! the current id plus every archived one — so archives keep their icon and
+//! History as a read-only archive. The registry keeps the lineage — the
+//! current id plus every archived one — so archives keep their icon and
 //! their exemptions, and anything still addressed to an archived id (a
 //! dispatch result, a relay, a queued message) is routed to the current
-//! session through [`current_for`].
+//! session through [`current_for`]. The Heartbeat and Voice sessions of
+//! earlier builds are archives of this lineage too (`hobbes_session`'s
+//! one-time migration), so they route to the Hobbes session.
 //!
 //! A plain registry (no Signals) so background code and tests can ask too.
-//! Seeded on first use from the ids the two features persist (and the
-//! archive list, meta key [`ARCHIVES_META_KEY`]), and updated whenever
-//! either creates or rotates its session.
+//! Seeded on first use from the persisted pointer and the archive list (meta
+//! key [`ARCHIVES_META_KEY`]), and updated whenever the session is created,
+//! migrated or rotated.
 
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-/// `meta` key holding the archived ids of each kind (JSON [`Archives`]).
+/// `meta` key holding the archived ids (JSON [`Archives`]).
 pub const ARCHIVES_META_KEY: &str = "system_session_archives";
 
+/// The kinds of system session. One since the Heartbeat and Voice tabs
+/// merged into the Hobbes tab.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemSession {
-    Heartbeat,
-    Voice,
+    Hobbes,
 }
 
 impl SystemSession {
-    pub const ALL: [SystemSession; 2] = [SystemSession::Heartbeat, SystemSession::Voice];
-
     /// The session's fixed title.
     pub fn title(self) -> &'static str {
         match self {
-            SystemSession::Heartbeat => crate::heartbeat::runtime::SESSION_TITLE,
-            SystemSession::Voice => crate::voice::session::SESSION_TITLE,
+            SystemSession::Hobbes => crate::hobbes_session::SESSION_TITLE,
         }
     }
 }
 
-/// Archived (rotated-out) ids per kind, oldest first. Persisted.
+/// Archived (rotated-out) ids, oldest first. Persisted.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Archives {
     #[serde(default)]
+    pub hobbes: Vec<String>,
+    /// Archives of the separate Heartbeat / Voice lineages written by
+    /// builds before the merge: read, folded into `hobbes` by
+    /// [`Archives::normalize`], never written again.
+    #[serde(default, skip_serializing)]
     pub heartbeat: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub voice: Vec<String>,
     /// Archived id → the session that replaced it. Written in the same
-    /// transaction as the rows and the feature's pointer, so a pointer that
-    /// a late, older write set back to an archive is followed forward again
-    /// at the next load ([`resolve_successor`]).
+    /// transaction as the rows and the pointer, so a pointer that a late,
+    /// older write set back to an archive is followed forward again at the
+    /// next load ([`resolve_successor`]).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub successors: std::collections::BTreeMap<String, String>,
 }
@@ -71,46 +77,38 @@ impl Archives {
         cur
     }
 
-    fn of(&self, kind: SystemSession) -> &Vec<String> {
-        match kind {
-            SystemSession::Heartbeat => &self.heartbeat,
-            SystemSession::Voice => &self.voice,
+    /// Fold the pre-merge Heartbeat / Voice archive lists into `hobbes`
+    /// (Heartbeat's first), keeping order and dropping duplicates.
+    pub fn normalize(mut self) -> Self {
+        let legacy: Vec<String> = self.heartbeat.drain(..).chain(self.voice.drain(..)).collect();
+        if !legacy.is_empty() {
+            let mut merged = legacy;
+            merged.append(&mut self.hobbes);
+            let mut seen = std::collections::HashSet::new();
+            merged.retain(|id| seen.insert(id.clone()));
+            self.hobbes = merged;
         }
+        self
     }
 
-    fn of_mut(&mut self, kind: SystemSession) -> &mut Vec<String> {
-        match kind {
-            SystemSession::Heartbeat => &mut self.heartbeat,
-            SystemSession::Voice => &mut self.voice,
-        }
+    fn parse(json: &str) -> Option<Self> {
+        serde_json::from_str::<Archives>(json).ok().map(Archives::normalize)
     }
 }
 
-/// The registry's contents: each kind's current id and its archives. Pure,
-/// so the lineage rules are unit-tested on a local value.
+/// The registry's contents: the current id and the archives. Pure, so the
+/// lineage rules are unit-tested on a local value.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Ids {
-    pub heartbeat: Option<String>,
-    pub voice: Option<String>,
+    pub current: Option<String>,
     pub archives: Archives,
     /// The persisted ids have been read (the store was open).
     seeded: bool,
 }
 
 impl Ids {
-    fn current(&self, kind: SystemSession) -> Option<&str> {
-        match kind {
-            SystemSession::Heartbeat => self.heartbeat.as_deref(),
-            SystemSession::Voice => self.voice.as_deref(),
-        }
-    }
-
-    fn set_current(&mut self, kind: SystemSession, id: &str) {
-        let slot = match kind {
-            SystemSession::Heartbeat => &mut self.heartbeat,
-            SystemSession::Voice => &mut self.voice,
-        };
-        *slot = Some(id.to_string());
+    fn current(&self) -> Option<&str> {
+        self.current.as_deref()
     }
 
     /// Which system session `id` is — current or archived.
@@ -118,61 +116,75 @@ impl Ids {
         if id.is_empty() {
             return None;
         }
-        SystemSession::ALL.into_iter().find(|&k| {
-            self.current(k) == Some(id) || self.archives.of(k).iter().any(|a| a == id)
-        })
+        (self.current() == Some(id) || self.archives.hobbes.iter().any(|a| a == id)).then_some(SystemSession::Hobbes)
     }
 
     /// `id` is a rotated-out archive (and not, by some race, also current).
     pub fn is_archive(&self, id: &str) -> bool {
-        self.kind(id).is_some_and(|k| self.current(k) != Some(id))
+        self.kind(id).is_some() && self.current() != Some(id)
     }
 
-    /// `id` is the live session of its kind.
+    /// `id` is the live session.
     pub fn is_current(&self, id: &str) -> bool {
-        SystemSession::ALL.into_iter().any(|k| self.current(k) == Some(id))
+        !id.is_empty() && self.current() == Some(id)
     }
 
-    /// Where something addressed to `id` should land: the current session of
-    /// its kind when `id` is an archive, else `id` itself.
+    /// Where something addressed to `id` should land: the current session
+    /// when `id` is an archive, else `id` itself.
     pub fn current_for(&self, id: &str) -> String {
-        match self.kind(id) {
-            Some(k) if self.is_archive(id) => self.current(k).unwrap_or(id).to_string(),
-            _ => id.to_string(),
+        if self.is_archive(id) {
+            self.current().unwrap_or(id).to_string()
+        } else {
+            id.to_string()
         }
     }
 
-    /// Every id the kind has had: archives (oldest first), then the current.
-    pub fn lineage(&self, kind: SystemSession) -> Vec<String> {
+    /// Every id the lineage has had: archives (oldest first), then the
+    /// current one.
+    pub fn lineage(&self) -> Vec<String> {
         let mut out: Vec<String> =
-            self.archives.of(kind).iter().filter(|a| self.current(kind) != Some(a.as_str())).cloned().collect();
-        if let Some(c) = self.current(kind) {
+            self.archives.hobbes.iter().filter(|a| self.current() != Some(a.as_str())).cloned().collect();
+        if let Some(c) = self.current() {
             out.push(c.to_string());
         }
         out
     }
 
-    /// The newest archive of the kind, if any.
-    pub fn latest_archive(&self, kind: SystemSession) -> Option<&str> {
-        self.archives.of(kind).iter().rev().find(|a| self.current(kind) != Some(a.as_str())).map(String::as_str)
-    }
-
-    /// Rotate: `old` joins the archives, `new` becomes current.
-    pub fn rotate(&mut self, kind: SystemSession, old: &str, new: &str) {
-        if !old.is_empty() && old != new {
-            let archives = self.archives.of_mut(kind);
-            if !archives.iter().any(|a| a == old) {
-                archives.push(old.to_string());
+    /// Rotate: each of `olds` joins the archives (in order), `new` becomes
+    /// current. A merge (the pre-merge Heartbeat and Voice sessions into the
+    /// Hobbes one) is a rotation with two olds.
+    pub fn rotate(&mut self, olds: &[&str], new: &str) {
+        for old in olds {
+            if !old.is_empty() && *old != new {
+                if !self.archives.hobbes.iter().any(|a| a == old) {
+                    self.archives.hobbes.push(old.to_string());
+                }
+                self.archives.successors.insert(old.to_string(), new.to_string());
             }
-            self.archives.successors.insert(old.to_string(), new.to_string());
         }
-        self.set_current(kind, new);
+        self.current = Some(new.to_string());
     }
 }
 
+/// The process-wide registry. Tests get one per thread, so parallel tests
+/// registering their own "current" session don't race.
+#[cfg(not(test))]
 fn registry() -> &'static RwLock<Ids> {
-    static REG: OnceLock<RwLock<Ids>> = OnceLock::new();
+    static REG: std::sync::OnceLock<RwLock<Ids>> = std::sync::OnceLock::new();
     REG.get_or_init(|| RwLock::new(Ids::default()))
+}
+
+#[cfg(test)]
+fn registry() -> &'static RwLock<Ids> {
+    thread_local! {
+        static REG: &'static RwLock<Ids> = Box::leak(Box::new(RwLock::new(Ids::default())));
+    }
+    REG.with(|r| *r)
+}
+
+/// The persisted archive list (normalized), empty when there is none.
+pub fn stored_archives() -> Archives {
+    crate::session_store::meta_get(ARCHIVES_META_KEY).and_then(|json| Archives::parse(&json)).unwrap_or_default()
 }
 
 /// Fill unknown ids from the store, once it is open.
@@ -180,31 +192,22 @@ fn seed() {
     if registry().read().map(|ids| ids.seeded).unwrap_or(true) || !crate::session_store::is_ready() {
         return;
     }
-    let heartbeat = crate::session_store::meta_get(crate::heartbeat::META_KEY)
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
-        .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
-        .filter(|s| !s.is_empty());
-    let voice = crate::session_store::meta_get(crate::voice::session::META_KEY).filter(|s| !s.is_empty());
-    let archives: Archives = crate::session_store::meta_get(ARCHIVES_META_KEY)
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default();
-    let heartbeat = heartbeat.map(|id| archives.resolve(&id));
-    let voice = voice.map(|id| archives.resolve(&id));
+    let archives = stored_archives();
+    let current = crate::hobbes_session::stored_pointer().map(|id| archives.resolve(&id));
+    // Before the one-time merge has run, the pre-merge Heartbeat / Voice
+    // sessions are already archives: read-only, never live system sessions
+    // of this build (`hobbes_session::migrate` gives them a successor).
+    let legacy = if current.is_none() { crate::hobbes_session::legacy_ids() } else { Vec::new() };
     if let Ok(mut ids) = registry().write() {
-        if ids.heartbeat.is_none() {
-            ids.heartbeat = heartbeat;
-        }
-        if ids.voice.is_none() {
-            ids.voice = voice;
+        if ids.current.is_none() {
+            ids.current = current;
         }
         for (old, new) in &archives.successors {
             ids.archives.successors.entry(old.clone()).or_insert_with(|| new.clone());
         }
-        for kind in SystemSession::ALL {
-            for a in archives.of(kind) {
-                if !ids.archives.of(kind).contains(a) {
-                    ids.archives.of_mut(kind).push(a.clone());
-                }
+        for a in archives.hobbes.iter().chain(legacy.iter()) {
+            if !ids.archives.hobbes.contains(a) && ids.current.as_deref() != Some(a.as_str()) {
+                ids.archives.hobbes.push(a.clone());
             }
         }
         ids.seeded = true;
@@ -216,39 +219,37 @@ fn read<T>(f: impl FnOnce(&Ids) -> T) -> Option<T> {
     registry().read().ok().map(|ids| f(&ids))
 }
 
-/// Record the session a system feature uses (on creation or adoption).
-pub fn register(kind: SystemSession, id: &str) {
+/// Record the session the Hobbes tab uses (on creation or adoption).
+pub fn register(id: &str) {
+    seed();
     if let Ok(mut ids) = registry().write() {
-        ids.set_current(kind, id);
+        ids.current = Some(id.to_string());
     }
 }
 
-/// The archive list as it will be after rotating `old` out for `new`, for
+/// The archive list as it will be after rotating `olds` out for `new`, for
 /// the caller to persist (in the rotation's transaction) before
 /// [`apply_rotation`]. Nothing changes here.
-pub fn archives_after_rotation(kind: SystemSession, old: &str, new: &str) -> Archives {
+pub fn archives_after_rotation(olds: &[&str], new: &str) -> Archives {
     seed();
     let mut ids = registry().read().map(|ids| ids.clone()).unwrap_or_default();
-    ids.rotate(kind, old, new);
+    ids.rotate(olds, new);
     ids.archives
 }
 
 /// Record a rotation in memory, once it is persisted.
-pub fn apply_rotation(kind: SystemSession, old: &str, new: &str) {
+pub fn apply_rotation(olds: &[&str], new: &str) {
     seed();
     if let Ok(mut ids) = registry().write() {
-        ids.rotate(kind, old, new);
+        ids.rotate(olds, new);
     }
 }
 
-/// Follow a persisted pointer forward through recorded rotations: a feature
-/// loading its session id calls this, so a pointer left on an archive (a
-/// crash between the rotation's commit and a stale async save) recovers.
+/// Follow a persisted pointer forward through recorded rotations: loading
+/// the session id calls this, so a pointer left on an archive (a crash
+/// between the rotation's commit and a stale async save) recovers.
 pub fn resolve_successor(id: &str) -> String {
-    crate::session_store::meta_get(ARCHIVES_META_KEY)
-        .and_then(|json| serde_json::from_str::<Archives>(&json).ok())
-        .map(|a| a.resolve(id))
-        .unwrap_or_else(|| id.to_string())
+    stored_archives().resolve(id)
 }
 
 /// Which system session `id` is (current or archived), if any.
@@ -262,7 +263,7 @@ pub fn is_system(id: &str) -> bool {
     kind(id).is_some()
 }
 
-/// The live Heartbeat or Voice session (not an archive).
+/// The live Hobbes session (not an archive).
 pub fn is_current(id: &str) -> bool {
     read(|ids| ids.is_current(id)).unwrap_or(false)
 }
@@ -272,30 +273,25 @@ pub fn is_archive(id: &str) -> bool {
     read(|ids| ids.is_archive(id)).unwrap_or(false)
 }
 
-/// Where something addressed to `id` should land: the current session of
-/// its kind when `id` is an archive, else `id` itself.
+/// Where something addressed to `id` should land: the current session when
+/// `id` is an archive, else `id` itself.
 pub fn current_for(id: &str) -> String {
     read(|ids| ids.current_for(id)).unwrap_or_else(|| id.to_string())
 }
 
-/// Every id `kind` has had (archives oldest first, then the current one).
-pub fn lineage(kind: SystemSession) -> Vec<String> {
-    read(|ids| ids.lineage(kind)).unwrap_or_default()
+/// Every id the lineage has had (archives oldest first, then the current).
+pub fn lineage() -> Vec<String> {
+    read(|ids| ids.lineage()).unwrap_or_default()
 }
 
 /// `id` and, for a system session, every id of its lineage (the sessions
 /// it rotated out of, or its successors when `id` is an archive).
 pub fn lineage_of(id: &str) -> Vec<String> {
-    let mut ids = kind(id).map(lineage).unwrap_or_default();
+    let mut ids = if is_system(id) { lineage() } else { Vec::new() };
     if !ids.iter().any(|i| i == id) {
         ids.push(id.to_string());
     }
     ids
-}
-
-/// The newest archive of `kind`, if any.
-pub fn latest_archive(kind: SystemSession) -> Option<String> {
-    read(|ids| ids.latest_archive(kind).map(str::to_string)).flatten()
 }
 
 /// Put a hydrated system session back in shape: its icon emoji (journaled,
@@ -355,79 +351,86 @@ mod tests {
 
     #[test]
     fn registered_sessions_are_recognised() {
-        register(SystemSession::Voice, "test-voice-session");
-        register(SystemSession::Heartbeat, "test-heartbeat-session");
-        assert_eq!(kind("test-voice-session"), Some(SystemSession::Voice));
-        assert_eq!(kind("test-heartbeat-session"), Some(SystemSession::Heartbeat));
+        register("test-hobbes-session");
+        assert_eq!(kind("test-hobbes-session"), Some(SystemSession::Hobbes));
+        assert!(is_current("test-hobbes-session"));
         assert!(!is_system("an-ordinary-chat"));
     }
 
     #[test]
     fn lineage_routes_archives_to_the_current_session() {
-        let mut ids = Ids { heartbeat: Some("hb-1".into()), voice: Some("v-1".into()), ..Default::default() };
-        assert_eq!(ids.current_for("hb-1"), "hb-1");
-        assert!(!ids.is_archive("hb-1"));
+        let mut ids = Ids { current: Some("h-1".into()), ..Default::default() };
+        assert_eq!(ids.current_for("h-1"), "h-1");
+        assert!(!ids.is_archive("h-1"));
 
-        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
-        ids.rotate(SystemSession::Heartbeat, "hb-2", "hb-3");
+        ids.rotate(&["h-1"], "h-2");
+        ids.rotate(&["h-2"], "h-3");
         // Archives keep their kind (icon, no project, no retitle) ...
-        assert_eq!(ids.kind("hb-1"), Some(SystemSession::Heartbeat));
-        assert_eq!(ids.kind("hb-2"), Some(SystemSession::Heartbeat));
-        assert!(ids.is_archive("hb-1") && ids.is_archive("hb-2"));
-        assert!(!ids.is_current("hb-1") && ids.is_current("hb-3"));
+        assert_eq!(ids.kind("h-1"), Some(SystemSession::Hobbes));
+        assert!(ids.is_archive("h-1") && ids.is_archive("h-2"));
+        assert!(!ids.is_current("h-1") && ids.is_current("h-3"));
         // ... and whatever is addressed to them lands in the current one.
-        assert_eq!(ids.current_for("hb-1"), "hb-3");
-        assert_eq!(ids.current_for("hb-2"), "hb-3");
-        assert_eq!(ids.current_for("hb-3"), "hb-3");
-        assert_eq!(ids.lineage(SystemSession::Heartbeat), vec!["hb-1", "hb-2", "hb-3"]);
-        assert_eq!(ids.latest_archive(SystemSession::Heartbeat), Some("hb-2"));
-
-        // Kinds don't mix; ordinary chats pass through untouched.
-        assert_eq!(ids.current_for("v-1"), "v-1");
-        assert_eq!(ids.latest_archive(SystemSession::Voice), None);
+        assert_eq!(ids.current_for("h-1"), "h-3");
+        assert_eq!(ids.current_for("h-2"), "h-3");
+        assert_eq!(ids.current_for("h-3"), "h-3");
+        assert_eq!(ids.lineage(), vec!["h-1", "h-2", "h-3"]);
+        // Ordinary chats pass through untouched.
         assert_eq!(ids.current_for("a-chat"), "a-chat");
         assert_eq!(ids.kind(""), None);
-        ids.rotate(SystemSession::Voice, "v-1", "v-2");
-        assert_eq!(ids.current_for("v-1"), "v-2");
-        assert_eq!(ids.kind("v-1"), Some(SystemSession::Voice));
+    }
+
+    #[test]
+    fn the_pre_merge_sessions_route_to_the_hobbes_session() {
+        // The old Heartbeat and Voice sessions, each with an archive of its
+        // own, merge into one Hobbes session.
+        let stored: Archives =
+            serde_json::from_str(r#"{"heartbeat":["hb-0"],"voice":["v-0"],"successors":{"hb-0":"hb-1","v-0":"v-1"}}"#)
+                .unwrap();
+        let archives = stored.normalize();
+        assert_eq!(archives.hobbes, vec!["hb-0", "v-0"]);
+        let mut ids = Ids { archives, ..Default::default() };
+        ids.rotate(&["hb-1", "v-1"], "hobbes");
+        assert_eq!(ids.lineage(), vec!["hb-0", "v-0", "hb-1", "v-1", "hobbes"]);
+        for old in ["hb-0", "v-0", "hb-1", "v-1"] {
+            assert!(ids.is_archive(old), "{old}");
+            assert_eq!(ids.current_for(old), "hobbes");
+            assert_eq!(ids.archives.resolve(old), "hobbes");
+        }
+        // The legacy lists are never written back.
+        let json = serde_json::to_value(&ids.archives).unwrap();
+        assert!(json.get("heartbeat").is_none() && json.get("voice").is_none());
+        let back = Archives::parse(&json.to_string()).unwrap();
+        assert_eq!(back.hobbes, ids.archives.hobbes);
     }
 
     #[test]
     fn rotation_is_idempotent_and_never_archives_the_current() {
         let mut ids = Ids::default();
-        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
-        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
-        assert_eq!(ids.archives.heartbeat, vec!["hb-1"]);
-        ids.rotate(SystemSession::Heartbeat, "hb-2", "hb-2");
-        assert_eq!(ids.archives.heartbeat, vec!["hb-1"]);
+        ids.rotate(&["h-1"], "h-2");
+        ids.rotate(&["h-1"], "h-2");
+        assert_eq!(ids.archives.hobbes, vec!["h-1"]);
+        ids.rotate(&["h-2"], "h-2");
+        assert_eq!(ids.archives.hobbes, vec!["h-1"]);
         // An archive list that (after a crash mid-rotation) still names the
         // current id treats it as current, not archived.
-        ids.archives.heartbeat.push("hb-2".into());
-        assert!(!ids.is_archive("hb-2"));
-        assert_eq!(ids.current_for("hb-2"), "hb-2");
-        assert_eq!(ids.lineage(SystemSession::Heartbeat), vec!["hb-1", "hb-2"]);
-        // Archives round-trip, and an old blob without a kind still loads.
+        ids.archives.hobbes.push("h-2".into());
+        assert!(!ids.is_archive("h-2"));
+        assert_eq!(ids.current_for("h-2"), "h-2");
+        assert_eq!(ids.lineage(), vec!["h-1", "h-2"]);
         let json = serde_json::to_string(&ids.archives).unwrap();
-        assert_eq!(serde_json::from_str::<Archives>(&json).unwrap(), ids.archives);
-        let partial: Archives = serde_json::from_str(r#"{"voice":["v-0"]}"#).unwrap();
-        assert!(partial.heartbeat.is_empty());
+        assert_eq!(Archives::parse(&json).unwrap(), ids.archives);
     }
 
     #[test]
     fn a_pointer_left_on_an_archive_resolves_forward() {
         let mut ids = Ids::default();
-        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
-        ids.rotate(SystemSession::Heartbeat, "hb-2", "hb-3");
+        ids.rotate(&["h-1"], "h-2");
+        ids.rotate(&["h-2"], "h-3");
         let a = &ids.archives;
-        // A late, older save set the Heartbeat's pointer back to hb-1 (or
-        // hb-2) after the rotation committed: loading follows it forward.
-        assert_eq!(a.resolve("hb-1"), "hb-3");
-        assert_eq!(a.resolve("hb-2"), "hb-3");
-        assert_eq!(a.resolve("hb-3"), "hb-3");
+        assert_eq!(a.resolve("h-1"), "h-3");
+        assert_eq!(a.resolve("h-2"), "h-3");
+        assert_eq!(a.resolve("h-3"), "h-3");
         assert_eq!(a.resolve("a-chat"), "a-chat");
-        // The map survives the round trip; a cycle can't spin.
-        let back: Archives = serde_json::from_str(&serde_json::to_string(a).unwrap()).unwrap();
-        assert_eq!(back.resolve("hb-1"), "hb-3");
         let mut cyclic = Archives::default();
         cyclic.successors.insert("x".into(), "y".into());
         cyclic.successors.insert("y".into(), "x".into());

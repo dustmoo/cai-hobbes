@@ -255,6 +255,7 @@ pub(crate) fn blank_session() -> Session {
         dispatch_link: None,
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
+        turn_origin: crate::session::TurnOrigin::User,
     }
 }
 

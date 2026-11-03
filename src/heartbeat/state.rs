@@ -172,10 +172,12 @@ pub struct HeartbeatState {
     pub trail: Vec<WakeRecord>,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
-    /// The dedicated Heartbeat chat session wakes are delivered to, once
-    /// created (not an open tab unless the user opens it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    /// The pre-merge Heartbeat session (wakes now go to the Hobbes session,
+    /// `hobbes_session`). Never written by this build, only kept so a save
+    /// before the one-time merge can't lose it; the merge reads it
+    /// (`hobbes_session::legacy_sessions`).
+    #[serde(default, rename = "session_id", skip_serializing_if = "Option::is_none")]
+    pub legacy_session_id: Option<String>,
     /// "Clear trail": the card hides wake records at or before this time.
     /// The records stay for the budget (the hourly cap and today's spend
     /// count them) until they age out.

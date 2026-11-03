@@ -1,5 +1,5 @@
-//! The Heartbeat's trust rules: every tool call from the dedicated Heartbeat
-//! session passes the agent-time scope check
+//! The Heartbeat's trust rules: every tool call from an unattended turn (a
+//! Heartbeat wake in the Hobbes session; `session::TurnOrigin`) passes the agent-time scope check
 //! (`todo::agent_time::agent_time_scope`) before the normal permission flow,
 //! run by `builtin_tools::heartbeat_gate` at both tool-call sites.
 //!
@@ -15,7 +15,7 @@
 
 use crate::todo::agent_time::{agent_time_scope, ScopeVerdict};
 
-/// The scope verdict for a call from the Heartbeat session.
+/// The scope verdict for a call from a Heartbeat (unattended) turn.
 pub fn heartbeat_scope(tool: &str, args: &serde_json::Value) -> ScopeVerdict {
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
     match tool {
@@ -30,7 +30,7 @@ pub fn heartbeat_scope(tool: &str, args: &serde_json::Value) -> ScopeVerdict {
 /// call sites already handle).
 #[derive(Debug, Clone, PartialEq)]
 pub enum HeartbeatVerdict {
-    /// Not the Heartbeat session, or in scope: the normal flow.
+    /// Not an unattended turn, or in scope: the normal flow.
     Proceed,
     /// Hold as a `PermissionRequest`, bypassing trust rules and
     /// always-allow (streaming path).
@@ -44,12 +44,12 @@ pub enum HeartbeatVerdict {
 /// approved or not (a call can't have been held for a Deny, but a resumed
 /// call is re-checked anyway).
 pub fn gate_verdict(
-    is_heartbeat_session: bool,
+    unattended: bool,
     tool: &str,
     args: &serde_json::Value,
     user_approved: bool,
 ) -> HeartbeatVerdict {
-    if !is_heartbeat_session {
+    if !unattended {
         return HeartbeatVerdict::Proceed;
     }
     match heartbeat_scope(tool, args) {

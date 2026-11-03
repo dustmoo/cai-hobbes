@@ -1,13 +1,8 @@
-//! Polished-steel mouth that stands in for the Voice session's tab emoji
-//! (the sibling of `metal_heart::MetalHeart`).
+//! Polished-steel mouth: the Hobbes tab's voice badge (`hobbes_icon`), the
+//! voice indicator's mark, and the icon of pre-merge Voice archives (the
+//! sibling of `metal_heart::MetalHeart`).
 
 use dioxus::prelude::*;
-
-/// The dedicated Voice session's id, as a memo (re-renders when it is first
-/// assigned, not on every voice state change).
-pub fn use_voice_session_id() -> Memo<Option<String>> {
-    use_memo(|| crate::voice::session::VOICE_SESSION_ID.read().clone())
-}
 
 #[component]
 pub fn MetalMouth(#[props(default = 13)] size: u32) -> Element {

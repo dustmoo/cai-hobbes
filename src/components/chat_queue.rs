@@ -23,6 +23,11 @@ pub struct QueuedMessage {
     /// the drain appends this incoming relay bubble and starts a turn
     /// without a user message. `text` then only labels the queue chip.
     pub relay: Option<crate::components::chat::Message>,
+    /// Who the turn this starts belongs to, when the producer knows: the
+    /// person (typed while a turn ran, a voice request) or the Heartbeat (a
+    /// wake). `None` — a timer, a relay, returned work — is resolved at the
+    /// drain ([`resolve_origin`]). Harness-set only; never from model output.
+    pub origin: Option<crate::session::TurnOrigin>,
 }
 
 impl QueuedMessage {
@@ -32,7 +37,14 @@ impl QueuedMessage {
             text,
             attachments,
             relay: None,
+            origin: None,
         }
+    }
+
+    /// State who the turn belongs to.
+    pub fn with_origin(mut self, origin: crate::session::TurnOrigin) -> Self {
+        self.origin = Some(origin);
+        self
     }
 
     /// A relay entry: delivered as the relay itself, never as user text.
@@ -48,8 +60,45 @@ impl QueuedMessage {
             text,
             attachments: Vec::new(),
             relay: Some(message),
+            origin: None,
         }
     }
+}
+
+/// The origin of a turn a queued message starts in `session_id`: what the
+/// producer stated, else — nobody being present for a timer, a relay or
+/// returned work — unattended in the Hobbes session (the Heartbeat's strict
+/// rules) and the person's anywhere else (as before the merge).
+pub fn resolve_origin(stated: Option<crate::session::TurnOrigin>, is_hobbes_session: bool) -> crate::session::TurnOrigin {
+    stated.unwrap_or(if is_hobbes_session {
+        crate::session::TurnOrigin::Heartbeat
+    } else {
+        crate::session::TurnOrigin::User
+    })
+}
+
+/// Origins the drain resolved for messages it handed to `submit`, keyed by
+/// session, until the send path takes them ([`take_turn_origin`]). The
+/// drain sets one immediately before its synchronous `submit` call, so the
+/// send it hands over to is the one that takes it.
+static PENDING_ORIGINS: std::sync::Mutex<Option<HashMap<String, crate::session::TurnOrigin>>> =
+    std::sync::Mutex::new(None);
+
+/// The drain is about to submit a queued message for `session_id`.
+pub fn set_pending_origin(session_id: &str, origin: crate::session::TurnOrigin) {
+    if let Ok(mut map) = PENDING_ORIGINS.lock() {
+        map.get_or_insert_with(HashMap::new).insert(session_id.to_string(), origin);
+    }
+}
+
+/// The origin of the send now starting in `session_id`: the one the drain
+/// left, else the person's (a typed send).
+pub fn take_turn_origin(session_id: &str) -> crate::session::TurnOrigin {
+    PENDING_ORIGINS
+        .lock()
+        .ok()
+        .and_then(|mut map| map.as_mut().and_then(|m| m.remove(session_id)))
+        .unwrap_or_default()
 }
 
 /// App-wide, per-session queue keyed by session id. A `GlobalSignal` (rather
@@ -182,6 +231,20 @@ mod tests {
         assert_eq!(map["s"].len(), 1, "the relay stays");
         assert!(queue_take_user_messages(&mut map, "s").is_empty());
         assert!(queue_take_user_messages(&mut map, "missing").is_empty());
+    }
+
+    #[test]
+    fn unstated_origins_are_unattended_only_in_the_hobbes_session() {
+        use crate::session::TurnOrigin;
+        assert_eq!(resolve_origin(None, true), TurnOrigin::Heartbeat);
+        assert_eq!(resolve_origin(None, false), TurnOrigin::User);
+        assert_eq!(resolve_origin(Some(TurnOrigin::User), true), TurnOrigin::User);
+        assert_eq!(resolve_origin(Some(TurnOrigin::Heartbeat), true), TurnOrigin::Heartbeat);
+        assert_eq!(msg("x").with_origin(TurnOrigin::Heartbeat).origin, Some(TurnOrigin::Heartbeat));
+        // The drain hands its resolution to the send; a typed send finds none.
+        set_pending_origin("origin-test", TurnOrigin::Heartbeat);
+        assert_eq!(take_turn_origin("origin-test"), TurnOrigin::Heartbeat);
+        assert_eq!(take_turn_origin("origin-test"), TurnOrigin::User);
     }
 
     #[test]

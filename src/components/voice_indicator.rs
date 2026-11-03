@@ -105,12 +105,12 @@ pub fn VoiceIndicator() -> Element {
                 button {
                     class: "px-2 py-0.5 text-xs bg-primary-800 hover:bg-primary-700 rounded transition-colors",
                     onclick: move |_| {
-                        let id = crate::voice::session::VOICE_SESSION_ID.peek().clone();
+                        let id = crate::hobbes_session::current_id();
                         if let Some(id) = id {
                             chat_command.set(Some(ChatCommand::SwitchToSession(id)));
                         }
                     },
-                    "Voice tab"
+                    "Hobbes tab"
                 }
                 button {
                     class: "px-2 py-0.5 text-xs bg-primary-800 hover:bg-primary-700 rounded transition-colors",

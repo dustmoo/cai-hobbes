@@ -99,6 +99,7 @@ mod tests {
                     cancelled: None,
                     hold_reason: None,
                     hold_rule_key: None,
+                    origin: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -183,6 +184,7 @@ mod tests {
                 cancelled: None,
                 hold_reason: None,
                 hold_rule_key: None,
+                origin: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,

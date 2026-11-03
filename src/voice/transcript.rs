@@ -1,4 +1,5 @@
-//! Where voice transcript lines go in the Voice session.
+//! Where voice transcript lines go in the Hobbes session (which Heartbeat
+//! wakes and typed turns share: each is a turn like the brain's).
 //!
 //! Transcript lines are buffered while the brain's turn runs (appending
 //! mid-turn would split it) and written later. Appending them at write time
@@ -79,6 +80,13 @@ fn starts_unit(m: &Message) -> bool {
     }
     m.author != "Hobbes"
         && !m.content.get_text_content().is_some_and(|t| t.starts_with(RECOVERY_PREFIX))
+}
+
+/// Whether `m` starts a turn of its own: a request, a relay or a wake —
+/// not a voice transcript line and not an auto-recovery prompt inside a
+/// turn. (The Heartbeat reads its wakes' windows with this.)
+pub fn starts_turn(m: &Message) -> bool {
+    starts_unit(m) && !transcript_line(m)
 }
 
 /// Whether a standalone message may go at index `j` of `messages` without
@@ -400,6 +408,47 @@ mod tests {
         assert_eq!(bodies(&msgs)[2], "🎙 bye");
         assert!(bodies(&msgs)[3].contains("[Voice request"));
         assert!(monotonic(&msgs));
+    }
+
+    /// The Hobbes session interleaves Heartbeat wakes with voice turns: a
+    /// wake is a turn like any other, so lines said while it ran land
+    /// before or after it — chronologically, never inside it.
+    #[test]
+    fn heartbeat_wakes_are_turns_lines_never_split() {
+        let wake = |msgs: &mut Vec<Message>| {
+            msgs.push(text("User", &format!("{}\n\nWhy: CI failed", crate::heartbeat::wake::WAKE_HEADER), 40));
+            msgs.push(call(42));
+            msgs.push(text("Hobbes", "CI is red on main.", 60));
+        };
+        let mut msgs = brain_turn();
+        wake(&mut msgs);
+        assert!(starts_turn(&msgs[5]), "a wake starts a turn");
+        insert_between_turns(
+            &mut msgs,
+            vec![line(true, "and the release?", 35), line(false, "Checking.", 45), line(true, "thanks", 61)],
+            false,
+        );
+        let b = bodies(&msgs);
+        let wake_at = b.iter().position(|x| x.starts_with(crate::heartbeat::wake::WAKE_HEADER)).unwrap();
+        // The wake's turn stays whole: request, call, reply.
+        assert_eq!(b[wake_at + 1], "<call>");
+        assert_eq!(b[wake_at + 2], "CI is red on main.");
+        // Before it: what was said before it (and, snapped to its nearer
+        // edge, what was said early in it); after it: what came later.
+        assert_eq!(b[wake_at - 2..wake_at], ["🎙 and the release?", "🔊 Checking."]);
+        assert_eq!(b[wake_at + 3], "🎙 thanks");
+        assert!(monotonic(&msgs));
+
+        // A wake still running at the tail is open: lines go before it.
+        let mut open = brain_turn();
+        wake(&mut open);
+        open.pop();
+        assert!(turn_open(&open, false, at(50)));
+        insert_between_turns(&mut open, vec![line(true, "bye", 70)], true);
+        let b = bodies(&open);
+        let wake_at = b.iter().position(|x| x.starts_with(crate::heartbeat::wake::WAKE_HEADER)).unwrap();
+        assert_eq!(b[wake_at - 1], "🎙 bye");
+        assert!(monotonic(&open));
     }
 
     /// Lines can sit between a spoken line and a turn that has no request

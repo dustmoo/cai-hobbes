@@ -97,13 +97,21 @@ pub enum VoiceCmd {
     Release { held_ms: u64 },
     /// End any live conversation.
     Stop,
-    /// A Heartbeat alert to speak while a conversation is live.
-    HeartbeatAlert(String),
-    /// A result that reached the Voice tab on its own (dispatched work
-    /// finishing, a brain answer after the conversation ended): said as
-    /// "Excuse me…" in a live conversation, or in a short speaking-only
-    /// session (mic off) otherwise.
-    Announce(String),
+    /// News that reached the Hobbes tab on its own (dispatched work
+    /// finishing, a brain answer after the conversation ended, a Heartbeat
+    /// wake with something for the person): said as "Excuse me…" in a live
+    /// conversation, or in a short speaking-only session (mic off)
+    /// otherwise.
+    Announce(String, AnnounceKind),
+}
+
+/// What an announcement is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnnounceKind {
+    /// A result of work handed off earlier.
+    Result,
+    /// What a Heartbeat wake found for the person.
+    Heartbeat,
 }
 
 /// How a session starts.
@@ -112,7 +120,7 @@ enum Start {
     /// The hotkey went down: mic open, tap or hold decided on release.
     Press,
     /// Hobbes speaks first, with the mic off; a press opens it.
-    Announce(String),
+    Announce(String, AnnounceKind),
 }
 
 /// The running controller's inbox (replaced if the root remounts).
@@ -130,13 +138,6 @@ pub fn is_live() -> bool {
     VOICE_UI.peek().phase != Phase::Idle
 }
 
-/// Speak a Heartbeat alert if a conversation is live and the setting allows.
-pub fn heartbeat_alert(text: String) {
-    if is_live() {
-        send(VoiceCmd::HeartbeatAlert(text));
-    }
-}
-
 /// Start the controller (once, from the app root).
 pub fn use_voice(ctx: BuiltinToolCtx) {
     use_hook(move || {
@@ -152,12 +153,12 @@ async fn controller_loop(ctx: BuiltinToolCtx, mut rx: mpsc::UnboundedReceiver<Vo
     while let Some(cmd) = rx.recv().await {
         let start = match cmd {
             VoiceCmd::Press => Start::Press,
-            VoiceCmd::Announce(text) => {
+            VoiceCmd::Announce(text, kind) => {
                 let s = ctx.settings.peek();
                 if !crate::voice::voice_active(&s) || !s.voice.announce_results {
                     continue;
                 }
-                Start::Announce(text)
+                Start::Announce(text, kind)
             }
             // Release / Stop / alerts while idle: nothing to do.
             _ => continue,
@@ -171,7 +172,7 @@ async fn controller_loop(ctx: BuiltinToolCtx, mut rx: mpsc::UnboundedReceiver<Vo
     }
 }
 
-/// What to say for a finished Voice-tab turn: the reply after its trigger
+/// What to say for a finished Hobbes-tab turn: the reply after its trigger
 /// (the last message not written by Hobbes), whether that trigger was a
 /// voice request, and whether the turn is held on an approval.
 #[derive(Debug, PartialEq)]
@@ -194,7 +195,7 @@ pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNe
     })
 }
 
-/// Whether a finished Voice-tab turn should be spoken. A voice request the
+/// Whether a finished Hobbes-tab turn should be spoken. A voice request the
 /// live conversation is still waiting on is delivered by that wait; with no
 /// conversation, a turn in the tab the person is looking at is theirs (they
 /// typed it), unless it answers an earlier voice request.
@@ -208,52 +209,79 @@ pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, view
     !(!live && viewing && !news.voice_request)
 }
 
-/// Called when any turn ends (stream_manager): speak Voice-tab news.
+/// Whether a finished turn's news should be spoken, given who started it:
+/// a Heartbeat wake speaks only with `speak_heartbeat` on, and only when it
+/// found something for the person (not its "nothing to report" line).
+pub fn announce_kind(origin: crate::session::TurnOrigin, news: &TurnNews, speak_heartbeat: bool) -> Option<AnnounceKind> {
+    if !origin.is_unattended() {
+        return Some(AnnounceKind::Result);
+    }
+    if !speak_heartbeat || (!news.needs_approval && crate::heartbeat::wake::is_quiet_reply(&news.reply)) {
+        return None;
+    }
+    Some(AnnounceKind::Heartbeat)
+}
+
+/// Called when any turn ends (stream_manager): speak Hobbes-tab news —
+/// returned results and what a Heartbeat wake found — through the one
+/// announce path.
 pub fn on_turn_end(
     session_state: Signal<crate::session::SessionState>,
     settings: Signal<crate::settings::Settings>,
     session_id: &str,
 ) {
-    if session::VOICE_SESSION_ID.peek().as_deref() != Some(session_id) {
+    if !crate::hobbes_session::is_hobbes(session_id) {
         return;
     }
-    {
+    let speak_heartbeat = {
         let s = settings.peek();
         if !crate::voice::voice_active(&s) || !s.voice.announce_results {
             return;
         }
-    }
-    let (news, viewing) = {
+        s.voice.speak_heartbeat
+    };
+    let (news, viewing, origin) = {
         let state = session_state.peek();
-        let Some(news) = state.sessions.get(session_id).and_then(|s| turn_news(&s.messages)) else {
-            return;
-        };
-        (news, state.active_session_id == session_id)
+        let Some(session) = state.sessions.get(session_id) else { return };
+        let Some(news) = turn_news(&session.messages) else { return };
+        (news, state.active_session_id == session_id, session.turn_origin)
     };
     if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing) {
         return;
     }
-    let text = if news.needs_approval {
-        "The brain needs your approval in the Voice tab before it can continue.".to_string()
-    } else {
-        news.reply
+    let Some(kind) = announce_kind(origin, &news, speak_heartbeat) else { return };
+    let text = match (news.needs_approval, kind) {
+        (true, AnnounceKind::Heartbeat) => {
+            "The Heartbeat needs your approval in the Hobbes tab before it can continue.".to_string()
+        }
+        (true, AnnounceKind::Result) => {
+            "The brain needs your approval in the Hobbes tab before it can continue.".to_string()
+        }
+        (false, _) => news.reply,
     };
-    tracing::info!("voice: announcing a Voice-tab result ({} chars)", text.chars().count());
-    send(VoiceCmd::Announce(text));
+    tracing::info!("voice: announcing Hobbes-tab news ({kind:?}, {} chars)", text.chars().count());
+    send(VoiceCmd::Announce(text, kind));
 }
 
-/// The instruction wrapped around an announced result.
-pub fn announce_prompt(text: &str, mid_conversation: bool) -> String {
-    let how = if mid_conversation {
-        "A result just came back from work handed off earlier. Politely get their attention — \
-         start with \"Excuse me\" — and tell them in one or two short spoken sentences, then \
-         carry on with them."
-    } else {
-        "You are interrupting the person to deliver news: a result just came back from work \
-         handed off earlier. Start with \"Excuse me\", tell them in one or two short spoken \
-         sentences, then stop. Only ask something if the result needs their decision."
+/// The instruction wrapped around an announcement.
+pub fn announce_prompt(text: &str, mid_conversation: bool, kind: AnnounceKind) -> String {
+    let what = match kind {
+        AnnounceKind::Result => "a result just came back from work handed off earlier",
+        AnnounceKind::Heartbeat => "the Heartbeat, checking on their day in the background, found something for them",
     };
-    format!("[{how} If there's more, say it's in the Voice tab.]\n\n{}", text.trim())
+    let how = if mid_conversation {
+        format!(
+            "News: {what}. Politely get their attention — start with \"Excuse me\" — and tell them in \
+             one or two short spoken sentences, then carry on with them."
+        )
+    } else {
+        format!(
+            "You are interrupting the person to deliver news: {what}. Start with \"Excuse me\", tell \
+             them in one or two short spoken sentences, then stop. Only ask something if it needs \
+             their decision."
+        )
+    };
+    format!("[{how} If there's more, say it's in the Hobbes tab.]\n\n{}", text.trim())
 }
 
 /// Mic / speaker problems and provider failures end up here.
@@ -269,10 +297,6 @@ struct Resolved {
     setup: RealtimeSetup,
     threshold_ms: u64,
     idle: Duration,
-    speak_heartbeat: bool,
-    profile: Option<String>,
-    /// Hobbes' home profile (system sessions are kept on it).
-    home: Option<String>,
     input_device: Option<String>,
     echo: VoiceEcho,
 }
@@ -288,12 +312,6 @@ fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
         setup,
         threshold_ms: settings.voice.hold_threshold_ms.max(100),
         idle: Duration::from_secs(settings.voice.idle_timeout_secs.max(15)),
-        speak_heartbeat: settings.voice.speak_heartbeat,
-        profile: settings
-            .home_profile_id()
-            .map(str::to_string)
-            .or_else(|| settings.get_active_profile().map(|p| p.id.clone())),
-        home: settings.home_profile_id().map(str::to_string),
         input_device: settings.voice.input_device_uid.clone(),
         echo: settings.voice.echo,
     })
@@ -332,8 +350,9 @@ pub fn realtime_for(settings: &crate::settings::Settings) -> Result<(Box<dyn Rea
     Ok((Box::new(crate::voice::gemini_live::GeminiLive::new(key)), setup))
 }
 
-/// The voice tier's instructions, with recent context from both sessions.
-pub fn system_instruction(now: chrono::DateTime<chrono::Local>, voice_tail: &str, heartbeat_tail: &str) -> String {
+/// The voice tier's instructions, with the recent conversation in the
+/// Hobbes tab (typed, spoken, and the Heartbeat's wakes).
+pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> String {
     let mut s = format!(
         "You are Hobbes, the person's chief-of-staff assistant, talking with them by voice. \
          Keep replies short and conversational: one to three spoken sentences, no lists, no \
@@ -346,38 +365,33 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, voice_tail: &str
          them. As you hand something to the brain, say a short holding phrase out loud — \
          \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
          silence. When the result comes back, summarise it naturally. Never read out code, URLs \
-         or long ids; say it's in the Voice tab. When they say goodbye, call {end}.\n\n\
+         or long ids; say it's in the Hobbes tab. When they say goodbye, call {end}.\n\n\
          It is {time}.",
         brain = tools::ASK_BRAIN,
         end = tools::END_CONVERSATION,
         time = now.format("%A %-d %B %Y, %H:%M"),
     );
-    if !heartbeat_tail.trim().is_empty() {
-        s.push_str("\n\nRecent Heartbeat notes (background monitoring):\n");
-        s.push_str(heartbeat_tail.trim());
-    }
-    if !voice_tail.trim().is_empty() {
-        s.push_str("\n\nThe end of your previous voice conversation:\n");
-        s.push_str(voice_tail.trim());
+    if !tail.trim().is_empty() {
+        s.push_str(
+            "\n\nThe end of the Hobbes tab, where your voice conversations, typed messages and the \
+             Heartbeat's background checks share one timeline:\n",
+        );
+        s.push_str(tail.trim());
     }
     s
-}
-
-fn tail_of(session_state: Signal<crate::session::SessionState>, peer: session::Peer, limit: usize) -> String {
-    session::peer_tail(session_state, peer, limit).unwrap_or_default()
 }
 
 /// One live conversation, from the press that opened it to its end.
 async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<VoiceCmd>, start: Start) {
     let pressed_at = Instant::now();
     let announcing_text = match &start {
-        Start::Announce(t) => Some(t.clone()),
+        Start::Announce(t, kind) => Some((t.clone(), *kind)),
         Start::Press => None,
     };
     let mut ui = VoiceUi { phase: Phase::Connecting, held: announcing_text.is_none(), ..VoiceUi::default() };
     *VOICE_UI.write() = ui.clone();
 
-    let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, home, input_device, echo } = match resolve(ctx) {
+    let Resolved { provider, mut setup, threshold_ms, idle, input_device, echo } = match resolve(ctx) {
         Ok(r) => r,
         Err(e) => {
             fail(e);
@@ -400,8 +414,12 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         }
     }
 
-    let Some(voice_session) = session::ensure_session(ctx.session_state, profile, home.as_deref()) else {
-        fail("The Voice session couldn't be created.");
+    let voice_session = {
+        let settings = ctx.settings.peek().clone();
+        crate::hobbes_session::ensure_session(ctx.session_state, &settings)
+    };
+    let Some(voice_session) = voice_session else {
+        fail("The Hobbes tab's session couldn't be created.");
         return;
     };
 
@@ -434,17 +452,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     };
     ui.echo_safe = audio_io.echo_safe();
 
-    setup.system_instruction = system_instruction(
-        chrono::Local::now(),
-        &tail_of(ctx.session_state, session::Peer::Voice, 6),
-        &tail_of(ctx.session_state, session::Peer::Heartbeat, 4),
-    );
-    // The Heartbeat's text now rides into what the voice hands the brain
-    // (the Voice session): carry its recent reads there too.
-    {
-        let settings = ctx.settings.peek().clone();
-        session::carry_peer_reads(ctx.session_state, &settings, &voice_session, session::Peer::Heartbeat, 4);
-    }
+    // One session: the Heartbeat's notes and earlier conversations are its
+    // own messages, so their cross-company reads already count there.
+    setup.system_instruction =
+        system_instruction(chrono::Local::now(), &session::session_tail(ctx.session_state, &voice_session, 10));
     let mut rt = match provider.connect(setup).await {
         Ok(s) => s,
         Err(e) => {
@@ -461,8 +472,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut ever_captured = capture_on;
     // Speaking-only until the person presses the key.
     let mut announcing = announcing_text.is_some();
-    if let Some(text) = &announcing_text {
-        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(text, false), respond: true });
+    if let Some((text, kind)) = &announcing_text {
+        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(text, false, *kind), respond: true });
     }
     let mut stats = Stats::default();
     let mut level_window = 0.0f32;
@@ -683,17 +694,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         last_activity = Instant::now();
                     }
                     VoiceCmd::Stop => break "stopped".to_string(),
-                    VoiceCmd::Announce(text) => {
+                    VoiceCmd::Announce(text, kind) => {
                         last_activity = Instant::now();
-                        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(&text, true), respond: true });
-                    }
-                    VoiceCmd::HeartbeatAlert(text) => {
-                        if speak_heartbeat {
-                            let _ = rt.control.send(RealtimeControl::InjectContext {
-                                text: format!("[Heartbeat alert — tell the person briefly] {text}"),
-                                respond: true,
-                            });
-                        }
+                        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(&text, true, kind), respond: true });
                     }
                 }
             }
@@ -874,7 +877,7 @@ pub fn brain_started_response() -> Value {
     })
 }
 
-/// Write buffered transcript lines into the Voice session, unless its last
+/// Write buffered transcript lines into the Hobbes session, unless its last
 /// turn is still in progress (streaming, between rounds, or held on an
 /// approval: `transcript::turn_open`) — `force` writes regardless (session
 /// end), and an open turn then only gets lines before it. Each line goes in
@@ -905,11 +908,11 @@ mod tests {
     #[test]
     fn instruction_names_the_tools_and_context() {
         let now = chrono::Local::now();
-        let s = system_instruction(now, "User: 🎙 hi", "Hobbes: CI is red");
+        let s = system_instruction(now, "User: 🎙 hi\nHobbes: CI is red");
         assert!(s.contains(tools::ASK_BRAIN) && s.contains(tools::END_CONVERSATION));
         assert!(s.contains("CI is red") && s.contains("🎙 hi"));
-        let bare = system_instruction(now, "", "");
-        assert!(!bare.contains("Heartbeat notes"));
+        let bare = system_instruction(now, "");
+        assert!(!bare.contains("The end of the Hobbes tab"));
     }
 
     fn msg(author: &str, text: &str) -> crate::components::chat::Message {
@@ -936,7 +939,7 @@ mod tests {
         // Live conversation: say it now. Not live and not looking: announce.
         assert!(should_announce(&news, true, 0, false));
         assert!(should_announce(&news, false, 0, false));
-        // Not live but looking at the Voice tab: they typed it; stay quiet.
+        // Not live but looking at the Hobbes tab: they typed it; stay quiet.
         assert!(!should_announce(&news, false, 0, true));
     }
 
@@ -947,7 +950,7 @@ mod tests {
         assert!(news.voice_request);
         // The live conversation's wait delivers it.
         assert!(!should_announce(&news, true, 1, false));
-        // The conversation ended first: announce it, even in the Voice tab.
+        // The conversation ended first: announce it, even in the Hobbes tab.
         assert!(should_announce(&news, false, 0, true));
         // Nothing to say: nothing announced.
         let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false };
@@ -956,8 +959,34 @@ mod tests {
 
     #[test]
     fn announcements_start_with_excuse_me() {
-        assert!(announce_prompt("CI is green.", true).contains("Excuse me"));
-        assert!(announce_prompt("CI is green.", false).ends_with("CI is green."));
+        assert!(announce_prompt("CI is green.", true, AnnounceKind::Result).contains("Excuse me"));
+        assert!(announce_prompt("CI is green.", false, AnnounceKind::Result).ends_with("CI is green."));
+        let hb = announce_prompt("CI is red on main.", false, AnnounceKind::Heartbeat);
+        assert!(hb.contains("Excuse me") && hb.contains("Heartbeat") && hb.ends_with("CI is red on main."));
+    }
+
+    #[test]
+    fn a_heartbeat_wake_speaks_only_when_it_found_something() {
+        use crate::session::TurnOrigin;
+        let msgs = vec![
+            msg("User", "[Heartbeat wake]\n\nWhy: CI failed"),
+            msg("Hobbes", "CI is red on main; I asked to dispatch a fix."),
+        ];
+        let news = turn_news(&msgs).unwrap();
+        assert!(!news.voice_request);
+        // Same rule as a returned result: live, or not looking at the tab.
+        assert!(should_announce(&news, false, 0, false));
+        assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, true), Some(AnnounceKind::Heartbeat));
+        // Off by the Heartbeat-specific switch.
+        assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), None);
+        // Nothing for the person: stay quiet.
+        let quiet = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: false };
+        assert_eq!(announce_kind(TurnOrigin::Heartbeat, &quiet, true), None);
+        // Held on an approval: say so.
+        let held = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: true };
+        assert_eq!(announce_kind(TurnOrigin::Heartbeat, &held, true), Some(AnnounceKind::Heartbeat));
+        // A turn the person started is a result, whatever the switch.
+        assert_eq!(announce_kind(TurnOrigin::User, &news, false), Some(AnnounceKind::Result));
     }
 
     #[test]
@@ -977,7 +1006,7 @@ mod tests {
 
     #[test]
     fn the_brain_handoff_is_announced() {
-        let s = system_instruction(chrono::Local::now(), "", "");
+        let s = system_instruction(chrono::Local::now(), "");
         assert!(s.contains("holding phrase"));
         let r = brain_started_response();
         assert_eq!(r["status"], "working");

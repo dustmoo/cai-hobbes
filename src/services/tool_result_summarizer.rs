@@ -127,6 +127,7 @@ mod tests {
                 cancelled: None,
                 hold_reason: None,
                 hold_rule_key: None,
+                origin: None,
             }),
             attachments: vec![],
             comments: vec![],
@@ -168,6 +169,7 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            turn_origin: Default::default(),
         }
     }
 

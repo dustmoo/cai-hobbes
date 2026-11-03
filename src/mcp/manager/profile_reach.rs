@@ -1,6 +1,7 @@
 //! Multi-profile reach: a chat pinned to one Composio profile (its *home*)
-//! may also act in other profiles — phase 1: the Heartbeat and Voice system
-//! sessions reach every configured profile.
+//! may also act in other profiles — phase 1: the Hobbes system session
+//! (Heartbeat wakes, voice and typed turns alike) reaches every configured
+//! profile.
 //!
 //! - **One tool set.** Composio slugs are identical across profiles (and
 //!   collapse to one provider-facing name), so the session sees each tool
@@ -54,9 +55,8 @@ pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<St
         .or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
 }
 
-/// The profiles `session_id` can act in, home first. Only the live system
-/// sessions (Heartbeat, Voice) reach beyond home in phase 1 — not their
-/// rotated-out archives, which are read-only; with no home profile there is
+/// The profiles `session_id` can act in, home first. Only the live Hobbes
+/// session reaches beyond home in phase 1 — not its rotated-out archives, which are read-only; with no home profile there is
 /// nothing to anchor to, so no reach either.
 pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<&str>) -> Vec<ReachProfile> {
     let Some(home) = home_id.and_then(|id| settings.composio_profiles.iter().find(|p| p.id == id)) else {
@@ -811,7 +811,7 @@ mod tests {
 
     #[test]
     fn approval_never_moves_a_call_to_another_company() {
-        crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, "reach-test-voice");
+        crate::system_sessions::register("reach-test-voice");
         let settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         let mut held = call(json!({"hobbes_profile": "Puget"}));
         held.server_name = "composio-native:Puget".into();
@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn an_unpinned_system_session_still_routes() {
-        crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "reach-test-hb");
+        crate::system_sessions::register("reach-test-hb");
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
         let home = home_profile(&settings, None);

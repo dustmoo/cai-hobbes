@@ -191,6 +191,14 @@ pub struct ToolCall {
     /// ordinary "always allow" for the tool never waves it through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_rule_key: Option<String>,
+    /// Who started the turn that minted this call (`Session::turn_origin`),
+    /// stamped by `stream_manager` over whatever the connector built — the
+    /// model can't set it. The scope gates read it on both tool-call paths,
+    /// so an approval resumed later keeps its turn's rules. `None` on
+    /// legacy rows and on calls never stamped (see
+    /// `builtin_tools::effective_origin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::session::TurnOrigin>,
 }
 
 /// Stop reason for a call cut off by the user's Stop.
@@ -271,6 +279,7 @@ impl ToolCall {
             cancelled: None,
             hold_reason: None,
             hold_rule_key: None,
+            origin: None,
         }
     }
 

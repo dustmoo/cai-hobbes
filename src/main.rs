@@ -55,6 +55,7 @@ mod session_store;
 mod str_utils;
 mod session_rotation;
 mod system_sessions;
+mod hobbes_session;
 mod tab_list;
 mod tab_tidy;
 #[cfg(test)]
@@ -932,9 +933,9 @@ fn app() -> Element {
                             .get(id)
                             .map(|p| p.asks_person())
                             .unwrap_or(false);
-                        // The Voice tab's news is spoken by the voice itself
+                        // The Hobbes tab's news is spoken by the voice itself
                         // (an approval it can't grant still toasts).
-                        let voice_speaks = voice::session::VOICE_SESSION_ID.peek().as_deref() == Some(id.as_str())
+                        let voice_speaks = crate::hobbes_session::is_hobbes(id)
                             && s.pending_gate.is_none()
                             && {
                                 let st = settings.peek();
@@ -1003,11 +1004,9 @@ fn app() -> Element {
                     // visible tab to show its activity in. `open_tabs` isn't
                     // reachable from this task (see `PENDING_TAB_REOPEN`), so
                     // park the id for the ChatCommand handler to reopen.
-                    // The Heartbeat's own session stays out of the tab
-                    // strip: its turn runs in the background like a wake.
-                    if heartbeat::HEARTBEAT.peek().session_id.as_deref()
-                        != Some(c.parent_session_id.as_str())
-                    {
+                    // The Hobbes session stays out of the tab strip: its
+                    // turn runs in the background like a wake.
+                    if !crate::hobbes_session::is_hobbes(&c.parent_session_id) {
                         PENDING_TAB_REOPEN
                             .write()
                             .insert(c.parent_session_id.clone());
@@ -2345,8 +2344,15 @@ fn app() -> Element {
         };
         voice::controller::use_voice(voice_ctx);
         voice::hotkey::use_voice_hotkey();
-        // Restore the Voice tab's icon / drop a stray project tag at launch.
-        use_hook(|| voice::session::repair_on_startup(session_state, settings.peek().home_profile_id().map(str::to_string)));
+        // The Hobbes tab at launch: the one-time merge of the pre-merge
+        // Heartbeat and Voice sessions, or a repair of its icon / project
+        // tag / home profile. On the next tick, not during this render.
+        use_hook(|| {
+            spawn(async move {
+                let settings_now = settings.peek().clone();
+                crate::hobbes_session::startup(session_state, &settings_now);
+            })
+        });
     }
 
     // Persist tab state to UiState (Pattern 12 & 13)
@@ -2589,17 +2595,15 @@ fn app() -> Element {
             }
 
             // Delete the session if it has no messages (empty tab).
-            // Sessions with messages are preserved in History. The
-            // Heartbeat's and Voice's own sessions are kept even while
-            // empty: they are waiting for their first wake or conversation
-            // (or were just rotated in, carrying the old one's summary), not
-            // abandoned tabs.
+            // Sessions with messages are preserved in History. The Hobbes
+            // session is kept even while empty: it is waiting for its first
+            // wake or conversation (or was just rotated in, carrying the old
+            // one's summary), not an abandoned tab.
             {
                 let state = session_state.read();
-                let is_heartbeat = heartbeat::HEARTBEAT.peek().session_id.as_deref()
-                    == Some(closing_session_id.as_str())
+                let is_system = crate::hobbes_session::is_hobbes(&closing_session_id)
                     || crate::system_sessions::is_current(&closing_session_id);
-                let is_empty = !is_heartbeat
+                let is_empty = !is_system
                     && state.sessions.get(&closing_session_id)
                         .map(|s| s.messages.is_empty())
                         .unwrap_or(true);

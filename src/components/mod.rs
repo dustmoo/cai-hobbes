@@ -8,6 +8,7 @@ pub mod comment_modal;
 pub mod conflict_modal;
 pub mod inline_comment_popover;
 pub mod markdown_renderer;
+pub mod hobbes_icon;
 pub mod metal_heart;
 pub mod metal_mouth;
 pub mod voice_indicator;

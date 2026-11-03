@@ -3,12 +3,12 @@
 //!
 //! Perception (cheap watchers, no LLM) turns planner, Fleet and CI changes
 //! into events; salience routes each to ignore / note / queue / wake; the
-//! budget caps wakes; a wake hands the dedicated Heartbeat session a
+//! budget caps wakes; a wake hands the Hobbes session (`hobbes_session`) a
 //! briefing. Design: the "Hobbes Heartbeat" doc.
 //!
 //! The engine (perception, salience, state, budget, wake) is pure; the
 //! runtime (`runtime.rs`, spawned from `main.rs`) polls it every 30 s,
-//! keeps the dedicated Heartbeat session and delivers wakes through the
+//! keeps the Hobbes session and delivers wakes through the
 //! background chat queue. One poll looks like:
 //!
 //! ```text
@@ -25,7 +25,8 @@
 //! }
 //! ```
 //!
-//! Tool calls from the Heartbeat session pass `trust::gate_verdict`
+//! Tool calls from a wake's turn (`TurnOrigin::Heartbeat`, carried by each
+//! call) pass `trust::gate_verdict`
 //! (`builtin_tools::heartbeat_gate`) at both tool-call sites.
 
 pub mod anchors;
@@ -185,14 +186,10 @@ pub const META_KEY: &str = "heartbeat_state";
 
 /// Read the persisted state; missing or unreadable state starts fresh.
 pub fn load() -> HeartbeatState {
-    let mut state = match crate::session_store::meta_get(META_KEY) {
+    match crate::session_store::meta_get(META_KEY) {
         Some(raw) => from_json(&raw),
         None => HeartbeatState::default(),
-    };
-    // A pointer a stale save left on a rotated-out archive moves forward to
-    // its successor (`session_rotation`).
-    state.session_id = state.session_id.map(|id| crate::system_sessions::resolve_successor(&id));
-    state
+    }
 }
 
 /// Parse persisted JSON, falling back to a fresh state (logged) on error.
@@ -285,6 +282,16 @@ mod tests {
         assert_eq!(back, e);
         let c: CiConclusion = serde_json::from_str("\"skipped\"").unwrap();
         assert_eq!(c, CiConclusion::Other);
+    }
+
+    #[test]
+    fn the_pre_merge_session_pointer_survives_a_save() {
+        // Until the one-time merge reads it, a save mustn't drop it.
+        let state = from_json(r#"{"session_id":"old-heartbeat"}"#);
+        assert_eq!(state.legacy_session_id.as_deref(), Some("old-heartbeat"));
+        let v = serde_json::to_value(&state).unwrap();
+        assert_eq!(v["session_id"], "old-heartbeat");
+        assert!(serde_json::to_value(HeartbeatState::default()).unwrap().get("session_id").is_none());
     }
 
     #[test]

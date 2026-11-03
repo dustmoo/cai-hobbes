@@ -443,7 +443,7 @@ pub struct Settings {
     #[serde(default)]
     pub composio_profiles: Vec<ComposioProfile>,
     pub active_composio_profile: Option<String>,
-    /// Hobbes' own home profile: the Heartbeat and Voice tabs act here by
+    /// Hobbes' own home profile: the Hobbes tab (Heartbeat and voice) acts here by
     /// default and reach the other profiles from it (profile_reach). `None`
     /// = each keeps the profile it was created with.
     #[serde(default)]
@@ -974,7 +974,8 @@ pub struct VoiceSettings {
     /// A conversation ends after this long with nobody speaking.
     #[serde(default = "default_voice_idle_timeout_secs")]
     pub idle_timeout_secs: u64,
-    /// While a conversation is live, urgent Heartbeat events are spoken.
+    /// What a Heartbeat wake finds for the person is spoken through the
+    /// announce path (with [`Self::announce_results`]): "Excuse me…".
     #[serde(default = "default_true")]
     pub speak_heartbeat: bool,
     /// Microphone to listen on (a CoreAudio device UID on macOS, the device
@@ -986,7 +987,7 @@ pub struct VoiceSettings {
     /// Bluetooth headsets into call mode; see [`VoiceEcho`].
     #[serde(default)]
     pub echo: VoiceEcho,
-    /// Results that reach the Voice tab later (dispatched work finishing, a
+    /// Results that reach the Hobbes tab later (dispatched work finishing, a
     /// brain answer after the conversation ended) are spoken: "Excuse me…"
     /// mid-conversation, or a short announcement with the mic off.
     #[serde(default = "default_true")]
@@ -3537,6 +3538,7 @@ mod tests {
         dispatch_link: None,
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
+        turn_origin: Default::default(),
         }
     }
 

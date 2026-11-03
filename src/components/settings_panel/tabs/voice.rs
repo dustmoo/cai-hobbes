@@ -246,7 +246,7 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                     class: "mb-4",
                     label { class: "block text-sm font-medium text-fg-muted mb-1", "Hobbes home profile" }
                     p { class: "text-xs text-fg-muted mb-1",
-                        "The Composio profile the Heartbeat and Voice tabs act in by default, as your own company. They can also use your other profiles; a write that lands outside home, or carries one company's data into another's, asks you first."
+                        "The Composio profile the Hobbes tab (the Heartbeat and voice) acts in by default, as your own company. They can also use your other profiles; a write that lands outside home, or carries one company's data into another's, asks you first."
                     }
                     select {
                         class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
@@ -327,8 +327,8 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                 div {
                     class: "flex items-center justify-between mb-4",
                     div {
-                        label { class: "text-sm font-medium text-fg-muted", "Speak urgent Heartbeat events" }
-                        p { class: "text-xs text-fg-muted", "While a conversation is live, urgent events are spoken aloud." }
+                        label { class: "text-sm font-medium text-fg-muted", "Speak the Heartbeat's news" }
+                        p { class: "text-xs text-fg-muted", "When a Heartbeat wake finds something for you, Hobbes says \"Excuse me…\" and tells you (needs \"Speak results that come back later\" on)." }
                     }
                     input {
                         r#type: "checkbox",
@@ -341,7 +341,7 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                     class: "flex items-center justify-between mb-4",
                     div {
                         label { class: "text-sm font-medium text-fg-muted", "Speak results that come back later" }
-                        p { class: "text-xs text-fg-muted", "When dispatched work finishes or the brain answers after you've hung up, Hobbes says \"Excuse me…\" and tells you, with the mic off, instead of flagging the Voice tab." }
+                        p { class: "text-xs text-fg-muted", "When dispatched work finishes or the brain answers after you've hung up, Hobbes says \"Excuse me…\" and tells you, with the mic off, instead of flagging the Hobbes tab." }
                     }
                     input {
                         r#type: "checkbox",

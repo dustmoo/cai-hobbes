@@ -282,6 +282,18 @@ impl StreamManagerContext {
         // later profile/connector switch must not relabel.
         let stream_connector_name = self.effective_connector(&session_id).map(|inst| inst.name);
         let stream_model = self.effective_model(&session_id);
+        // Who started the turn this stream belongs to (set by the harness
+        // when the turn began, kept across its continuations). Stamped on
+        // every tool call below, over anything the connector produced, so
+        // the scope gates — here and on the approval-resume path — see the
+        // turn's origin, not the model's say.
+        let stream_origin = self
+            .session_state
+            .peek()
+            .sessions
+            .get(&session_id)
+            .map(|s| s.turn_origin)
+            .unwrap_or_default();
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -630,6 +642,7 @@ impl StreamManagerContext {
                         // Every call in this response shares the turn's placeholder id,
                         // so the prompt builder can find the latest round.
                         tool_call.round_id = Some(message_id.to_string());
+                        crate::components::builtin_tools::stamp_turn_origin(&mut tool_call, stream_origin);
 
                         // Multi-profile reach (profile_reach): route a Composio
                         // call to the profile it names (restamped before it is
@@ -814,7 +827,7 @@ impl StreamManagerContext {
                             // here, bypassing trust rules and always-allow
                             // (use_mcp_tool is never reached). The resume
                             // path in chat.rs runs the same gate. The
-                            // Heartbeat session gets the same scope rules
+                            // Heartbeat's (unattended) turns get the same scope rules
                             // (`scope_gates` runs both gates).
                             let mut agent_time_gate =
                                 crate::components::builtin_tools::scope_gates(
@@ -1203,7 +1216,11 @@ impl StreamManagerContext {
                                             &response_str,
                                         )
                                     {
+                                        // The turn's origin comes from the stored
+                                        // call, never from the response JSON.
+                                        tc.origin = None;
                                         if let crate::components::shared::MessageContent::ToolCall(orig) = &msg.content {
+                                            tc.origin = orig.origin;
                                             tc.round_id = orig.round_id.clone();
                                             // Keep the routing: target profile,
                                             // stored arguments (with `profile`)

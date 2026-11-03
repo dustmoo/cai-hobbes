@@ -64,7 +64,7 @@ pub struct SalienceCtx {
     pub intention_todo_ids: HashSet<String>,
     /// To-dos the Heartbeat itself dispatched.
     pub heartbeat_todo_ids: HashSet<String>,
-    /// The dedicated Heartbeat chat session, once it exists — runs
+    /// The Hobbes session (where wakes run), once it exists — runs
     /// dispatched from it count as the Heartbeat's own.
     pub heartbeat_session_id: Option<String>,
     /// The Heartbeat's rotated-out sessions (`system_sessions::lineage`):

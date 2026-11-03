@@ -883,7 +883,7 @@ pub fn ChatInput(
                 chat_queue::queue_push(
                     &mut CHAT_QUEUE.write(),
                     &session_id,
-                    QueuedMessage::new(user_message, atts),
+                    QueuedMessage::new(user_message, atts).with_origin(crate::session::TurnOrigin::User),
                 );
                 crate::components::shared::set_chat_draft(draft, String::new(), None, false);
                 attachments.set(Vec::new());
@@ -947,11 +947,18 @@ pub fn ChatInput(
             let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
             if let Some(qm) = popped {
                 chat_queue::DISPATCHING.write().insert(session_id.clone());
+                // Who this turn belongs to (trust follows the turn: an
+                // unattended one in the Hobbes session gets the Heartbeat's
+                // rules). Harness-decided here, never by the model.
+                let origin = chat_queue::resolve_origin(qm.origin, crate::hobbes_session::is_hobbes(&session_id));
                 match qm.relay {
                     // A waking dispatch relay: append it and start a turn
                     // with no user message (todo::relay). Never resets the
                     // turn count, and never runs a call awaiting approval.
                     Some(relay) => {
+                        if let Some(s) = session_state.write().sessions.get_mut(&session_id) {
+                            s.turn_origin = origin;
+                        }
                         let start = crate::todo::relay::deliver_queued_relay(
                             session_state,
                             &_planner_state.peek(),
@@ -964,7 +971,10 @@ pub fn ChatInput(
                                 .trigger_continuation(session_id.clone());
                         }
                     }
-                    None => submit.call((qm.text, qm.attachments, session_id.clone())),
+                    None => {
+                        chat_queue::set_pending_origin(&session_id, origin);
+                        submit.call((qm.text, qm.attachments, session_id.clone()));
+                    }
                 }
                 // Failsafe: a queued no-op (e.g. a command that starts no stream)
                 // must not wedge the queue. Real turns clear the guard sooner via
@@ -978,7 +988,8 @@ pub fn ChatInput(
         }
     });
 
-    // A rotated-out Heartbeat / Voice session is a read-only archive: its
+    // A rotated-out Hobbes session (or a pre-merge Heartbeat / Voice one)
+    // is a read-only archive: its
     // successor carries on the conversation (session_rotation).
     let archived = crate::system_sessions::is_archive(&current_session_id.read());
     let placeholder = if archived {

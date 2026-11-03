@@ -3761,6 +3761,7 @@ mod tests {
                 dispatch_link: None,
                 dispatched_workers: Vec::new(),
                 carried_reads: Vec::new(),
+                turn_origin: Default::default(),
             }
         }
 

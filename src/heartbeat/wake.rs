@@ -1,4 +1,4 @@
-//! Wakes: when to wake the Heartbeat session, the message a wake delivers,
+//! Wakes: when to wake the Hobbes session, the message a wake delivers,
 //! and how a finished wake's cost, outcome and actions are read back. All
 //! pure; the runtime (`runtime.rs`) feeds them live state.
 //!
@@ -354,7 +354,8 @@ fn event_section(events: &[&HeartbeatEvent], todos: &HashMap<String, TodoInfo>, 
     lines
 }
 
-/// The wake message: a queued user message in the Heartbeat session. Leads
+/// The wake message: a queued message (an unattended turn) in the Hobbes
+/// session. Leads
 /// with the look-ahead, then why it woke, what changed, the workers to
 /// diagnose, the rules, the budget and goal-directed standing instructions.
 /// No line starts with "/" (the chat input would read it as a skill
@@ -426,7 +427,7 @@ pub fn build_wake_message(b: &WakeBrief<'_>) -> String {
         "Act only within the rules above; prefer dispatching a worker or raising a decision over doing outside effects yourself.",
         "Don't repeat what the Fleet already shows the person.",
         "Write a handoff note (HOBBES_WRITE_HANDOFF) before you finish.",
-        "If nothing is worth doing, say so in one line.",
+        "If nothing is worth the person's attention, reply with just \"Nothing to report.\" (anything else is spoken to them when they use voice).",
     ]);
     out.extend(rules.iter().map(|s| format!("- {s}")));
     out.join("\n")
@@ -471,13 +472,19 @@ pub fn wake_completion(
     if session_busy {
         return None;
     }
-    let after: Vec<&Message> = messages.iter().filter(|m| m.created_at >= wake.at).collect();
+    // The wake shares the Hobbes session with typed and voice turns: only
+    // its own turn counts.
+    let until = wake_window_end(messages, wake.at, until);
+    let after: Vec<&Message> =
+        messages.iter().filter(|m| m.created_at >= wake.at && until.is_none_or(|t| m.created_at < t)).collect();
     let delivered = after.iter().any(|m| m.author == "User");
     let age = now - wake.at;
     if !delivered && age < Duration::minutes(DELIVERY_TIMEOUT_MINUTES) {
         return None;
     }
-    let waiting = has_pending_approval(messages);
+    let waiting = after.iter().any(|m| {
+        matches!(m.content, MessageContent::PermissionRequest(_) | MessageContent::SkillPermissionRequest(_))
+    });
     if delivered && waiting && age < Duration::hours(APPROVAL_WAIT_HOURS) {
         return None;
     }
@@ -501,6 +508,47 @@ pub fn wake_completion(
         None => "no reply".to_string(),
     };
     Some((cost, outcome))
+}
+
+/// The reply a wake gives when nothing needs the person (the standing
+/// instruction in [`build_wake_message`]).
+pub const QUIET_REPLY: &str = "Nothing to report.";
+
+/// Whether a wake's reply says it found nothing for the person: empty, or
+/// [`QUIET_REPLY`] (case, trailing punctuation and quotes aside). Such a
+/// reply isn't spoken (`voice::controller::announce_kind`).
+pub fn is_quiet_reply(reply: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == '*')
+            .trim_end_matches(['.', '!'])
+            .trim()
+            .to_lowercase()
+    };
+    let r = norm(reply);
+    r.is_empty() || r == norm(QUIET_REPLY)
+}
+
+/// When the wake at `since` stopped owning the session: the first message
+/// after its wake message that starts another turn (a typed message, a
+/// voice request, a relay — not a voice transcript line or an auto-recovery
+/// prompt inside the turn), or the next wake (`until`), whichever is first.
+/// The Hobbes session hosts typed and voice turns between wakes; their
+/// cost, actions and replies aren't the wake's.
+pub fn wake_window_end(
+    messages: &[Message],
+    since: DateTime<Utc>,
+    until: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let mut after = messages.iter().filter(|m| m.created_at >= since);
+    let turn_end = after
+        .find(|m| m.author == "User")
+        .and_then(|_| after.find(|m| crate::voice::transcript::starts_turn(m)))
+        .map(|m| m.created_at);
+    match (until, turn_end) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// To-dos the Heartbeat dispatched: Fleet runs launched from any of its
@@ -935,7 +983,7 @@ mod tests {
              - Act only within the rules above; prefer dispatching a worker or raising a decision over doing outside effects yourself.\n\
              - Don't repeat what the Fleet already shows the person.\n\
              - Write a handoff note (HOBBES_WRITE_HANDOFF) before you finish.\n\
-             - If nothing is worth doing, say so in one line.",
+             - If nothing is worth the person's attention, reply with just \"Nothing to report.\" (anything else is spoken to them when they use voice).",
             hm(&stuck), hm(&earlier), hm(&overdue), hm(&ci), hm(&old),
             m_start = local(14, 30), m_end = local(15, 0),
         );
@@ -1033,6 +1081,45 @@ mod tests {
         let (_, outcome) = wake_completion(&wake, None, "hb", &long, &[], false, now()).unwrap();
         assert_eq!(outcome.chars().count(), OUTCOME_MAX_CHARS);
         assert!(outcome.ends_with('…'));
+    }
+
+    #[test]
+    fn quiet_replies_are_recognised() {
+        assert!(is_quiet_reply(""));
+        assert!(is_quiet_reply("Nothing to report."));
+        assert!(is_quiet_reply("  \"nothing to report\"  "));
+        assert!(is_quiet_reply("**Nothing to report!**"));
+        assert!(!is_quiet_reply("Nothing to report, except CI is red."));
+        assert!(!is_quiet_reply("CI is red on main."));
+    }
+
+    #[test]
+    fn a_wake_owns_only_its_own_turn_in_the_shared_session() {
+        let wake = fired(10);
+        let t = wake.at;
+        let held = tool("gmail_send_email", "{}", crate::components::shared::ToolCallStatus::Running);
+        let msgs = vec![
+            msg_at("User", text("[Heartbeat wake]"), t),
+            msg_at("Hobbes", text("CI is red on main; dispatched a fix."), t + Duration::minutes(1)),
+            // A voice line said during the wake, written after it: still
+            // the wake's window.
+            msg_at("User", text("🎙 hello"), t + Duration::minutes(1) + Duration::seconds(30)),
+            // The person's own turn afterwards: not the wake's.
+            msg_at("User", text("Draft the reply to Acme"), t + Duration::minutes(3)),
+            msg_at("Hobbes", MessageContent::PermissionRequest(held), t + Duration::minutes(4)),
+            msg_at("Hobbes", text("Drafted; it needs your approval."), t + Duration::minutes(5)),
+        ];
+        assert_eq!(wake_window_end(&msgs, t, None), Some(t + Duration::minutes(3)));
+        assert_eq!(wake_window_end(&msgs, t, Some(t + Duration::minutes(2))), Some(t + Duration::minutes(2)));
+        let spend = [
+            Spend { session_id: "hb", at: t + Duration::minutes(1), cost: Some(0.5) },
+            Spend { session_id: "hb", at: t + Duration::minutes(5), cost: Some(2.0) },
+        ];
+        // The user's held call and later reply don't hold or label the wake,
+        // and their spend isn't charged to it.
+        let (cost, outcome) = wake_completion(&wake, None, "hb", &msgs, &spend, false, now()).unwrap();
+        assert!((cost - 0.5).abs() < 1e-9, "{cost}");
+        assert_eq!(outcome, "CI is red on main; dispatched a fix.");
     }
 
     #[test]

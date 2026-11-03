@@ -1,8 +1,8 @@
 //! `VOICE_ASK_BRAIN`: hand a request from the voice tier to the global
-//! connector. The request is queued into the Voice session through the
+//! connector. The request is queued into the Hobbes session through the
 //! background chat queue (the same path a Heartbeat wake uses), so the brain
 //! runs a normal turn — full prompt builder, tools, trust rules, permission
-//! bubbles — on whatever `active_connector_id` points at (the Voice session
+//! bubbles — on whatever `active_connector_id` points at (the Hobbes session
 //! is never pinned). This module waits for that turn and returns its text.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +25,7 @@ const MAX_RESULT_CHARS: usize = 4000;
 #[derive(Clone, Debug, PartialEq)]
 pub enum BrainOutcome {
     Done(String),
-    /// The turn is held on a permission bubble in the Voice tab.
+    /// The turn is held on a permission bubble in the Hobbes tab.
     NeedsApproval(String),
     Failed(String),
     Cancelled,
@@ -37,7 +37,7 @@ pub fn framed_request(request: &str) -> String {
         "🎙 {}\n\n[Voice request, relayed by Hobbes' voice layer from a live spoken conversation. \
          Do what is asked. Your final reply is read aloud: answer in one to four short plain \
          sentences, no markdown, no code, no URLs; put anything long in the reply after a line \
-         that says \"Details:\" and the voice will point the person to the Voice tab.]",
+         that says \"Details:\" and the voice will point the person to the Hobbes tab.]",
         request.trim()
     )
 }
@@ -63,7 +63,7 @@ pub fn collect_reply(messages: &[Message], anchor: usize) -> String {
     let mut text = parts.join("\n\n");
     if let Some(idx) = text.find("Details:") {
         text.truncate(idx);
-        text = format!("{} (Full details are in the Voice tab.)", text.trim_end());
+        text = format!("{} (Full details are in the Hobbes tab.)", text.trim_end());
     }
     if text.chars().count() > MAX_RESULT_CHARS {
         text = text.chars().take(MAX_RESULT_CHARS).collect::<String>() + "…";
@@ -103,7 +103,7 @@ fn turn_needs_approval(messages: &[Message], anchor: usize) -> bool {
 pub struct BrainHandle {
     /// Stop the brain's turn too (VOICE_CANCEL_BRAIN).
     pub cancel: Arc<AtomicBool>,
-    /// Only stop waiting; the turn keeps running in the Voice tab
+    /// Only stop waiting; the turn keeps running in the Hobbes tab
     /// (the conversation ended).
     pub detach: Arc<AtomicBool>,
 }
@@ -135,7 +135,7 @@ pub fn is_voice_request(text: &str) -> bool {
     text.starts_with(crate::voice::session::HEARD_PREFIX) && text.contains("[Voice request, relayed by Hobbes' voice layer")
 }
 
-/// Queue `request` into the Voice session and wait for the brain's turn.
+/// Queue `request` into the Hobbes session and wait for the brain's turn.
 /// Logs the outcome (kind, duration, reply length; never content).
 /// `streaming` reports whether a session is mid-turn. Runs on the Dioxus
 /// runtime (it peeks signals); no guard crosses an await.
@@ -176,7 +176,7 @@ async fn run_inner(
 ) -> BrainOutcome {
     let before = match session_state.peek().sessions.get(&session_id) {
         Some(s) => s.messages.len(),
-        None => return BrainOutcome::Failed("The Voice session isn't loaded.".into()),
+        None => return BrainOutcome::Failed("The Hobbes session isn't loaded.".into()),
     };
     let framed = framed_request(&request);
     let queued_id = {
@@ -206,13 +206,13 @@ async fn run_inner(
             return BrainOutcome::Cancelled;
         }
         if started_at.elapsed() > BRAIN_TIMEOUT {
-            return BrainOutcome::Failed("The brain took too long; it may still finish in the Voice tab.".into());
+            return BrainOutcome::Failed("The brain took too long; it may still finish in the Hobbes tab.".into());
         }
         let is_streaming = streaming(&session_id);
         let (reply, pending) = {
             let state = session_state.peek();
             let Some(s) = state.sessions.get(&session_id) else {
-                return BrainOutcome::Failed("The Voice session was closed.".into());
+                return BrainOutcome::Failed("The Hobbes session was closed.".into());
             };
             if anchor.is_none() {
                 anchor = find_anchor(&s.messages, before, &framed);
@@ -231,11 +231,11 @@ async fn run_inner(
             continue;
         }
         if pending {
-            return BrainOutcome::NeedsApproval("The brain is waiting for your approval in the Voice tab.".into());
+            return BrainOutcome::NeedsApproval("The brain is waiting for your approval in the Hobbes tab.".into());
         }
         if seen_stream {
             return if reply.is_empty() {
-                BrainOutcome::Failed("The brain finished without a reply; check the Voice tab.".into())
+                BrainOutcome::Failed("The brain finished without a reply; check the Hobbes tab.".into())
             } else {
                 BrainOutcome::Done(reply)
             };
@@ -248,7 +248,7 @@ async fn run_inner(
         }
         // Appended but never started (e.g. the turn limit was reached).
         if reply.is_empty() && quiet.elapsed() >= NO_START_TIMEOUT {
-            return BrainOutcome::Failed("The brain didn't start; check the Voice tab.".into());
+            return BrainOutcome::Failed("The brain didn't start; check the Hobbes tab.".into());
         }
     }
 }
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn details_become_a_pointer() {
         let msgs = vec![text("User", "ask"), text("Hobbes", "Two PRs need review.\nDetails:\n- #12\n- #14")];
-        assert_eq!(collect_reply(&msgs, 0), "Two PRs need review. (Full details are in the Voice tab.)");
+        assert_eq!(collect_reply(&msgs, 0), "Two PRs need review. (Full details are in the Hobbes tab.)");
     }
 
     #[test]

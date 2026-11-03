@@ -82,20 +82,39 @@ pub struct ExpansionStateContext(pub Signal<HashMap<String, bool>>);
 
 /// Heartbeat events about work this chat dispatched, for the turn briefing
 /// (the briefing keeps the ones newer than the previous turn).
-fn heartbeat_briefing_events(session_id: &str) -> Vec<crate::heartbeat::HeartbeatEvent> {
+fn heartbeat_briefing_events(session_id: &str, unattended: bool) -> Vec<crate::heartbeat::HeartbeatEvent> {
     let since = chrono::Utc::now() - chrono::Duration::days(crate::heartbeat::state::EVENT_MAX_AGE_DAYS);
     let state = crate::heartbeat::HEARTBEAT.peek();
-    // The Heartbeat session's own wake message already lists these.
-    if state.session_id.as_deref() == Some(session_id) {
+    // A wake's own message already lists these.
+    if crate::hobbes_session::is_hobbes(session_id) && unattended {
         return Vec::new();
     }
-    // A rotated system session (Voice) also owns what its archives dispatched.
+    // A rotated system session also owns what its archives dispatched.
     let ids = crate::system_sessions::lineage_of(session_id);
     state
         .events_for_session_since(&ids, since)
         .into_iter()
         .cloned()
         .collect()
+}
+
+/// The origin a resumed approval continues under: unattended if any of the
+/// resumed calls was minted by an unattended turn (the strict side wins),
+/// else the person's. Read from each call's own stamp
+/// (`builtin_tools::effective_origin`), never from the session's current
+/// turn, so a typed turn started while the approval waited can't loosen it.
+pub(crate) fn resumed_turn_origin<'a>(
+    calls: impl IntoIterator<Item = &'a crate::components::shared::ToolCall>,
+    session_id: &str,
+) -> crate::session::TurnOrigin {
+    if calls
+        .into_iter()
+        .any(|tc| crate::components::builtin_tools::effective_origin(tc, session_id).is_unattended())
+    {
+        crate::session::TurnOrigin::Heartbeat
+    } else {
+        crate::session::TurnOrigin::User
+    }
 }
 
 // The main ChatWindow component
@@ -470,6 +489,19 @@ pub fn ChatWindow(
                     return;
                 }
 
+                // The resumed calls carry the origin of the turn that raised
+                // them (stamped when minted); the continuation that follows
+                // belongs to that turn too, whatever started in between.
+                {
+                    let resumed = resumed_turn_origin(
+                        tools_to_run.iter().map(|(_, tc)| tc),
+                        &owning_id,
+                    );
+                    if let Some(session) = session_state.write().sessions.get_mut(&owning_id) {
+                        session.turn_origin = resumed;
+                    }
+                }
+
                 // 2. Execute tools
                 for (msg_id, tool_call) in tools_to_run {
                     // The step's clock starts when the approved call actually
@@ -737,6 +769,10 @@ pub fn ChatWindow(
     // session, so the send path must never infer its target from the active tab.
     let send_message = std::rc::Rc::new(
         move |(user_message, attachments, target_id): (String, Vec<Attachment>, String)| {
+            // Who this turn belongs to: what the queue drain resolved for a
+            // queued message, else the person (a typed send). Taken first,
+            // synchronously, so it can't outlive this send.
+            let turn_origin = crate::components::chat_queue::take_turn_origin(&target_id);
             // An archived system session is read-only (session_rotation).
             if crate::system_sessions::is_archive(&target_id) {
                 tracing::warn!(session_id = %target_id, "send refused: archived system session");
@@ -753,9 +789,13 @@ pub fn ChatWindow(
                 async move {
                     let settings_read = settings.read().clone();
 
-                    // Reset the AI turn count every time the user sends a message.
+                    // Reset the AI turn count every time the user sends a message,
+                    // and record who started this turn: every tool call it
+                    // mints is stamped with it (stream_manager), and the scope
+                    // gates read that stamp on both tool-call paths.
                     if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
                         session.reset_turn_count();
+                        session.turn_origin = turn_origin;
                     }
                     // The user has the floor: a relay no longer started this turn.
                     crate::todo::relay::clear_turn_origin(&target_id);
@@ -821,7 +861,7 @@ pub fn ChatWindow(
                                 if let Some(session) = state.sessions.get(&target_id) {
                                     let builder = PromptBuilder::new(session, &settings_read)
                                         .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
-                                        .with_heartbeat_events(heartbeat_briefing_events(&target_id))
+                                        .with_heartbeat_events(heartbeat_briefing_events(&target_id, session.turn_origin.is_unattended()))
                                         .with_planner_today(
                                             crate::todo::handlers::planner_today_context(
                                                 &planner_state.read(),
@@ -1003,7 +1043,7 @@ pub fn ChatWindow(
                         if let Some(session) = state.sessions.get(&target_id) {
                             let builder = PromptBuilder::new(session, &settings_read)
                                 .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
-                                .with_heartbeat_events(heartbeat_briefing_events(&target_id))
+                                .with_heartbeat_events(heartbeat_briefing_events(&target_id, session.turn_origin.is_unattended()))
                                 .with_planner_today(crate::todo::handlers::planner_today_context(
                                     &planner_state.read(),
                                     &settings_read,
@@ -1111,7 +1151,7 @@ pub fn ChatWindow(
                     if let Some(session) = state.sessions.get(&target_id) {
                         let builder = PromptBuilder::new(session, &settings)
                             .with_agent_time_tools(crate::components::builtin_tools::agent_time_tool_visible(&planner_state.peek(), &target_id))
-                            .with_heartbeat_events(heartbeat_briefing_events(&target_id))
+                            .with_heartbeat_events(heartbeat_briefing_events(&target_id, session.turn_origin.is_unattended()))
                             .with_planner_today(crate::todo::handlers::planner_today_context(
                                 &planner_state.read(),
                                 &settings,

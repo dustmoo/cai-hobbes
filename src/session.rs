@@ -387,6 +387,39 @@ pub struct Session {
     /// this session's own messages until they age out of the read window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_reads: Vec<CarriedRead>,
+    /// Who started the turn now running (or last run) in this session —
+    /// set only by the harness when a turn starts (`chat.rs` send path, the
+    /// queue drain), never from model output. Every tool call the turn
+    /// mints is stamped with it (`ToolCall::origin`), and the scope gates
+    /// read the call's stamp, so a resumed approval keeps its turn's rules.
+    #[serde(default, skip_serializing_if = "TurnOrigin::is_user")]
+    pub turn_origin: TurnOrigin,
+}
+
+/// Who started a turn. Trust follows the turn, not the session: the Hobbes
+/// session hosts typed turns, voice hand-offs and Heartbeat wakes alike, and
+/// only the unattended ones get the Heartbeat's strict scope rules
+/// (`builtin_tools::heartbeat_gate`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    /// The person: a typed message, a voice request, anything they did.
+    #[default]
+    User,
+    /// Unattended: a Heartbeat wake, or anything else nobody is present
+    /// for in the Hobbes session (a timer, a relay, returned work).
+    Heartbeat,
+}
+
+impl TurnOrigin {
+    pub fn is_user(&self) -> bool {
+        *self == TurnOrigin::User
+    }
+
+    /// Whether the Heartbeat's strict, unattended rules apply.
+    pub fn is_unattended(self) -> bool {
+        self == TurnOrigin::Heartbeat
+    }
 }
 
 /// One Composio read carried into a rotated system session's successor.
@@ -1767,6 +1800,7 @@ impl SessionState {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            turn_origin: TurnOrigin::User,
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -2373,6 +2407,7 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            turn_origin: TurnOrigin::User,
             }
         }
 
@@ -3224,6 +3259,7 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            turn_origin: TurnOrigin::User,
             messages: vec![
                 Message {
                     id: msg1_id,
@@ -3276,6 +3312,7 @@ mod tests {
                         cancelled: None,
                         hold_reason: None,
                         hold_rule_key: None,
+                        origin: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -3305,6 +3342,7 @@ mod tests {
                         cancelled: None,
                         hold_reason: None,
                         hold_rule_key: None,
+                        origin: None,
                     }),
                     attachments: vec![],
                     comments: vec![],

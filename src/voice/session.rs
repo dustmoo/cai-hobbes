@@ -1,7 +1,7 @@
-//! The dedicated **Voice** chat session: where voice conversations are
-//! transcribed and where the brain's turns run (on the global connector —
-//! the session is never pinned). Separate from the Heartbeat's session; each
-//! can read the other through [`peer_tail`].
+//! Voice in the Hobbes session (`hobbes_session`): voice conversations are
+//! transcribed there and the brain's turns run there (on the global
+//! connector — the session is never pinned), alongside typed turns and
+//! Heartbeat wakes.
 
 use dioxus::prelude::*;
 
@@ -9,85 +9,10 @@ use crate::components::chat::Message;
 use crate::components::shared::MessageContent;
 use crate::session::SessionState;
 
-/// Title of the dedicated session.
-pub const SESSION_TITLE: &str = "Voice";
-/// Its tab emoji (the tab components draw a metal mouth in its place).
-pub const SESSION_EMOJI: &str = "👄";
-/// `session_store` meta key holding the session id across launches.
-pub const META_KEY: &str = "voice_session_id";
-
-/// The Voice session's id once known (cached from the store at first use).
-pub static VOICE_SESSION_ID: GlobalSignal<Option<String>> = Signal::global(|| {
-    crate::session_store::meta_get(META_KEY)
-        .filter(|s| !s.is_empty())
-        // Past any rotation the pointer missed (session_rotation).
-        .map(|id| crate::system_sessions::resolve_successor(&id))
-});
-
 /// Prefix on transcript lines of what the person said.
 pub const HEARD_PREFIX: &str = "🎙 ";
 /// Prefix on transcript lines of what the voice said.
 pub const SPOKE_PREFIX: &str = "🔊 ";
-
-/// The Voice session's id, hydrating it if it is only on disk and creating
-/// it if it never existed or was deleted. Never touches the active session
-/// or the open tabs. `None` when the store is unwritable.
-/// `profile`: the Composio profile a new session starts with; `home`:
-/// Hobbes' home profile, which an existing session is moved to when set.
-pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<String>, home: Option<&str>) -> Option<String> {
-    if session_state.peek().save_disabled {
-        return None;
-    }
-    let known = VOICE_SESSION_ID.peek().clone();
-    if let Some(id) = known {
-        let mut hydrated = session_state.peek().sessions.contains_key(&id);
-        if !hydrated {
-            if let Some(session) = crate::session_store::load_session(&id) {
-                session_state.write().sessions.insert(id.clone(), session);
-                hydrated = true;
-            }
-        }
-        if hydrated {
-            adopt(&mut session_state, &id, home);
-            return Some(id);
-        }
-        tracing::info!("voice: session {id} is gone; creating a new one");
-    }
-    let id = {
-        let mut state = session_state.write();
-        let previous_active = state.active_session_id.clone();
-        let id = state.create_session_raw(profile);
-        if !previous_active.is_empty() {
-            state.active_session_id = previous_active;
-        }
-        // A user-set name, so auto-titling never renames it.
-        state.update_session_name_raw(&id, SESSION_TITLE.to_string());
-        id
-    };
-    adopt(&mut session_state, &id, home);
-    if let Err(e) = crate::session_store::meta_set(META_KEY, &id) {
-        tracing::warn!("voice: could not persist the session id: {e}");
-    }
-    *VOICE_SESSION_ID.write() = Some(id.clone());
-    tracing::info!("voice: created session {id}");
-    Some(id)
-}
-
-/// Mark `id` as the Voice system session and repair its icon / project tag.
-fn adopt(session_state: &mut Signal<SessionState>, id: &str, home: Option<&str>) {
-    crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, id);
-    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI, home) {
-        SessionState::save_signal(session_state, None);
-    }
-}
-
-/// Startup: repair the Voice session if its tab is open (hydrated).
-pub fn repair_on_startup(mut session_state: Signal<SessionState>, home: Option<String>) {
-    let Some(id) = VOICE_SESSION_ID.peek().clone() else { return };
-    if session_state.peek().sessions.contains_key(&id) {
-        adopt(&mut session_state, &id, home.as_deref());
-    }
-}
 
 /// A transcript line as a chat message.
 pub fn transcript_message(heard: bool, text: &str) -> Message {
@@ -131,162 +56,35 @@ pub fn tail_text(messages: &[Message], limit: usize, max_chars: usize) -> String
     out
 }
 
-/// Which peer session to read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Peer {
-    Voice,
-    Heartbeat,
-}
-
-impl Peer {
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "voice" => Some(Peer::Voice),
-            "heartbeat" => Some(Peer::Heartbeat),
-            _ => None,
-        }
-    }
-
-    fn session_id(self) -> Option<String> {
-        match self {
-            Peer::Voice => VOICE_SESSION_ID.peek().clone(),
-            Peer::Heartbeat => crate::heartbeat::HEARTBEAT.peek().session_id.clone(),
-        }
-    }
-}
-
-/// The recent conversation of the Voice or Heartbeat session (read-only),
-/// hydrated from disk if needed without inserting it into memory.
-pub fn peer_tail(session_state: Signal<SessionState>, peer: Peer, limit: usize) -> Result<String, String> {
-    let name = match peer {
-        Peer::Voice => "Voice",
-        Peer::Heartbeat => "Heartbeat",
-    };
-    let id = peer.session_id().ok_or_else(|| format!("The {name} session doesn't exist yet."))?;
-    let limit = limit.clamp(1, 40);
-    let messages = |id: &str| -> Option<Vec<Message>> {
-        let state = session_state.peek();
-        match state.sessions.get(id) {
-            Some(s) => Some(s.messages[s.messages.len().saturating_sub(limit)..].to_vec()),
-            None => {
-                drop(state);
-                crate::session_store::load_session(id).map(|s| {
-                    let start = s.messages.len().saturating_sub(limit);
-                    s.messages[start..].to_vec()
-                })
+/// The recent conversation in the Hobbes session (read-only) for the voice
+/// tier's instructions: the last `limit` messages as "Author: text" lines,
+/// a Heartbeat wake briefing reduced to one line (it is long, and its
+/// outcome is in the reply after it).
+pub fn session_tail(session_state: Signal<SessionState>, session_id: &str, limit: usize) -> String {
+    let state = session_state.peek();
+    let Some(s) = state.sessions.get(session_id) else { return String::new() };
+    let start = s.messages.len().saturating_sub(limit.clamp(1, 40));
+    let tail: Vec<Message> = s.messages[start..]
+        .iter()
+        .map(|m| {
+            let wake = m.author == "User"
+                && m.content.get_text_content().is_some_and(|t| t.starts_with(crate::heartbeat::wake::WAKE_HEADER));
+            if wake {
+                let mut short = m.clone();
+                short.author = "Heartbeat".to_string();
+                short.content = MessageContent::Text {
+                    content: "(woke to check on the person's day)".to_string(),
+                    thought_signature: None,
+                    thought_summary: None,
+                    signature_provider: None,
+                };
+                short
+            } else {
+                m.clone()
             }
-        }
-    };
-    let mut tail = messages(&id).ok_or_else(|| format!("The {name} session couldn't be read."))?;
-    // Just after a rotation the session is nearly empty: top the tail up
-    // from the archive it replaced (session_rotation).
-    if tail.len() < limit {
-        let kind = match peer {
-            Peer::Voice => crate::system_sessions::SystemSession::Voice,
-            Peer::Heartbeat => crate::system_sessions::SystemSession::Heartbeat,
-        };
-        if let Some(mut earlier) = crate::system_sessions::latest_archive(kind).and_then(|a| messages(&a)) {
-            earlier.append(&mut tail);
-            tail = earlier;
-        }
-    }
-    let text = tail_text(&tail, limit, 6000);
-    if text.is_empty() {
-        Ok(format!("The {name} session has no messages yet."))
-    } else {
-        Ok(format!("Recent messages in the {name} session (oldest first):\n{text}"))
-    }
-}
-
-impl Peer {
-    fn kind(self) -> crate::system_sessions::SystemSession {
-        match self {
-            Peer::Voice => crate::system_sessions::SystemSession::Voice,
-            Peer::Heartbeat => crate::system_sessions::SystemSession::Heartbeat,
-        }
-    }
-}
-
-/// The peer's Composio reads still inside the cross-company read window:
-/// its own and those it carries, plus the archive [`peer_tail`] tops up from
-/// when the peer has fewer than `limit` messages.
-fn peer_recent_reads(
-    session_state: Signal<SessionState>,
-    settings: &crate::settings::Settings,
-    peer: Peer,
-    limit: usize,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Vec<crate::session::CarriedRead> {
-    use crate::mcp::manager::profile_reach::session_recent_reads;
-    let reads_of = |id: &str| -> (Vec<crate::session::CarriedRead>, usize) {
-        let state = session_state.peek();
-        match state.sessions.get(id) {
-            Some(s) => (session_recent_reads(settings, s, now), s.messages.len()),
-            None => {
-                drop(state);
-                crate::session_store::load_session(id)
-                    .map(|s| (session_recent_reads(settings, &s, now), s.messages.len()))
-                    .unwrap_or_default()
-            }
-        }
-    };
-    let Some(id) = peer.session_id() else { return Vec::new() };
-    let (mut reads, len) = reads_of(&id);
-    if len < limit.clamp(1, 40) {
-        if let Some(archive) = crate::system_sessions::latest_archive(peer.kind()) {
-            reads.extend(reads_of(&archive).0);
-        }
-    }
-    reads
-}
-
-/// A system session (`reader`) is about to take in its peer's text: add the
-/// peer's recent reads to the reader's `carried_reads` (journaled), so the
-/// cross-company hold sees another company's data that rides along in that
-/// text until it ages out.
-pub fn carry_peer_reads(
-    mut session_state: Signal<SessionState>,
-    settings: &crate::settings::Settings,
-    reader: &str,
-    peer: Peer,
-    limit: usize,
-) {
-    let now = chrono::Utc::now();
-    let incoming = peer_recent_reads(session_state, settings, peer, limit, now);
-    if incoming.is_empty() {
-        return;
-    }
-    let merged = {
-        let state = session_state.peek();
-        let Some(s) = state.sessions.get(reader) else { return };
-        let merged = crate::mcp::manager::profile_reach::merge_reads(
-            s.carried_reads.iter().cloned().chain(incoming),
-            now,
-        );
-        if merged == s.carried_reads {
-            return;
-        }
-        merged
-    };
-    if let Some(s) = session_state.write().sessions.get_mut(reader) {
-        s.carried_reads = merged.clone();
-    }
-    crate::session_events::log_event(reader, crate::session_events::SessionEvent::ReadsCarried { reads: merged });
-    SessionState::save_signal(&session_state, None);
-}
-
-/// `HOBBES_PEER_READ` for `reader`: the peer's tail ([`peer_tail`]), with
-/// its recent reads carried into the reader ([`carry_peer_reads`]).
-pub fn peer_read(
-    session_state: Signal<SessionState>,
-    settings: &crate::settings::Settings,
-    reader: &str,
-    peer: Peer,
-    limit: usize,
-) -> Result<String, String> {
-    let text = peer_tail(session_state, peer, limit)?;
-    carry_peer_reads(session_state, settings, reader, peer, limit);
-    Ok(text)
+        })
+        .collect();
+    tail_text(&tail, limit, 6000)
 }
 
 #[cfg(test)]
@@ -315,59 +113,29 @@ mod tests {
     }
 
     #[test]
-    fn reading_the_heartbeat_carries_its_company_reads_into_voice() {
-        use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile};
+    fn the_session_tail_shortens_wake_briefings() {
         let mut dom = VirtualDom::new(|| {
-            let settings = crate::settings::Settings::default();
             let mut state = SessionState::new();
-            let hb = state.create_session_raw(Some("cm".into()));
-            let voice = state.create_session_raw(Some("cm".into()));
-            // The Heartbeat read Puget twenty minutes ago.
-            let mut tc = crate::components::shared::ToolCall::new(
-                "composio-native:Puget".into(),
-                "GMAIL_FETCH_EMAILS".into(),
-                serde_json::json!({}),
-                None,
-                None,
-            );
-            tc.profile_id = Some("pg".into());
-            tc.status = crate::components::shared::ToolCallStatus::Completed;
-            let at = chrono::Utc::now() - chrono::Duration::minutes(20);
-            tc.completed_at = Some(at);
-            let mut read = transcript_message(false, "x");
-            read.content = MessageContent::ToolCall(tc);
-            read.created_at = at;
-            state.sessions.get_mut(&hb).unwrap().messages.push(read);
+            let id = state.create_session_raw(None);
+            let s = state.sessions.get_mut(&id).unwrap();
+            s.messages.push(transcript_message(true, "what's blocked?"));
+            let mut wake = transcript_message(true, "x");
+            wake.content = MessageContent::Text {
+                content: format!("{}\n\nWhy: CI failed\n{}", crate::heartbeat::wake::WAKE_HEADER, "detail ".repeat(500)),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            };
+            s.messages.push(wake);
+            s.messages.push(transcript_message(false, "CI is red on main."));
             let sig = use_signal(|| state);
-            crate::heartbeat::HEARTBEAT.write().session_id = Some(hb.clone());
-
-            let home = ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
-            let reach = vec![home.clone(), ReachProfile { id: "pg".into(), name: "Puget".into() }];
-            let before = session_read_profiles(&settings, &sig.peek().sessions[&voice], chrono::Utc::now());
-            assert!(cross_company_hold(Some(&home), &home, &before, &reach, true).is_none());
-
-            // Voice reads the Heartbeat's tail ...
-            let text = peer_read(sig, &settings, &voice, Peer::Heartbeat, 12).unwrap();
-            assert!(text.contains("Heartbeat"));
-            // ... and now a Clearmirror write from Voice is held, naming Puget.
-            let carried = sig.peek().sessions[&voice].carried_reads.clone();
-            assert_eq!(carried.len(), 1);
-            assert_eq!(carried[0].profile_id, "pg");
-            let read_from = session_read_profiles(&settings, &sig.peek().sessions[&voice], chrono::Utc::now());
-            let hold = cross_company_hold(Some(&home), &home, &read_from, &reach, true);
-            assert!(hold.is_some_and(|h| h.reason.contains("Puget")));
-            // Reading again adds nothing new.
-            peer_read(sig, &settings, &voice, Peer::Heartbeat, 12).unwrap();
-            assert_eq!(sig.peek().sessions[&voice].carried_reads, carried);
+            let tail = session_tail(sig, &id, 6);
+            assert!(tail.contains("🎙 what's blocked?") && tail.contains("CI is red on main."));
+            assert!(tail.contains("Heartbeat: (woke"));
+            assert!(!tail.contains("detail detail"));
+            assert_eq!(session_tail(sig, "missing", 6), "");
             rsx! { div {} }
         });
         crate::test_support::rebuild_or_fail(&mut dom);
-    }
-
-    #[test]
-    fn peer_names_parse() {
-        assert_eq!(Peer::parse("Heartbeat"), Some(Peer::Heartbeat));
-        assert_eq!(Peer::parse(" voice "), Some(Peer::Voice));
-        assert_eq!(Peer::parse("other"), None);
     }
 }

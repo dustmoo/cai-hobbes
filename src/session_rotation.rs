@@ -1,12 +1,16 @@
-//! Session rotation for the system sessions (Heartbeat, Voice).
+//! Session rotation for the system session (the Hobbes tab).
 //!
 //! Each session is one SQLite row whose whole `data` JSON is re-serialized
-//! on every save, and the two system sessions never end, so their saves get
+//! on every save, and the system session never ends, so its saves get
 //! slower forever (the prompt is budgeted; storage and save cost are not).
 //! When one passes a size threshold, at a quiet moment, Hobbes **rotates**
 //! it: a fresh session becomes the system session and the old one stays in
 //! History as a read-only archive named after its date range
-//! ("Heartbeat · Oct 22 – Nov 3"). Nothing is deleted or trimmed.
+//! ("Hobbes · Oct 22 – Nov 3"). Nothing is deleted or trimmed.
+//!
+//! The one-time merge of the pre-merge Heartbeat and Voice sessions into
+//! the Hobbes session (`hobbes_session::migrate`) is the same operation with
+//! two old sessions and a fresh successor ([`prepare_merge`]).
 //!
 //! - **Continuity.** The successor carries the conversation summary, the
 //!   scratchpad, the handoff note, the Composio profile, any connector pin,
@@ -16,7 +20,7 @@
 //!   — the summary otherwise reaches the prompt only after a history trim,
 //!   and the handoff only through a briefing that needs a previous turn.
 //! - **Atomic.** The archive row (renamed), the successor row, the archive
-//!   list and the feature's pointer are written in one transaction
+//!   list and the session pointer are written in one transaction
 //!   ([`commit`]). Only then does memory change; a failed write leaves
 //!   everything as it was, and the next check retries. A pointer that a
 //!   late, older save sets back to the archive is followed forward at the
@@ -48,13 +52,13 @@ use crate::timers::TimerStatus;
 
 /// Rotate past this many messages. The Heartbeat measured 287 messages /
 /// 2.7 MB after 12 days (~9 KB a message, tool results included), so 250
-/// lands near the byte cap for it and archives roughly every week and a
-/// half, a range still worth reading back in History.
+/// lands near the byte cap for it, a range still worth reading back in
+/// History.
 pub const MAX_MESSAGES: usize = 250;
 /// Rotate past this many bytes of stored JSON. 1.5 MB keeps each save of a
 /// system session to a few milliseconds of serialization and hashing (every
-/// save re-serializes every hydrated session to fingerprint it); Voice,
-/// at ~2 MB a day, rotates about daily on this cap.
+/// save re-serializes every hydrated session to fingerprint it); voice,
+/// at ~2 MB a day, makes the Hobbes session rotate about daily on this cap.
 pub const MAX_BYTES: u64 = 1_500_000;
 /// Never rotate a session shorter than this, whatever its size: a few huge
 /// tool results would otherwise make archives of a handful of messages.
@@ -172,12 +176,12 @@ pub struct Activity {
     // moment exists where neither session has the timer), and one firing
     // right after simply prompts the successor. A just-fired timer is
     // covered by `recently_active`.
-    /// Heartbeat: a fired wake hasn't been read back yet (its cost and
+    /// A fired Heartbeat wake hasn't been read back yet (its cost and
     /// outcome come from this session's messages).
     pub open_wake: bool,
-    /// Voice: a conversation is live.
+    /// A voice conversation is live.
     pub voice_live: bool,
-    /// Voice: brain hand-offs still waiting on a turn in this session.
+    /// Voice brain hand-offs still waiting on a turn in this session.
     pub brain_waits: usize,
     // ── Soft ──
     /// An unresolved approval newer than [`APPROVAL_STALE_HOURS`].
@@ -240,7 +244,7 @@ pub fn last_activity(session: &Session) -> DateTime<Utc> {
 
 
 /// The archive's name: the title and the local date range of its messages,
-/// "Heartbeat · Oct 22 – Nov 3" (one date when they share a day, years
+/// "Hobbes · Oct 22 – Nov 3" (one date when they share a day, years
 /// when the range crosses one).
 pub fn archive_name(title: &str, first: DateTime<Local>, last: DateTime<Local>) -> String {
     let (first, last) = if first <= last { (first, last) } else { (last, first) };
@@ -395,30 +399,14 @@ pub struct Prepared {
 /// one clone of the old session (once per rotation) so nothing in memory
 /// changes until the write succeeds.
 pub fn prepare(
-    kind: SystemSession,
     old: &Session,
     settings: &crate::settings::Settings,
     new_id: &str,
     now: DateTime<Utc>,
 ) -> Prepared {
     let carry = CarryOver::from_session(old);
-    let archive_title = archive_name_for(kind.title(), old);
-
-    let mut archive = old.clone();
-    archive.name = archive_title.clone();
-    archive.name_user_set = true;
-    let mut archive_events = vec![SessionEvent::SessionRenamed { name: archive_title.clone() }];
-    // Pending timers move to the
-    // successor under the same id; the archive's copies are cancelled, so
-    // the archive never fires or loads at startup.
-    let mut moved = Vec::new();
-    for t in archive.scheduled_timers.iter_mut().filter(|t| t.status == TimerStatus::Pending) {
-        let mut m = t.clone();
-        m.session_id = new_id.to_string();
-        moved.push(m);
-        t.status = TimerStatus::Cancelled;
-        archive_events.push(SessionEvent::TimerCancelled { timer_id: t.id.clone() });
-    }
+    let ArchiveOf { title: archive_title, archive, events: archive_events, moved_timers: moved } =
+        archive_of(SystemSession::Hobbes.title(), old, new_id);
 
     let mut successor = crate::session_events::blank_session();
     successor.id = new_id.to_string();
@@ -480,21 +468,130 @@ pub fn prepare(
     }
 }
 
-// ── The Dioxus side ─────────────────────────────────────────────────────────
-
-/// The current id of a system session.
-fn current_id(kind: SystemSession) -> Option<String> {
-    match kind {
-        SystemSession::Heartbeat => crate::heartbeat::HEARTBEAT.peek().session_id.clone(),
-        SystemSession::Voice => crate::voice::session::VOICE_SESSION_ID.peek().clone(),
-    }
+/// An old session as it is archived: renamed after `title` and its date
+/// range, its pending timers cancelled (they move to `new_id` under the
+/// same ids, so the archive never fires or loads them at startup).
+struct ArchiveOf {
+    title: String,
+    archive: Session,
+    events: Vec<SessionEvent>,
+    moved_timers: Vec<crate::timers::ScheduledTimer>,
 }
 
-/// What is in flight for a system session right now.
-fn activity(kind: SystemSession, session: &Session, streaming: &HashSet<String>, now: DateTime<Utc>) -> Activity {
+fn archive_of(title: &str, old: &Session, new_id: &str) -> ArchiveOf {
+    let archive_title = archive_name_for(title, old);
+    let mut archive = old.clone();
+    archive.name = archive_title.clone();
+    archive.name_user_set = true;
+    let mut events = vec![SessionEvent::SessionRenamed { name: archive_title.clone() }];
+    let mut moved = Vec::new();
+    for t in archive.scheduled_timers.iter_mut().filter(|t| t.status == TimerStatus::Pending) {
+        let mut m = t.clone();
+        m.session_id = new_id.to_string();
+        moved.push(m);
+        t.status = TimerStatus::Cancelled;
+        events.push(SessionEvent::TimerCancelled { timer_id: t.id.clone() });
+    }
+    ArchiveOf { title: archive_title, archive, events, moved_timers: moved }
+}
+
+/// The one-time merge of the pre-merge Heartbeat and Voice sessions into a
+/// fresh Hobbes session, worked out in full before anything is written.
+#[derive(Debug, Clone)]
+pub struct PreparedMerge {
+    pub new_id: String,
+    /// (old id, archive as written, its journal events), oldest lineage
+    /// first.
+    pub archives: Vec<(String, Session, Vec<SessionEvent>)>,
+    pub successor: Session,
+    pub successor_events: Vec<SessionEvent>,
+}
+
+/// Work out the merge of `olds` ((title, session): "Heartbeat", "Voice")
+/// into a new session `new_id`. The Hobbes session starts fresh — no
+/// history, summary or scratchpad comes along — but what keeps things
+/// working and safe does: the cross-company reads of every old session
+/// (the hold must not reset), the dispatch-relay workers, and pending
+/// timers. Pure.
+pub fn prepare_merge(
+    olds: &[(&str, &Session)],
+    settings: &crate::settings::Settings,
+    new_id: &str,
+    profile: Option<String>,
+    now: DateTime<Utc>,
+) -> PreparedMerge {
+    use crate::hobbes_session::{SESSION_EMOJI, SESSION_TITLE};
+    let mut archives = Vec::new();
+    let mut moved = Vec::new();
+    let mut workers: Vec<String> = Vec::new();
+    let mut reads = Vec::new();
+    let mut titles = Vec::new();
+    for (title, old) in olds {
+        let a = archive_of(title, old, new_id);
+        moved.extend(a.moved_timers);
+        for w in &old.dispatched_workers {
+            if !workers.contains(w) {
+                workers.push(w.clone());
+            }
+        }
+        reads.extend(carried_reads(old, settings, now));
+        titles.push(format!("\"{}\"", a.title));
+        archives.push((old.id.clone(), a.archive, a.events));
+    }
+
+    let mut successor = crate::session_events::blank_session();
+    successor.id = new_id.to_string();
+    successor.name = SESSION_TITLE.to_string();
+    successor.name_user_set = true;
+    successor.last_updated = now;
+    successor.tab_emoji = Some(SESSION_EMOJI.to_string());
+    successor.composio_profile = profile.clone();
+    successor.dispatched_workers = workers.clone();
+    successor.scheduled_timers = moved.clone();
+    successor.carried_reads = crate::mcp::manager::profile_reach::merge_reads(reads, now);
+    let intro = Message {
+        id: uuid::Uuid::new_v4(),
+        author: "Hobbes".to_string(),
+        content: MessageContent::Text {
+            content: format!(
+                "The Heartbeat and voice now share this one Hobbes tab. Earlier conversations: {} (archived in History).",
+                titles.join(" and ")
+            ),
+            thought_signature: None,
+            thought_summary: None,
+            signature_provider: None,
+        },
+        attachments: Vec::new(),
+        comments: Vec::new(),
+        created_at: now,
+        usage: None,
+    };
+    successor.messages.push(intro.clone());
+
+    let mut successor_events =
+        vec![SessionEvent::SessionCreated { id: new_id.to_string(), name: SESSION_TITLE.to_string() }];
+    if profile.is_some() {
+        successor_events.push(SessionEvent::ComposioProfileSet { profile });
+    }
+    successor_events.push(SessionEvent::SessionRenamed { name: SESSION_TITLE.to_string() });
+    successor_events.push(SessionEvent::TabTitled { emoji: Some(SESSION_EMOJI.to_string()), title: None });
+    successor_events.extend(workers.into_iter().map(|w| SessionEvent::WorkerAdded { worker_session_id: w }));
+    successor_events.extend(moved.into_iter().map(|timer| SessionEvent::TimerCreated { timer }));
+    if !successor.carried_reads.is_empty() {
+        successor_events.push(SessionEvent::ReadsCarried { reads: successor.carried_reads.clone() });
+    }
+    successor_events.push(SessionEvent::AssistantMessage { message: intro });
+
+    PreparedMerge { new_id: new_id.to_string(), archives, successor, successor_events }
+}
+
+// ── The Dioxus side ─────────────────────────────────────────────────────────
+
+/// What is in flight for the system session right now.
+fn activity(session: &Session, streaming: &HashSet<String>, now: DateTime<Utc>) -> Activity {
     let id = session.id.as_str();
     let (latest_turn_approval, recent_approval) = approval_state(&session.messages, now);
-    let mut a = Activity {
+    Activity {
         turn_in_flight: streaming.contains(id)
             || TURN_ACTIVITY.peek().contains(id)
             || crate::components::chat_queue::DISPATCHING.peek().contains(id)
@@ -503,27 +600,19 @@ fn activity(kind: SystemSession, session: &Session, streaming: &HashSet<String>,
         recently_active: now - last_activity(session) < Duration::minutes(IDLE_MINUTES),
         latest_turn_approval,
         recent_approval,
-        ..Default::default()
-    };
-    match kind {
-        SystemSession::Heartbeat => {
-            a.open_wake = crate::heartbeat::HEARTBEAT
-                .peek()
-                .trail
-                .iter()
-                .any(|w| !w.deferred && w.cost_usd.is_none() && w.outcome.is_none());
-        }
-        SystemSession::Voice => {
-            a.voice_live = crate::voice::controller::is_live();
-            a.brain_waits = crate::voice::brain::waits_in_flight();
-        }
+        open_wake: crate::heartbeat::HEARTBEAT
+            .peek()
+            .trail
+            .iter()
+            .any(|w| !w.deferred && w.cost_usd.is_none() && w.outcome.is_none()),
+        voice_live: crate::voice::controller::is_live(),
+        brain_waits: crate::voice::brain::waits_in_flight(),
     }
-    a
 }
 
-/// Check both system sessions and rotate any that are due. Only a session
-/// already in memory is considered (one on disk isn't growing). Synchronous:
-/// no signal guard crosses an await.
+/// Check the system session and rotate it when due. Only a session already
+/// in memory is considered (one on disk isn't growing). Synchronous: no
+/// signal guard crosses an await.
 pub fn check_all(
     session_state: Signal<SessionState>,
     settings: &crate::settings::Settings,
@@ -533,72 +622,74 @@ pub fn check_all(
         return;
     }
     let now = Utc::now();
-    for kind in SystemSession::ALL {
-        let Some(id) = current_id(kind) else { continue };
-        let prepared = {
-            let state = session_state.peek();
-            let Some(session) = state.sessions.get(&id) else { continue };
-            let messages = session.messages.len();
-            if messages < MIN_MESSAGES {
-                continue;
-            }
-            let size = SessionSize { messages, bytes: crate::session_store::row_bytes(&id) };
-            if !over_threshold(size) {
-                continue;
-            }
-            let a = activity(kind, session, streaming, now);
-            if !should_rotate(size, &a) {
-                tracing::debug!(session_id = %id, "rotation: {kind:?} session is due but busy");
-                continue;
-            }
-            tracing::info!(session_id = %id, messages, bytes = size.bytes.unwrap_or(0), "rotation: rotating the {kind:?} session");
-            prepare(kind, session, settings, &uuid::Uuid::new_v4().to_string(), now)
-        };
-        rotate(session_state, kind, prepared);
-    }
-}
-
-/// The `meta` entry holding the feature's pointer, set to `new_id`.
-fn pointer_meta(kind: SystemSession, new_id: &str) -> Result<(String, String), String> {
-    match kind {
-        SystemSession::Heartbeat => {
-            let mut hb = crate::heartbeat::HEARTBEAT.peek().clone();
-            hb.session_id = Some(new_id.to_string());
-            let json = serde_json::to_string(&hb).map_err(|e| e.to_string())?;
-            Ok((crate::heartbeat::META_KEY.to_string(), json))
+    let Some(id) = crate::hobbes_session::current_id() else { return };
+    let prepared = {
+        let state = session_state.peek();
+        let Some(session) = state.sessions.get(&id) else { return };
+        let messages = session.messages.len();
+        if messages < MIN_MESSAGES {
+            return;
         }
-        SystemSession::Voice => Ok((crate::voice::session::META_KEY.to_string(), new_id.to_string())),
-    }
+        let size = SessionSize { messages, bytes: crate::session_store::row_bytes(&id) };
+        if !over_threshold(size) {
+            return;
+        }
+        let a = activity(session, streaming, now);
+        if !should_rotate(size, &a) {
+            tracing::debug!(session_id = %id, "rotation: the Hobbes session is due but busy");
+            return;
+        }
+        tracing::info!(session_id = %id, messages, bytes = size.bytes.unwrap_or(0), "rotation: rotating the Hobbes session");
+        prepare(session, settings, &uuid::Uuid::new_v4().to_string(), now)
+    };
+    rotate(session_state, prepared);
 }
 
-/// Write the archive row, the successor row, the archive list and the
-/// feature's pointer in one transaction, on the calling thread (P-009's
-/// serialize-then-write, minus the hop: memory must not change before the
-/// write is known to have landed). A rotation happens about once a week.
-fn commit(kind: SystemSession, p: &Prepared) -> Result<(), String> {
+/// Write `rows`, the archive list after rotating `olds` out for `new_id`,
+/// and the session pointer in one transaction, on the calling thread
+/// (P-009's serialize-then-write, minus the hop: memory must not change
+/// before the write is known to have landed). Rare: a rotation every week
+/// or so, the merge once.
+fn commit_rows(sessions: &[&Session], olds: &[&str], new_id: &str) -> Result<(), String> {
     use crate::session_store as store;
-    let rows = vec![
-        store::build_row(&p.archive, store::next_seq()).map_err(|e| e.to_string())?,
-        store::build_row(&p.successor, store::next_seq()).map_err(|e| e.to_string())?,
-    ];
-    let archives = system_sessions::archives_after_rotation(kind, &p.old_id, &p.new_id);
+    let rows = sessions
+        .iter()
+        .map(|s| store::build_row(s, store::next_seq()).map_err(|e| e.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let archives = system_sessions::archives_after_rotation(olds, new_id);
     let archives_json = serde_json::to_string(&archives).map_err(|e| e.to_string())?;
-    let (pointer_key, pointer_value) = pointer_meta(kind, &p.new_id)?;
     let meta = vec![
         (system_sessions::ARCHIVES_META_KEY.to_string(), archives_json, store::next_seq()),
-        (pointer_key, pointer_value, store::next_seq()),
+        (crate::hobbes_session::META_KEY.to_string(), new_id.to_string(), store::next_seq()),
     ];
     store::write_rows_and_meta(&rows, &meta)?;
     store::mark_rows_saved(&rows);
     Ok(())
 }
 
-/// Persist `p`, then switch memory, the feature and the tab over to the
+fn commit(p: &Prepared) -> Result<(), String> {
+    commit_rows(&[&p.archive, &p.successor], &[&p.old_id], &p.new_id)
+}
+
+/// Point the registry, the session pointer and the tabs at `new_id`, and
+/// retire each of `olds` (its Fleet row ends with `closing_briefs`' entry).
+fn switch_over(olds: &[(String, Option<serde_json::Value>)], new_id: &str) {
+    let old_ids: Vec<&str> = olds.iter().map(|(id, _)| id.as_str()).collect();
+    system_sessions::apply_rotation(&old_ids, new_id);
+    *crate::hobbes_session::HOBBES_SESSION_ID.write() = Some(new_id.to_string());
+    for (old_id, brief) in olds {
+        crate::fleet::bridge::report_with_brief(old_id, "", crate::fleet::bridge::HobbesSignal::Closed, brief.clone());
+        crate::llm::claude::keepalive::cancel_session(old_id);
+        crate::request_tab_replace(old_id, new_id);
+    }
+}
+
+/// Persist `p`, then switch memory, the pointer and the tab over to the
 /// successor. On a failed write nothing changes (the next check retries).
 /// Returns the new id.
-pub fn rotate(mut session_state: Signal<SessionState>, kind: SystemSession, p: Prepared) -> Option<String> {
-    if let Err(e) = commit(kind, &p) {
-        tracing::warn!(session_id = %p.old_id, "rotation: write failed, {kind:?} session left as it was: {e}");
+pub fn rotate(mut session_state: Signal<SessionState>, p: Prepared) -> Option<String> {
+    if let Err(e) = commit(&p) {
+        tracing::warn!(session_id = %p.old_id, "rotation: write failed, the Hobbes session left as it was: {e}");
         return None;
     }
     let Prepared { old_id, new_id, archive_title, archive, successor, successor_events, archive_events } = p;
@@ -618,27 +709,44 @@ pub fn rotate(mut session_state: Signal<SessionState>, kind: SystemSession, p: P
             state.active_session_id = new_id.clone();
         }
     }
-    system_sessions::apply_rotation(kind, &old_id, &new_id);
-    match kind {
-        SystemSession::Heartbeat => {
-            crate::heartbeat::HEARTBEAT.write().session_id = Some(new_id.clone());
-            // A newer generation than any save still in flight with the old
-            // id, so a late one can't win (and a crash before it lands is
-            // resolved at load).
-            crate::heartbeat::save_signal();
-        }
-        SystemSession::Voice => {
-            *crate::voice::session::VOICE_SESSION_ID.write() = Some(new_id.clone());
+    crate::session_events::log_events(&new_id, successor_events);
+    crate::session_events::log_events(&old_id, archive_events);
+    // The archive's Fleet row ends, with its summary as the closing brief.
+    switch_over(&[(old_id.clone(), closing_brief)], &new_id);
+    tracing::info!(old_session = %old_id, new_session = %new_id, archive = %archive_title, "rotation: the Hobbes session archived and replaced");
+    Some(new_id)
+}
+
+/// Persist the merge `p`, then switch memory, the pointer and any open
+/// Heartbeat / Voice tab over to the Hobbes session. On a failed write
+/// nothing changes (the next start retries). Returns the new id.
+pub fn apply_merge(mut session_state: Signal<SessionState>, p: PreparedMerge) -> Option<String> {
+    let old_ids: Vec<&str> = p.archives.iter().map(|(id, _, _)| id.as_str()).collect();
+    let mut rows: Vec<&Session> = p.archives.iter().map(|(_, a, _)| a).collect();
+    rows.push(&p.successor);
+    if let Err(e) = commit_rows(&rows, &old_ids, &p.new_id) {
+        tracing::warn!("hobbes tab: merge write failed, the old sessions left as they were: {e}");
+        return None;
+    }
+    let PreparedMerge { new_id, archives, successor, successor_events } = p;
+    {
+        let mut state = session_state.write();
+        state.sessions.insert(new_id.clone(), successor);
+        for (old_id, _, _) in &archives {
+            state.sessions.remove(old_id);
+            if state.active_session_id == *old_id {
+                state.active_session_id = new_id.clone();
+            }
         }
     }
     crate::session_events::log_events(&new_id, successor_events);
-    crate::session_events::log_events(&old_id, archive_events);
-
-    // The archive's Fleet row ends, with its summary as the closing brief.
-    crate::fleet::bridge::report_with_brief(&old_id, "", crate::fleet::bridge::HobbesSignal::Closed, closing_brief);
-    crate::llm::claude::keepalive::cancel_session(&old_id);
-    crate::request_tab_replace(&old_id, &new_id);
-    tracing::info!(old_session = %old_id, new_session = %new_id, archive = %archive_title, "rotation: {kind:?} session archived and replaced");
+    let mut olds = Vec::new();
+    for (old_id, _, events) in archives {
+        crate::session_events::log_events(&old_id, events);
+        olds.push((old_id, None));
+    }
+    switch_over(&olds, &new_id);
+    tracing::info!(new_session = %new_id, archived = olds.len(), "hobbes tab: merged the Heartbeat and Voice sessions into the Hobbes session");
     Some(new_id)
 }
 
@@ -806,8 +914,8 @@ mod tests {
     fn prepare_archives_the_old_and_seeds_the_successor() {
         let (state, old) = rotated_session();
         let now = Utc::now();
-        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], &crate::settings::Settings::default(), "new-id", now);
-        assert!(p.archive_title.starts_with("Heartbeat · "));
+        let p = prepare(&state.sessions[&old], &crate::settings::Settings::default(), "new-id", now);
+        assert!(p.archive_title.starts_with("Hobbes · "));
         assert_eq!(p.archive.name, p.archive_title);
         assert!(p.archive.name_user_set);
         assert_eq!(p.archive.messages.len(), 2, "history stays in the archive");
@@ -848,7 +956,7 @@ mod tests {
     #[test]
     fn the_successor_s_first_prompt_carries_the_summary_and_handoff() {
         let (state, old) = rotated_session();
-        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], &crate::settings::Settings::default(), "new-id", Utc::now());
+        let p = prepare(&state.sessions[&old], &crate::settings::Settings::default(), "new-id", Utc::now());
         let mut successor = p.successor;
         successor.messages.push(msg("User", text("[Heartbeat wake] new"), Utc::now()));
         let settings = crate::settings::Settings::default();
@@ -974,6 +1082,95 @@ mod tests {
     }
 
     #[test]
+    fn the_merge_archives_both_and_starts_hobbes_fresh_keeping_the_reads() {
+        use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile};
+        let settings = crate::settings::Settings::default();
+        let now = Utc::now();
+        let (mut state, hb) = rotated_session();
+        let voice = state.create_session_raw(Some("home".into()));
+        {
+            let h = state.sessions.get_mut(&hb).unwrap();
+            h.composio_profile = Some("cm".into());
+            h.messages.push(composio_read("pg", now - Duration::minutes(30)));
+            h.dispatched_workers = vec!["w-1".into()];
+            let v = state.sessions.get_mut(&voice).unwrap();
+            v.name = "Voice".into();
+            v.tab_emoji = Some("👄".into());
+            v.messages.push(msg("User", text("🎙 check the Acme inbox"), now - Duration::minutes(25)));
+            v.messages.push(composio_read("ac", now - Duration::minutes(20)));
+            v.dispatched_workers = vec!["w-1".into(), "w-2".into()];
+            v.scheduled_timers = vec![timer("voice-timer", 30, TimerStatus::Pending)];
+        }
+        let p = prepare_merge(
+            &[("Heartbeat", &state.sessions[&hb]), ("Voice", &state.sessions[&voice])],
+            &settings,
+            "hobbes-id",
+            Some("cm".into()),
+            now,
+        );
+        // Both old sessions become archives named after their own titles,
+        // with their history; their pending timers move.
+        assert_eq!(p.archives.len(), 2);
+        assert_eq!(p.archives[0].0, hb);
+        assert!(p.archives[0].1.name.starts_with("Heartbeat · "));
+        assert!(p.archives[1].1.name.starts_with("Voice · "));
+        assert!(p.archives.iter().all(|(_, a, _)| a.name_user_set && a.next_pending_timer().is_none()));
+        assert_eq!(p.archives[1].1.messages.len(), 2, "history stays in the archive");
+        // The Hobbes session starts fresh: its own name and icon, no
+        // summary, scratchpad, handoff or history — one intro message.
+        let h = &p.successor;
+        assert_eq!((h.id.as_str(), h.name.as_str()), ("hobbes-id", "Hobbes"));
+        assert!(h.name_user_set);
+        assert_eq!(h.tab_emoji.as_deref(), Some(crate::hobbes_session::SESSION_EMOJI));
+        assert_eq!(h.composio_profile.as_deref(), Some("cm"));
+        assert!(h.active_context.conversation_summary.summary.is_empty() && h.handoff.is_none());
+        assert_eq!(h.messages.len(), 1);
+        let intro = h.messages[0].content.get_text_content().unwrap();
+        assert!(intro.contains("Heartbeat · ") && intro.contains("Voice · "));
+        // What keeps things working comes along: workers (once each) and
+        // every pending timer.
+        assert_eq!(h.dispatched_workers, vec!["w-1", "w-2"]);
+        let timers: Vec<&str> = h.scheduled_timers.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(timers, ["soon", "later", "voice-timer"]);
+        assert!(h.scheduled_timers.iter().all(|t| t.session_id == "hobbes-id"));
+        // Both old sessions' recent cross-company reads carry, so the hold
+        // doesn't reset with the merge.
+        let read: Vec<&str> = h.carried_reads.iter().map(|r| r.profile_id.as_str()).collect();
+        assert_eq!(read, ["ac", "pg"]);
+        let home = ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
+        let reach = vec![home.clone(), ReachProfile { id: "pg".into(), name: "Puget".into() }];
+        let hold = cross_company_hold(Some(&home), &home, &session_read_profiles(&settings, h, now), &reach, true);
+        assert!(hold.is_some_and(|h| h.reason.contains("Puget")));
+        // Replay reproduces it: the journal carries the icon, name and reads.
+        assert!(p.successor_events.iter().any(|e| matches!(e, SessionEvent::TabTitled { emoji: Some(e), .. } if e == crate::hobbes_session::SESSION_EMOJI)));
+        assert!(p.successor_events.iter().any(|e| matches!(e, SessionEvent::ReadsCarried { reads } if reads.len() == 2)));
+        assert!(p.successor_events.iter().any(|e| matches!(e, SessionEvent::SessionRenamed { name } if name == "Hobbes")));
+    }
+
+    #[test]
+    fn a_failed_merge_write_leaves_everything_as_it_was() {
+        assert!(!crate::session_store::is_available());
+        let mut dom = VirtualDom::new(|| {
+            let (state, hb) = rotated_session();
+            let sig = use_signal(|| state);
+            let p = prepare_merge(
+                &[("Heartbeat", &sig.peek().sessions[&hb])],
+                &crate::settings::Settings::default(),
+                "never-hobbes",
+                None,
+                Utc::now(),
+            );
+            assert_eq!(apply_merge(sig, p), None);
+            assert!(sig.peek().sessions.contains_key(&hb));
+            assert!(!sig.peek().sessions.contains_key("never-hobbes"));
+            assert_eq!(crate::hobbes_session::current_id(), None);
+            assert!(!system_sessions::is_archive(&hb));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
     fn recent_reads_carry_into_the_successor_and_keep_the_hold() {
         use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile, READ_WINDOW};
         let settings = crate::settings::Settings::default();
@@ -987,7 +1184,7 @@ mod tests {
             s.messages.push(composio_read("ac", now - Duration::days(1)));
             s.messages.push(composio_read("pg", now - Duration::minutes(40)));
         }
-        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], &settings, "new-id", now);
+        let p = prepare(&state.sessions[&old], &settings, "new-id", now);
         // Only reads inside the window, newest per profile.
         assert_eq!(
             p.successor.carried_reads,
@@ -1019,9 +1216,9 @@ mod tests {
         assert_eq!(session_read_profiles(&settings, &projected, now), read_from);
 
         // A second rotation inside the window passes it on again.
-        let p2 = prepare(SystemSession::Heartbeat, &p.successor, &settings, "newer-id", now + Duration::minutes(10));
+        let p2 = prepare(&p.successor, &settings, "newer-id", now + Duration::minutes(10));
         assert_eq!(p2.successor.carried_reads, p.successor.carried_reads);
-        let p3 = prepare(SystemSession::Heartbeat, &p.successor, &settings, "newest-id", later);
+        let p3 = prepare(&p.successor, &settings, "newest-id", later);
         assert!(p3.successor.carried_reads.is_empty());
     }
 
@@ -1034,16 +1231,17 @@ mod tests {
             let (state, old) = rotated_session();
             let mut sig = use_signal(|| state);
             sig.write().active_session_id = old.clone();
-            crate::heartbeat::HEARTBEAT.write().session_id = Some(old.clone());
-            let p = prepare(SystemSession::Heartbeat, &sig.peek().sessions[&old], &crate::settings::Settings::default(), "never-new", Utc::now());
+            *crate::hobbes_session::HOBBES_SESSION_ID.write() = Some(old.clone());
+            system_sessions::register(&old);
+            let p = prepare(&sig.peek().sessions[&old], &crate::settings::Settings::default(), "never-new", Utc::now());
             let before = sig.peek().sessions[&old].clone();
-            assert_eq!(rotate(sig, SystemSession::Heartbeat, p), None);
+            assert_eq!(rotate(sig, p), None);
             let after = sig.peek();
             assert_eq!(after.sessions.len(), 1);
             assert_eq!(after.sessions[&old], before, "the old session is untouched");
             assert!(!after.sessions.contains_key("never-new"));
             assert_eq!(after.active_session_id, old);
-            assert_eq!(crate::heartbeat::HEARTBEAT.peek().session_id.as_deref(), Some(old.as_str()));
+            assert_eq!(crate::hobbes_session::current_id().as_deref(), Some(old.as_str()));
             assert!(!system_sessions::is_archive(&old));
             assert_eq!(system_sessions::current_for(&old), old);
             assert!(crate::PENDING_TAB_REPLACE.peek().is_empty(), "no tab swap requested");

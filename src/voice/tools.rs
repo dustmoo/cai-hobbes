@@ -2,7 +2,7 @@
 //!
 //! The voice tier gets a small, mostly read-only set. Anything that needs
 //! thought or changes things goes to the brain (`VOICE_ASK_BRAIN`), whose
-//! turn runs in the Voice session with the full permission system. Built-in
+//! turn runs in the Hobbes session with the full permission system. Built-in
 //! calls go through `scope_gates` + `dispatch_builtin_tool` exactly like a
 //! chat turn's (P-015) — never a parallel dispatch path.
 
@@ -15,10 +15,9 @@ use crate::voice::realtime::ToolDecl;
 pub const ASK_BRAIN: &str = "VOICE_ASK_BRAIN";
 pub const CANCEL_BRAIN: &str = "VOICE_CANCEL_BRAIN";
 pub const END_CONVERSATION: &str = "VOICE_END_CONVERSATION";
-pub const PEER_READ: &str = "HOBBES_PEER_READ";
 
 /// Read-only (or harmless) built-ins the voice tier may call directly.
-const CORE_TOOLS: &[&str] = &["HOBBES_FLEET_STATUS", "HOBBES_LIST_TIMERS", "HOBBES_SET_TIMER", PEER_READ];
+const CORE_TOOLS: &[&str] = &["HOBBES_FLEET_STATUS", "HOBBES_LIST_TIMERS", "HOBBES_SET_TIMER"];
 const PLANNER_TOOLS: &[&str] = &["HOBBES_TODO_LIST", "HOBBES_CALENDAR_LIST"];
 
 /// The voice tier's own tools.
@@ -59,22 +58,6 @@ fn voice_only_decls() -> Vec<ToolDecl> {
         },
     ]
 }
-
-/// The peer-read tool (hobbes-core; dispatched in `builtin_tools`).
-pub fn peer_read_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "session": {"type": "string", "enum": ["voice", "heartbeat"], "description": "Which session to read."},
-            "limit": {"type": "integer", "description": "How many recent messages (default 12, max 40)."}
-        },
-        "required": ["session"]
-    })
-}
-
-pub const PEER_READ_DESCRIPTION: &str = "Read the recent messages of the Voice session (spoken \
-    conversations with the person) or the Heartbeat session (background monitoring of the \
-    planner, Fleet and CI). Read-only.";
 
 /// Gemini accepts an OpenAPI subset; run schemas through the existing
 /// sanitizer (falls back to the raw schema).
@@ -129,6 +112,9 @@ pub async fn dispatch(ctx: BuiltinToolCtx, session_id: &str, name: &str, args: &
         tool_name: name.to_string(),
         arguments: args.to_string(),
         status: ToolCallStatus::Running,
+        // The voice tier is the person talking: interactive rules (the
+        // cross-company hold still applies to what the brain does).
+        origin: Some(crate::session::TurnOrigin::User),
         ..Default::default()
     };
     match builtin_tools::scope_gates(ctx, &tool_call, args, session_id, false) {
@@ -159,10 +145,10 @@ mod tests {
     #[test]
     fn voice_tools_are_curated() {
         let names: Vec<String> = voice_tool_decls(true).into_iter().map(|d| d.name).collect();
-        for n in [ASK_BRAIN, CANCEL_BRAIN, END_CONVERSATION, PEER_READ, "HOBBES_FLEET_STATUS", "HOBBES_TODO_LIST"] {
+        for n in [ASK_BRAIN, CANCEL_BRAIN, END_CONVERSATION, "HOBBES_FLEET_STATUS", "HOBBES_TODO_LIST"] {
             assert!(names.iter().any(|x| x == n), "missing {n}: {names:?}");
         }
-        assert!(!names.iter().any(|x| x == "HOBBES_DISPATCH" || x == "HOBBES_TODO_UPDATE"));
+        assert!(!names.iter().any(|x| x == "HOBBES_DISPATCH" || x == "HOBBES_TODO_UPDATE" || x == "HOBBES_PEER_READ"));
         let no_planner: Vec<String> = voice_tool_decls(false).into_iter().map(|d| d.name).collect();
         assert!(!no_planner.iter().any(|x| x == "HOBBES_TODO_LIST"));
     }

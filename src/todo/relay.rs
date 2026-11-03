@@ -391,13 +391,14 @@ fn worker_title(planner: &PlannerState, worker: &Session) -> String {
         .unwrap_or_else(|| worker.display_title())
 }
 
-/// Whether a wake into the Heartbeat session fits its budget (always true
-/// for any other session).
+/// Whether a wake into the Hobbes session (an unattended turn there, under
+/// the Heartbeat's rules) fits the Heartbeat's budget (always true for any
+/// other session).
 fn heartbeat_budget_allows(settings: &Settings, receiver: &str, now: DateTime<Utc>) -> bool {
-    let hb = crate::heartbeat::HEARTBEAT.peek();
-    if hb.session_id.as_deref() != Some(receiver) {
+    if !crate::hobbes_session::is_hobbes(receiver) {
         return true;
     }
+    let hb = crate::heartbeat::HEARTBEAT.peek();
     let budget = crate::heartbeat::budget::Budget::from_settings(settings);
     let spent = crate::heartbeat::budget::spent_since(
         &hb.trail,
@@ -500,14 +501,15 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
     if wake {
         // Delivered by the background chat queue once the receiver is idle
         // (see `deliver_queued_relay`); the tab is reopened so the turn has
-        // somewhere visible to run. The Heartbeat stays out of the strip.
+        // somewhere visible to run. The Hobbes tab stays out of the strip
+        // (its turns run in the background, like a wake).
         crate::components::chat_queue::queue_push(
             &mut crate::components::chat_queue::CHAT_QUEUE.write(),
             out.to,
             crate::components::chat_queue::QueuedMessage::relay(incoming),
         );
         crate::components::chat_queue::request_drain();
-        if crate::heartbeat::HEARTBEAT.peek().session_id.as_deref() != Some(out.to) {
+        if !crate::hobbes_session::is_hobbes(out.to) {
             crate::request_tab_reopen(out.to);
         }
     } else {

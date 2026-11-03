@@ -2,9 +2,11 @@
 //!
 //! Every [`TICK_SECS`] while `heartbeat_active`: capture the enabled
 //! sources (planner, Fleet; CI every `ci::CI_POLL_MINUTES` on a tokio task),
-//! decide salience, ingest, then wake the dedicated Heartbeat session if
-//! `wake::decide_wake` says so — by queueing a user message for the
-//! background chat queue, exactly like an unfocused dispatch. Day anchors
+//! decide salience, ingest, then wake the Hobbes session (`hobbes_session`)
+//! if `wake::decide_wake` says so — by queueing a message, marked as an
+//! unattended turn (`TurnOrigin::Heartbeat`), for the background chat queue,
+//! exactly like an unfocused dispatch. A wake waits while any other turn
+//! (typed, voice) is in flight in that session. Day anchors
 //! (`anchors.rs`) are checked every poll too. Finished wakes get their cost,
 //! outcome and actions read back from the usage log and the session.
 //!
@@ -31,10 +33,6 @@ use crate::settings::Settings;
 
 /// Poll interval.
 pub const TICK_SECS: u64 = 30;
-/// Title of the dedicated session.
-pub const SESSION_TITLE: &str = "Heartbeat";
-/// Its tab icon (the tab components draw a metal heart in its place).
-pub const SESSION_EMOJI: &str = "🫀";
 /// At most this many projects are polled for CI per round (projects with
 /// open agent work first), to stay gentle on `gh`'s rate limits.
 const MAX_CI_PROJECTS: usize = 12;
@@ -91,10 +89,10 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
     let active = super::heartbeat_active(&settings);
     let mut dirty = false;
 
-    // Rotate an oversized system session (Heartbeat or Voice) at a quiet
-    // moment (`session_rotation`). Here because this tick runs whether or
-    // not the Heartbeat is on; before `ensure_session`, so a rotated
-    // Heartbeat's successor is adopted on this same tick.
+    // Rotate an oversized Hobbes session at a quiet moment
+    // (`session_rotation`). Here because this tick runs whether or not the
+    // Heartbeat is on; before `ensure_session`, so a rotated session's
+    // successor is adopted on this same tick.
     if pacer
         .last_rotation_check
         .is_none_or(|t| now - t >= Duration::minutes(crate::session_rotation::CHECK_EVERY_MINUTES))
@@ -104,9 +102,9 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
     }
 
     let session_id = if active {
-        ensure_session(deps, &settings, &mut dirty)
+        crate::hobbes_session::ensure_session(deps.session_state, &settings)
     } else {
-        HEARTBEAT.peek().session_id.clone()
+        crate::hobbes_session::current_id()
     };
     // Finished wakes are read back even when the Heartbeat was just turned
     // off, so the trail doesn't keep a wake open forever.
@@ -181,69 +179,17 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
     }
 }
 
-// ── The dedicated session ───────────────────────────────────────────────────
+// ── The Hobbes session ──────────────────────────────────────────────────────
 
-/// Mark `id` as the Heartbeat system session and repair its icon (journaled)
-/// and project tag. Cheap when nothing needs fixing (runs every tick).
-fn adopt_session(session_state: &mut dioxus::prelude::Signal<SessionState>, id: &str, home: Option<&str>) {
-    crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, id);
-    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI, home) {
-        SessionState::save_signal(session_state, None);
-    }
-}
-
-/// The Heartbeat session's id, hydrating it into memory if it is only on
-/// disk and creating it if it never existed or was deleted. Never touches
-/// the active session or the open tabs.
-fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) -> Option<String> {
-    let mut session_state = deps.session_state;
-    if session_state.peek().save_disabled {
-        // Startup couldn't read the store: don't create rows we can't save.
-        return None;
-    }
-    if let Some(id) = HEARTBEAT.peek().session_id.clone() {
-        let mut hydrated = session_state.peek().sessions.contains_key(&id);
-        // One indexed row: fine on the UI thread (P-017).
-        if !hydrated {
-            if let Some(session) = crate::session_store::load_session(&id) {
-                session_state.write().sessions.insert(id.clone(), session);
-                hydrated = true;
-            }
-        }
-        if hydrated {
-            adopt_session(&mut session_state, &id, settings.home_profile_id());
-            return Some(id);
-        }
-        tracing::info!("heartbeat: session {id} is gone; creating a new one");
-    }
-    // Like every other new tab: the active Composio profile.
-    let profile = settings
-        .home_profile_id()
-        .map(str::to_string)
-        .or_else(|| settings.get_active_profile().map(|p| p.id.clone()));
-    let id = {
-        let mut state = session_state.write();
-        // create_session_raw makes the new session active; put it back.
-        let previous_active = state.active_session_id.clone();
-        let id = state.create_session_raw(profile);
-        if !previous_active.is_empty() {
-            state.active_session_id = previous_active;
-        }
-        // A user-set name, so auto-titling never renames it (nor its icon).
-        state.update_session_name_raw(&id, SESSION_TITLE.to_string());
-        id
-    };
-    adopt_session(&mut session_state, &id, settings.home_profile_id());
-    SessionState::save_signal(&session_state, None);
-    HEARTBEAT.write().session_id = Some(id.clone());
-    *dirty = true;
-    tracing::info!("heartbeat: created session {id}");
-    Some(id)
-}
-
-/// Mid-turn, a message waiting in its queue, or a call waiting on approval.
+/// Mid-turn (a typed, voice or wake turn alike — the Hobbes session hosts
+/// all three), a message popped from its queue but not streaming yet, a
+/// message waiting in its queue, or a call waiting on approval. A wake
+/// waits for all of these, so it never interleaves with or aborts another
+/// turn.
 fn session_busy(deps: HeartbeatDeps, session_id: &str, streaming: &HashSet<String>) -> bool {
     streaming.contains(session_id)
+        || crate::session_rotation::TURN_ACTIVITY.peek().contains(session_id)
+        || chat_queue::DISPATCHING.peek().contains(session_id)
         || chat_queue::CHAT_QUEUE.peek().get(session_id).is_some_and(|q| !q.is_empty())
         || deps
             .session_state
@@ -309,7 +255,7 @@ fn salience_ctx(deps: HeartbeatDeps, settings: &Settings, session_id: Option<&st
         if let Some(sid) = session_id {
             let session = state.sessions.get(sid);
             let messages = session.map(|s| s.messages.as_slice()).unwrap_or(&[]);
-            let mut lineage = crate::system_sessions::lineage(crate::system_sessions::SystemSession::Heartbeat);
+            let mut lineage = crate::system_sessions::lineage();
             if !lineage.iter().any(|id| id == sid) {
                 lineage.push(sid.to_string());
             }
@@ -376,7 +322,7 @@ fn maybe_wake(
 fn day_view(deps: HeartbeatDeps, settings: &Settings, now: DateTime<Utc>) -> Option<DayView> {
     (settings.planner_enabled && settings.heartbeat_source_planner).then(|| {
         let mut day = DayView::capture(&deps.planner.peek(), settings, now);
-        let heartbeat_session = HEARTBEAT.peek().session_id.clone();
+        let heartbeat_session = crate::hobbes_session::current_id();
         day.fleet =
             housekeeping::fleet_digest(&deps.fleet.peek(), &deps.planner.peek(), heartbeat_session.as_deref(), now);
         day
@@ -520,7 +466,7 @@ fn fire_wake(
     };
     let diagnoses = diagnoses(deps, &targets, &todos);
     let trust = super::trust::trust_summary(settings.planner_enabled, settings.agent_time_enabled());
-    let (text, voice_alert) = {
+    let text = {
         let mut hb = HEARTBEAT.write();
         let spent = spent_since(&hb.trail, local_day_start(now));
         // decide_wake already checked; re-checking here keeps the invariant
@@ -537,8 +483,6 @@ fn fire_wake(
         let anchors: Vec<Anchor> = day.map(|d| due_anchors(&hb, d, now)).unwrap_or_default();
         let ids = hb.queue.clone();
         let choices = wake::choice_summary(&hb, &ids);
-        // Spoken if a voice conversation is live (voice::controller).
-        let voice_alert = format!("{why}. {choices}");
         let last_wake = wake::last_fired_at(&hb.trail);
         let budget_line = wake::budget_line(&hb.trail, budget, spent, now);
         let events = hb.drain_queue();
@@ -561,18 +505,20 @@ fn fire_wake(
         if let Some(d) = day {
             hb.mark_anchors_fired(anchors.iter().map(|a| a.key.as_str()), d.today, now);
         }
-        (text, voice_alert)
+        text
     };
     // The background chat queue sends it: its drain runs for any hydrated
-    // session, focused or not (see todo::dispatch::dispatch_to_chat).
+    // session, focused or not (see todo::dispatch::dispatch_to_chat). The
+    // turn is marked unattended, so the Heartbeat's scope rules apply to
+    // every call it makes; what it has for the person is spoken when its
+    // turn ends (voice::controller::on_turn_end).
     chat_queue::queue_push(
         &mut chat_queue::CHAT_QUEUE.write(),
         session_id,
-        chat_queue::QueuedMessage::new(text, Vec::new()),
+        chat_queue::QueuedMessage::new(text, Vec::new()).with_origin(crate::session::TurnOrigin::Heartbeat),
     );
     chat_queue::request_drain();
     tracing::info!("heartbeat: woke session {session_id}");
-    crate::voice::controller::heartbeat_alert(voice_alert);
 }
 
 /// Fill in cost and outcome for fired wakes whose turn has finished. True
@@ -619,7 +565,9 @@ fn complete_finished_wakes(
                 let busy = busy && until.is_none();
                 wake::wake_completion(w, *until, session_id, &session.messages, &spend, busy, now).map(
                     |(cost, outcome)| {
-                        let actions = wake::wake_actions(&session.messages, w.at, *until, title);
+                        // Only the wake's own turn (`wake::wake_window_end`).
+                        let until = wake::wake_window_end(&session.messages, w.at, *until);
+                        let actions = wake::wake_actions(&session.messages, w.at, until, title);
                         (w.id.clone(), cost, outcome, actions)
                     },
                 )

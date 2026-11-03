@@ -6,7 +6,8 @@
 //! - [`audio`]: mic + speaker with platform echo cancellation.
 //! - [`controller`]: the live conversation (hotkey, barge-in, tools).
 //! - [`brain`]: `VOICE_ASK_BRAIN` — a turn on the global connector.
-//! - [`session`]: the dedicated Voice chat session and peer reads.
+//! - [`session`]: transcript lines and the session tail, in the Hobbes
+//!   session (`hobbes_session`).
 //! - [`tools`]: the voice tier's curated tools.
 //! - [`transcript`]: placing transcript lines between turns, in time order.
 //! - [`hotkey`]: the global tap / hold hotkey.

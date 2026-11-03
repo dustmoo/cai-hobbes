@@ -161,11 +161,6 @@ impl CoreClient {
                     })).unwrap_or_default(),
             ).with_title("Fleet Status"),
             Tool::new(
-                crate::voice::tools::PEER_READ,
-                crate::voice::tools::PEER_READ_DESCRIPTION,
-                serde_json::from_value::<JsonObject>(crate::voice::tools::peer_read_schema()).unwrap_or_default(),
-            ).with_title("Read Voice / Heartbeat"),
-            Tool::new(
                 "HOBBES_CANCEL_TIMER",
                 "Cancel a pending timer by its id (from the set-timer confirmation or \
                     HOBBES_LIST_TIMERS).",
