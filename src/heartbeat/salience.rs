@@ -67,6 +67,9 @@ pub struct SalienceCtx {
     /// The dedicated Heartbeat chat session, once it exists — runs
     /// dispatched from it count as the Heartbeat's own.
     pub heartbeat_session_id: Option<String>,
+    /// The Heartbeat's rotated-out sessions (`system_sessions::lineage`):
+    /// runs dispatched from them before a rotation are still its own.
+    pub heartbeat_archived_ids: HashSet<String>,
     /// Projects with open agent-lane work (see [`agent_project_ids`]).
     pub agent_project_ids: HashSet<String>,
     /// `dispatch_auto_continue`: a finished run already hands its result
@@ -107,9 +110,16 @@ impl SalienceCtx {
     /// A run the Heartbeat session dispatched, whose result the auto-continue
     /// already delivers to it: a wake on top would be a second turn.
     fn continued_into_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
-        self.dispatch_auto_continue
-            && self.heartbeat_session_id.is_some()
-            && ev.dispatched_from == self.heartbeat_session_id
+        self.dispatch_auto_continue && self.dispatched_by_heartbeat(ev)
+    }
+
+    /// Dispatched from the Heartbeat session — the current one or any it
+    /// rotated out of.
+    fn dispatched_by_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
+        let Some(from) = ev.dispatched_from.as_deref() else {
+            return false;
+        };
+        self.heartbeat_session_id.as_deref() == Some(from) || self.heartbeat_archived_ids.contains(from)
     }
 
     /// A chat worker the Heartbeat session dispatched, whose completion the
@@ -124,7 +134,7 @@ impl SalienceCtx {
         ev.todo_id
             .as_ref()
             .is_some_and(|t| self.intention_todo_ids.contains(t) || self.heartbeat_todo_ids.contains(t))
-            || (self.heartbeat_session_id.is_some() && ev.dispatched_from == self.heartbeat_session_id)
+            || self.dispatched_by_heartbeat(ev)
     }
 }
 
@@ -361,6 +371,23 @@ mod tests {
         // No Heartbeat session: a run with no parent is not "awaited".
         r.dispatched_from = None;
         ctx.heartbeat_session_id = None;
+        assert_eq!(choice(&r, &ctx), Choice::Note);
+    }
+
+    #[test]
+    fn work_dispatched_before_a_rotation_is_still_the_heartbeat_s() {
+        let mut r = ev(EventSource::Fleet, KIND_RUN_ENDED, Urgency::Low);
+        r.dispatched_from = Some("hb-old".into());
+        let mut ctx = SalienceCtx { heartbeat_session_id: Some("hb-new".into()), ..Default::default() };
+        assert_eq!(choice(&r, &ctx), Choice::Note, "not its own until the lineage is known");
+        ctx.heartbeat_archived_ids.insert("hb-old".into());
+        assert_eq!(choice(&r, &ctx), Choice::WakeNow);
+        // Auto-continue hands the result to the successor already.
+        ctx.dispatch_auto_continue = true;
+        assert_eq!(choice(&r, &ctx), Choice::Note);
+        // Another chat's run is still not the Heartbeat's.
+        ctx.dispatch_auto_continue = false;
+        r.dispatched_from = Some("a-chat".into());
         assert_eq!(choice(&r, &ctx), Choice::Note);
     }
 

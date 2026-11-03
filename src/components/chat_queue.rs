@@ -79,7 +79,13 @@ pub fn queue_push(
     session_id: &str,
     msg: QueuedMessage,
 ) {
-    map.entry(session_id.to_string())
+    // A rotated-out system session is a read-only archive: whatever is
+    // still addressed to it runs in its successor (`system_sessions`).
+    let target = crate::system_sessions::current_for(session_id);
+    if target != session_id {
+        tracing::debug!(from = session_id, to = %target, "chat queue: archived system session; queued in its successor");
+    }
+    map.entry(target)
         .or_default()
         .push_back(msg);
 }

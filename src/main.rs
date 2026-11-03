@@ -53,6 +53,7 @@ mod session;
 mod session_events;
 mod session_store;
 mod str_utils;
+mod session_rotation;
 mod system_sessions;
 mod tab_list;
 mod tab_tidy;
@@ -152,6 +153,40 @@ fn drain_pending_tab_reopens() -> Vec<String> {
     std::mem::take(&mut *PENDING_TAB_REOPEN.write())
         .into_iter()
         .collect()
+}
+
+/// Rotated system sessions (`session_rotation`) whose tab, if open, the
+/// successor takes over: (archived id, new id). Same reach problem and fix
+/// as `PENDING_TAB_REOPEN`: the rotation runs in the Heartbeat runtime's
+/// tick, which can't see `open_tabs`.
+static PENDING_TAB_REPLACE: GlobalSignal<Vec<(String, String)>> = Signal::global(Vec::new);
+
+/// Ask the `ChatCommand` handler to put `new` in `old`'s tab (same position,
+/// active if `old` was) and close `old`'s.
+pub(crate) fn request_tab_replace(old: &str, new: &str) {
+    PENDING_TAB_REPLACE.write().push((old.to_string(), new.to_string()));
+}
+
+/// Drain `PENDING_TAB_REPLACE`, subscribing the caller (see
+/// `drain_pending_tab_reopens`).
+fn drain_pending_tab_replacements() -> Vec<(String, String)> {
+    if PENDING_TAB_REPLACE.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *PENDING_TAB_REPLACE.write())
+}
+
+/// `tabs` with `old` replaced by `new` in place (`old` dropped if `new` is
+/// already open). `None` when `old` isn't open.
+fn replace_tab(tabs: &[String], old: &str, new: &str) -> Option<Vec<String>> {
+    let pos = tabs.iter().position(|t| t == old)?;
+    let mut out = tabs.to_vec();
+    if out.iter().any(|t| t == new) {
+        out.remove(pos);
+    } else {
+        out[pos] = new.to_string();
+    }
+    Some(out)
 }
 
 /// One entry in the visible tab strip, in `tab_bar.rs`'s left-to-right render
@@ -301,6 +336,17 @@ fn tidy_inputs(
 #[cfg(test)]
 mod tab_cycle_tests {
     use super::*;
+
+    #[test]
+    fn a_rotated_session_s_tab_is_replaced_in_place() {
+        let tabs: Vec<String> = ["a", "hb-old", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(replace_tab(&tabs, "hb-old", "hb-new").unwrap(), vec!["a", "hb-new", "c"]);
+        // Not open: nothing to do.
+        assert_eq!(replace_tab(&tabs, "elsewhere", "hb-new"), None);
+        // The successor already open: the archive's tab just goes.
+        let both: Vec<String> = ["hb-old", "hb-new"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(replace_tab(&both, "hb-old", "hb-new").unwrap(), vec!["hb-new"]);
+    }
 
     #[test]
     fn cycle_index_wraps_forward() {
@@ -894,7 +940,10 @@ fn app() -> Element {
                 // task) can't touch Signals, so it parks the continuations on
                 // FleetShared and pokes us; this is the only side that writes
                 // the chat queue.
-                for c in shared.take_continuations() {
+                for mut c in shared.take_continuations() {
+                    // A run dispatched from a system session that has since
+                    // rotated reports to its successor.
+                    c.parent_session_id = crate::system_sessions::current_for(&c.parent_session_id);
                     let todo_title = c
                         .todo_id
                         .as_deref()
@@ -2529,12 +2578,15 @@ fn app() -> Element {
 
             // Delete the session if it has no messages (empty tab).
             // Sessions with messages are preserved in History. The
-            // Heartbeat's own session is kept even while empty: it is
-            // waiting for its first wake, not an abandoned tab.
+            // Heartbeat's and Voice's own sessions are kept even while
+            // empty: they are waiting for their first wake or conversation
+            // (or were just rotated in, carrying the old one's summary), not
+            // abandoned tabs.
             {
                 let state = session_state.read();
                 let is_heartbeat = heartbeat::HEARTBEAT.peek().session_id.as_deref()
-                    == Some(closing_session_id.as_str());
+                    == Some(closing_session_id.as_str())
+                    || crate::system_sessions::is_current(&closing_session_id);
                 let is_empty = !is_heartbeat
                     && state.sessions.get(&closing_session_id)
                         .map(|s| s.messages.is_empty())
@@ -2958,6 +3010,23 @@ fn app() -> Element {
             }
             if changed {
                 open_tabs.set(tabs);
+            }
+        }
+
+        // A rotated system session's tab now shows its successor, in the
+        // same position (see `PENDING_TAB_REPLACE`).
+        for (old, new) in drain_pending_tab_replacements() {
+            let tabs = open_tabs.peek().clone();
+            if let Some(next) = replace_tab(&tabs, &old, &new) {
+                let len = next.len();
+                open_tabs.set(next);
+                if *active_tab_index.peek() >= len {
+                    active_tab_index.set(len.saturating_sub(1));
+                }
+            }
+            if *current_session_id.peek() == old {
+                current_session_id.set(new.clone());
+                session_state.write().active_session_id = new;
             }
         }
 

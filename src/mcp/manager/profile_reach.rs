@@ -54,15 +54,16 @@ pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<St
         .or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
 }
 
-/// The profiles `session_id` can act in, home first. Only system sessions
-/// (Heartbeat, Voice) reach beyond home in phase 1; with no home profile
-/// there is nothing to anchor to, so no reach either.
+/// The profiles `session_id` can act in, home first. Only the live system
+/// sessions (Heartbeat, Voice) reach beyond home in phase 1 — not their
+/// rotated-out archives, which are read-only; with no home profile there is
+/// nothing to anchor to, so no reach either.
 pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<&str>) -> Vec<ReachProfile> {
     let Some(home) = home_id.and_then(|id| settings.composio_profiles.iter().find(|p| p.id == id)) else {
         return Vec::new();
     };
     let mut out = vec![ReachProfile { id: home.id.clone(), name: home.name.clone() }];
-    if crate::system_sessions::is_system(session_id) {
+    if crate::system_sessions::is_current(session_id) {
         out.extend(
             settings
                 .composio_profiles
@@ -342,7 +343,9 @@ pub fn resume_profile(
     }
     // Only system sessions route; everything else keeps its own pin. (Not
     // `reach.len()`: a system session whose other profiles dropped out must
-    // still refuse a call routed to one of them.)
+    // still refuse a call routed to one of them. An archive counts here, so
+    // a stale held call in it is refused rather than run at home: its reach
+    // is home only.)
     if !crate::system_sessions::is_system(session_id) {
         return Ok(session_profile.map(str::to_string));
     }

@@ -4,11 +4,25 @@
 //! changed emoji can't hide them), are never filed under a project, and are
 //! never retitled from a summary.
 //!
+//! A system session that grows too large is **rotated**
+//! (`session_rotation`): a fresh session takes over and the old one stays in
+//! History as a read-only archive. The registry keeps each kind's lineage —
+//! the current id plus every archived one — so archives keep their icon and
+//! their exemptions, and anything still addressed to an archived id (a
+//! dispatch result, a relay, a queued message) is routed to the current
+//! session through [`current_for`].
+//!
 //! A plain registry (no Signals) so background code and tests can ask too.
-//! Seeded on first use from the ids the two features persist, and updated
-//! whenever either creates its session.
+//! Seeded on first use from the ids the two features persist (and the
+//! archive list, meta key [`ARCHIVES_META_KEY`]), and updated whenever
+//! either creates or rotates its session.
 
 use std::sync::{OnceLock, RwLock};
+
+use serde::{Deserialize, Serialize};
+
+/// `meta` key holding the archived ids of each kind (JSON [`Archives`]).
+pub const ARCHIVES_META_KEY: &str = "system_session_archives";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SystemSession {
@@ -16,12 +30,122 @@ pub enum SystemSession {
     Voice,
 }
 
-#[derive(Default)]
-struct Ids {
-    heartbeat: Option<String>,
-    voice: Option<String>,
+impl SystemSession {
+    pub const ALL: [SystemSession; 2] = [SystemSession::Heartbeat, SystemSession::Voice];
+
+    /// The session's fixed title.
+    pub fn title(self) -> &'static str {
+        match self {
+            SystemSession::Heartbeat => crate::heartbeat::runtime::SESSION_TITLE,
+            SystemSession::Voice => crate::voice::session::SESSION_TITLE,
+        }
+    }
+}
+
+/// Archived (rotated-out) ids per kind, oldest first. Persisted.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Archives {
+    #[serde(default)]
+    pub heartbeat: Vec<String>,
+    #[serde(default)]
+    pub voice: Vec<String>,
+}
+
+impl Archives {
+    fn of(&self, kind: SystemSession) -> &Vec<String> {
+        match kind {
+            SystemSession::Heartbeat => &self.heartbeat,
+            SystemSession::Voice => &self.voice,
+        }
+    }
+
+    fn of_mut(&mut self, kind: SystemSession) -> &mut Vec<String> {
+        match kind {
+            SystemSession::Heartbeat => &mut self.heartbeat,
+            SystemSession::Voice => &mut self.voice,
+        }
+    }
+}
+
+/// The registry's contents: each kind's current id and its archives. Pure,
+/// so the lineage rules are unit-tested on a local value.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Ids {
+    pub heartbeat: Option<String>,
+    pub voice: Option<String>,
+    pub archives: Archives,
     /// The persisted ids have been read (the store was open).
     seeded: bool,
+}
+
+impl Ids {
+    fn current(&self, kind: SystemSession) -> Option<&str> {
+        match kind {
+            SystemSession::Heartbeat => self.heartbeat.as_deref(),
+            SystemSession::Voice => self.voice.as_deref(),
+        }
+    }
+
+    fn set_current(&mut self, kind: SystemSession, id: &str) {
+        let slot = match kind {
+            SystemSession::Heartbeat => &mut self.heartbeat,
+            SystemSession::Voice => &mut self.voice,
+        };
+        *slot = Some(id.to_string());
+    }
+
+    /// Which system session `id` is — current or archived.
+    pub fn kind(&self, id: &str) -> Option<SystemSession> {
+        if id.is_empty() {
+            return None;
+        }
+        SystemSession::ALL.into_iter().find(|&k| {
+            self.current(k) == Some(id) || self.archives.of(k).iter().any(|a| a == id)
+        })
+    }
+
+    /// `id` is a rotated-out archive (and not, by some race, also current).
+    pub fn is_archive(&self, id: &str) -> bool {
+        self.kind(id).is_some_and(|k| self.current(k) != Some(id))
+    }
+
+    /// `id` is the live session of its kind.
+    pub fn is_current(&self, id: &str) -> bool {
+        SystemSession::ALL.into_iter().any(|k| self.current(k) == Some(id))
+    }
+
+    /// Where something addressed to `id` should land: the current session of
+    /// its kind when `id` is an archive, else `id` itself.
+    pub fn current_for(&self, id: &str) -> String {
+        match self.kind(id) {
+            Some(k) if self.is_archive(id) => self.current(k).unwrap_or(id).to_string(),
+            _ => id.to_string(),
+        }
+    }
+
+    /// Every id the kind has had: archives (oldest first), then the current.
+    pub fn lineage(&self, kind: SystemSession) -> Vec<String> {
+        let mut out: Vec<String> =
+            self.archives.of(kind).iter().filter(|a| self.current(kind) != Some(a.as_str())).cloned().collect();
+        if let Some(c) = self.current(kind) {
+            out.push(c.to_string());
+        }
+        out
+    }
+
+    /// The newest archive of the kind, if any.
+    pub fn latest_archive(&self, kind: SystemSession) -> Option<&str> {
+        self.archives.of(kind).iter().rev().find(|a| self.current(kind) != Some(a.as_str())).map(String::as_str)
+    }
+
+    /// Rotate: `old` joins the archives, `new` becomes current.
+    pub fn rotate(&mut self, kind: SystemSession, old: &str, new: &str) {
+        let archives = self.archives.of_mut(kind);
+        if !old.is_empty() && old != new && !archives.iter().any(|a| a == old) {
+            archives.push(old.to_string());
+        }
+        self.set_current(kind, new);
+    }
 }
 
 fn registry() -> &'static RwLock<Ids> {
@@ -39,6 +163,9 @@ fn seed() {
         .and_then(|v| v.get("session_id").and_then(|s| s.as_str()).map(str::to_string))
         .filter(|s| !s.is_empty());
     let voice = crate::session_store::meta_get(crate::voice::session::META_KEY).filter(|s| !s.is_empty());
+    let archives: Archives = crate::session_store::meta_get(ARCHIVES_META_KEY)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
     if let Ok(mut ids) = registry().write() {
         if ids.heartbeat.is_none() {
             ids.heartbeat = heartbeat;
@@ -46,36 +173,85 @@ fn seed() {
         if ids.voice.is_none() {
             ids.voice = voice;
         }
+        for kind in SystemSession::ALL {
+            for a in archives.of(kind) {
+                if !ids.archives.of(kind).contains(a) {
+                    ids.archives.of_mut(kind).push(a.clone());
+                }
+            }
+        }
         ids.seeded = true;
     }
+}
+
+fn read<T>(f: impl FnOnce(&Ids) -> T) -> Option<T> {
+    seed();
+    registry().read().ok().map(|ids| f(&ids))
 }
 
 /// Record the session a system feature uses (on creation or adoption).
 pub fn register(kind: SystemSession, id: &str) {
     if let Ok(mut ids) = registry().write() {
-        let slot = match kind {
-            SystemSession::Heartbeat => &mut ids.heartbeat,
-            SystemSession::Voice => &mut ids.voice,
-        };
-        *slot = Some(id.to_string());
+        ids.set_current(kind, id);
     }
 }
 
-/// Which system session `id` is, if any.
-pub fn kind(id: &str) -> Option<SystemSession> {
+/// Record a rotation (`old` archived, `new` current) and persist the archive
+/// list. The caller persists the feature's own current id.
+pub fn record_rotation(kind: SystemSession, old: &str, new: &str) {
     seed();
-    let ids = registry().read().ok()?;
-    if ids.heartbeat.as_deref() == Some(id) {
-        Some(SystemSession::Heartbeat)
-    } else if ids.voice.as_deref() == Some(id) {
-        Some(SystemSession::Voice)
-    } else {
-        None
+    let archives = match registry().write() {
+        Ok(mut ids) => {
+            ids.rotate(kind, old, new);
+            ids.archives.clone()
+        }
+        Err(_) => return,
+    };
+    match serde_json::to_string(&archives) {
+        Ok(json) => {
+            if let Err(e) = crate::session_store::meta_set(ARCHIVES_META_KEY, &json) {
+                tracing::warn!("system sessions: could not persist the archive list: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("system sessions: could not serialize the archive list: {e}"),
     }
 }
 
+/// Which system session `id` is (current or archived), if any.
+pub fn kind(id: &str) -> Option<SystemSession> {
+    read(|ids| ids.kind(id)).flatten()
+}
+
+/// A system session, current or archived: keeps its icon, stays out of
+/// projects and is never retitled.
 pub fn is_system(id: &str) -> bool {
     kind(id).is_some()
+}
+
+/// The live Heartbeat or Voice session (not an archive).
+pub fn is_current(id: &str) -> bool {
+    read(|ids| ids.is_current(id)).unwrap_or(false)
+}
+
+/// A rotated-out, read-only archive of a system session.
+pub fn is_archive(id: &str) -> bool {
+    read(|ids| ids.is_archive(id)).unwrap_or(false)
+}
+
+/// Where something addressed to `id` should land: the current session of
+/// its kind when `id` is an archive, else `id` itself.
+pub fn current_for(id: &str) -> String {
+    read(|ids| ids.current_for(id)).unwrap_or_else(|| id.to_string())
+}
+
+/// Every id `kind` has had (archives oldest first, then the current one).
+pub fn lineage(kind: SystemSession) -> Vec<String> {
+    read(|ids| ids.lineage(kind)).unwrap_or_default()
+}
+
+/// The newest archive of `kind`, if any.
+pub fn latest_archive(kind: SystemSession) -> Option<String> {
+    read(|ids| ids.latest_archive(kind).map(str::to_string)).flatten()
 }
 
 /// Put a hydrated system session back in shape: its icon emoji (journaled,
@@ -140,5 +316,56 @@ mod tests {
         assert_eq!(kind("test-voice-session"), Some(SystemSession::Voice));
         assert_eq!(kind("test-heartbeat-session"), Some(SystemSession::Heartbeat));
         assert!(!is_system("an-ordinary-chat"));
+    }
+
+    #[test]
+    fn lineage_routes_archives_to_the_current_session() {
+        let mut ids = Ids { heartbeat: Some("hb-1".into()), voice: Some("v-1".into()), ..Default::default() };
+        assert_eq!(ids.current_for("hb-1"), "hb-1");
+        assert!(!ids.is_archive("hb-1"));
+
+        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
+        ids.rotate(SystemSession::Heartbeat, "hb-2", "hb-3");
+        // Archives keep their kind (icon, no project, no retitle) ...
+        assert_eq!(ids.kind("hb-1"), Some(SystemSession::Heartbeat));
+        assert_eq!(ids.kind("hb-2"), Some(SystemSession::Heartbeat));
+        assert!(ids.is_archive("hb-1") && ids.is_archive("hb-2"));
+        assert!(!ids.is_current("hb-1") && ids.is_current("hb-3"));
+        // ... and whatever is addressed to them lands in the current one.
+        assert_eq!(ids.current_for("hb-1"), "hb-3");
+        assert_eq!(ids.current_for("hb-2"), "hb-3");
+        assert_eq!(ids.current_for("hb-3"), "hb-3");
+        assert_eq!(ids.lineage(SystemSession::Heartbeat), vec!["hb-1", "hb-2", "hb-3"]);
+        assert_eq!(ids.latest_archive(SystemSession::Heartbeat), Some("hb-2"));
+
+        // Kinds don't mix; ordinary chats pass through untouched.
+        assert_eq!(ids.current_for("v-1"), "v-1");
+        assert_eq!(ids.latest_archive(SystemSession::Voice), None);
+        assert_eq!(ids.current_for("a-chat"), "a-chat");
+        assert_eq!(ids.kind(""), None);
+        ids.rotate(SystemSession::Voice, "v-1", "v-2");
+        assert_eq!(ids.current_for("v-1"), "v-2");
+        assert_eq!(ids.kind("v-1"), Some(SystemSession::Voice));
+    }
+
+    #[test]
+    fn rotation_is_idempotent_and_never_archives_the_current() {
+        let mut ids = Ids::default();
+        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
+        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
+        assert_eq!(ids.archives.heartbeat, vec!["hb-1"]);
+        ids.rotate(SystemSession::Heartbeat, "hb-2", "hb-2");
+        assert_eq!(ids.archives.heartbeat, vec!["hb-1"]);
+        // An archive list that (after a crash mid-rotation) still names the
+        // current id treats it as current, not archived.
+        ids.archives.heartbeat.push("hb-2".into());
+        assert!(!ids.is_archive("hb-2"));
+        assert_eq!(ids.current_for("hb-2"), "hb-2");
+        assert_eq!(ids.lineage(SystemSession::Heartbeat), vec!["hb-1", "hb-2"]);
+        // Archives round-trip, and an old blob without a kind still loads.
+        let json = serde_json::to_string(&ids.archives).unwrap();
+        assert_eq!(serde_json::from_str::<Archives>(&json).unwrap(), ids.archives);
+        let partial: Archives = serde_json::from_str(r#"{"voice":["v-0"]}"#).unwrap();
+        assert!(partial.heartbeat.is_empty());
     }
 }

@@ -22,7 +22,8 @@ use crate::tab_list::{arrange_tabs, tab_group_options, TabFacts, TabListOrder, T
 use crate::todo::PlannerState;
 use chrono::{DateTime, Utc};
 use dioxus::prelude::*;
-use crate::components::metal_heart::{use_heartbeat_session_id, MetalHeart};
+use crate::components::metal_heart::{system_icon, use_heartbeat_session_id, MetalHeart};
+use crate::system_sessions::SystemSession;
 use crate::components::metal_mouth::{use_voice_session_id, MetalMouth};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
@@ -295,8 +296,8 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     onmouseup: move |evt| if is_middle_click(&evt) { on_close.call(idx) },
                                     match glyph {
                                         // System tabs: the icon follows the id, whatever the emoji.
-                                        _ if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalHeart { size: 15 } },
-                                        _ if voice_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalMouth { size: 15 } },
+                                        _ if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Heartbeat) => rsx! { MetalHeart { size: 15 } },
+                                        _ if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Voice) => rsx! { MetalMouth { size: 15 } },
                                         RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
                                         RailGlyph::Letter(l) => rsx! {
                                             span {
@@ -575,9 +576,9 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                                     title: "{crate::timers::waiting_title(at)}",
                                                 }
                                             }
-                                            if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) {
+                                            if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Heartbeat) {
                                                 MetalHeart {}
-                                            } else if voice_id.read().as_deref() == Some(tab.session_id.as_str()) {
+                                            } else if system_icon(heartbeat_id, voice_id, &tab.session_id) == Some(SystemSession::Voice) {
                                                 MetalMouth {}
                                             } else if let Some(e) = &tab.emoji {
                                                 span { class: "text-[13px] leading-none shrink-0", "{e}" }

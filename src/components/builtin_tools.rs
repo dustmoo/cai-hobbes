@@ -255,7 +255,11 @@ pub fn heartbeat_gate(
     session_id: &str,
     user_approved: bool,
 ) -> AgentTimeGate {
-    let is_heartbeat = crate::heartbeat::HEARTBEAT.peek().session_id.as_deref() == Some(session_id);
+    // An archived (rotated-out) Heartbeat session stays under the same
+    // gate: it is read-only, but if a call ever ran there it is still the
+    // Heartbeat's.
+    let is_heartbeat = crate::heartbeat::HEARTBEAT.peek().session_id.as_deref() == Some(session_id)
+        || crate::system_sessions::kind(session_id) == Some(crate::system_sessions::SystemSession::Heartbeat);
     match crate::heartbeat::trust::gate_verdict(is_heartbeat, &tool_call.tool_name, args_json, user_approved) {
         crate::heartbeat::trust::HeartbeatVerdict::Proceed => AgentTimeGate::Proceed,
         crate::heartbeat::trust::HeartbeatVerdict::ForceApproval => AgentTimeGate::ForceApproval,

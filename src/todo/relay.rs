@@ -358,6 +358,14 @@ pub struct Delivered {
     pub woke: bool,
 }
 
+/// Whether a worker whose link names `linked_parent` belongs to `parent`:
+/// the same chat, or `linked_parent` is a rotated-out system session whose
+/// successor is `parent` (`system_sessions::current_for`) — the successor
+/// carries the archive's worker list.
+fn parent_matches(linked_parent: &str, parent: &str) -> bool {
+    linked_parent == parent || crate::system_sessions::current_for(linked_parent) == parent
+}
+
 /// Make sure `id` is in memory (it may be a closed tab); false when gone.
 fn ensure_hydrated(mut state: Signal<SessionState>, id: &str) -> bool {
     if state.peek().sessions.contains_key(id) {
@@ -432,7 +440,7 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
         let linked = worker
             .dispatch_link
             .as_ref()
-            .is_some_and(|l| l.parent_session_id == parent.id);
+            .is_some_and(|l| parent_matches(&l.parent_session_id, &parent.id));
         if !linked {
             return Err("those chats aren't linked by a dispatch".to_string());
         }
@@ -642,11 +650,12 @@ fn message_parent(sig: RelaySignals, args: &serde_json::Value, session_id: &str)
         RelayKind::Result => auto_continue,
         _ => false,
     };
+    let parent = crate::system_sessions::current_for(&link.parent_session_id);
     let delivered = deliver(
         sig,
         Outgoing {
             from: session_id,
-            to: &link.parent_session_id,
+            to: &parent,
             direction: RelayDirection::ToParent,
             kind,
             text,
@@ -752,7 +761,7 @@ fn message_worker(sig: RelaySignals, args: &serde_json::Value, session_id: &str)
         .sessions
         .get(&worker)
         .and_then(|s| s.dispatch_link.clone())
-        .filter(|l| l.parent_session_id == session_id)
+        .filter(|l| parent_matches(&l.parent_session_id, session_id))
         .ok_or("that chat isn't one of this chat's workers")?;
     if !todo_open(&sig.planner.peek(), link.todo_id.as_deref()) {
         return Err("that worker's to-do is closed".to_string());
@@ -845,11 +854,12 @@ pub fn send_completion_report(sig: RelaySignals, worker: &str) -> bool {
     };
     set_link(sig.session_state, worker, DispatchLink { report_sent: true, ..link.clone() });
     let wake = sig.settings.peek().dispatch_auto_continue;
+    let parent = crate::system_sessions::current_for(&link.parent_session_id);
     match deliver(
         sig,
         Outgoing {
             from: worker,
-            to: &link.parent_session_id,
+            to: &parent,
             direction: RelayDirection::ToParent,
             kind: RelayKind::Report,
             text,

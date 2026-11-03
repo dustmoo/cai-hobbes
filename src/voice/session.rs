@@ -180,16 +180,33 @@ pub fn peer_tail(session_state: Signal<SessionState>, peer: Peer, limit: usize) 
     };
     let id = peer.session_id().ok_or_else(|| format!("The {name} session doesn't exist yet."))?;
     let limit = limit.clamp(1, 40);
-    let text = {
+    let messages = |id: &str| -> Option<Vec<Message>> {
         let state = session_state.peek();
-        state.sessions.get(&id).map(|s| tail_text(&s.messages, limit, 6000))
+        match state.sessions.get(id) {
+            Some(s) => Some(s.messages[s.messages.len().saturating_sub(limit)..].to_vec()),
+            None => {
+                drop(state);
+                crate::session_store::load_session(id).map(|s| {
+                    let start = s.messages.len().saturating_sub(limit);
+                    s.messages[start..].to_vec()
+                })
+            }
+        }
     };
-    let text = match text {
-        Some(t) => t,
-        None => crate::session_store::load_session(&id)
-            .map(|s| tail_text(&s.messages, limit, 6000))
-            .ok_or_else(|| format!("The {name} session couldn't be read."))?,
-    };
+    let mut tail = messages(&id).ok_or_else(|| format!("The {name} session couldn't be read."))?;
+    // Just after a rotation the session is nearly empty: top the tail up
+    // from the archive it replaced (session_rotation).
+    if tail.len() < limit {
+        let kind = match peer {
+            Peer::Voice => crate::system_sessions::SystemSession::Voice,
+            Peer::Heartbeat => crate::system_sessions::SystemSession::Heartbeat,
+        };
+        if let Some(mut earlier) = crate::system_sessions::latest_archive(kind).and_then(|a| messages(&a)) {
+            earlier.append(&mut tail);
+            tail = earlier;
+        }
+    }
+    let text = tail_text(&tail, limit, 6000);
     if text.is_empty() {
         Ok(format!("The {name} session has no messages yet."))
     } else {

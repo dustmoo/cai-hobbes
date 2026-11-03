@@ -860,6 +860,10 @@ pub fn ChatInput(
         let user_message = draft.read().clone();
         let atts = attachments.read().clone();
         let session_id = current_session_id.read().clone();
+        if crate::system_sessions::is_archive(&session_id) {
+            tracing::debug!("'send_message' blocked: archived system session is read-only.");
+            return;
+        }
         if user_message.is_empty()
             && atts.is_empty()
             && !has_new_comments.read().contains(&session_id)
@@ -973,6 +977,15 @@ pub fn ChatInput(
             }
         }
     });
+
+    // A rotated-out Heartbeat / Voice session is a read-only archive: its
+    // successor carries on the conversation (session_rotation).
+    let archived = crate::system_sessions::is_archive(&current_session_id.read());
+    let placeholder = if archived {
+        "Archived — read-only. The conversation continues in the current tab."
+    } else {
+        "Type your message..."
+    };
 
     rsx! {
         if !attachments.read().is_empty() {
@@ -1113,7 +1126,8 @@ pub fn ChatInput(
                         class: "w-full min-h-[44px] px-4 pt-3 pb-1.5 bg-transparent border-0 text-fg placeholder-gray-500 focus:outline-none focus:ring-0 resize-none overflow-y-auto",
                         style: "max-height: 50vh;",
                         rows: "1",
-                        placeholder: "Type your message...",
+                        placeholder: "{placeholder}",
+                        disabled: archived,
                         // UNCONTROLLED on purpose: a controlled `value` binding races
                         // the IPC round-trip and snaps the caret to the end mid-typing.
                         // Programmatic writes go through shared::set_chat_draft, which
