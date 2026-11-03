@@ -3538,6 +3538,7 @@ mod tests {
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
         profile_reach: Vec::new(),
+        summary_sources: Vec::new(),
         }
     }
 

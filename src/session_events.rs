@@ -260,6 +260,7 @@ pub(crate) fn blank_session() -> Session {
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
         profile_reach: Vec::new(),
+        summary_sources: Vec::new(),
     }
 }
 
@@ -306,6 +307,12 @@ pub fn project(base: Option<Session>, events: &[LoadedSessionEvent]) -> Session 
     session
 }
 
+/// [`apply_event`] for other modules' tests.
+#[cfg(test)]
+pub(crate) fn apply_for_test(session: &mut Session, event: &SessionEvent) {
+    apply_event(session, event)
+}
+
 fn apply_event(session: &mut Session, event: &SessionEvent) {
     use SessionEvent as E;
     match event {
@@ -336,7 +343,13 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         }
         E::SummaryComputed { summary } => {
             match serde_json::from_value(summary.clone()) {
-                Ok(parsed) => session.active_context.conversation_summary = parsed,
+                Ok(parsed) => {
+                    session.active_context.conversation_summary = parsed;
+                    session.summary_sources = summary
+                        .get(crate::session::SUMMARY_SOURCES_KEY)
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                }
                 Err(e) => tracing::warn!("project: unparseable SummaryComputed payload: {e}"),
             }
         }

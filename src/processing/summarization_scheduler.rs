@@ -72,8 +72,6 @@ pub fn use_summarization_scheduler() {
                             .generate_summary(&active_session, &settings_guard)
                             .await
                         {
-                            let summary_value =
-                                serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null);
                             // Write the new summary back to the session, and
                             // apply any tab emoji/topic it carries (see
                             // `apply_tab_identity_from_summary`'s doc comment
@@ -88,15 +86,12 @@ pub fn use_summarization_scheduler() {
                             // apply this summary/tab_title/tab_emoji to
                             // whatever tab is active *now* instead of the
                             // one it was actually generated for.
-                            let tab_titled = {
+                            let (summary_value, tab_titled) = {
                                 let mut state = session_state.write();
-                                state.sessions.get_mut(&active_session.id).and_then(|session| {
-                                    let titled = crate::session::apply_tab_identity_from_summary(
-                                        session, &summary,
-                                    );
-                                    session.active_context.conversation_summary = summary;
-                                    titled
-                                })
+                                match state.sessions.get_mut(&active_session.id) {
+                                    Some(session) => crate::session::adopt_summary(session, summary),
+                                    None => (serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null), None),
+                                }
                             };
                             crate::session_events::log_event(
                                 &active_session.id,
@@ -153,8 +148,6 @@ pub fn use_summarization_scheduler() {
                                 .generate_summary(&active_session, &settings_guard)
                                 .await
                             {
-                                let summary_value = serde_json::to_value(&summary)
-                                    .unwrap_or(serde_json::Value::Null);
                                 // Write the new summary back to the session,
                                 // and apply any tab emoji/topic it carries —
                                 // this is the path an ordinary new tab (no
@@ -172,15 +165,12 @@ pub fn use_summarization_scheduler() {
                                 // apply this session's summary/tab_title/
                                 // tab_emoji onto whatever tab is active now
                                 // instead of the one it was generated for.
-                                let tab_titled = {
+                                let (summary_value, tab_titled) = {
                                     let mut state = session_state.write();
-                                    state.sessions.get_mut(&active_session.id).and_then(|session| {
-                                        let titled = crate::session::apply_tab_identity_from_summary(
-                                            session, &summary,
-                                        );
-                                        session.active_context.conversation_summary = summary;
-                                        titled
-                                    })
+                                    match state.sessions.get_mut(&active_session.id) {
+                                        Some(session) => crate::session::adopt_summary(session, summary),
+                                        None => (serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null), None),
+                                    }
                                 };
                                 crate::session_events::log_event(
                                     &active_session.id,

@@ -183,6 +183,33 @@ pub const TAB_TITLE_MATURE_USER_MESSAGES: usize = 3;
 /// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
 /// carried no proposal, the tab's identity is locked (user-set or a final AI
 /// title), the tab is still too short to retitle, or it has no user message.
+/// A tab emoji and title to journal as `TabTitled`.
+pub type TabIdentity = (Option<String>, Option<String>);
+
+/// The key under which a `SummaryComputed` journal entry carries
+/// `Session::summary_sources` beside the summary's own fields.
+pub const SUMMARY_SOURCES_KEY: &str = "source_profiles";
+
+/// Adopt a freshly computed summary into `session`: record which
+/// companies' data it may hold (`Session::summary_sources`, harness-set —
+/// the model has no say), apply its tab identity, and store it. Returns the
+/// payload to journal as `SummaryComputed` (the summary plus its sources)
+/// and the tab identity to journal as `TabTitled`. Every site that computes
+/// a summary goes through here.
+pub fn adopt_summary(
+    session: &mut Session,
+    summary: ConversationSummary,
+) -> (Value, Option<TabIdentity>) {
+    session.summary_sources = crate::mcp::manager::profile_reach::summary_sources(session);
+    let titled = apply_tab_identity_from_summary(session, &summary);
+    let mut value = serde_json::to_value(&summary).unwrap_or(Value::Null);
+    if let (Some(map), false) = (value.as_object_mut(), session.summary_sources.is_empty()) {
+        map.insert(SUMMARY_SOURCES_KEY.into(), serde_json::json!(session.summary_sources));
+    }
+    session.active_context.conversation_summary = summary;
+    (value, titled)
+}
+
 pub fn apply_tab_identity_from_summary(
     session: &mut Session,
     summary: &ConversationSummary,
@@ -394,6 +421,27 @@ pub struct Session {
     /// there); ignored for system sessions. Journaled as `ProfileReachSet`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_reach: Vec<String>,
+    /// The Composio profiles whose data the conversation summary may hold
+    /// (profile ids, or a `composio-native:{name}` server name for an
+    /// unstamped call). Set only by `adopt_summary`, never from model
+    /// output, and kept off the summary itself so it never reaches the
+    /// prompt. The cross-company hold counts these in an ordinary tab after
+    /// the messages they came from are gone. Journaled inside
+    /// `SummaryComputed`; cleared with the summary on rewind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary_sources: Vec<String>,
+}
+
+impl Session {
+    /// After a repin: the new home leaves the tab's reach list (it is home,
+    /// not reach). Returns the new list when it changed, for the caller to
+    /// journal as `ProfileReachSet`.
+    pub fn drop_home_from_reach(&mut self) -> Option<Vec<String>> {
+        let home = self.composio_profile.as_deref()?;
+        let i = self.profile_reach.iter().position(|p| p == home)?;
+        self.profile_reach.remove(i);
+        Some(self.profile_reach.clone())
+    }
 }
 
 /// One Composio read carried into a rotated system session's successor.
@@ -644,6 +692,7 @@ impl Session {
 
         if count > 0 {
             self.active_context.conversation_summary = Default::default();
+            self.summary_sources.clear();
             tracing::debug!(
                 "Reset conversation_summary after undo ({} messages removed)",
                 count
@@ -1775,6 +1824,7 @@ impl SessionState {
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
+            summary_sources: Vec::new(),
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -2382,6 +2432,7 @@ mod tests {
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
+            summary_sources: Vec::new(),
             }
         }
 
@@ -3234,6 +3285,7 @@ mod tests {
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
+            summary_sources: Vec::new(),
             messages: vec![
                 Message {
                     id: msg1_id,

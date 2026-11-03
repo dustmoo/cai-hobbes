@@ -109,6 +109,28 @@ pub fn reach_of(settings: &Settings, session: &crate::session::Session) -> Vec<R
     session_reach(settings, &session.id, home.as_deref(), &session.profile_reach)
 }
 
+/// What a tab's profile chip shows, from the same resolution dispatch uses
+/// ([`reach_of`]): the home profile's id (`None` when nothing resolves),
+/// whether its reach can be edited here (an ordinary tab with a home), and
+/// the names of the other profiles it reaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChipReach {
+    pub home: Option<String>,
+    pub editable: bool,
+    pub extra: Vec<String>,
+}
+
+pub fn chip_reach(settings: &Settings, session: &crate::session::Session) -> ChipReach {
+    let reach = reach_of(settings, session);
+    let home = reach.first().map(|h| h.id.clone());
+    let editable = home.is_some() && !crate::system_sessions::is_system(&session.id);
+    ChipReach {
+        home,
+        editable,
+        extra: if editable { reach.into_iter().skip(1).map(|p| p.name).collect() } else { Vec::new() },
+    }
+}
+
 /// Every configured profile as a [`ReachProfile`] — names for a hold's
 /// wording when a profile read earlier has since left the reach.
 pub fn all_profiles(settings: &Settings) -> Vec<ReachProfile> {
@@ -119,29 +141,15 @@ pub fn all_profiles(settings: &Settings) -> Vec<ReachProfile> {
         .collect()
 }
 
-/// Whether `session` called a Composio tool through reach (naming a
-/// profile with [`PROFILE_ARG`]) within [`READ_WINDOW`] of `now`. Such a
-/// session stays under the cross-company hold after its reach is narrowed:
-/// taking a profile off the chip doesn't take its data out of the
-/// conversation, and doesn't reset the reads already recorded.
-pub fn used_reach(session: &crate::session::Session, now: chrono::DateTime<chrono::Utc>) -> bool {
-    session.messages.iter().any(|m| match &m.content {
-        MessageContent::ToolCall(tc) if is_composio_native(&tc.server_name) => {
-            now - tc.completed_at.unwrap_or(m.created_at) <= READ_WINDOW
-                && serde_json::from_str::<Value>(&tc.arguments)
-                    .ok()
-                    .and_then(|a| asked_profile(&tc.tool_name, &a))
-                    .is_some()
-        }
-        _ => false,
-    })
-}
-
-/// [`resume_profile`] with an ordinary tab's own reach (`selected`). A held
-/// call the model routed with [`PROFILE_ARG`] runs in the profile it was
-/// routed to — refused if that profile has since left the tab's reach (or
-/// was deleted), never moved home. Unrouted calls, and system sessions,
-/// behave exactly as before.
+/// [`resume_profile`] with an ordinary tab's own reach (`selected`). The
+/// profile a Composio call was stamped with at mint (`profile_id`: its
+/// routed target, else the turn's home) is where it runs — `hobbes_profile`
+/// argument or not — and only while that profile is still the tab's home or
+/// in its reach; otherwise it is refused, never moved to the current home
+/// (repinning between hold and approval would run a flow nobody was shown).
+/// Only a call that is neither routed nor flow-held, in a tab without
+/// reach, keeps the old behaviour: the tab's current pin. System sessions
+/// use [`resume_profile`] unchanged.
 pub fn resume_profile_in(
     settings: &Settings,
     session_id: &str,
@@ -152,23 +160,53 @@ pub fn resume_profile_in(
     if crate::system_sessions::is_system(session_id) || !is_composio_native(&tool_call.server_name) {
         return resume_profile(settings, session_id, session_profile, tool_call);
     }
-    let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
-    if asked_profile(&tool_call.tool_name, &args).is_none() {
-        return Ok(session_profile.map(str::to_string));
-    }
     let home = home_profile(settings, session_profile);
     let reach = session_reach(settings, session_id, home.as_deref(), selected);
+    let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+    let routed = asked_profile(&tool_call.tool_name, &args).is_some();
+    if reach.len() < 2 && !routed && tool_call.hold_rule_key.is_none() {
+        return Ok(session_profile.map(str::to_string));
+    }
     let target = tool_call
         .profile_id
         .clone()
         .or_else(|| profile_for_server_name(settings, &tool_call.server_name).map(str::to_string));
     match target {
         Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
+        None if !routed => Ok(session_profile.map(str::to_string)),
         _ => Err(format!(
-            "Not run: the profile this was meant for ({}) is no longer in this tab's reach, and it won't be run in another company's account.",
+            "Not run: the profile this was meant for ({}) is no longer this tab's home or in its reach, and it won't be run in another company's account.",
             tool_call.server_name.trim_start_matches(COMPOSIO_NATIVE_PREFIX).trim_start_matches(':')
         )),
     }
+}
+
+/// Whether the cross-company hold applies to a call: the session has reach,
+/// or it holds data read from a profile other than its current `home` —
+/// through reach since narrowed, or at an earlier home before a repin. A
+/// tab that has only ever used one profile is never checked.
+pub fn flow_checked(reach: &[ReachProfile], read_from: &BTreeSet<String>) -> bool {
+    match reach.first() {
+        None => false,
+        Some(home) => reach.len() >= 2 || read_from.iter().any(|id| id != &home.id),
+    }
+}
+
+/// The profiles a session's next summary may hold data from: what its
+/// current summary holds plus every Composio result still in its messages.
+/// Profile ids where the call was stamped, else its server name (resolved
+/// when read, by [`session_read_profiles`]).
+pub fn summary_sources(session: &crate::session::Session) -> Vec<String> {
+    let mut out: BTreeSet<String> =
+        session.summary_sources.iter().cloned().collect();
+    for m in &session.messages {
+        if let MessageContent::ToolCall(tc) = &m.content {
+            if tc.status == ToolCallStatus::Completed && is_composio_native(&tc.server_name) {
+                out.insert(tc.profile_id.clone().unwrap_or_else(|| tc.server_name.clone()));
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// The bubble's "always allow" wording for a flow key, in profile names.
@@ -524,16 +562,39 @@ pub fn session_recent_reads(
     merge_reads(recent_reads(settings, &session.messages, now).into_iter().chain(session.carried_reads.iter().cloned()), now)
 }
 
-/// Profiles this session has read Composio results from within
-/// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
-/// model's context — plus reads a rotated system session carried over from
-/// the session it replaced (`Session::carried_reads`; the data may be in
-/// the carried summary).
+/// Profiles whose data is in play in this session.
+///
+/// - **System sessions** (Heartbeat, Voice): Composio results read within
+///   [`READ_WINDOW`] of `now` — across messages, since read data stays in
+///   the model's context — plus reads a rotated session carried over from
+///   the session it replaced (`Session::carried_reads`; the data may be in
+///   the carried summary).
+/// - **Ordinary tabs**: no clock. A tab keeps its history in context for
+///   days, so every Composio result still in its messages counts, and so
+///   does every profile its conversation summary holds data from
+///   (`Session::summary_sources`), after the messages are gone. Reads
+///   carried in from elsewhere (`carried_reads`) keep their window.
 pub fn session_read_profiles(
     settings: &Settings,
     session: &crate::session::Session,
     now: chrono::DateTime<chrono::Utc>,
 ) -> BTreeSet<String> {
+    if !crate::system_sessions::is_system(&session.id) {
+        let carried = session.carried_reads.iter().filter(|r| now - r.read_at <= READ_WINDOW).map(|r| r.profile_id.clone());
+        return summary_sources(session)
+            .into_iter()
+            .filter_map(|s| {
+                if s.starts_with(COMPOSIO_NATIVE_PREFIX) {
+                    profile_for_server_name(settings, &s).map(str::to_string)
+                } else {
+                    // A stamped id — kept even if the profile was deleted
+                    // since: its data is still in the conversation.
+                    Some(s)
+                }
+            })
+            .chain(carried)
+            .collect();
+    }
     let mut out: BTreeSet<String> =
         recent_reads(settings, &session.messages, now).into_iter().map(|r| r.profile_id).collect();
     out.extend(
@@ -882,11 +943,13 @@ mod tests {
             mk("Hobbes", "terminal", Some("x"), ToolCallStatus::Completed), // not Composio
         ];
         let now = chrono::Utc::now();
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, "reach-test-voice");
         let mut session = crate::session_events::blank_session();
+        session.id = "reach-test-voice".into();
         session.messages = msgs;
         let read = session_read_profiles(&settings, &session, now);
         assert_eq!(read.into_iter().collect::<Vec<_>>(), ["cm", "pg"]);
-        // Reads age out of the window.
+        // A system session's reads age out of the window.
         assert!(session_read_profiles(&settings, &session, now + READ_WINDOW + chrono::Duration::minutes(1)).is_empty());
     }
 
@@ -956,10 +1019,10 @@ mod tests {
         // Only deleted profiles ticked: still single-profile.
         assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &["gone".to_string()]).len(), 1);
         // System sessions keep their own reach; the tab list is ignored.
-        crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "p2-hb");
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "reach-test-hb");
         assert_eq!(
-            session_reach(&settings, "p2-hb", Some("cm"), &["gone".to_string()]),
-            reach_for_session(&settings, "p2-hb", Some("cm"))
+            session_reach(&settings, "reach-test-hb", Some("cm"), &["gone".to_string()]),
+            reach_for_session(&settings, "reach-test-hb", Some("cm"))
         );
     }
 
@@ -1028,14 +1091,159 @@ mod tests {
         // …and the held one is refused on approval, never moved home.
         assert!(resume_profile_in(&settings, &session.id, Some("cm"), &session.profile_reach, &held).is_err());
         // The Puget read still counts: a write at home is held as a flow.
-        assert!(used_reach(&session, now));
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(read_from.contains("pg"));
+        assert!(flow_checked(&reach, &read_from));
         let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
         assert_eq!(h.rule_key, "profile-flow:pg>cm");
         assert!(h.reason.contains("read Puget data"), "named although Puget left the reach");
-        // Once the read window passes, the tab is back to single-profile.
-        assert!(!used_reach(&session, now + READ_WINDOW + chrono::Duration::minutes(1)));
+    }
+
+    // ── Review fixes ────────────────────────────────────────────────────
+
+    fn tab(id: &str, home: &str, reach: &[&str]) -> crate::session::Session {
+        let mut s = crate::session_events::blank_session();
+        s.id = id.into();
+        s.composio_profile = Some(home.into());
+        s.profile_reach = reach.iter().map(|r| r.to_string()).collect();
+        s
+    }
+
+    /// A read made at home, without `hobbes_profile` (stamped at mint).
+    fn read_at_home(profile: &ReachProfile, at: chrono::DateTime<chrono::Utc>) -> Message {
+        let mut m = read_via_reach(profile, at);
+        if let MessageContent::ToolCall(tc) = &mut m.content {
+            tc.arguments = json!({}).to_string();
+        }
+        m
+    }
+
+    /// 1. A held write with no `hobbes_profile` runs where it was stamped —
+    /// never in a profile the tab was repinned to after the hold.
+    #[test]
+    fn a_repin_never_reroutes_a_held_write() {
+        let settings = reach_settings();
+        let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
+        let session = tab("p2-repin-resume", "cm", &["pg"]);
+        // Home Clearmirror, Puget ticked: a write with no argument routes home
+        // (stamped cm) and, with Puget data read, is held as pg>cm.
+        let mut held = call(json!({"to": "a@b.c"}));
+        assert_eq!(route_tool_call(&reach_of(&settings, &session), &mut held), Route::To(cm.clone()));
+        let read_from: BTreeSet<String> = ["cm".to_string(), "pg".to_string()].into();
+        let hold = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
+        assert_eq!(hold.rule_key, "profile-flow:pg>cm");
+        held.hold_rule_key = Some(hold.rule_key);
+        // Approved while still home: runs in Clearmirror.
+        assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), &["pg".into()], &held), Ok(Some("cm".into())));
+        // "Make Puget home", then approve: refused, not run in Puget.
+        assert!(resume_profile_in(&settings, &session.id, Some("pg"), &[], &held).is_err());
+        // Still in reach after the repin: runs where it was shown, Clearmirror.
+        assert_eq!(resume_profile_in(&settings, &session.id, Some("pg"), &["cm".into()], &held), Ok(Some("cm".into())));
+        // An unheld call in a tab without reach keeps the tab's current pin.
+        let mut plain = call(json!({"to": "a@b.c"}));
+        plain.profile_id = Some(pg.id.clone());
+        assert_eq!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), &[], &plain), Ok(Some("cm".into())));
+    }
+
+    /// 2. Ordinary tabs keep foreign data in play with no clock; system
+    /// sessions keep the window.
+    #[test]
+    fn an_ordinary_tab_reads_never_age_out() {
+        let settings = reach_settings();
+        let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
+        let then = chrono::Utc::now() - chrono::Duration::minutes(150);
+        let now = chrono::Utc::now();
+        let mut session = tab("p2-no-clock", "cm", &["pg"]);
+        session.messages.push(read_via_reach(&pg, then));
+        let read_from = session_read_profiles(&settings, &session, now);
+        assert!(read_from.contains("pg"), "a read 2.5 h old still counts in an ordinary tab");
+        let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+
+        // Summarised, then the messages are gone: the summary still counts.
+        let (value, _) = crate::session::adopt_summary(&mut session, Default::default());
+        assert_eq!(value[crate::session::SUMMARY_SOURCES_KEY], json!(["pg"]), "journaled with the summary");
+        assert!(
+            serde_json::to_value(&session.active_context.conversation_summary).unwrap().get(crate::session::SUMMARY_SOURCES_KEY).is_none(),
+            "kept off the summary the prompt renders"
+        );
+        session.messages.clear();
+        assert_eq!(session_read_profiles(&settings, &session, now), BTreeSet::from(["pg".to_string()]));
+        // The next summary keeps it (it was written from this one).
+        let _ = crate::session::adopt_summary(&mut session, Default::default());
+        assert_eq!(session.summary_sources, ["pg"]);
+        // A replay rebuild keeps it.
+        let mut replayed = crate::session_events::blank_session();
+        crate::session_events::apply_for_test(&mut replayed, &crate::session_events::SessionEvent::SummaryComputed { summary: value });
+        assert_eq!(replayed.summary_sources, ["pg"]);
+        // An undo that resets the summary clears it.
+        let m = read_at_home(&cm, now);
+        let id = m.id.to_string();
+        session.messages.push(m);
+        session.truncate_from_message(&id);
+        assert!(session.summary_sources.is_empty());
+        assert!(session_read_profiles(&settings, &session, now).is_empty());
+
+        // A system session keeps the 2 h window exactly.
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, "reach-test-voice");
+        let mut voice = tab("reach-test-voice", "cm", &[]);
+        voice.messages.push(read_via_reach(&pg, then));
+        assert!(session_read_profiles(&settings, &voice, now).is_empty());
+    }
+
+    /// 3. A repin keeps the old home's data under the hold; a tab that only
+    /// ever used one profile is unchanged.
+    #[test]
+    fn a_repin_keeps_the_flow_check() {
+        let settings = reach_settings();
+        let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
+        let now = chrono::Utc::now();
+        // Read Puget at home (no argument), then "Make Clearmirror home".
+        let mut session = tab("p2-repin-flow", "pg", &[]);
+        session.messages.push(read_at_home(&pg, now));
+        session.composio_profile = Some("cm".into());
+        let reach = reach_of(&settings, &session);
+        assert_eq!(reach, vec![cm.clone()]);
+        let read_from = session_read_profiles(&settings, &session, now);
+        assert!(flow_checked(&reach, &read_from));
+        let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+
+        // A one-profile tab: never checked.
+        let mut single = tab("p2-single", "cm", &[]);
+        single.messages.push(read_at_home(&cm, now));
+        let reach = reach_of(&settings, &single);
+        assert!(!flow_checked(&reach, &session_read_profiles(&settings, &single, now)));
+        assert!(!flow_checked(&[], &BTreeSet::from(["pg".to_string()])));
+    }
+
+    /// 4. The chip's home is dispatch's home, not a display fallback.
+    #[test]
+    fn the_chip_shows_the_home_calls_run_in() {
+        let settings = reach_settings();
+        let chip = chip_reach(&settings, &tab("p2-chip", "cm", &["pg", "gone"]));
+        assert_eq!(chip, ChipReach { home: Some("cm".into()), editable: true, extra: vec!["Puget".into()] });
+        // Pinned to a deleted profile: dispatch has no home, so neither does
+        // the chip (not the global active profile), and reach can't be edited.
+        let chip = chip_reach(&settings, &tab("p2-chip-gone", "gone", &["pg"]));
+        assert_eq!(chip, ChipReach { home: None, editable: false, extra: vec![] });
+        // Unpinned: the global active profile, as dispatch.
+        let mut unpinned = tab("p2-chip-unpinned", "x", &["pg"]);
+        unpinned.composio_profile = None;
+        assert_eq!(chip_reach(&settings, &unpinned).home.as_deref(), Some("cm"));
+        // System sessions: no editing.
+        crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "reach-test-hb");
+        assert!(!chip_reach(&settings, &tab("reach-test-hb", "cm", &[])).editable);
+    }
+
+    /// 5. Repinning to a ticked profile takes it out of the reach list.
+    #[test]
+    fn a_new_home_leaves_the_reach_list() {
+        let mut session = tab("p2-new-home", "cm", &["pg", "ac"]);
+        assert_eq!(session.drop_home_from_reach(), None, "home wasn't ticked");
+        session.composio_profile = Some("pg".into());
+        assert_eq!(session.drop_home_from_reach(), Some(vec!["ac".to_string()]));
+        assert_eq!(session.profile_reach, ["ac"]);
     }
 
     #[test]
