@@ -380,10 +380,8 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let rule_server = tool_call.hold_rule_key.clone().unwrap_or_else(|| tool_call.server_name.clone());
     let allow_label = match (&command_prefix, &tool_call.hold_rule_key) {
         (Some(p), _) => format!("Always allow `{p}`"),
-        (None, Some(_)) => format!(
-            "Always allow {} across these companies ({})",
-            tool_call.tool_name, tool_call.server_name
-        ),
+        (None, Some(key)) => crate::mcp::manager::profile_reach::flow_label(&settings.peek(), key, &tool_call.tool_name)
+            .unwrap_or_else(|| format!("Always allow {} here", tool_call.tool_name)),
         (None, None) => format!(
             "Always allow {} on {}",
             tool_call.tool_name, tool_call.server_name

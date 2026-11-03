@@ -74,6 +74,20 @@ pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<
     out
 }
 
+/// The bubble's "always allow" wording for a flow key, in profile names.
+pub fn flow_label(settings: &Settings, rule_key: &str, tool: &str) -> Option<String> {
+    let rest = rule_key.strip_prefix(FLOW_KEY_PREFIX)?;
+    let (from, to) = rest.split_once('>')?;
+    let name = |id: &str| settings.profile_name_for_id(id).unwrap_or(id).to_string();
+    let to_name = if to == "local" { "commands and other tabs".to_string() } else { name(to) };
+    Some(if from == "act" {
+        format!("Always allow {tool} in {to_name} (with no other company's data in play)")
+    } else {
+        let from: Vec<String> = from.split('+').map(name).collect();
+        format!("Always allow {tool} to carry {} data into {to_name}", from.join(" and "))
+    })
+}
+
 /// The system-prompt instruction for a session with reach.
 pub fn reach_instruction(home: &str, others: &[&str]) -> String {
     format!(
@@ -348,13 +362,24 @@ pub fn resume_profile(
     }
 }
 
-/// Profiles this session has read Composio results from — anywhere in its
-/// history, since read data stays in the model's context and summary.
-pub fn session_read_profiles(settings: &Settings, messages: &[Message]) -> BTreeSet<String> {
+/// How long a read counts: data read from a company within this window is
+/// treated as still in play. Long enough to span a voice conversation or a
+/// run of Heartbeat wakes (not just the latest message); short enough that
+/// one read doesn't hold every write in a long-lived session for good.
+pub const READ_WINDOW: chrono::Duration = chrono::Duration::hours(2);
+
+/// Profiles this session has read Composio results from within
+/// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
+/// model's context.
+pub fn session_read_profiles(settings: &Settings, messages: &[Message], now: chrono::DateTime<chrono::Utc>) -> BTreeSet<String> {
     messages
         .iter()
         .filter_map(|m| match &m.content {
-            MessageContent::ToolCall(tc) if tc.status == ToolCallStatus::Completed && is_composio_native(&tc.server_name) => {
+            MessageContent::ToolCall(tc)
+                if tc.status == ToolCallStatus::Completed
+                    && is_composio_native(&tc.server_name)
+                    && now - tc.completed_at.unwrap_or(m.created_at) <= READ_WINDOW =>
+            {
                 tc.profile_id
                     .clone()
                     .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string))
@@ -368,7 +393,9 @@ pub fn session_read_profiles(settings: &Settings, messages: &[Message]) -> BTree
 /// discover or load tools don't; the execute meta tool is judged by the
 /// tool it runs.
 pub fn is_write(tool_name: &str, args: &Value) -> bool {
-    if tool_name.starts_with("COMPOSIO_") && tool_name != EXECUTE_TOOL {
+    // Only Hobbes' own discovery / loading meta tools; any other COMPOSIO_*
+    // tool (multi-execute, workbench, …) is judged like a normal tool.
+    if matches!(tool_name, "COMPOSIO_DISCOVER_APPS" | "COMPOSIO_GET_APP_TOOLS" | "COMPOSIO_CLEAR_TOOLS") {
         return false;
     }
     let (tool, inner) = if tool_name == EXECUTE_TOOL {
@@ -382,12 +409,26 @@ pub fn is_write(tool_name: &str, args: &Value) -> bool {
     crate::todo::agent_time::agent_time_scope_allows(tool, &inner) != crate::todo::agent_time::ScopeVerdict::Allow
 }
 
+/// Whether a call that isn't routed to a Composio profile moves data out of
+/// the session: terminal commands and other MCP writes, and handing work or
+/// messages to another tab. Hobbes' own space (timers, todos, planner,
+/// scratchpad) is not another company.
+pub fn local_write(server_name: &str, tool_name: &str, args: &Value) -> bool {
+    use super::{HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER};
+    if matches!(server_name, HOBBES_CORE_SERVER | HOBBES_META_SERVER | HOBBES_PLANNER_SERVER) || tool_name.starts_with("HOBBES_") {
+        return matches!(tool_name, "HOBBES_DISPATCH" | "HOBBES_MESSAGE_PARENT" | "HOBBES_MESSAGE_WORKER");
+    }
+    is_write(tool_name, args)
+}
+
 /// A held cross-company write: why, and the trust key that remembers it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hold {
     pub reason: String,
-    /// `profile-flow:{source ids}>{target id or "local"}` — matched by trust
-    /// rules created from this bubble only.
+    /// `profile-flow:{source ids}>{target id or "local"}` (data flowing) or
+    /// `profile-flow:act>{target id}` (acting outside home, no foreign data)
+    /// — distinct, so allowing one never allows the other; matched only by
+    /// trust rules created from such a bubble.
     pub rule_key: String,
 }
 
@@ -426,7 +467,7 @@ pub fn cross_company_hold(
     match target {
         Some(t) if t.id != home.id => Some(Hold {
             reason: format!("This acts in {}, outside {} (Hobbes' home profile).", t.name, home.name),
-            rule_key: format!("{FLOW_KEY_PREFIX}{}>{}", home.id, t.id),
+            rule_key: format!("{FLOW_KEY_PREFIX}act>{}", t.id),
         }),
         _ => None,
     }
@@ -608,7 +649,8 @@ mod tests {
         // Any write outside home holds.
         let h = cross_company_hold(Some(&pg), &cm, &none, &reach, true).unwrap();
         assert!(h.reason.contains("outside Clearmirror"));
-        assert_eq!(h.rule_key, "profile-flow:cm>pg");
+        // Distinct from "Clearmirror data into Puget", so allowing one never allows the other.
+        assert_eq!(h.rule_key, "profile-flow:act>pg");
     }
 
     #[test]
@@ -636,6 +678,29 @@ mod tests {
         // Discovery / loading meta tools are not writes.
         assert!(!is_write("COMPOSIO_DISCOVER_APPS", &json!({})));
         assert!(!is_write("COMPOSIO_CLEAR_TOOLS", &json!({})));
+        // Other COMPOSIO_* tools are judged by their verbs.
+        assert!(is_write("COMPOSIO_MULTI_EXECUTE_TOOL", &json!({})));
+    }
+
+    #[test]
+    fn hobbes_own_space_is_not_another_company() {
+        assert!(!local_write("hobbes-core", "HOBBES_SET_TIMER", &json!({})));
+        assert!(!local_write("hobbes-planner", "HOBBES_TODO_CREATE", &json!({})));
+        // Data leaving the session for another tab or the shell.
+        assert!(local_write("hobbes-planner", "HOBBES_DISPATCH", &json!({})));
+        assert!(local_write("hobbes-core", "HOBBES_MESSAGE_WORKER", &json!({})));
+        assert!(local_write("hobbes-terminal", "RUN_COMMAND", &json!({"command": "curl -X POST x"})));
+    }
+
+    #[test]
+    fn flow_labels_say_what_is_allowed() {
+        let settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        assert_eq!(
+            flow_label(&settings, "profile-flow:cm>pg", "GMAIL_SEND_EMAIL").unwrap(),
+            "Always allow GMAIL_SEND_EMAIL to carry Clearmirror data into Puget"
+        );
+        assert!(flow_label(&settings, "profile-flow:act>pg", "X").unwrap().contains("in Puget (with no other company's data"));
+        assert_eq!(flow_label(&settings, "composio-native:Puget", "X"), None);
     }
 
     #[test]
@@ -659,8 +724,11 @@ mod tests {
             mk("Hobbes", "composio-native:Acme", Some("ac"), ToolCallStatus::Running), // not read yet
             mk("Hobbes", "terminal", Some("x"), ToolCallStatus::Completed), // not Composio
         ];
-        let read = session_read_profiles(&settings, &msgs);
+        let now = chrono::Utc::now();
+        let read = session_read_profiles(&settings, &msgs, now);
         assert_eq!(read.into_iter().collect::<Vec<_>>(), ["cm", "pg"]);
+        // Reads age out of the window.
+        assert!(session_read_profiles(&settings, &msgs, now + READ_WINDOW + chrono::Duration::minutes(1)).is_empty());
     }
 
     fn settings_with(profiles: &[(&str, &str, bool)]) -> Settings {

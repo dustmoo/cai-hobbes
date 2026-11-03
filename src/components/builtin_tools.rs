@@ -576,7 +576,14 @@ pub async fn dispatch_builtin_tool(
                 .and_then(serde_json::Value::as_str)
                 .and_then(crate::voice::session::Peer::parse);
             let limit = args_json.get("limit").and_then(serde_json::Value::as_u64).unwrap_or(12) as usize;
+            // Only the system sessions read each other: their tails can hold
+            // any company's data, and an ordinary tab has no cross-company
+            // guard (mcp::manager::profile_reach).
             let (status, response) = match peer {
+                Some(_) if !crate::system_sessions::is_system(session_id) => (
+                    ToolCallStatus::Error,
+                    "Only the Heartbeat and Voice tabs can read each other.".to_string(),
+                ),
                 Some(p) => match crate::voice::session::peer_tail(session_state, p, limit) {
                     Ok(text) => (ToolCallStatus::Completed, text),
                     Err(e) => (ToolCallStatus::Error, e),

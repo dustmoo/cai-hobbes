@@ -557,7 +557,11 @@ pub fn ChatWindow(
                                     &tool_call,
                                 )
                             };
-                            let routed = matches!(&call_profile, Ok(Some(p)) if composio_profile.as_deref() != Some(p.as_str()));
+                            // Connect only another company's client (not home's).
+                            let routed = {
+                                let home = crate::mcp::manager::profile_reach::home_profile(&settings.peek(), composio_profile.as_deref());
+                                matches!(&call_profile, Ok(Some(p)) if home.as_deref() != Some(p.as_str()))
+                            };
                             let result_receiver = match call_profile {
                                 // Its profile is gone: refuse, never re-route.
                                 Err(e) => Err(e),

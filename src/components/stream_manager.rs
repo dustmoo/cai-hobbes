@@ -640,15 +640,13 @@ impl StreamManagerContext {
                                 let state = self.session_state.peek();
                                 let session = state.sessions.get(&session_id);
                                 let read_from = session
-                                    .map(|s| reach_mod::session_read_profiles(&settings_read, &s.messages))
+                                    .map(|s| reach_mod::session_read_profiles(&settings_read, &s.messages, chrono::Utc::now()))
                                     .unwrap_or_default();
-                                let hold = reach_mod::cross_company_hold(
-                                    target,
-                                    &reach[0],
-                                    &read_from,
-                                    &reach,
-                                    reach_mod::is_write(&tool_call.tool_name, &args),
-                                );
+                                let write = match target {
+                                    Some(_) => reach_mod::is_write(&tool_call.tool_name, &args),
+                                    None => reach_mod::local_write(&tool_call.server_name, &tool_call.tool_name, &args),
+                                };
+                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &reach, write);
                                 if let Some(hold) = hold {
                                     let project_id = session.and_then(|s| s.project_id.clone());
                                     let rule = crate::context::trust::evaluate(
@@ -678,8 +676,16 @@ impl StreamManagerContext {
                                     }
                                 }
                             }
-                            route
+                            // Only another company's client may need connecting
+                            // (home's is already up; a legacy single client
+                            // must not get a second, profile-keyed twin).
+                            let connect_target = match &route {
+                                reach_mod::Route::To(t) if Some(&t.id) != home.as_ref() => Some(t.clone()),
+                                _ => None,
+                            };
+                            (route, connect_target)
                         };
+                        let (route, connect_target) = route;
 
                         tool_call_count += 1;
                         let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
@@ -959,8 +965,8 @@ impl StreamManagerContext {
                             // A call routed to another profile needs that
                             // profile's client: connect it, and fail rather than
                             // fall back to another company's account.
-                            let ensured: Result<(), String> = match &route {
-                                crate::mcp::manager::profile_reach::Route::To(t) => {
+                            let ensured: Result<(), String> = match &connect_target {
+                                Some(t) => {
                                     let settings_snapshot = self.settings.peek().clone();
                                     mcp_manager
                                         .read()
