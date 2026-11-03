@@ -387,6 +387,13 @@ pub struct Session {
     /// this session's own messages until they age out of the read window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_reads: Vec<CarriedRead>,
+    /// Multi-profile reach, phase 2: the other Composio profiles (ids) this
+    /// ordinary tab may also act in, ticked on its profile chip. Its pin
+    /// (`composio_profile`) stays home. Empty = single-profile, as before.
+    /// Resolved by `profile_reach::session_reach` (deleted profiles drop out
+    /// there); ignored for system sessions. Journaled as `ProfileReachSet`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_reach: Vec<String>,
 }
 
 /// One Composio read carried into a rotated system session's successor.
@@ -1767,6 +1774,7 @@ impl SessionState {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -2373,6 +2381,7 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
             }
         }
 
@@ -3224,6 +3233,7 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
             messages: vec![
                 Message {
                     id: msg1_id,

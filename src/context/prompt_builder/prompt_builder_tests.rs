@@ -44,6 +44,7 @@ fn create_test_session() -> Session {
         dispatch_link: None,
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
     }
 }
 

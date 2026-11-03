@@ -155,6 +155,9 @@ pub enum SessionEvent {
     /// A rotated system session took over its predecessor's recent Composio
     /// reads (`session_rotation`), so the cross-company hold still sees them.
     ReadsCarried { reads: Vec<crate::session::CarriedRead> },
+    /// The profiles ticked on an ordinary tab's profile chip as its reach
+    /// (`Session::profile_reach`; empty = none).
+    ProfileReachSet { profiles: Vec<String> },
 }
 
 impl SessionEvent {
@@ -191,6 +194,7 @@ impl SessionEvent {
             SessionEvent::DispatchLinked { .. } => "DispatchLinked",
             SessionEvent::WorkerAdded { .. } => "WorkerAdded",
             SessionEvent::ReadsCarried { .. } => "ReadsCarried",
+            SessionEvent::ProfileReachSet { .. } => "ProfileReachSet",
         }
     }
 }
@@ -255,6 +259,7 @@ pub(crate) fn blank_session() -> Session {
         dispatch_link: None,
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
     }
 }
 
@@ -320,6 +325,7 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
             }
         }
         E::ReadsCarried { reads } => session.carried_reads = reads.clone(),
+        E::ProfileReachSet { profiles } => session.profile_reach = profiles.clone(),
         E::ScratchpadSet { content } => session.scratchpad = content.clone(),
         E::HandoffWritten { note } => session.handoff = Some(note.clone()),
         E::SkillLoaded { name, payload } => {
@@ -788,9 +794,13 @@ mod tests {
             // Auto-tag, then a manual clear: the clear wins and locks.
             SessionEvent::ProjectTagged { project_id: Some("proj-1".into()), user_set: false },
             SessionEvent::ProjectTagged { project_id: None, user_set: true },
+            // Reach ticked on the chip, then narrowed: the last set wins.
+            SessionEvent::ProfileReachSet { profiles: vec!["profile-2".into(), "profile-3".into()] },
+            SessionEvent::ProfileReachSet { profiles: vec!["profile-3".into()] },
         ]);
 
         let s = project(None, &events);
+        assert_eq!(s.profile_reach, ["profile-3"], "a replay rebuild keeps the tab's reach");
         assert_eq!(s.id, "s1");
         assert_eq!(s.name, "Renamed");
         assert_eq!(s.composio_profile.as_deref(), Some("profile-1"));

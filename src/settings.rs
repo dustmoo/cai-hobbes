@@ -3537,6 +3537,7 @@ mod tests {
         dispatch_link: None,
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
         }
     }
 
