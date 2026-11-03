@@ -485,6 +485,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut ending_at: Option<Instant> = None;
     // When the voice last told them it was thinking (rate-limits the phrase).
     let mut last_holding: Option<Instant> = None;
+    // When the voice last produced speech (any turn): Gemini often says its
+    // holding phrase in one turn and calls the brain in the next.
+    let mut last_spoke: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     ui.phase = Phase::Listening;
     ui.error = None;
@@ -511,6 +514,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 match ev {
                     RealtimeEvent::Ready | RealtimeEvent::Reconnected => {}
                     RealtimeEvent::Audio { pcm, sample_rate } => {
+                        last_spoke = Some(Instant::now());
                         stats.model_audio_ms += (pcm.len() as u64 * 1000) / sample_rate.max(1) as u64;
                         if !heard_buf.trim().is_empty() {
                             pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
@@ -531,6 +535,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         ui.phase = Phase::Listening;
                     }
                     RealtimeEvent::OutputTranscript(t) => {
+                        last_spoke = Some(Instant::now());
                         stats.spoke_fragments += 1;
                         if spoke_buf.trim().is_empty() {
                             spoke_at = Some(chrono::Utc::now());
@@ -575,7 +580,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                     // spoke this turn (its own holding phrase), nor
                                     // again within the cooldown. The result follows
                                     // on this call either way.
-                                    let speak = holding_should_speak(!spoke_buf.trim().is_empty(), last_holding, Instant::now());
+                                    let spoke_recently = !spoke_buf.trim().is_empty()
+                                        || last_spoke.is_some_and(|t| t.elapsed() < RECENT_SPEECH);
+                                    let speak = holding_should_speak(spoke_recently, last_holding, Instant::now());
                                     last_holding = Some(Instant::now());
                                     let _ = rt.control.send(RealtimeControl::ToolResponse {
                                         id: id.clone(),
@@ -836,10 +843,15 @@ fn respond(control: &mpsc::UnboundedSender<RealtimeControl>, id: &str, name: &st
 /// Don't announce "thinking" twice within this long.
 pub const HOLDING_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Speech this recent counts as the voice having just told them (its own
+/// holding phrase, possibly in the turn before the brain call).
+pub const RECENT_SPEECH: Duration = Duration::from_secs(8);
+
 /// Whether the interim response should prompt a holding phrase: not if the
-/// voice already spoke this turn (it said its own), nor within the cooldown.
-pub fn holding_should_speak(spoke_this_turn: bool, last_holding: Option<Instant>, now: Instant) -> bool {
-    !spoke_this_turn && last_holding.is_none_or(|t| now.duration_since(t) >= HOLDING_COOLDOWN)
+/// voice spoke recently (it said its own — this turn or the one before), nor
+/// within the cooldown.
+pub fn holding_should_speak(spoke_recently: bool, last_holding: Option<Instant>, now: Instant) -> bool {
+    !spoke_recently && last_holding.is_none_or(|t| now.duration_since(t) >= HOLDING_COOLDOWN)
 }
 
 /// The interim response when a holding phrase was already said: absorbed
@@ -953,7 +965,8 @@ mod tests {
         let t0 = Instant::now();
         // First hand-off, nothing said yet: say it.
         assert!(holding_should_speak(false, None, t0));
-        // It already said its own holding phrase this turn: stay quiet.
+        // It already said its own holding phrase — this turn, or (as Gemini
+        // does) in the turn just before the brain call: stay quiet.
         assert!(!holding_should_speak(true, None, t0));
         // A second request ten seconds later: quiet.
         assert!(!holding_should_speak(false, Some(t0), t0 + Duration::from_secs(10)));
