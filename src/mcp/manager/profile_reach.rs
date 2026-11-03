@@ -371,25 +371,54 @@ pub fn resume_profile(
 /// one read doesn't hold every write in a long-lived session for good.
 pub const READ_WINDOW: chrono::Duration = chrono::Duration::hours(2);
 
-/// Profiles this session has read Composio results from within
-/// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
-/// model's context.
-pub fn session_read_profiles(settings: &Settings, messages: &[Message], now: chrono::DateTime<chrono::Utc>) -> BTreeSet<String> {
+/// The Composio reads in `messages` within [`READ_WINDOW`] of `now`: which
+/// profile, and when.
+pub fn recent_reads(
+    settings: &Settings,
+    messages: &[Message],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::session::CarriedRead> {
     messages
         .iter()
         .filter_map(|m| match &m.content {
             MessageContent::ToolCall(tc)
-                if tc.status == ToolCallStatus::Completed
-                    && is_composio_native(&tc.server_name)
-                    && now - tc.completed_at.unwrap_or(m.created_at) <= READ_WINDOW =>
+                if tc.status == ToolCallStatus::Completed && is_composio_native(&tc.server_name) =>
             {
-                tc.profile_id
+                let read_at = tc.completed_at.unwrap_or(m.created_at);
+                if now - read_at > READ_WINDOW {
+                    return None;
+                }
+                let profile_id = tc
+                    .profile_id
                     .clone()
-                    .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string))
+                    .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string))?;
+                Some(crate::session::CarriedRead { profile_id, read_at })
             }
             _ => None,
         })
         .collect()
+}
+
+/// Profiles this session has read Composio results from within
+/// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
+/// model's context — plus reads a rotated system session carried over from
+/// the session it replaced (`Session::carried_reads`; the data may be in
+/// the carried summary).
+pub fn session_read_profiles(
+    settings: &Settings,
+    session: &crate::session::Session,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> =
+        recent_reads(settings, &session.messages, now).into_iter().map(|r| r.profile_id).collect();
+    out.extend(
+        session
+            .carried_reads
+            .iter()
+            .filter(|r| now - r.read_at <= READ_WINDOW)
+            .map(|r| r.profile_id.clone()),
+    );
+    out
 }
 
 /// Whether a call changes something outside. Composio meta tools that only
@@ -728,10 +757,12 @@ mod tests {
             mk("Hobbes", "terminal", Some("x"), ToolCallStatus::Completed), // not Composio
         ];
         let now = chrono::Utc::now();
-        let read = session_read_profiles(&settings, &msgs, now);
+        let mut session = crate::session_events::blank_session();
+        session.messages = msgs;
+        let read = session_read_profiles(&settings, &session, now);
         assert_eq!(read.into_iter().collect::<Vec<_>>(), ["cm", "pg"]);
         // Reads age out of the window.
-        assert!(session_read_profiles(&settings, &msgs, now + READ_WINDOW + chrono::Duration::minutes(1)).is_empty());
+        assert!(session_read_profiles(&settings, &session, now + READ_WINDOW + chrono::Duration::minutes(1)).is_empty());
     }
 
     fn settings_with(profiles: &[(&str, &str, bool)]) -> Settings {

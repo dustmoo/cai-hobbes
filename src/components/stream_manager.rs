@@ -653,7 +653,7 @@ impl StreamManagerContext {
                                 let state = self.session_state.peek();
                                 let session = state.sessions.get(&session_id);
                                 let read_from = session
-                                    .map(|s| reach_mod::session_read_profiles(&settings_read, &s.messages, chrono::Utc::now()))
+                                    .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
                                     .unwrap_or_default();
                                 let write = match target {
                                     Some(_) => reach_mod::is_write(&tool_call.tool_name, &args),

@@ -43,6 +43,7 @@ fn create_test_session() -> Session {
         context_ledger: Vec::new(),
         dispatch_link: None,
         dispatched_workers: Vec::new(),
+        carried_reads: Vec::new(),
     }
 }
 

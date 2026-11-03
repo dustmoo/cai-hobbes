@@ -59,9 +59,9 @@ pub const MAX_BYTES: u64 = 1_500_000;
 /// Never rotate a session shorter than this, whatever its size: a few huge
 /// tool results would otherwise make archives of a handful of messages.
 pub const MIN_MESSAGES: usize = 20;
-/// Past this multiple of a threshold the soft rules (a stale approval, a
-/// recent read from another company) stop postponing rotation, so a session
-/// can't grow without bound.
+/// Past this multiple of a threshold the soft rule (a recent approval in an
+/// earlier turn) stops postponing rotation, so a session can't grow without
+/// bound.
 pub const FORCE_FACTOR: u64 = 2;
 /// How often the sizes are checked (one indexed `length()` query each).
 pub const CHECK_EVERY_MINUTES: i64 = 5;
@@ -133,11 +133,9 @@ pub struct Activity {
     // ── Soft ──
     /// An unresolved approval newer than [`APPROVAL_STALE_HOURS`].
     pub recent_approval: bool,
-    /// Composio data from a profile other than home was read within
-    /// `profile_reach::READ_WINDOW`. The cross-company hold looks for such
-    /// reads in the session's own messages, which stay in the archive, while
-    /// the carried summary may still hold that data.
-    pub recent_foreign_reads: bool,
+    // Recent Composio reads don't hold rotation: they are carried into the
+    // successor (`Session::carried_reads`), where the cross-company hold
+    // keeps counting them until they age out.
 }
 
 impl Activity {
@@ -155,7 +153,7 @@ impl Activity {
 
     /// None of the soft rules hold.
     pub fn soft_quiet(&self) -> bool {
-        !self.recent_approval && !self.recent_foreign_reads
+        !self.recent_approval
     }
 }
 
@@ -323,6 +321,30 @@ pub fn continuation_text(archive_title: &str, carry: &CarryOver) -> String {
     out
 }
 
+/// The Composio reads of `old` still inside `profile_reach::READ_WINDOW` at
+/// `now` — its own and any it carried itself — newest per profile. The
+/// successor keeps them, so the cross-company hold still sees data that
+/// may live on in the carried summary until it ages out.
+pub fn carried_reads(
+    old: &Session,
+    settings: &crate::settings::Settings,
+    now: DateTime<Utc>,
+) -> Vec<crate::session::CarriedRead> {
+    use crate::mcp::manager::profile_reach::{recent_reads, READ_WINDOW};
+    let mut newest: std::collections::BTreeMap<String, DateTime<Utc>> = std::collections::BTreeMap::new();
+    let carried = old.carried_reads.iter().filter(|r| now - r.read_at <= READ_WINDOW).cloned();
+    for r in recent_reads(settings, &old.messages, now).into_iter().chain(carried) {
+        let at = newest.entry(r.profile_id).or_insert(r.read_at);
+        if r.read_at > *at {
+            *at = r.read_at;
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(profile_id, read_at)| crate::session::CarriedRead { profile_id, read_at })
+        .collect()
+}
+
 /// A rotation worked out in full before anything is written.
 #[derive(Debug, Clone)]
 pub struct Prepared {
@@ -342,7 +364,13 @@ pub struct Prepared {
 /// Work out a rotation of `old` into a new session `new_id` at `now`. Pure:
 /// one clone of the old session (once per rotation) so nothing in memory
 /// changes until the write succeeds.
-pub fn prepare(kind: SystemSession, old: &Session, new_id: &str, now: DateTime<Utc>) -> Prepared {
+pub fn prepare(
+    kind: SystemSession,
+    old: &Session,
+    settings: &crate::settings::Settings,
+    new_id: &str,
+    now: DateTime<Utc>,
+) -> Prepared {
     let carry = CarryOver::from_session(old);
     let archive_title = archive_name_for(kind.title(), old);
 
@@ -369,6 +397,7 @@ pub fn prepare(kind: SystemSession, old: &Session, new_id: &str, now: DateTime<U
     successor.last_updated = now;
     carry.apply(&mut successor);
     successor.scheduled_timers = moved.clone();
+    successor.carried_reads = carried_reads(old, settings, now);
     let intro = Message {
         id: uuid::Uuid::new_v4(),
         author: "Hobbes".to_string(),
@@ -392,6 +421,9 @@ pub fn prepare(kind: SystemSession, old: &Session, new_id: &str, now: DateTime<U
     successor_events.push(SessionEvent::SessionRenamed { name: carry.name.clone() });
     successor_events.extend(carry.events());
     successor_events.extend(moved.into_iter().map(|timer| SessionEvent::TimerCreated { timer }));
+    if !successor.carried_reads.is_empty() {
+        successor_events.push(SessionEvent::ReadsCarried { reads: successor.carried_reads.clone() });
+    }
     successor_events.push(SessionEvent::AssistantMessage { message: intro });
 
     Prepared {
@@ -416,20 +448,9 @@ fn current_id(kind: SystemSession) -> Option<String> {
 }
 
 /// What is in flight for a system session right now.
-fn activity(
-    kind: SystemSession,
-    session: &Session,
-    settings: &crate::settings::Settings,
-    streaming: &HashSet<String>,
-    now: DateTime<Utc>,
-) -> Activity {
-    use crate::mcp::manager::profile_reach;
+fn activity(kind: SystemSession, session: &Session, streaming: &HashSet<String>, now: DateTime<Utc>) -> Activity {
     let id = session.id.as_str();
     let (latest_turn_approval, recent_approval) = approval_state(&session.messages, now);
-    let home = profile_reach::home_profile(settings, session.composio_profile.as_deref());
-    let recent_foreign_reads = profile_reach::session_read_profiles(settings, &session.messages, now)
-        .iter()
-        .any(|p| Some(p) != home.as_ref());
     let mut a = Activity {
         turn_in_flight: streaming.contains(id)
             || TURN_ACTIVITY.peek().contains(id)
@@ -439,7 +460,6 @@ fn activity(
         latest_turn_approval,
         timer_due_soon: timer_due_soon(&session.scheduled_timers, now),
         recent_approval,
-        recent_foreign_reads,
         ..Default::default()
     };
     match kind {
@@ -483,13 +503,13 @@ pub fn check_all(
             if !over_threshold(size) {
                 continue;
             }
-            let a = activity(kind, session, settings, streaming, now);
+            let a = activity(kind, session, streaming, now);
             if !should_rotate(size, &a) {
                 tracing::debug!(session_id = %id, "rotation: {kind:?} session is due but busy");
                 continue;
             }
             tracing::info!(session_id = %id, messages, bytes = size.bytes.unwrap_or(0), "rotation: rotating the {kind:?} session");
-            prepare(kind, session, &uuid::Uuid::new_v4().to_string(), now)
+            prepare(kind, session, settings, &uuid::Uuid::new_v4().to_string(), now)
         };
         rotate(session_state, kind, prepared);
     }
@@ -622,7 +642,7 @@ mod tests {
             // Hard rules hold however large the session.
             assert!(!should_rotate(huge, &a), "{a:?}");
         }
-        let soft = [Activity { recent_approval: true, ..quiet }, Activity { recent_foreign_reads: true, ..quiet }];
+        let soft = [Activity { recent_approval: true, ..quiet }];
         for a in soft {
             assert!(!should_rotate(big, &a), "{a:?}");
             // Past twice a threshold the soft rules give way.
@@ -728,7 +748,7 @@ mod tests {
     fn prepare_archives_the_old_and_seeds_the_successor() {
         let (state, old) = rotated_session();
         let now = Utc::now();
-        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], "new-id", now);
+        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], &crate::settings::Settings::default(), "new-id", now);
         assert!(p.archive_title.starts_with("Heartbeat · "));
         assert_eq!(p.archive.name, p.archive_title);
         assert!(p.archive.name_user_set);
@@ -765,7 +785,7 @@ mod tests {
     #[test]
     fn the_successor_s_first_prompt_carries_the_summary_and_handoff() {
         let (state, old) = rotated_session();
-        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], "new-id", Utc::now());
+        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], &crate::settings::Settings::default(), "new-id", Utc::now());
         let mut successor = p.successor;
         successor.messages.push(msg("User", text("[Heartbeat wake] new"), Utc::now()));
         let settings = crate::settings::Settings::default();
@@ -869,6 +889,100 @@ mod tests {
         assert_eq!(projected.llm_connector_id, n.llm_connector_id);
         assert_eq!(projected.chat_model, n.chat_model);
         assert!(projected.name_user_set);
+    }
+
+    /// A completed Composio read from `profile` at `at`.
+    fn composio_read(profile: &str, at: DateTime<Utc>) -> Message {
+        let mut tc = crate::components::shared::ToolCall::new(
+            format!("composio-native:{profile}"),
+            "GMAIL_FETCH_EMAILS".into(),
+            serde_json::json!({}),
+            None,
+            None,
+        );
+        tc.profile_id = Some(profile.to_string());
+        tc.status = crate::components::shared::ToolCallStatus::Completed;
+        tc.completed_at = Some(at);
+        msg("Hobbes", MessageContent::ToolCall(tc), at)
+    }
+
+    #[test]
+    fn recent_reads_carry_into_the_successor_and_keep_the_hold() {
+        use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile, READ_WINDOW};
+        let settings = crate::settings::Settings::default();
+        let now = Utc::now();
+        let (mut state, old) = rotated_session();
+        {
+            let s = state.sessions.get_mut(&old).unwrap();
+            // Home is "cm"; Puget was read half an hour ago, Acme a day ago.
+            s.composio_profile = Some("cm".into());
+            s.messages.push(composio_read("pg", now - Duration::minutes(30)));
+            s.messages.push(composio_read("ac", now - Duration::days(1)));
+            s.messages.push(composio_read("pg", now - Duration::minutes(40)));
+        }
+        let p = prepare(SystemSession::Heartbeat, &state.sessions[&old], &settings, "new-id", now);
+        // Only reads inside the window, newest per profile.
+        assert_eq!(
+            p.successor.carried_reads,
+            vec![crate::session::CarriedRead { profile_id: "pg".into(), read_at: now - Duration::minutes(30) }]
+        );
+        assert!(!p.successor.messages.iter().any(|m| matches!(m.content, MessageContent::ToolCall(_))));
+
+        // The successor's first write home is held: it has read Puget data.
+        let home = ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
+        let puget = ReachProfile { id: "pg".into(), name: "Puget".into() };
+        let reach = vec![home.clone(), puget];
+        let read_from = session_read_profiles(&settings, &p.successor, now);
+        assert!(read_from.contains("pg"));
+        let hold = cross_company_hold(Some(&home), &home, &read_from, &reach, true);
+        assert!(hold.is_some_and(|h| h.reason.contains("Puget")), "a carried read holds the write");
+        // A write to Puget itself carries no other company's data.
+        assert!(cross_company_hold(Some(&reach[1]), &home, &read_from, &reach, true)
+            .is_none_or(|h| !h.reason.contains("has read")));
+
+        // It ages out with the window.
+        let later = now + READ_WINDOW;
+        let aged = session_read_profiles(&settings, &p.successor, later);
+        assert!(aged.is_empty(), "{aged:?}");
+        assert!(cross_company_hold(Some(&home), &home, &aged, &reach, true).is_none());
+
+        // The journal keeps it, so a replayed successor holds the same way.
+        let projected = crate::session_events::project(None, &events_with_seq(p.successor_events.clone()));
+        assert_eq!(projected.carried_reads, p.successor.carried_reads);
+        assert_eq!(session_read_profiles(&settings, &projected, now), read_from);
+
+        // A second rotation inside the window passes it on again.
+        let p2 = prepare(SystemSession::Heartbeat, &p.successor, &settings, "newer-id", now + Duration::minutes(10));
+        assert_eq!(p2.successor.carried_reads, p.successor.carried_reads);
+        let p3 = prepare(SystemSession::Heartbeat, &p.successor, &settings, "newest-id", later);
+        assert!(p3.successor.carried_reads.is_empty());
+    }
+
+    #[test]
+    fn a_failed_write_leaves_everything_as_it_was() {
+        // Tests never open the global store (`session_store::init`), so the
+        // commit's write fails here exactly as a real write error would.
+        assert!(!crate::session_store::is_available());
+        let mut dom = VirtualDom::new(|| {
+            let (state, old) = rotated_session();
+            let mut sig = use_signal(|| state);
+            sig.write().active_session_id = old.clone();
+            crate::heartbeat::HEARTBEAT.write().session_id = Some(old.clone());
+            let p = prepare(SystemSession::Heartbeat, &sig.peek().sessions[&old], &crate::settings::Settings::default(), "never-new", Utc::now());
+            let before = sig.peek().sessions[&old].clone();
+            assert_eq!(rotate(sig, SystemSession::Heartbeat, p), None);
+            let after = sig.peek();
+            assert_eq!(after.sessions.len(), 1);
+            assert_eq!(after.sessions[&old], before, "the old session is untouched");
+            assert!(!after.sessions.contains_key("never-new"));
+            assert_eq!(after.active_session_id, old);
+            assert_eq!(crate::heartbeat::HEARTBEAT.peek().session_id.as_deref(), Some(old.as_str()));
+            assert!(!system_sessions::is_archive(&old));
+            assert_eq!(system_sessions::current_for(&old), old);
+            assert!(crate::PENDING_TAB_REPLACE.peek().is_empty(), "no tab swap requested");
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     fn events_with_seq(events: Vec<SessionEvent>) -> Vec<crate::session_store::LoadedSessionEvent> {
