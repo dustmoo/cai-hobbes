@@ -52,13 +52,20 @@ struct Shared {
     out_rate: AtomicU32,
 }
 
+/// Commands to the thread that owns the streams.
+enum Ctl {
+    /// Run (true) or pause (false) the input stream. Paused, the device is
+    /// released: the system mic indicator goes off.
+    Capture(bool),
+}
+
 pub struct CpalIo {
     shared: Arc<Shared>,
     /// Output is headphones: the mic can't hear the voice.
     headphones: bool,
     input_uid: Option<String>,
-    /// Dropping/sending on this ends the audio thread (and its streams).
-    stop_tx: Option<std_mpsc::Sender<()>>,
+    /// Dropping this ends the audio thread (and its streams).
+    stop_tx: Option<std_mpsc::Sender<Ctl>>,
 }
 
 impl CpalIo {
@@ -83,18 +90,31 @@ impl AudioIo for CpalIo {
     fn start(&mut self, mic_tx: mpsc::UnboundedSender<Vec<i16>>) -> Result<(), AudioError> {
         self.stop();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<(), AudioError>>();
-        let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
+        let (stop_tx, stop_rx) = std_mpsc::channel::<Ctl>();
         let shared = self.shared.clone();
         let input_uid = self.input_uid.clone();
         std::thread::Builder::new()
             .name("hobbes-voice-audio".into())
             .spawn(move || {
                 match build_streams(&shared, input_uid.as_deref(), mic_tx) {
-                    Ok(streams) => {
+                    Ok((input, output)) => {
                         let _ = ready_tx.send(Ok(()));
-                        // Park until stop (message or sender dropped).
-                        let _ = stop_rx.recv();
-                        drop(streams);
+                        // Serve capture toggles until the sender is dropped.
+                        while let Ok(Ctl::Capture(on)) = stop_rx.recv() {
+                            let r = if on { input.play().map_err(|e| e.to_string()) } else { input.pause().map_err(|e| e.to_string()) };
+                            match r {
+                                Ok(()) => tracing::debug!("voice audio: capture {}", if on { "on" } else { "off" }),
+                                Err(e) => tracing::warn!("voice audio: couldn't turn capture {}: {e}", if on { "on" } else { "off" }),
+                            }
+                        }
+                        // Pause before dropping: on macOS, dropping a cpal
+                        // stream alone leaves the device running (the mic
+                        // indicator stays on; `capture_toggle_releases_the_mic`
+                        // caught it). Pausing stops the IO unit.
+                        let _ = input.pause();
+                        let _ = output.pause();
+                        drop(input);
+                        drop(output);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -146,9 +166,17 @@ impl AudioIo for CpalIo {
         self.headphones
     }
 
+    fn set_capture(&self, on: bool) {
+        self.set_mic_enabled(on);
+        if let Some(tx) = self.stop_tx.as_ref() {
+            let _ = tx.send(Ctl::Capture(on));
+        }
+    }
+
     fn stop(&mut self) {
-        if let Some(tx) = self.stop_tx.take() {
-            let _ = tx.send(());
+        // Dropping the sender ends the thread, which drops both streams.
+        if self.stop_tx.take().is_some() {
+            tracing::debug!("voice audio: streams released");
         }
         self.flush();
         self.shared.out_rate.store(0, Ordering::Release);

@@ -77,6 +77,8 @@ pub struct VoiceUi {
     pub mic: String,
     /// Recent mic peak level, 0.0–1.0.
     pub level: f32,
+    /// The mic device is open (push-to-talk releases it between holds).
+    pub mic_on: bool,
     /// The mic isn't delivering audio (shown while the conversation runs).
     pub mic_warning: Option<String>,
     /// Last problem worth showing (cleared on the next successful start).
@@ -322,6 +324,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     };
     tracing::info!("voice: conversation started (mic '{}', echo-safe: {})", ui.mic, ui.echo_safe);
     let live_at = Instant::now();
+    // The mic device is open from the press; push-to-talk releases it
+    // between holds (see the end of the loop).
+    let mut capture_on = true;
     let mut stats = Stats::default();
     let mut level_window = 0.0f32;
 
@@ -517,7 +522,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
             _ = tick.tick() => {
                 ui.level = level_window;
                 level_window = 0.0;
-                ui.mic_warning = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic);
+                if capture_on {
+                    ui.mic_warning = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic);
+                }
                 if ui.phase == Phase::Speaking && !audio_io.is_playing() {
                     ui.phase = Phase::Listening;
                 }
@@ -544,8 +551,21 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 }
             }
         }
+        // The mic is open only while the key is held, or for the whole of a
+        // hands-free conversation (`mode` is undecided until the first
+        // release, and the key is still down then).
+        let want_capture = mic_wanted(held, mode);
+        if want_capture != capture_on {
+            audio_io.set_capture(want_capture);
+            capture_on = want_capture;
+            if !want_capture {
+                level_window = 0.0;
+                ui.level = 0.0;
+            }
+        }
         ui.mode = mode.or(ui.mode);
         ui.held = held;
+        ui.mic_on = capture_on;
         if *VOICE_UI.peek() != ui {
             *VOICE_UI.write() = ui.clone();
         }
@@ -566,7 +586,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     }
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
     tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
-    if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic) {
+    if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic).filter(|_| stats.mic_frames == 0 || capture_on) {
         fail(w);
         return;
     }
@@ -602,6 +622,12 @@ impl Stats {
             self.tool_calls,
         )
     }
+}
+
+/// Whether the mic device should be open: while the key is down, and
+/// throughout a hands-free conversation.
+pub fn mic_wanted(held: bool, mode: Option<Mode>) -> bool {
+    held || mode == Some(Mode::Conversation)
 }
 
 /// After a grace period: no frames at all, or only digital silence, from the mic.
@@ -659,6 +685,17 @@ mod tests {
         assert!(s.contains("CI is red") && s.contains("🎙 hi"));
         let bare = system_instruction(now, "", "");
         assert!(!bare.contains("Heartbeat notes"));
+    }
+
+    #[test]
+    fn push_to_talk_opens_the_mic_only_while_held() {
+        // The opening press: open until we know tap vs hold.
+        assert!(mic_wanted(true, None));
+        // Push-to-talk: open while held, released between holds.
+        assert!(mic_wanted(true, Some(Mode::PushToTalk)));
+        assert!(!mic_wanted(false, Some(Mode::PushToTalk)));
+        // Hands-free: open throughout.
+        assert!(mic_wanted(false, Some(Mode::Conversation)));
     }
 
     #[test]

@@ -67,6 +67,14 @@ pub trait AudioIo: Send {
     /// Gate the mic (push-to-talk / mute) without tearing down the engine.
     /// While disabled, nothing is sent on `mic_tx`.
     fn set_mic_enabled(&self, enabled: bool);
+    /// Open (true) or release (false) the mic device itself, not just the
+    /// stream to the model: released, the system's mic indicator goes off.
+    /// Playback is unaffected. Backends that can't release the mic without
+    /// stopping playback (macOS voice processing shares one engine) only
+    /// gate, as [`AudioIo::set_mic_enabled`].
+    fn set_capture(&self, on: bool) {
+        self.set_mic_enabled(on);
+    }
     /// Whether the model can't hear itself: the backend cancels speaker
     /// echo (macOS voice processing), or the output is headphones. When
     /// false the controller mutes the mic while the voice speaks.
@@ -281,6 +289,44 @@ mod tests {
             .await
             .expect("mic check");
         println!("{r:?}\n{}", crate::voice::probe::verdict_text(r.verdict(), &r.input_name));
+    }
+
+    /// Push-to-talk releases the mic device between holds, and stopping
+    /// releases it for good — checked with the HAL's "running somewhere"
+    /// flag (the mic indicator), not just our own gate.
+    /// `HOBBES_MIC_UID=<uid> cargo test --release capture_toggle_releases_the_mic -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn capture_toggle_releases_the_mic() {
+        let uid = std::env::var("HOBBES_MIC_UID").expect("set HOBBES_MIC_UID");
+        // This process only: other apps may be using the same mic.
+        let running = || macos::this_process_running_input().expect("HAL process query");
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(400));
+        println!("device in use by anyone: {:?}", macos::device_running_somewhere(&uid));
+        assert!(!running(), "this process already has input running");
+        let mut o = open(Some(&uid), VoiceEcho::Off).expect("open");
+        assert!(!o.voice_processing);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        o.io.start(tx).expect("start");
+        settle();
+        println!("started: running={}", running());
+        assert!(running());
+        o.io.set_capture(false);
+        settle();
+        while rx.try_recv().is_ok() {}
+        settle();
+        println!("capture off: running={} frames since={}", running(), rx.try_recv().is_ok());
+        assert!(!running(), "mic still open after capture off");
+        o.io.set_capture(true);
+        settle();
+        println!("capture on: running={}", running());
+        assert!(running());
+        assert!(rx.try_recv().is_ok(), "no frames after capture on");
+        o.io.stop();
+        settle();
+        println!("stopped: running={}", running());
+        assert!(!running(), "mic still open after stop");
     }
 
     #[test]

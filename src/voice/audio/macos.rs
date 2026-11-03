@@ -734,6 +734,47 @@ pub fn list_input_devices() -> Vec<AudioDevice> {
     input_devices_with_ids().into_iter().map(|(_, d)| d).collect()
 }
 
+/// Whether any process is running IO on the input device `uid` (what the
+/// system mic indicator reflects). `None` if the device isn't present.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn device_running_somewhere(uid: &str) -> Option<bool> {
+    use objc2_core_audio::kAudioDevicePropertyDeviceIsRunningSomewhere;
+    let (id, _) = input_devices_with_ids().into_iter().find(|(_, d)| d.uid == uid)?;
+    prop_pod_vec::<u32>(id, prop_addr(kAudioDevicePropertyDeviceIsRunningSomewhere, kAudioObjectPropertyScopeGlobal))
+        .first()
+        .map(|&v| v != 0)
+}
+
+/// Whether this process is running audio input on any device (macOS 14+;
+/// `None` when the HAL can't say). Unlike the device's "running somewhere"
+/// flag this ignores other apps.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn this_process_running_input() -> Option<bool> {
+    use objc2_core_audio::{kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioProcessPropertyIsRunningInput};
+    let pid = std::process::id() as i32;
+    let addr = prop_addr(kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioObjectPropertyScopeGlobal);
+    let mut obj: AudioObjectID = 0;
+    let mut size = std::mem::size_of::<AudioObjectID>() as u32;
+    // SAFETY: the qualifier is a pid_t, the value an AudioObjectID; both
+    // sized as passed.
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            SYSTEM_OBJECT,
+            NonNull::from(&addr),
+            std::mem::size_of::<i32>() as u32,
+            (&pid as *const i32).cast(),
+            NonNull::from(&mut size),
+            NonNull::from(&mut obj).cast(),
+        )
+    };
+    if status != 0 || obj == 0 {
+        return None;
+    }
+    prop_pod_vec::<u32>(obj, prop_addr(kAudioProcessPropertyIsRunningInput, kAudioObjectPropertyScopeGlobal))
+        .first()
+        .map(|&v| v != 0)
+}
+
 /// The default output device's kind: Bluetooth, or the built-in jack with
 /// headphones plugged in, counts as headphones.
 pub fn default_output_kind() -> super::OutputKind {

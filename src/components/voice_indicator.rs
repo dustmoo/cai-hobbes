@@ -89,10 +89,14 @@ pub fn VoiceIndicator() -> Element {
                 if !ui.mic.is_empty() {
                     span {
                         class: "flex items-center gap-1.5 text-xs text-fg-muted",
-                        title: "Microphone in use and its level",
+                        title: "Microphone and its level",
                         "{ui.mic}"
-                        div { class: "w-10 h-1.5 rounded bg-primary-800 overflow-hidden",
-                            div { class: "h-full bg-primary-400", style: "width: {level_pct}%" }
+                        if ui.mic_on {
+                            div { class: "w-10 h-1.5 rounded bg-primary-800 overflow-hidden",
+                                div { class: "h-full bg-primary-400", style: "width: {level_pct}%" }
+                            }
+                        } else {
+                            " · mic off"
                         }
                     }
                 }
