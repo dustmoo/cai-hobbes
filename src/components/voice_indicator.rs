@@ -24,17 +24,17 @@ pub fn hotkey_label(raw: &str) -> String {
         .collect()
 }
 
-/// The strip's status line.
-pub fn status_text(phase: Phase, mode: Option<Mode>, held: bool, brain_busy: usize) -> &'static str {
-    match (phase, brain_busy > 0) {
-        (Phase::Idle, _) => "",
-        (Phase::Connecting, _) => "Connecting…",
-        (Phase::Speaking, _) => "Speaking",
-        (Phase::Listening, true) => "Listening · brain working",
-        (Phase::Listening, false) => match (mode, held) {
-            (Some(Mode::PushToTalk), false) => "Hold to talk",
-            _ => "Listening",
-        },
+/// The strip's status line. "Listening" only while the mic is actually
+/// open (push-to-talk releases it between holds).
+pub fn status_text(phase: Phase, brain_busy: usize, mic_on: bool) -> &'static str {
+    match (phase, brain_busy > 0, mic_on) {
+        (Phase::Idle, _, _) => "",
+        (Phase::Connecting, _, _) => "Connecting…",
+        (Phase::Speaking, _, _) => "Speaking",
+        (Phase::Listening, true, true) => "Listening · brain working",
+        (Phase::Listening, true, false) => "Brain working",
+        (Phase::Listening, false, true) => "Listening",
+        (Phase::Listening, false, false) => "Hold to talk",
     }
 }
 
@@ -63,7 +63,7 @@ pub fn VoiceIndicator() -> Element {
         };
     }
 
-    let status = status_text(ui.phase, ui.mode, ui.held, ui.brain_busy);
+    let status = status_text(ui.phase, ui.brain_busy, ui.mic_on);
     let hint = match ui.mode {
         Some(Mode::PushToTalk) => format!("Hold {key} to talk · tap to go hands-free"),
         _ => format!("Tap {key} to end"),
@@ -75,7 +75,8 @@ pub fn VoiceIndicator() -> Element {
             class: "flex items-center justify-between gap-3 px-4 py-2 bg-primary-900/80 border-b border-primary-700 text-fg text-sm",
             div { class: "flex items-center gap-2 min-w-0",
                 MetalMouth { size: 15 }
-                if ui.phase != Phase::Connecting {
+                // The live dot means the mic is open, or Hobbes is speaking.
+                if ui.phase != Phase::Connecting && (ui.mic_on || ui.phase == Phase::Speaking) {
                     div { class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse shrink-0" }
                 }
                 span { class: "font-medium shrink-0", "{status}" }
@@ -133,10 +134,12 @@ mod tests {
 
     #[test]
     fn status_reads_naturally() {
-        assert_eq!(status_text(Phase::Connecting, None, true, 0), "Connecting…");
-        assert_eq!(status_text(Phase::Listening, Some(Mode::Conversation), false, 1), "Listening · brain working");
-        assert_eq!(status_text(Phase::Listening, Some(Mode::PushToTalk), false, 0), "Hold to talk");
-        assert_eq!(status_text(Phase::Listening, Some(Mode::PushToTalk), true, 0), "Listening");
+        assert_eq!(status_text(Phase::Connecting, 0, true), "Connecting…");
+        assert_eq!(status_text(Phase::Listening, 1, true), "Listening · brain working");
+        // Push-to-talk between holds: the mic is off, so never "Listening".
+        assert_eq!(status_text(Phase::Listening, 1, false), "Brain working");
+        assert_eq!(status_text(Phase::Listening, 0, false), "Hold to talk");
+        assert_eq!(status_text(Phase::Listening, 0, true), "Listening");
     }
 
     #[test]
