@@ -856,12 +856,14 @@ pub fn brain_started_response() -> Value {
     })
 }
 
-/// Write buffered transcript lines into the Voice session, unless its turn
-/// is streaming — `force` writes regardless (session end). Each line goes in
+/// Write buffered transcript lines into the Voice session, unless its last
+/// turn is still in progress (streaming, between rounds, or held on an
+/// approval: `transcript::turn_open`) — `force` writes regardless (session
+/// end), and an open turn then only gets lines before it. Each line goes in
 /// at the time it was said, between turns: before the brain's request it
 /// preceded, never inside a turn (see `transcript::insert_between_turns`).
 fn flush_lines(ctx: BuiltinToolCtx, session_id: &str, lines: &mut Vec<PendingLine>, force: bool) {
-    if lines.is_empty() || (!force && crate::session_streaming(session_id)) {
+    if lines.is_empty() || (!force && crate::voice::transcript::session_turn_open(ctx.session_state, session_id)) {
         return;
     }
     crate::voice::transcript::write_lines(ctx.session_state, session_id, std::mem::take(lines));

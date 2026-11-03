@@ -1332,9 +1332,16 @@ impl StreamManagerContext {
                                 // block produced. Move it past them (vec order and
                                 // `created_at` together, so the journal replays the
                                 // same layout).
+                                // Without tool calls the reply stays put, but it
+                                // is stamped when it finished, not when its
+                                // placeholder was pushed: a turn otherwise "ends"
+                                // at its start, and anything placed by time
+                                // (voice transcript lines) lands after a reply
+                                // that came later. Clamped, so order holds.
                                 final_snapshot = if tool_call_count > 0 {
                                     session.move_message_to_end(&message_id, now)
                                 } else {
+                                    session.restamp_message(&message_id, now);
                                     session.messages.iter().find(|m| m.id == message_id).cloned()
                                 };
                             }
