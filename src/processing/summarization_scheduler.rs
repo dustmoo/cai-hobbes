@@ -58,6 +58,14 @@ pub fn use_summarization_scheduler() {
 
                         // For forced refresh, we ignore the message count check because the context might have changed (e.g. profile switch)
                         let current_message_count = active_session.messages.len();
+                        // Not an archive, nor a rotated-in system session
+                        // before its first real turn (session_rotation).
+                        if !crate::session_rotation::may_summarize(&active_session) {
+                            continue;
+                        }
+                        // Counted as activity, so the session can't rotate
+                        // while its summary is being written.
+                        let _summarizing = crate::session_rotation::summarizing(&active_session.id);
 
                         let processor_guard = processor.read();
                         if let Some(summary) = processor_guard
@@ -134,8 +142,12 @@ pub fn use_summarization_scheduler() {
 
                         let last_count =
                             last_summarized.get(&active_session.id).copied().unwrap_or(0);
-                        if current_message_count > last_count && settings_guard.enable_summarization {
+                        if current_message_count > last_count
+                            && settings_guard.enable_summarization
+                            && crate::session_rotation::may_summarize(&active_session)
+                        {
                             tracing::info!("Inactivity detected. Summarizing conversation.");
+                            let _summarizing = crate::session_rotation::summarizing(&active_session.id);
                             let processor_guard = processor.read();
                             if let Some(summary) = processor_guard
                                 .generate_summary(&active_session, &settings_guard)

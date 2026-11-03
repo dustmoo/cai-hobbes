@@ -90,16 +90,7 @@ fn heartbeat_briefing_events(session_id: &str) -> Vec<crate::heartbeat::Heartbea
         return Vec::new();
     }
     // A rotated system session (Voice) also owns what its archives dispatched.
-    let ids = match crate::system_sessions::kind(session_id) {
-        Some(kind) => {
-            let mut ids = crate::system_sessions::lineage(kind);
-            if !ids.iter().any(|i| i == session_id) {
-                ids.push(session_id.to_string());
-            }
-            ids
-        }
-        None => vec![session_id.to_string()],
-    };
+    let ids = crate::system_sessions::lineage_of(session_id);
     state
         .events_for_session_since(&ids, since)
         .into_iter()

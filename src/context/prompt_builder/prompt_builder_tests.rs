@@ -3084,6 +3084,28 @@ fn briefing_lists_changes_to_dispatched_work() {
 }
 
 #[test]
+fn a_rotated_session_s_predecessor_work_is_not_work_it_dispatched() {
+    use super::briefing::turn_briefing_in;
+    let session = create_test_session();
+    let prior = finished_turn_at(utc(0));
+    let lineage = vec!["old_session".to_string(), "test_session".to_string()];
+    // The predecessor's own to-do (it was the worker): not dispatched work.
+    let mut own = hb_event("worker_done", "Agent finished \"old own task\"", utc(70));
+    own.session_id = Some("old_session".into());
+    // A run the predecessor dispatched: still this chat's dispatched work.
+    let mut ran = hb_event("run_ended", "Fleet: dispatched run before rotation ended", utc(80));
+    ran.dispatched_from = Some("old_session".into());
+    let b = turn_briefing_in(&session, &lineage, &prior, &[own.clone(), ran], fixed_clock(120));
+    assert_eq!(
+        b,
+        format!("{BRIEFING_HEADER}\nWork you dispatched: Fleet: dispatched run before rotation ended ({}).", hhmm(utc(80)))
+    );
+    // Without the lineage the predecessor's own work would leak in.
+    assert!(turn_briefing_in(&session, &["test_session".to_string()], &prior, &[own], fixed_clock(120))
+        .contains("old own task"));
+}
+
+#[test]
 fn dispatched_work_rides_the_boundary_tail_and_replays_unchanged() {
     let mut sim = briefing_sim(LlmProvider::Claude);
     let last = utc(sim.clock);

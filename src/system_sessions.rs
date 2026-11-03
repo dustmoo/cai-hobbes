@@ -283,6 +283,16 @@ pub fn lineage(kind: SystemSession) -> Vec<String> {
     read(|ids| ids.lineage(kind)).unwrap_or_default()
 }
 
+/// `id` and, for a system session, every id of its lineage (the sessions
+/// it rotated out of, or its successors when `id` is an archive).
+pub fn lineage_of(id: &str) -> Vec<String> {
+    let mut ids = kind(id).map(lineage).unwrap_or_default();
+    if !ids.iter().any(|i| i == id) {
+        ids.push(id.to_string());
+    }
+    ids
+}
+
 /// The newest archive of `kind`, if any.
 pub fn latest_archive(kind: SystemSession) -> Option<String> {
     read(|ids| ids.latest_archive(kind).map(str::to_string)).flatten()

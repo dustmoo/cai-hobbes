@@ -438,6 +438,12 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         &tail_of(ctx.session_state, session::Peer::Voice, 6),
         &tail_of(ctx.session_state, session::Peer::Heartbeat, 4),
     );
+    // The Heartbeat's text now rides into what the voice hands the brain
+    // (the Voice session): carry its recent reads there too.
+    {
+        let settings = ctx.settings.peek().clone();
+        session::carry_peer_reads(ctx.session_state, &settings, &voice_session, session::Peer::Heartbeat, 4);
+    }
     let mut rt = match provider.connect(setup).await {
         Ok(s) => s,
         Err(e) => {

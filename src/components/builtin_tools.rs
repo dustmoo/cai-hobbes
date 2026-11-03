@@ -588,7 +588,13 @@ pub async fn dispatch_builtin_tool(
                     ToolCallStatus::Error,
                     "Only the Heartbeat and Voice tabs can read each other.".to_string(),
                 ),
-                Some(p) => match crate::voice::session::peer_tail(session_state, p, limit) {
+                Some(p) => match crate::voice::session::peer_read(
+                    session_state,
+                    &deps.settings.peek().clone(),
+                    session_id,
+                    p,
+                    limit,
+                ) {
                     Ok(text) => (ToolCallStatus::Completed, text),
                     Err(e) => (ToolCallStatus::Error, e),
                 },

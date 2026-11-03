@@ -10,7 +10,7 @@
 //!
 //! - **Continuity.** The successor carries the conversation summary, the
 //!   scratchpad, the handoff note, the Composio profile, any connector pin,
-//!   the dispatch-relay worker list, pending timers not due soon, the tab
+//!   the dispatch-relay worker list, pending timers, recent Composio reads, the tab
 //!   emoji and the name ([`CarryOver`]), and opens with a Hobbes message
 //!   ([`continuation_text`]) restating the summary, current task and handoff
 //!   — the summary otherwise reaches the prompt only after a history trim,
@@ -44,7 +44,7 @@ use crate::components::shared::MessageContent;
 use crate::session::{ConversationSummary, Session, SessionState};
 use crate::session_events::SessionEvent;
 use crate::system_sessions::{self, SystemSession};
-use crate::timers::{ScheduledTimer, TimerStatus};
+use crate::timers::TimerStatus;
 
 /// Rotate past this many messages. The Heartbeat measured 287 messages /
 /// 2.7 MB after 12 days (~9 KB a message, tool results included), so 250
@@ -72,9 +72,6 @@ pub const CHECK_EVERY_MINUTES: i64 = 5;
 /// last seconds; three minutes is far above them and costs nothing, as
 /// rotation is never urgent.
 pub const IDLE_MINUTES: i64 = 3;
-/// A pending timer due within this long holds rotation (it is about to fire
-/// in this session); later ones move to the successor.
-pub const TIMER_SOON_MINUTES: i64 = 60;
 /// An unresolved approval newer than this holds rotation (the person may
 /// still answer it); older ones stay in the archive, unanswerable, unless
 /// they belong to the latest turn.
@@ -84,6 +81,54 @@ pub const APPROVAL_STALE_HOURS: i64 = 24;
 /// (stream map, continuation, summarization). Mirrored by `StreamBridge`
 /// in `main.rs` from `StreamManagerContext::turn_activity`.
 pub static TURN_ACTIVITY: GlobalSignal<HashSet<String>> = Signal::global(HashSet::new);
+
+/// Sessions the idle / forced summarizer is summarizing right now (it isn't
+/// tracked in `summarizing_sessions`). A plain set: the guard is held across
+/// the summarizer's await.
+fn idle_summaries() -> &'static std::sync::Mutex<HashSet<String>> {
+    static SET: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> = std::sync::OnceLock::new();
+    SET.get_or_init(Default::default)
+}
+
+/// Marks `id` as being summarized until dropped.
+pub struct SummaryGuard(String);
+
+impl Drop for SummaryGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = idle_summaries().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// Mark `id` as being summarized by the idle / forced summarizer.
+pub fn summarizing(id: &str) -> SummaryGuard {
+    if let Ok(mut set) = idle_summaries().lock() {
+        set.insert(id.to_string());
+    }
+    SummaryGuard(id.to_string())
+}
+
+fn is_summarizing(id: &str) -> bool {
+    idle_summaries().lock().map(|set| set.contains(id)).unwrap_or(false)
+}
+
+/// Whether the idle / forced summarizer may summarize `session`: never an
+/// archive (it is read-only), and not a system session before its first
+/// real turn — a successor holds only its opening message, and a summary of
+/// that would overwrite the summary and current task it carried over.
+pub fn may_summarize(session: &Session) -> bool {
+    summarizable(
+        system_sessions::is_archive(&session.id),
+        system_sessions::is_system(&session.id),
+        session.user_message_count(),
+    )
+}
+
+/// [`may_summarize`]'s rule.
+fn summarizable(archive: bool, system: bool, user_messages: usize) -> bool {
+    !(archive || (system && user_messages == 0))
+}
 
 /// A system session's size: messages in memory, bytes of its stored row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -121,8 +166,12 @@ pub struct Activity {
     pub recently_active: bool,
     /// An unresolved approval in the latest turn.
     pub latest_turn_approval: bool,
-    /// A pending timer due within [`TIMER_SOON_MINUTES`].
-    pub timer_due_soon: bool,
+    // Pending timers don't hold rotation, however soon they are due: they
+    // move to the successor under the same id in the same synchronous step
+    // (the timer scheduler reads hydrated sessions on its own tick, so no
+    // moment exists where neither session has the timer), and one firing
+    // right after simply prompts the successor. A just-fired timer is
+    // covered by `recently_active`.
     /// Heartbeat: a fired wake hasn't been read back yet (its cost and
     /// outcome come from this session's messages).
     pub open_wake: bool,
@@ -145,7 +194,6 @@ impl Activity {
             && !self.queued_messages
             && !self.recently_active
             && !self.latest_turn_approval
-            && !self.timer_due_soon
             && !self.open_wake
             && !self.voice_live
             && self.brain_waits == 0
@@ -190,12 +238,6 @@ pub fn last_activity(session: &Session) -> DateTime<Utc> {
     [Some(session.last_updated), newest_message, fired].into_iter().flatten().max().unwrap_or(session.last_updated)
 }
 
-/// A pending timer is due within [`TIMER_SOON_MINUTES`].
-pub fn timer_due_soon(timers: &[ScheduledTimer], now: DateTime<Utc>) -> bool {
-    timers
-        .iter()
-        .any(|t| t.status == TimerStatus::Pending && t.fire_at <= now + Duration::minutes(TIMER_SOON_MINUTES))
-}
 
 /// The archive's name: the title and the local date range of its messages,
 /// "Heartbeat · Oct 22 – Nov 3" (one date when they share a day, years
@@ -330,19 +372,7 @@ pub fn carried_reads(
     settings: &crate::settings::Settings,
     now: DateTime<Utc>,
 ) -> Vec<crate::session::CarriedRead> {
-    use crate::mcp::manager::profile_reach::{recent_reads, READ_WINDOW};
-    let mut newest: std::collections::BTreeMap<String, DateTime<Utc>> = std::collections::BTreeMap::new();
-    let carried = old.carried_reads.iter().filter(|r| now - r.read_at <= READ_WINDOW).cloned();
-    for r in recent_reads(settings, &old.messages, now).into_iter().chain(carried) {
-        let at = newest.entry(r.profile_id).or_insert(r.read_at);
-        if r.read_at > *at {
-            *at = r.read_at;
-        }
-    }
-    newest
-        .into_iter()
-        .map(|(profile_id, read_at)| crate::session::CarriedRead { profile_id, read_at })
-        .collect()
+    crate::mcp::manager::profile_reach::session_recent_reads(settings, old, now)
 }
 
 /// A rotation worked out in full before anything is written.
@@ -378,7 +408,7 @@ pub fn prepare(
     archive.name = archive_title.clone();
     archive.name_user_set = true;
     let mut archive_events = vec![SessionEvent::SessionRenamed { name: archive_title.clone() }];
-    // Pending timers (none due soon, or rotation would wait) move to the
+    // Pending timers move to the
     // successor under the same id; the archive's copies are cancelled, so
     // the archive never fires or loads at startup.
     let mut moved = Vec::new();
@@ -398,6 +428,19 @@ pub fn prepare(
     carry.apply(&mut successor);
     successor.scheduled_timers = moved.clone();
     successor.carried_reads = carried_reads(old, settings, now);
+    // Stamped at the old session's last turn, not now: the turn briefing
+    // measures "since your last turn here" from the newest non-User message,
+    // so the successor's first briefing still reports the gap before the
+    // rotation. It is the successor's only message, so order stays
+    // monotonic, and it predates every wake that follows.
+    let last_turn = old
+        .messages
+        .iter()
+        .filter(|m| m.author != "User")
+        .map(|m| m.created_at)
+        .max()
+        .unwrap_or(old.last_updated)
+        .min(now);
     let intro = Message {
         id: uuid::Uuid::new_v4(),
         author: "Hobbes".to_string(),
@@ -409,7 +452,7 @@ pub fn prepare(
         },
         attachments: Vec::new(),
         comments: Vec::new(),
-        created_at: now,
+        created_at: last_turn,
         usage: None,
     };
     successor.messages.push(intro.clone());
@@ -454,11 +497,11 @@ fn activity(kind: SystemSession, session: &Session, streaming: &HashSet<String>,
     let mut a = Activity {
         turn_in_flight: streaming.contains(id)
             || TURN_ACTIVITY.peek().contains(id)
-            || crate::components::chat_queue::DISPATCHING.peek().contains(id),
+            || crate::components::chat_queue::DISPATCHING.peek().contains(id)
+            || is_summarizing(id),
         queued_messages: crate::components::chat_queue::CHAT_QUEUE.peek().get(id).is_some_and(|q| !q.is_empty()),
         recently_active: now - last_activity(session) < Duration::minutes(IDLE_MINUTES),
         latest_turn_approval,
-        timer_due_soon: timer_due_soon(&session.scheduled_timers, now),
         recent_approval,
         ..Default::default()
     };
@@ -602,6 +645,7 @@ pub fn rotate(mut session_state: Signal<SessionState>, kind: SystemSession, p: P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::timers::ScheduledTimer;
     use chrono::TimeZone;
 
     fn local(y: i32, m: u32, d: u32, h: u32) -> DateTime<Local> {
@@ -620,6 +664,20 @@ mod tests {
     }
 
     #[test]
+    fn summaries_skip_archives_and_fresh_successors_and_count_as_activity() {
+        assert!(!summarizable(true, true, 10), "an archive is read-only");
+        assert!(!summarizable(false, true, 0), "a successor holding only its opening message");
+        assert!(summarizable(false, true, 1));
+        assert!(summarizable(false, false, 0), "ordinary chats are unchanged");
+        let id = "summary-guard-test";
+        {
+            let _g = summarizing(id);
+            assert!(is_summarizing(id));
+        }
+        assert!(!is_summarizing(id), "the guard clears on drop");
+    }
+
+    #[test]
     fn rotates_only_at_a_quiet_moment() {
         let big = SessionSize { messages: MAX_MESSAGES + 1, bytes: Some(10) };
         let small = SessionSize { messages: 10, bytes: Some(10) };
@@ -631,7 +689,6 @@ mod tests {
             Activity { queued_messages: true, ..quiet },
             Activity { recently_active: true, ..quiet },
             Activity { latest_turn_approval: true, ..quiet },
-            Activity { timer_due_soon: true, ..quiet },
             Activity { open_wake: true, ..quiet },
             Activity { voice_live: true, ..quiet },
             Activity { brain_waits: 1, ..quiet },
@@ -706,9 +763,6 @@ mod tests {
     #[test]
     fn idle_and_timer_rules() {
         let now = Utc::now();
-        assert!(timer_due_soon(&[timer("a", 30, TimerStatus::Pending)], now));
-        assert!(!timer_due_soon(&[timer("a", 30, TimerStatus::Fired)], now));
-        assert!(!timer_due_soon(&[timer("a", TIMER_SOON_MINUTES + 30, TimerStatus::Pending)], now));
 
         let mut state = SessionState::new();
         let id = state.create_session_raw(None);
@@ -740,7 +794,11 @@ mod tests {
             written_at: now - Duration::hours(2),
         });
         s.messages = vec![msg("User", text("[Heartbeat wake] old"), now - Duration::days(3)), msg("Hobbes", text("done"), now - Duration::days(1))];
-        s.scheduled_timers = vec![timer("later", 600, TimerStatus::Pending), timer("gone", -60, TimerStatus::Fired)];
+        s.scheduled_timers = vec![
+            timer("soon", 5, TimerStatus::Pending),
+            timer("later", 600, TimerStatus::Pending),
+            timer("gone", -60, TimerStatus::Fired),
+        ];
         (state, old)
     }
 
@@ -755,10 +813,15 @@ mod tests {
         assert_eq!(p.archive.messages.len(), 2, "history stays in the archive");
         // The pending timer moved; the archive keeps a cancelled copy.
         assert_eq!(p.archive.next_pending_timer(), None);
-        assert_eq!(p.successor.scheduled_timers.len(), 1);
-        assert_eq!(p.successor.scheduled_timers[0].id, "later");
-        assert_eq!(p.successor.scheduled_timers[0].session_id, "new-id");
+        // Every pending timer moves, however soon it is due.
+        let moved: Vec<&str> = p.successor.scheduled_timers.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(moved, ["soon", "later"]);
+        assert!(p.successor.scheduled_timers.iter().all(|t| t.session_id == "new-id"));
         assert!(p.archive_events.iter().any(|e| matches!(e, SessionEvent::TimerCancelled { timer_id } if timer_id == "later")));
+        assert!(p.archive_events.iter().any(|e| matches!(e, SessionEvent::TimerCancelled { timer_id } if timer_id == "soon")));
+        // The opening message carries the old turn boundary.
+        let old_last_reply = state.sessions[&old].messages.iter().filter(|m| m.author != "User").map(|m| m.created_at).max();
+        assert_eq!(Some(p.successor.messages[0].created_at), old_last_reply);
         // The successor: carried state, one visible opening message.
         assert_eq!(p.successor.id, "new-id");
         assert_eq!(p.successor.name, "Heartbeat");
@@ -802,6 +865,10 @@ mod tests {
             .join("\n");
         assert!(all.contains("Tracking the v0.13 release"), "summary reaches the prompt");
         assert!(all.contains("Waiting on the macOS release build"), "handoff reaches the prompt");
+        // The first briefing still reports the gap since the old session's
+        // last turn (a day ago), not since the rotation.
+        assert!(all.contains("since your last turn here"), "the gap before the rotation is kept");
+        assert!(all.contains("24 h") || all.contains("23 h"), "{all}");
         // It opens with a user turn, then the carried assistant message.
         assert_eq!(msgs[0].role, crate::llm::types::ChatRole::User);
         let first_assistant = msgs.iter().position(|m| m.role == crate::llm::types::ChatRole::Assistant).unwrap();

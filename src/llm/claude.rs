@@ -685,8 +685,19 @@ fn fingerprint_request(request: &Value, tail: VolatileTail) -> RequestFingerprin
         .collect();
     let shapes = stable.iter().map(message_shape).collect();
 
+    // A chat that opens with the fixed opening turn (prompt_builder's
+    // `OPENING_USER_TURN`, ahead of an assistant-first chat) shares that
+    // first message with every such chat: key on the next one too.
+    let opens_fixed = stable.first().is_some_and(|m| {
+        m["content"]
+            .as_array()
+            .and_then(|b| b.first())
+            .and_then(|b| b["text"].as_str())
+            == Some(crate::context::prompt_builder::OPENING_USER_TURN)
+    });
+    let key_messages = &messages[..messages.len().min(if opens_fixed { 2 } else { 1 })];
     let mut kh = std::collections::hash_map::DefaultHasher::new();
-    (system.first(), messages.first()).hash(&mut kh);
+    (system.first(), key_messages).hash(&mut kh);
     let mut sh = std::collections::hash_map::DefaultHasher::new();
     system.hash(&mut sh);
     RequestFingerprint {
@@ -2927,6 +2938,37 @@ mod tests {
             parameters: json!({ "type": "object" }),
             server_name: "srv".to_string(),
         }
+    }
+
+    #[test]
+    fn chats_opening_with_the_fixed_turn_get_distinct_keys() {
+        let req = |second: &str, third: &str| {
+            json!({
+                "system": [{"type": "text", "text": "persona"}],
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": crate::context::prompt_builder::OPENING_USER_TURN}]},
+                    {"role": "assistant", "content": [{"type": "text", "text": second}]},
+                    {"role": "user", "content": [{"type": "text", "text": third}]},
+                ],
+            })
+        };
+        let a = fingerprint_request(&req("Continuing from Heartbeat · Oct 22 – Nov 3", "wake"), VolatileTail::None);
+        let b = fingerprint_request(&req("Dispatched a background agent", "wake"), VolatileTail::None);
+        assert_ne!(a.key, b.key, "two opening-turn chats don't share a key");
+        // Still stable across a conversation's own growth.
+        let a2 = fingerprint_request(&req("Continuing from Heartbeat · Oct 22 – Nov 3", "later turn"), VolatileTail::None);
+        assert_eq!(a.key, a2.key);
+        // An ordinary chat keys on its first message only.
+        let plain = |second: &str| {
+            json!({"system": [{"type": "text", "text": "persona"}], "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hello"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": second}]},
+            ]})
+        };
+        assert_eq!(
+            fingerprint_request(&plain("x"), VolatileTail::None).key,
+            fingerprint_request(&plain("y"), VolatileTail::None).key
+        );
     }
 
     #[test]

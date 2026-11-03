@@ -11,6 +11,7 @@ mod prompt_builder_tests;
 
 // Re-exports for external consumers
 pub use types::PromptBuildResult;
+pub(crate) use message_history::OPENING_USER_TURN;
 
 use crate::llm::types::{ChatMessage, ChatRole, ContentBlock, LlmPrompt as NeutralLlmPrompt};
 use crate::session::Session;

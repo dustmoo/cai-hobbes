@@ -399,6 +399,35 @@ pub fn recent_reads(
         .collect()
 }
 
+/// `reads` still inside [`READ_WINDOW`] of `now`, newest per profile (sorted
+/// by profile id, so equal inputs give equal lists).
+pub fn merge_reads(
+    reads: impl IntoIterator<Item = crate::session::CarriedRead>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::session::CarriedRead> {
+    let mut newest: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> = Default::default();
+    for r in reads.into_iter().filter(|r| now - r.read_at <= READ_WINDOW) {
+        let at = newest.entry(r.profile_id).or_insert(r.read_at);
+        if r.read_at > *at {
+            *at = r.read_at;
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(profile_id, read_at)| crate::session::CarriedRead { profile_id, read_at })
+        .collect()
+}
+
+/// A session's reads still in play: those in its own messages and those it
+/// carries, newest per profile.
+pub fn session_recent_reads(
+    settings: &Settings,
+    session: &crate::session::Session,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::session::CarriedRead> {
+    merge_reads(recent_reads(settings, &session.messages, now).into_iter().chain(session.carried_reads.iter().cloned()), now)
+}
+
 /// Profiles this session has read Composio results from within
 /// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
 /// model's context — plus reads a rotated system session carried over from

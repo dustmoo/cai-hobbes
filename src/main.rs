@@ -3044,8 +3044,16 @@ fn app() -> Element {
 
         if let Some(cmd) = cmd_opt {
             tracing::debug!("App handling global ChatCommand: {:?}", cmd);
+            // An archived system session is read-only (session_rotation):
+            // its profile, model and connector stay as they were.
+            let archived_tab = crate::system_sessions::is_archive(&current_session_id.peek());
 
             match cmd {
+                ChatCommand::SwitchProfile(_) | ChatCommand::SwitchModel(_) | ChatCommand::SwitchConnector(_)
+                    if archived_tab =>
+                {
+                    tracing::debug!("ignored a profile/model switch on an archived system session");
+                }
                 ChatCommand::SwitchToSettingsTab(tab, slug) => {
                     tracing::info!(
                         "App: Switching to Settings Tab: {:?}, slug: {:?}",
