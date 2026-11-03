@@ -3138,6 +3138,35 @@ fn app() -> Element {
                         }
                     }
                 }
+                ChatCommand::ToggleProfileReach(profile_id) => {
+                    // Multi-profile reach, phase 2: the tab's pin stays home;
+                    // ticked profiles join its reach. System sessions keep
+                    // their own reach. Journaled so a replay rebuild keeps it.
+                    let sid = current_session_id.peek().clone();
+                    let changed = if crate::system_sessions::is_system(&sid) {
+                        None
+                    } else {
+                        let mut state = session_state.write();
+                        state.sessions.get_mut(&sid).map(|session| {
+                            if let Some(i) = session.profile_reach.iter().position(|p| p == &profile_id) {
+                                session.profile_reach.remove(i);
+                            } else {
+                                session.profile_reach.push(profile_id.clone());
+                            }
+                            // The next send re-fetches the tool set for the new reach.
+                            session.active_context.mcp_tools = None;
+                            session.profile_reach.clone()
+                        })
+                    };
+                    if let Some(profiles) = changed {
+                        crate::session_events::log_event(
+                            &sid,
+                            crate::session_events::SessionEvent::ProfileReachSet { profiles },
+                        );
+                        SessionState::save_async(&session_state.read(), Some(save_error));
+                        mcp_manager.read().invalidate_status_cache();
+                    }
+                }
                 ChatCommand::SwitchModel(idx) => {
                     // Slots come from the session's effective connector so the picker
                     // works in tabs pinned to a non-global connector.

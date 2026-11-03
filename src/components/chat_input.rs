@@ -70,6 +70,9 @@ pub enum ChatCommand {
     OpenTabInBackground(String),
     /// Switch the current session's profile to the profile at this index.
     SwitchProfile(usize),
+    /// Tick or untick a Composio profile (by id) in the current tab's reach
+    /// (multi-profile reach, phase 2); the tab's pinned profile stays home.
+    ToggleProfileReach(String),
     /// Switch the current session's model to the model at this index in the available models list.
     SwitchModel(usize),
     /// Switch the current session's LLM connector to the instance with this
@@ -405,6 +408,7 @@ pub fn ChatInput(
                 | ChatCommand::NewChat
                 | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)
+                | ChatCommand::ToggleProfileReach(_)
                 | ChatCommand::SwitchModel(_)
                 | ChatCommand::SwitchConnector(_)
                 | ChatCommand::CloseTab
@@ -1665,8 +1669,32 @@ pub fn ChatInput(
                                     .cloned()
                                     .unwrap_or_else(|| profiles[0].clone());
 
+                                // Multi-profile reach (phase 2): the profiles ticked
+                                // for this tab besides its home. System sessions keep
+                                // their own reach, so they get no checkboxes.
+                                let (reach_enabled, ticked, reach_extra): (bool, Vec<String>, Vec<String>) = {
+                                    let state = session_state.read();
+                                    match state.get_active_session() {
+                                        Some(s) if !crate::system_sessions::is_system(&s.id) => {
+                                            let reach = crate::mcp::manager::profile_reach::reach_of(&settings_read, s);
+                                            (
+                                                true,
+                                                s.profile_reach.clone(),
+                                                reach.into_iter().skip(1).map(|p| p.name).collect(),
+                                            )
+                                        }
+                                        _ => (false, Vec::new(), Vec::new()),
+                                    }
+                                };
+                                let reach_badge = (!reach_extra.is_empty()).then(|| format!("+{}", reach_extra.len()));
+                                let reach_title = if reach_extra.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · also reaches {}", reach_extra.join(", "))
+                                };
                                 let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
                                 let active_name = active_profile.name.clone();
+                                let active_id = active_profile.id.clone();
                                 let active_color = active_profile.color.clone();
                                 // The pill borrows the profile's colour for its border so the
                                 // tab's identity is legible without opening anything.
@@ -1688,10 +1716,13 @@ pub fn ChatInput(
                                         if interactive {
                                             button {
                                                 class: "{pill_class} cursor-pointer hover:brightness-110 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600",
-                                                title: "Profile: {active_name}",
+                                                title: "Profile: {active_name}{reach_title}",
                                                 onclick: move |_| show_profile_selector.set(!show_profile_selector()),
                                                 span { class: "{avatar_class}", "{active_initial}" }
                                                 span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                                if let Some(badge) = &reach_badge {
+                                                    span { class: "text-fg-muted font-mono", "{badge}" }
+                                                }
                                                 Icon { width: 12, height: 12, icon: fi_icons::FiChevronDown, class: "text-fg-muted shrink-0" }
                                             }
                                         } else {
@@ -1705,45 +1736,90 @@ pub fn ChatInput(
 
                                         if show_profile_selector() {
                                             div {
-                                                class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                                class: "absolute bottom-10 left-0 w-64 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                                // Home: the tab's pinned profile.
+                                                if reach_enabled {
+                                                    div {
+                                                        class: "w-full px-4 py-2 text-sm text-fg flex items-center justify-between border-b border-faint",
+                                                        div {
+                                                            class: "flex items-center space-x-2 min-w-0",
+                                                            span {
+                                                                class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm shrink-0", active_color),
+                                                                "{active_initial}"
+                                                            }
+                                                            span { class: "truncate", "{active_name}" }
+                                                        }
+                                                        span { class: "text-xs text-fg-muted", "home" }
+                                                    }
+                                                }
                                                 for (index, profile) in profiles.iter().enumerate() {
                                                     {
                                                         let profile_name = profile.name.clone();
                                                         let profile_color = profile.color.clone();
                                                         let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
+                                                        let profile_id = profile.id.clone();
+                                                        let in_reach = ticked.iter().any(|t| t == &profile.id);
+                                                        // A profile that isn't set up can't be reached.
+                                                        let reachable = profile.is_fully_configured();
+                                                        let check_title = if reachable {
+                                                            format!("Also use {profile_name} from this tab")
+                                                        } else {
+                                                            format!("{profile_name} isn't set up")
+                                                        };
+                                                        let pick_class = if reach_enabled {
+                                                            "flex-1 min-w-0 text-left pl-2 pr-4 py-2 text-sm text-fg-muted hover:text-fg transition-colors flex items-center justify-between"
+                                                        } else {
+                                                            "w-full text-left px-4 py-2 text-sm text-fg-muted hover:text-fg transition-colors flex items-center justify-between"
+                                                        };
 
-                                                        if profile.name != active_profile.name {
+                                                        if profile.id != active_id {
                                                             rsx! {
-                                                                button {
-                                                                    class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
-                                                                    onclick: move |_| {
-                                                                        // Route through the global command so the session
-                                                                        // pin is PERSISTED (save_async) and the profile
-                                                                        // change is journaled (ComposioProfileSet in the
-                                                                        // SwitchProfile handler) — writing the signals
-                                                                        // directly here would lose both.
-                                                                        chat_command.set(Some(ChatCommand::SwitchProfile(index)));
-
-                                                                        // Trigger summary refresh
-                                                                        scheduler.send(SchedulerSignal::ForceRefresh);
-                                                                        show_profile_selector.set(false);
-                                                                    },
-                                                                    div {
-                                                                        class: "flex items-center space-x-2",
-                                                                        span {
-                                                                            class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile_color),
-                                                                            "{profile_initial}"
+                                                                div {
+                                                                    class: "w-full flex items-center hover:bg-primary-900/50 transition-colors",
+                                                                    if reach_enabled {
+                                                                        input {
+                                                                            r#type: "checkbox",
+                                                                            class: "ml-4 w-3.5 h-3.5 accent-white/50 cursor-pointer shrink-0 disabled:cursor-not-allowed",
+                                                                            title: "{check_title}",
+                                                                            checked: in_reach,
+                                                                            disabled: !reachable && !in_reach,
+                                                                            onchange: move |_| {
+                                                                                chat_command.set(Some(ChatCommand::ToggleProfileReach(profile_id.clone())));
+                                                                            }
                                                                         }
-                                                                        span { class: "truncate", "{profile_name}" }
                                                                     }
-                                                                    // Hotkey hint (1-indexed). Profile switching is
-                                                                    // the RESERVED Cmd+Option+N combo (hotkey.rs) —
-                                                                    // plain Cmd+N is tab switching, so a bare ⌘ hint
-                                                                    // advertised a binding this popup doesn't own.
-                                                                    if index < 9 {
-                                                                        span {
-                                                                            class: "text-xs text-fg-muted font-mono",
-                                                                            "⌥⌘{index + 1}"
+                                                                    button {
+                                                                        class: "{pick_class}",
+                                                                        title: "Make {profile_name} this tab's home profile",
+                                                                        onclick: move |_| {
+                                                                            // Route through the global command so the session
+                                                                            // pin is PERSISTED (save_async) and the profile
+                                                                            // change is journaled (ComposioProfileSet in the
+                                                                            // SwitchProfile handler) — writing the signals
+                                                                            // directly here would lose both.
+                                                                            chat_command.set(Some(ChatCommand::SwitchProfile(index)));
+
+                                                                            // Trigger summary refresh
+                                                                            scheduler.send(SchedulerSignal::ForceRefresh);
+                                                                            show_profile_selector.set(false);
+                                                                        },
+                                                                        div {
+                                                                            class: "flex items-center space-x-2",
+                                                                            span {
+                                                                                class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm", profile_color),
+                                                                                "{profile_initial}"
+                                                                            }
+                                                                            span { class: "truncate", "{profile_name}" }
+                                                                        }
+                                                                        // Hotkey hint (1-indexed). Profile switching is
+                                                                        // the RESERVED Cmd+Option+N combo (hotkey.rs) —
+                                                                        // plain Cmd+N is tab switching, so a bare ⌘ hint
+                                                                        // advertised a binding this popup doesn't own.
+                                                                        if index < 9 {
+                                                                            span {
+                                                                                class: "text-xs text-fg-muted font-mono",
+                                                                                "⌥⌘{index + 1}"
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
@@ -1757,7 +1833,11 @@ pub fn ChatInput(
                                                 // switch is not free — say so before it is taken.
                                                 p {
                                                     class: "mt-1 px-4 pt-1.5 pb-1 text-[11px] text-fg-muted border-t border-faint",
-                                                    "Tools in this tab reload for the chosen profile."
+                                                    if reach_enabled {
+                                                        "Pick a profile to make it home; tick one to also use it here. Writes that cross companies ask first."
+                                                    } else {
+                                                        "Tools in this tab reload for the chosen profile."
+                                                    }
                                                 }
                                             }
                                         }
