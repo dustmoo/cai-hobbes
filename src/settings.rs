@@ -976,6 +976,27 @@ pub struct VoiceSettings {
     /// name elsewhere). `None`, or a device that is gone, = system default.
     #[serde(default)]
     pub input_device_uid: Option<String>,
+    /// Speaker-echo handling (macOS). Apple's voice processing cancels the
+    /// speaker's echo but only works on the system default mic and puts
+    /// Bluetooth headsets into call mode; see [`VoiceEcho`].
+    #[serde(default)]
+    pub echo: VoiceEcho,
+}
+
+/// How voice keeps the model from hearing itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceEcho {
+    /// Apple voice processing only when it can help: the system default mic
+    /// is in use and the output isn't headphones. Otherwise the chosen mic
+    /// is used directly (full duplex on headphones, mic muted while Hobbes
+    /// speaks on speakers).
+    #[default]
+    Auto,
+    /// Always Apple voice processing (uses the system default mic).
+    On,
+    /// Never; the chosen mic is used directly.
+    Off,
 }
 
 fn default_voice_hotkey() -> String {
@@ -998,6 +1019,7 @@ impl Default for VoiceSettings {
             idle_timeout_secs: default_voice_idle_timeout_secs(),
             speak_heartbeat: true,
             input_device_uid: None,
+            echo: VoiceEcho::Auto,
         }
     }
 }

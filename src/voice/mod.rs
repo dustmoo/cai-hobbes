@@ -9,12 +9,14 @@
 //! - [`session`]: the dedicated Voice chat session and peer reads.
 //! - [`tools`]: the voice tier's curated tools.
 //! - [`hotkey`]: the global tap / hold hotkey.
+//! - [`probe`]: mic check and speech round-trip diagnostics.
 
 pub mod audio;
 pub mod brain;
 pub mod controller;
 pub mod gemini_live;
 pub mod hotkey;
+pub mod probe;
 pub mod realtime;
 pub mod session;
 pub mod tools;

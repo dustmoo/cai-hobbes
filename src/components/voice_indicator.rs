@@ -68,7 +68,8 @@ pub fn VoiceIndicator() -> Element {
         Some(Mode::PushToTalk) => format!("Hold {key} to talk · tap to go hands-free"),
         _ => format!("Tap {key} to end"),
     };
-    let echo_note = (!ui.echo_cancelled).then_some(" · headphones recommended");
+    let echo_note = (!ui.echo_safe).then_some(" · headphones recommended");
+    let level_pct = level_percent(ui.level);
     rsx! {
         div {
             class: "flex items-center justify-between gap-3 px-4 py-2 bg-primary-900/80 border-b border-primary-700 text-fg text-sm",
@@ -78,11 +79,23 @@ pub fn VoiceIndicator() -> Element {
                     div { class: "w-2 h-2 rounded-full bg-primary-400 animate-pulse shrink-0" }
                 }
                 span { class: "font-medium shrink-0", "{status}" }
-                if !ui.heard.is_empty() {
+                if let Some(w) = ui.mic_warning.clone() {
+                    span { class: "truncate text-amber-300", "{w}" }
+                } else if !ui.heard.is_empty() {
                     span { class: "truncate text-fg-muted", "“{ui.heard}”" }
                 }
             }
             div { class: "flex items-center gap-2 shrink-0",
+                if !ui.mic.is_empty() {
+                    span {
+                        class: "flex items-center gap-1.5 text-xs text-fg-muted",
+                        title: "Microphone in use and its level",
+                        "{ui.mic}"
+                        div { class: "w-10 h-1.5 rounded bg-primary-800 overflow-hidden",
+                            div { class: "h-full bg-primary-400", style: "width: {level_pct}%" }
+                        }
+                    }
+                }
                 span { class: "text-xs text-fg-muted", "{hint}{echo_note.unwrap_or_default()}" }
                 button {
                     class: "px-2 py-0.5 text-xs bg-primary-800 hover:bg-primary-700 rounded transition-colors",
@@ -104,6 +117,12 @@ pub fn VoiceIndicator() -> Element {
     }
 }
 
+/// Mic peak (0–1) as a meter width: speech peaks well under full scale,
+/// so the scale is stretched (√) to make normal talking fill most of it.
+pub fn level_percent(peak: f32) -> u32 {
+    (peak.clamp(0.0, 1.0).sqrt() * 100.0).round() as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +133,13 @@ mod tests {
         assert_eq!(status_text(Phase::Listening, Some(Mode::Conversation), false, 1), "Listening · brain working");
         assert_eq!(status_text(Phase::Listening, Some(Mode::PushToTalk), false, 0), "Hold to talk");
         assert_eq!(status_text(Phase::Listening, Some(Mode::PushToTalk), true, 0), "Listening");
+    }
+
+    #[test]
+    fn level_meter_stretches_quiet_speech() {
+        assert_eq!(level_percent(0.0), 0);
+        assert_eq!(level_percent(0.25), 50);
+        assert_eq!(level_percent(2.0), 100);
     }
 
     #[cfg(target_os = "macos")]

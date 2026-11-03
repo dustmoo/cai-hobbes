@@ -920,4 +920,26 @@ mod tests {
         println!("\ntool result spoken: {spoke_after} samples");
         s.control.send(RealtimeControl::Close).unwrap();
     }
+
+    /// The mic path's protocol: real (synthesized) speech streamed as
+    /// `realtimeInput.audio` must be transcribed and answered aloud.
+    /// `GEMINI_API_KEY=… cargo test --release gemini_live_speech_round_trip -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn gemini_live_speech_round_trip() {
+        let key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
+        let model = std::env::var("GEMINI_LIVE_MODEL").unwrap_or_else(|_| "gemini-3.8-live".into());
+        let speech = crate::voice::probe::synth_speech(crate::voice::probe::TEST_QUESTION).expect("say");
+        let setup = RealtimeSetup {
+            model,
+            system_instruction: "Answer in one short sentence.".into(),
+            ..Default::default()
+        };
+        let r = crate::voice::probe::speech_round_trip(&GeminiLive::new(key), setup, speech)
+            .await
+            .expect("round trip");
+        println!("heard {:?}\nreplied {:?} ({:.1} s audio, first after {:?})", r.heard, r.replied, r.reply_secs, r.first_audio_after);
+        assert!(r.heard.to_lowercase().contains("two"), "transcript: {:?}", r.heard);
+        assert!(r.reply_secs > 0.3);
+    }
 }

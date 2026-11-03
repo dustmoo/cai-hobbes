@@ -6,7 +6,7 @@ use crate::components::hotkey_recorder::HotkeyRecorder;
 use crate::settings::{
     default_realtime_model, realtime_capable, VoiceProfile, VOICE_NEEDS_REALTIME,
 };
-use crate::voice::audio::MicPermission;
+use crate::voice::audio::{MicPermission, VoiceEcho};
 use dioxus::prelude::*;
 
 const GEMINI_VOICES: &[&str] = &[
@@ -198,6 +198,10 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
     let mut local_settings = ctx.local_settings;
     let mut mic = use_signal(crate::voice::audio::mic_permission);
     let mut devices = use_signal(crate::voice::audio::list_input_devices);
+    let mut check_level = use_signal(|| None::<f32>);
+    let mut check_result = use_signal(|| None::<String>);
+    let mut test_result = use_signal(|| None::<String>);
+    let mut testing = use_signal(|| false);
     if !crate::voice::voice_available() {
         return rsx! {};
     }
@@ -351,6 +355,108 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                             onclick: move |_| devices.set(crate::voice::audio::list_input_devices()),
                             "Refresh"
                         }
+                    }
+                }
+                div {
+                    class: "mb-4",
+                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Echo cancellation" }
+                    p { class: "text-xs text-fg-muted mb-1",
+                        "Stops Hobbes hearing itself on speakers. Apple's echo cancellation only works with the system default mic and switches Bluetooth headsets to call quality. Auto uses it only when no mic is chosen and you're on speakers; otherwise the chosen mic is used directly, and on speakers the mic pauses while Hobbes talks."
+                    }
+                    select {
+                        class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+                        onchange: move |e| {
+                            local_settings.write().voice.echo = match e.value().as_str() {
+                                "on" => VoiceEcho::On,
+                                "off" => VoiceEcho::Off,
+                                _ => VoiceEcho::Auto,
+                            };
+                        },
+                        option { value: "auto", selected: s.voice.echo == VoiceEcho::Auto, "Auto (recommended)" }
+                        option { value: "on", selected: s.voice.echo == VoiceEcho::On, "On (system default mic)" }
+                        option { value: "off", selected: s.voice.echo == VoiceEcho::Off, "Off (use the chosen mic)" }
+                    }
+                }
+                div {
+                    class: "mb-4",
+                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Test the pipes" }
+                    p { class: "text-xs text-fg-muted mb-2",
+                        "Check mic listens for 3 seconds and shows the level (nothing is recorded or sent). Test voice model sends a short spoken question to the voice profile, without the mic, and shows what it heard and said back. Both use the settings above, saved or not."
+                    }
+                    div {
+                        class: "flex items-center gap-2",
+                        button {
+                            class: "px-3 py-1.5 rounded-md text-xs bg-input text-fg-muted hover:text-fg border border-subtle disabled:opacity-50",
+                            disabled: *testing.read() || crate::voice::controller::is_live(),
+                            onclick: move |_| {
+                                let (uid, echo) = {
+                                    let ls = local_settings.read();
+                                    (ls.voice.input_device_uid.clone(), ls.voice.echo)
+                                };
+                                testing.set(true);
+                                check_result.set(Some("Listening… say something.".into()));
+                                check_level.set(Some(0.0));
+                                spawn(async move {
+                                    let r = crate::voice::probe::mic_check(uid, echo, std::time::Duration::from_secs(3), move |l| check_level.set(Some(l))).await;
+                                    check_level.set(None);
+                                    check_result.set(Some(match r {
+                                        Ok(rep) => {
+                                            let via = if rep.voice_processing { " · with Apple echo cancellation" } else { "" };
+                                            format!("{}{via}", crate::voice::probe::verdict_text(rep.verdict(), &rep.input_name))
+                                        }
+                                        Err(e) => format!("Couldn't open the mic: {e}"),
+                                    }));
+                                    testing.set(false);
+                                });
+                            },
+                            "Check mic"
+                        }
+                        button {
+                            class: "px-3 py-1.5 rounded-md text-xs bg-input text-fg-muted hover:text-fg border border-subtle disabled:opacity-50",
+                            disabled: *testing.read() || crate::voice::controller::is_live(),
+                            onclick: move |_| {
+                                let built = crate::voice::controller::realtime_for(&local_settings.read());
+                                testing.set(true);
+                                test_result.set(Some("Asking the voice model a test question…".into()));
+                                spawn(async move {
+                                    let msg = match built {
+                                        Err(e) => e,
+                                        Ok((provider, mut setup)) => {
+                                            setup.system_instruction = "This is an audio sound check. Answer in one short sentence.".into();
+                                            setup.tools.clear();
+                                            match tokio::task::spawn_blocking(|| crate::voice::probe::synth_speech(crate::voice::probe::TEST_QUESTION)).await {
+                                                Ok(Ok(speech)) => match crate::voice::probe::speech_round_trip(provider.as_ref(), setup, speech).await {
+                                                    Ok(r) => format!(
+                                                        "Working. Heard: “{}”. Replied: “{}” ({:.1} s of speech, first sound after {:.1} s).",
+                                                        r.heard,
+                                                        r.replied,
+                                                        r.reply_secs,
+                                                        r.first_audio_after.unwrap_or_default().as_secs_f32()
+                                                    ),
+                                                    Err(e) => format!("The voice model test failed: {e}"),
+                                                },
+                                                Ok(Err(e)) => format!("Couldn't make the test speech: {e}"),
+                                                Err(e) => format!("Couldn't make the test speech: {e}"),
+                                            }
+                                        }
+                                    };
+                                    test_result.set(Some(msg));
+                                    testing.set(false);
+                                });
+                            },
+                            "Test voice model"
+                        }
+                        if let Some(l) = *check_level.read() {
+                            div { class: "w-24 h-1.5 rounded bg-primary-800 overflow-hidden",
+                                div { class: "h-full bg-primary-400", style: "width: {crate::components::voice_indicator::level_percent(l)}%" }
+                            }
+                        }
+                    }
+                    if let Some(r) = check_result.read().clone() {
+                        p { class: "text-xs text-fg-muted mt-2", "{r}" }
+                    }
+                    if let Some(r) = test_result.read().clone() {
+                        p { class: "text-xs text-fg-muted mt-1", "{r}" }
                     }
                 }
                 div {

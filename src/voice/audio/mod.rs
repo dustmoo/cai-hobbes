@@ -3,17 +3,21 @@
 //! Processing IO). That is what lets the person talk over Hobbes on laptop
 //! speakers without the model hearing itself.
 //!
-//! - macOS: `AVAudioEngine` with voice processing enabled (`macos.rs`).
-//! - Elsewhere: `cpal`, without echo cancellation (`cpal_io.rs`); headphones
-//!   recommended.
+//! - macOS, voice processing: `AVAudioEngine` with Apple's echo canceller
+//!   (`macos.rs`). It always captures from the system default mic (it
+//!   ignores a chosen device) and puts a Bluetooth headset into call mode.
+//! - Everywhere else, and on macOS when a specific mic is chosen or the
+//!   output is headphones: `cpal` on exactly the chosen device, no echo
+//!   cancellation (`cpal_io.rs`). See [`use_voice_processing`].
 
 use tokio::sync::mpsc;
 
 mod dsp;
 #[cfg(target_os = "macos")]
 mod macos;
-#[cfg(not(target_os = "macos"))]
 mod cpal_io;
+
+pub use crate::settings::VoiceEcho;
 
 /// Why audio could not start.
 #[derive(Clone, Debug, PartialEq)]
@@ -63,8 +67,10 @@ pub trait AudioIo: Send {
     /// Gate the mic (push-to-talk / mute) without tearing down the engine.
     /// While disabled, nothing is sent on `mic_tx`.
     fn set_mic_enabled(&self, enabled: bool);
-    /// Whether this backend cancels speaker echo (macOS VPIO: true).
-    fn echo_cancelled(&self) -> bool;
+    /// Whether the model can't hear itself: the backend cancels speaker
+    /// echo (macOS voice processing), or the output is headphones. When
+    /// false the controller mutes the mic while the voice speaks.
+    fn echo_safe(&self) -> bool;
     /// Stop everything. Idempotent; also done on drop.
     fn stop(&mut self);
 }
@@ -103,19 +109,83 @@ pub fn resolve_input_device<'a>(
     devices.iter().find(|d| d.uid == uid)
 }
 
-/// The platform's best audio backend, capturing from the input device
-/// `input_uid` names (see [`list_input_devices`]). `None`, or a device that
-/// is gone (logged at WARN), uses the system default input. Output always
-/// goes to the system default.
-pub fn open(input_uid: Option<&str>) -> Result<Box<dyn AudioIo>, AudioError> {
+/// What the default output device is, as far as echo goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputKind {
+    /// Bluetooth audio or the headphone jack: the mic can't hear it.
+    Headphones,
+    /// Built-in or external speakers (or unknown: assume the worst).
+    Speakers,
+}
+
+/// The default output device's kind.
+pub fn default_output_kind() -> OutputKind {
     #[cfg(target_os = "macos")]
     {
-        macos::VoiceProcessingIo::new(input_uid).map(|io| Box::new(io) as Box<dyn AudioIo>)
+        macos::default_output_kind()
     }
     #[cfg(not(target_os = "macos"))]
     {
-        cpal_io::CpalIo::new(input_uid).map(|io| Box::new(io) as Box<dyn AudioIo>)
+        OutputKind::Speakers
     }
+}
+
+/// Whether to use Apple voice processing (macOS only). It only captures
+/// from the system default mic, so a specifically chosen mic always wins
+/// in `Auto`; and on headphones there is no echo to cancel.
+pub fn use_voice_processing(mode: VoiceEcho, chosen_mic: bool, output: OutputKind) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    match mode {
+        VoiceEcho::On => true,
+        VoiceEcho::Off => false,
+        VoiceEcho::Auto => !chosen_mic && output == OutputKind::Speakers,
+    }
+}
+
+/// An opened (not yet started) audio backend and what it is using.
+pub struct Opened {
+    pub io: Box<dyn AudioIo>,
+    /// The mic actually captured from, for the indicator and logs.
+    pub input_name: String,
+    pub voice_processing: bool,
+}
+
+/// Open audio for a conversation: capture from the mic `input_uid` names
+/// (see [`list_input_devices`]; `None` or a device that is gone = system
+/// default), play to the system default output.
+pub fn open(input_uid: Option<&str>, echo: VoiceEcho) -> Result<Opened, AudioError> {
+    let devices = list_input_devices();
+    let chosen = resolve_input_device(&devices, input_uid).cloned();
+    if input_uid.is_some_and(|u| !u.is_empty()) && chosen.is_none() {
+        tracing::warn!("voice audio: the chosen mic isn't connected; using the system default");
+    }
+    let output = default_output_kind();
+    let vp = use_voice_processing(echo, chosen.is_some(), output);
+    let default_name = devices.iter().find(|d| d.is_default).map(|d| d.name.clone());
+    if vp {
+        return open_voice_processing(default_name, output);
+    }
+    // cpal finds devices by name.
+    let name = chosen.as_ref().map(|d| d.name.clone());
+    let io = cpal_io::CpalIo::new(name.as_deref(), output == OutputKind::Headphones)?;
+    let input_name = name.or(default_name).unwrap_or_else(|| "the system default mic".into());
+    tracing::info!("voice audio: mic '{input_name}', no echo cancellation; output {output:?}");
+    Ok(Opened { io: Box::new(io), input_name, voice_processing: false })
+}
+
+#[cfg(target_os = "macos")]
+fn open_voice_processing(default_name: Option<String>, output: OutputKind) -> Result<Opened, AudioError> {
+    let io = macos::VoiceProcessingIo::new()?;
+    let input_name = default_name.unwrap_or_else(|| "the system default mic".into());
+    tracing::info!("voice audio: mic '{input_name}' (system default) with Apple voice processing; output {output:?}");
+    Ok(Opened { io: Box::new(io), input_name, voice_processing: true })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_voice_processing(_: Option<String>, _: OutputKind) -> Result<Opened, AudioError> {
+    Err(AudioError::Backend("voice processing is macOS-only".into()))
 }
 
 /// Current microphone permission.
@@ -185,5 +255,45 @@ mod tests {
         assert_eq!(resolve_input_device(&devs, Some("gone")), None);
         assert_eq!(resolve_input_device(&devs, Some("")), None);
         assert_eq!(resolve_input_device(&devs, None), None);
+    }
+
+    /// Every CoreAudio mic must be findable by cpal under the same name
+    /// (cpal opens devices by name). Query only; opens nothing.
+    /// `cargo test --release cpal_sees_the_same_mics -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore]
+    fn cpal_sees_the_same_mics() {
+        let cpal_names: Vec<String> = cpal_io::list_input_devices().into_iter().map(|d| d.name).collect();
+        println!("cpal: {cpal_names:?}");
+        for d in list_input_devices() {
+            assert!(cpal_names.contains(&d.name), "cpal can't see {:?}", d.name);
+        }
+    }
+
+    /// Opens a mic for 3 s and prints frames + peak (nothing is kept).
+    /// `HOBBES_MIC_UID=<uid> cargo test --release mic_check_prints -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn mic_check_prints() {
+        let uid = std::env::var("HOBBES_MIC_UID").ok();
+        let r = crate::voice::probe::mic_check(uid, VoiceEcho::Auto, std::time::Duration::from_secs(3), |_| {})
+            .await
+            .expect("mic check");
+        println!("{r:?}\n{}", crate::voice::probe::verdict_text(r.verdict(), &r.input_name));
+    }
+
+    #[test]
+    fn a_chosen_mic_wins_over_voice_processing_in_auto() {
+        let on_mac = cfg!(target_os = "macos");
+        // No mic chosen, laptop speakers: echo cancellation helps.
+        assert_eq!(use_voice_processing(VoiceEcho::Auto, false, OutputKind::Speakers), on_mac);
+        // A chosen mic (e.g. the webcam): honour it; VPIO would ignore it.
+        assert!(!use_voice_processing(VoiceEcho::Auto, true, OutputKind::Speakers));
+        // Headphones: nothing to cancel, and VPIO would flip a Bluetooth
+        // headset into call mode.
+        assert!(!use_voice_processing(VoiceEcho::Auto, false, OutputKind::Headphones));
+        assert_eq!(use_voice_processing(VoiceEcho::On, true, OutputKind::Headphones), on_mac);
+        assert!(!use_voice_processing(VoiceEcho::Off, false, OutputKind::Speakers));
     }
 }

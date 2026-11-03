@@ -9,8 +9,14 @@
 //! detection, so one session setup serves both.
 //!
 //! **Barge-in.** The provider reports `Interrupted` when the person talks
-//! over the voice; playback is flushed immediately. Without platform echo
-//! cancellation (non-macOS), the mic is muted while the voice speaks.
+//! over the voice; playback is flushed immediately. When the model could
+//! hear itself (no echo cancellation and the output isn't headphones), the
+//! mic is muted while the voice speaks.
+//!
+//! **Pipes.** The strip shows which mic is live and its level, and warns
+//! within a few seconds when no audio (or only digital silence) arrives.
+//! Each conversation logs counts — frames captured and sent, model audio,
+//! transcript fragments — never content.
 //!
 //! **The brain.** `VOICE_ASK_BRAIN` runs in the background (`brain.rs`); its
 //! result goes back as the tool response (`WHEN_IDLE`), or as injected
@@ -29,7 +35,8 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use crate::components::builtin_tools::BuiltinToolCtx;
-use crate::voice::audio::{self, AudioIo, MicPermission};
+use crate::voice::audio::{self, AudioIo, MicPermission, VoiceEcho};
+use crate::voice::probe;
 use crate::voice::brain::{self, BrainHandle, BrainOutcome};
 use crate::voice::realtime::{
     RealtimeControl, RealtimeEvent, RealtimeSetup, RealtimeVoice, Scheduling,
@@ -64,7 +71,14 @@ pub struct VoiceUi {
     pub brain_busy: usize,
     /// What the person is saying right now (live transcript tail).
     pub heard: String,
-    pub echo_cancelled: bool,
+    /// The model can't hear itself (echo cancelled, or headphones).
+    pub echo_safe: bool,
+    /// The mic being captured from.
+    pub mic: String,
+    /// Recent mic peak level, 0.0–1.0.
+    pub level: f32,
+    /// The mic isn't delivering audio (shown while the conversation runs).
+    pub mic_warning: Option<String>,
     /// Last problem worth showing (cleared on the next successful start).
     pub error: Option<String>,
 }
@@ -145,6 +159,7 @@ struct Resolved {
     speak_heartbeat: bool,
     profile: Option<String>,
     input_device: Option<String>,
+    echo: VoiceEcho,
 }
 
 fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
@@ -152,6 +167,22 @@ fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
     if !crate::voice::voice_active(&settings) {
         return Err("Voice is off. Turn it on in Settings → Voice.".into());
     }
+    let (provider, setup) = realtime_for(&settings)?;
+    Ok(Resolved {
+        provider,
+        setup,
+        threshold_ms: settings.voice.hold_threshold_ms.max(100),
+        idle: Duration::from_secs(settings.voice.idle_timeout_secs.max(15)),
+        speak_heartbeat: settings.voice.speak_heartbeat,
+        profile: settings.get_active_profile().map(|p| p.id.clone()),
+        input_device: settings.voice.input_device_uid.clone(),
+        echo: settings.voice.echo,
+    })
+}
+
+/// The realtime provider and session setup for `settings`' voice profile
+/// (also used by the Settings connection test).
+pub fn realtime_for(settings: &crate::settings::Settings) -> Result<(Box<dyn RealtimeVoice>, RealtimeSetup), String> {
     let Some(conn) = settings.voice_connector() else {
         return Err("Pick a voice profile in Settings → Voice.".into());
     };
@@ -179,15 +210,7 @@ fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
         tools: tools::voice_tool_decls(settings.planner_enabled),
         manual_activity: false,
     };
-    Ok(Resolved {
-        provider: Box::new(crate::voice::gemini_live::GeminiLive::new(key)),
-        setup,
-        threshold_ms: settings.voice.hold_threshold_ms.max(100),
-        idle: Duration::from_secs(settings.voice.idle_timeout_secs.max(15)),
-        speak_heartbeat: settings.voice.speak_heartbeat,
-        profile: settings.get_active_profile().map(|p| p.id.clone()),
-        input_device: settings.voice.input_device_uid.clone(),
-    })
+    Ok((Box::new(crate::voice::gemini_live::GeminiLive::new(key)), setup))
 }
 
 /// The voice tier's instructions, with recent context from both sessions.
@@ -229,7 +252,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut ui = VoiceUi { phase: Phase::Connecting, held: true, ..VoiceUi::default() };
     *VOICE_UI.write() = ui.clone();
 
-    let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, input_device } = match resolve(ctx) {
+    let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, input_device, echo } = match resolve(ctx) {
         Ok(r) => r,
         Err(e) => {
             fail(e);
@@ -261,14 +284,17 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
     // Opening and starting the engine blocks for a second or two (VPIO
     // setup): off the UI thread.
-    let started = tokio::task::spawn_blocking(move || -> Result<Box<dyn AudioIo>, String> {
-        let mut io = audio::open(input_device.as_deref()).map_err(|e| format!("Couldn't open the microphone: {e}"))?;
-        io.start(mic_tx).map_err(|e| format!("Couldn't start audio: {e}"))?;
-        Ok(io)
+    let started = tokio::task::spawn_blocking(move || -> Result<audio::Opened, String> {
+        let mut o = audio::open(input_device.as_deref(), echo).map_err(|e| format!("Couldn't open the microphone: {e}"))?;
+        o.io.start(mic_tx).map_err(|e| format!("Couldn't start audio on {}: {e}", o.input_name))?;
+        Ok(o)
     })
     .await;
     let mut audio_io: Box<dyn AudioIo> = match started {
-        Ok(Ok(a)) => a,
+        Ok(Ok(o)) => {
+            ui.mic = o.input_name;
+            o.io
+        }
         Ok(Err(e)) => {
             fail(e);
             return;
@@ -279,7 +305,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         }
     };
     audio_io.set_mic_enabled(true);
-    ui.echo_cancelled = audio_io.echo_cancelled();
+    ui.echo_safe = audio_io.echo_safe();
 
     setup.system_instruction = system_instruction(
         chrono::Local::now(),
@@ -294,7 +320,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
             return;
         }
     };
-    tracing::info!("voice: conversation started (echo cancellation: {})", ui.echo_cancelled);
+    tracing::info!("voice: conversation started (mic '{}', echo-safe: {})", ui.mic, ui.echo_safe);
+    let live_at = Instant::now();
+    let mut stats = Stats::default();
+    let mut level_window = 0.0f32;
 
     // Until the key comes up we don't know tap vs hold; treat as held.
     let mut mode: Option<Mode> = None;
@@ -316,10 +345,15 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         tokio::select! {
             frame = mic_rx.recv() => {
                 let Some(frame) = frame else { break "audio stopped".to_string() };
+                let p = probe::peak(&frame);
+                stats.mic_frames += 1;
+                stats.max_peak = stats.max_peak.max(p);
+                level_window = level_window.max(p);
                 let mic_open = held || mode == Some(Mode::Conversation);
-                // Without echo cancellation the model would hear itself.
-                let echo_risk = !ui.echo_cancelled && audio_io.is_playing() && !held;
+                // Without echo cancellation or headphones the model would hear itself.
+                let echo_risk = !ui.echo_safe && audio_io.is_playing() && !held;
                 if mic_open && !echo_risk {
+                    stats.sent_frames += 1;
                     let _ = rt.control.send(RealtimeControl::Audio(frame));
                 }
             }
@@ -328,6 +362,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 match ev {
                     RealtimeEvent::Ready | RealtimeEvent::Reconnected => {}
                     RealtimeEvent::Audio { pcm, sample_rate } => {
+                        stats.model_audio_ms += (pcm.len() as u64 * 1000) / sample_rate.max(1) as u64;
                         if !heard_buf.trim().is_empty() {
                             pending_lines.push((true, std::mem::take(&mut heard_buf)));
                         }
@@ -337,12 +372,16 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         ui.heard.clear();
                     }
                     RealtimeEvent::InputTranscript(t) => {
+                        stats.heard_fragments += 1;
                         heard_buf.push_str(&t);
                         last_activity = Instant::now();
                         ui.heard = live_tail(&heard_buf);
                         ui.phase = Phase::Listening;
                     }
-                    RealtimeEvent::OutputTranscript(t) => spoke_buf.push_str(&t),
+                    RealtimeEvent::OutputTranscript(t) => {
+                        stats.spoke_fragments += 1;
+                        spoke_buf.push_str(&t);
+                    }
                     RealtimeEvent::Interrupted => {
                         audio_io.flush();
                         if !spoke_buf.trim().is_empty() {
@@ -352,6 +391,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         last_activity = Instant::now();
                     }
                     RealtimeEvent::TurnComplete => {
+                        stats.turns += 1;
                         if !heard_buf.trim().is_empty() {
                             pending_lines.push((true, std::mem::take(&mut heard_buf)));
                         }
@@ -362,6 +402,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         last_activity = Instant::now();
                     }
                     RealtimeEvent::ToolCall { id, name, args } => {
+                        stats.tool_calls += 1;
                         last_activity = Instant::now();
                         match name.as_str() {
                             tools::ASK_BRAIN => {
@@ -474,6 +515,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 }
             }
             _ = tick.tick() => {
+                ui.level = level_window;
+                level_window = 0.0;
+                ui.mic_warning = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic);
                 if ui.phase == Phase::Speaking && !audio_io.is_playing() {
                     ui.phase = Phase::Listening;
                 }
@@ -521,9 +565,53 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         pending_lines.push((false, spoke_buf));
     }
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
-    tracing::info!("voice: conversation ended ({close_reason})");
+    tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
+    if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic) {
+        fail(w);
+        return;
+    }
     if !matches!(close_reason.as_str(), "ended" | "stopped" | "goodbye" | "idle" | "app closing") {
         fail(format!("The voice conversation ended: {close_reason}"));
+    }
+}
+
+/// Per-conversation counts for the end-of-conversation log line (no content).
+#[derive(Default)]
+struct Stats {
+    mic_frames: u64,
+    sent_frames: u64,
+    max_peak: f32,
+    model_audio_ms: u64,
+    heard_fragments: u64,
+    spoke_fragments: u64,
+    turns: u64,
+    tool_calls: u64,
+}
+
+impl Stats {
+    fn summary(&self) -> String {
+        format!(
+            "mic frames {} (sent {}), peak {:.3}, model audio {:.1}s, heard/spoke fragments {}/{}, turns {}, tool calls {}",
+            self.mic_frames,
+            self.sent_frames,
+            self.max_peak,
+            self.model_audio_ms as f32 / 1000.0,
+            self.heard_fragments,
+            self.spoke_fragments,
+            self.turns,
+            self.tool_calls,
+        )
+    }
+}
+
+/// After a grace period: no frames at all, or only digital silence, from the mic.
+pub fn mic_warning(live_for: Duration, frames: u64, max_peak: f32, mic: &str) -> Option<String> {
+    if live_for < Duration::from_secs(3) {
+        return None;
+    }
+    match probe::mic_verdict(frames as usize, max_peak) {
+        probe::MicVerdict::Ok(_) => None,
+        v => Some(probe::verdict_text(v, mic)),
     }
 }
 
@@ -571,6 +659,14 @@ mod tests {
         assert!(s.contains("CI is red") && s.contains("🎙 hi"));
         let bare = system_instruction(now, "", "");
         assert!(!bare.contains("Heartbeat notes"));
+    }
+
+    #[test]
+    fn mic_warning_waits_then_names_the_mic() {
+        assert_eq!(mic_warning(Duration::from_secs(1), 0, 0.0, "BRIO"), None);
+        assert!(mic_warning(Duration::from_secs(4), 0, 0.0, "BRIO").unwrap().contains("No audio is arriving from BRIO"));
+        assert!(mic_warning(Duration::from_secs(4), 200, 0.0, "BRIO").unwrap().contains("sending silence"));
+        assert_eq!(mic_warning(Duration::from_secs(4), 200, 0.1, "BRIO"), None);
     }
 
     #[test]

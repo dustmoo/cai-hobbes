@@ -1,5 +1,6 @@
-//! Cross-platform audio over `cpal` (used where macOS VPIO isn't available,
-//! i.e. Windows/Linux). No echo cancellation: headphones recommended.
+//! Audio over `cpal`: Windows/Linux, and macOS whenever a specific mic is
+//! chosen or the output is headphones (voice processing only captures from
+//! the system default mic). No echo cancellation.
 //!
 //! Threading: cpal streams aren't `Send` on every platform, so a dedicated
 //! thread ("hobbes-voice-audio") builds and owns both streams and parks until
@@ -25,7 +26,8 @@ const MIC_RATE: u32 = 16_000;
 const MIC_FRAME_SAMPLES: usize = 320;
 
 /// Input devices via cpal. cpal has no stable device id, so `uid` is the
-/// device name.
+/// device name. (macOS lists devices through CoreAudio instead.)
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn list_input_devices() -> Vec<AudioDevice> {
     let host = cpal::default_host();
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
@@ -52,6 +54,8 @@ struct Shared {
 
 pub struct CpalIo {
     shared: Arc<Shared>,
+    /// Output is headphones: the mic can't hear the voice.
+    headphones: bool,
     input_uid: Option<String>,
     /// Dropping/sending on this ends the audio thread (and its streams).
     stop_tx: Option<std_mpsc::Sender<()>>,
@@ -60,8 +64,10 @@ pub struct CpalIo {
 impl CpalIo {
     /// `input_uid`: the input device name from [`list_input_devices`]
     /// (`None` = default; a missing device falls back to the default).
-    pub fn new(input_uid: Option<&str>) -> Result<Self, AudioError> {
+    /// `headphones`: the output can't leak into the mic (see `echo_safe`).
+    pub fn new(input_uid: Option<&str>, headphones: bool) -> Result<Self, AudioError> {
         Ok(Self {
+            headphones,
             shared: Arc::new(Shared {
                 mic_enabled: AtomicBool::new(true),
                 ring: Mutex::new(VecDeque::new()),
@@ -136,8 +142,8 @@ impl AudioIo for CpalIo {
         self.shared.mic_enabled.store(enabled, Ordering::Release);
     }
 
-    fn echo_cancelled(&self) -> bool {
-        false
+    fn echo_safe(&self) -> bool {
+        self.headphones
     }
 
     fn stop(&mut self) {
@@ -167,7 +173,7 @@ fn pick_input(host: &cpal::Host, uid: Option<&str>) -> Option<cpal::Device> {
             .and_then(|mut it| it.find(|d| d.name().map(|n| n == uid).unwrap_or(false)));
         match found {
             Some(d) => return Some(d),
-            None => tracing::warn!("voice audio: chosen input device is gone; using the default"),
+            None => tracing::warn!("voice audio: cpal can't find the chosen mic; using the default"),
         }
     }
     host.default_input_device()

@@ -18,9 +18,6 @@
 
 use super::dsp::{i16_to_f32, Framer, StreamResampler};
 use super::{AudioDevice, AudioError, AudioIo, MicPermission};
-use objc2_audio_toolbox::{
-    kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, AudioUnitSetProperty,
-};
 use objc2_core_audio::{
     kAudioDevicePropertyDeviceUID, kAudioDevicePropertyStreams,
     kAudioHardwarePropertyDefaultInputDevice, kAudioHardwarePropertyDevices,
@@ -120,9 +117,11 @@ pub struct VoiceProcessingIo {
 }
 
 impl VoiceProcessingIo {
-    /// `input_uid`: CoreAudio UID of the mic to use (`None` = system
-    /// default; an unknown UID falls back to the default with a WARN).
-    pub fn new(input_uid: Option<&str>) -> Result<Self, AudioError> {
+    /// Captures from the system default mic: voice processing ignores a
+    /// device set on the node's IO unit (seen on macOS 27: the unit
+    /// accepts the property and keeps capturing from the default), so a chosen mic
+    /// goes through `cpal_io` instead (see `audio::open`).
+    pub fn new() -> Result<Self, AudioError> {
         let shared = Arc::new(Shared {
             mic_enabled: AtomicBool::new(true),
             queued: AtomicUsize::new(0),
@@ -131,13 +130,12 @@ impl VoiceProcessingIo {
         });
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
         let thread_shared = shared.clone();
-        let input_uid = input_uid.filter(|u| !u.is_empty()).map(str::to_owned);
         // Detached: the thread ends when the command channel closes (on
         // drop). Not joined, so a wedged CoreAudio call can't hang the
         // dropper.
         std::thread::Builder::new()
             .name("hobbes-voice-audio".into())
-            .spawn(move || audio_thread(cmd_rx, thread_shared, input_uid))
+            .spawn(move || audio_thread(cmd_rx, thread_shared))
             .map_err(|e| AudioError::Backend(format!("audio thread: {e}")))?;
         Ok(Self {
             cmd_tx: Some(cmd_tx),
@@ -196,7 +194,7 @@ impl AudioIo for VoiceProcessingIo {
         self.shared.mic_enabled.store(enabled, Ordering::Release);
     }
 
-    fn echo_cancelled(&self) -> bool {
+    fn echo_safe(&self) -> bool {
         self.shared.echo_cancelled.load(Ordering::Acquire)
     }
 
@@ -276,7 +274,6 @@ struct Engine {
 
 struct ThreadState {
     shared: Arc<Shared>,
-    input_uid: Option<String>,
     engine: Option<Engine>,
     /// Set while a session is started; lets the watchdog rebuild the engine.
     mic_tx: Option<mpsc::UnboundedSender<Vec<i16>>>,
@@ -288,7 +285,7 @@ impl ThreadState {
         let Some(tx) = self.mic_tx.clone() else {
             return Ok(());
         };
-        self.engine = Some(build_engine(tx, &self.shared, self.input_uid.as_deref())?);
+        self.engine = Some(build_engine(tx, &self.shared)?);
         Ok(())
     }
 
@@ -368,10 +365,9 @@ impl ThreadState {
     }
 }
 
-fn audio_thread(rx: std_mpsc::Receiver<Cmd>, shared: Arc<Shared>, input_uid: Option<String>) {
+fn audio_thread(rx: std_mpsc::Receiver<Cmd>, shared: Arc<Shared>) {
     let mut st = ThreadState {
         shared,
-        input_uid,
         engine: None,
         mic_tx: None,
         restarts: RestartBudget::new(3, Duration::from_secs(60)),
@@ -394,7 +390,6 @@ fn ns_err(e: &NSError) -> AudioError {
 fn build_engine(
     mic_tx: mpsc::UnboundedSender<Vec<i16>>,
     shared: &Arc<Shared>,
-    input_uid: Option<&str>,
 ) -> Result<Engine, AudioError> {
     // SAFETY (whole block): plain AVFAudio calls on objects this thread
     // owns; the engine is stopped while we configure it, as VPIO requires.
@@ -428,25 +423,6 @@ fn build_engine(
             }
         };
         shared.echo_cancelled.store(vpio, Ordering::Release);
-
-        // Pick the mic. Order matters: AFTER enabling voice processing
-        // (enabling it swaps the node's IO unit for a VPIO unit, so a device
-        // set on the old AUHAL is lost) and BEFORE reading the input format,
-        // installing the tap and starting.
-        if let Some(uid) = input_uid {
-            match find_input_device(uid) {
-                Some((id, name)) => {
-                    if let Err(status) = set_input_device(&input, id, vpio) {
-                        tracing::warn!(
-                            "voice audio: could not select input '{name}' (OSStatus {status}); using the default"
-                        );
-                    }
-                }
-                None => {
-                    tracing::warn!("voice audio: chosen input device is gone; using the default")
-                }
-            }
-        }
 
         if vpio {
             // Keep other apps' audio as loud as VPIO allows (macOS 14+).
@@ -758,40 +734,49 @@ pub fn list_input_devices() -> Vec<AudioDevice> {
     input_devices_with_ids().into_iter().map(|(_, d)| d).collect()
 }
 
-/// HAL id and name of the input device with this UID.
-fn find_input_device(uid: &str) -> Option<(AudioObjectID, String)> {
-    let all = input_devices_with_ids();
-    let devices: Vec<AudioDevice> = all.iter().map(|(_, d)| d.clone()).collect();
-    let chosen = super::resolve_input_device(&devices, Some(uid))?;
-    all.into_iter()
-        .find(|(_, d)| d.uid == chosen.uid)
-        .map(|(id, d)| (id, d.name))
+/// The default output device's kind: Bluetooth, or the built-in jack with
+/// headphones plugged in, counts as headphones.
+pub fn default_output_kind() -> super::OutputKind {
+    use objc2_core_audio::{
+        kAudioDevicePropertyDataSource, kAudioDevicePropertyTransportType,
+        kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
+        kAudioDeviceTransportTypeBuiltIn, kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioObjectPropertyScopeOutput,
+    };
+    /// 'hdpn': the built-in output's headphone data source.
+    const HEADPHONES_SOURCE: u32 = u32::from_be_bytes(*b"hdpn");
+    let Some(id) = prop_pod_vec::<AudioObjectID>(
+        SYSTEM_OBJECT,
+        prop_addr(kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal),
+    )
+    .first()
+    .copied() else {
+        return super::OutputKind::Speakers;
+    };
+    let transport = prop_pod_vec::<u32>(id, prop_addr(kAudioDevicePropertyTransportType, kAudioObjectPropertyScopeGlobal))
+        .first()
+        .copied()
+        .unwrap_or(0);
+    let source = || {
+        prop_pod_vec::<u32>(id, prop_addr(kAudioDevicePropertyDataSource, kAudioObjectPropertyScopeOutput))
+            .first()
+            .copied()
+    };
+    output_kind(transport, kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE, kAudioDeviceTransportTypeBuiltIn, source, HEADPHONES_SOURCE)
 }
 
-/// Point the input node's IO unit at `device`. On the VPIO unit the input
-/// device is element 1 (element 0 is the output device, which we leave on
-/// the system default); on a plain AUHAL input unit it is element 0.
-fn set_input_device(
-    input: &objc2_avf_audio::AVAudioInputNode,
-    device: AudioObjectID,
-    vpio: bool,
-) -> Result<(), i32> {
-    // SAFETY: `audioUnit` is the node's live IO unit (checked non-null);
-    // the property value is a u32 AudioDeviceID.
-    unsafe {
-        let unit = input.audioUnit();
-        if unit.is_null() {
-            return Err(-1);
-        }
-        let status = AudioUnitSetProperty(
-            unit,
-            kAudioOutputUnitProperty_CurrentDevice,
-            kAudioUnitScope_Global,
-            if vpio { 1 } else { 0 },
-            (&device as *const AudioObjectID).cast(),
-            std::mem::size_of::<AudioObjectID>() as u32,
-        );
-        if status == 0 { Ok(()) } else { Err(status) }
+fn output_kind(
+    transport: u32,
+    bt: u32,
+    ble: u32,
+    builtin: u32,
+    source: impl FnOnce() -> Option<u32>,
+    headphones_source: u32,
+) -> super::OutputKind {
+    if transport == bt || transport == ble || (transport == builtin && source() == Some(headphones_source)) {
+        super::OutputKind::Headphones
+    } else {
+        super::OutputKind::Speakers
     }
 }
 
@@ -888,6 +873,17 @@ mod tests {
         assert!(b.take(t0 + Duration::from_secs(61)));
     }
 
+    #[test]
+    fn bluetooth_and_headphone_jack_count_as_headphones() {
+        use crate::voice::audio::OutputKind::*;
+        let k = |t: u32, src: Option<u32>| output_kind(t, 1, 2, 3, || src, 9);
+        assert_eq!(k(1, None), Headphones);
+        assert_eq!(k(2, None), Headphones);
+        assert_eq!(k(3, Some(9)), Headphones);
+        assert_eq!(k(3, Some(4)), Speakers);
+        assert_eq!(k(7, Some(9)), Speakers); // USB etc.: assume speakers
+    }
+
     /// Lists input devices (CoreAudio query only; opens nothing).
     /// `cargo test --release list_input_devices_prints -- --ignored --nocapture`
     #[test]
@@ -896,6 +892,7 @@ mod tests {
         for d in list_input_devices() {
             println!("{d:?}");
         }
+        println!("default output: {:?}", default_output_kind());
     }
 
     /// Manual smoke test: plays a 1 s 440 Hz tone and captures 3 s.
@@ -904,14 +901,14 @@ mod tests {
     #[ignore]
     fn vpio_loopback_smoke() {
         println!("mic permission: {:?}", mic_permission());
-        let mut io = VoiceProcessingIo::new(None).expect("new");
+        let mut io = VoiceProcessingIo::new().expect("new");
         let (tx, mut rx) = mpsc::unbounded_channel();
         let t0 = std::time::Instant::now();
         io.start(tx).expect("start");
         println!(
             "started in {:?}, echo_cancelled={}",
             t0.elapsed(),
-            io.echo_cancelled()
+            io.echo_safe()
         );
         let tone: Vec<i16> = (0..PLAYBACK_RATE)
             .map(|i| {
