@@ -307,10 +307,16 @@ mod tests {
         assert!(!running(), "this process already has input running");
         let mut o = open(Some(&uid), VoiceEcho::Off).expect("open");
         assert!(!o.voice_processing);
+        // An announcement starts with the mic off: the device must stay closed.
+        o.io.set_capture(false);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         o.io.start(tx).expect("start");
         settle();
-        println!("started: running={}", running());
+        println!("started with capture off: running={}", running());
+        assert!(!running(), "mic opened although capture started off");
+        o.io.set_capture(true);
+        settle();
+        println!("capture on: running={}", running());
         assert!(running());
         o.io.set_capture(false);
         settle();

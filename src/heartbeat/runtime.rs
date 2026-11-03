@@ -170,6 +170,15 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
 
 // ── The dedicated session ───────────────────────────────────────────────────
 
+/// Mark `id` as the Heartbeat system session and repair its icon (journaled)
+/// and project tag. Cheap when nothing needs fixing (runs every tick).
+fn adopt_session(session_state: &mut dioxus::prelude::Signal<SessionState>, id: &str) {
+    crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, id);
+    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI) {
+        SessionState::save_signal(session_state, None);
+    }
+}
+
 /// The Heartbeat session's id, hydrating it into memory if it is only on
 /// disk and creating it if it never existed or was deleted. Never touches
 /// the active session or the open tabs.
@@ -180,23 +189,16 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
         return None;
     }
     if let Some(id) = HEARTBEAT.peek().session_id.clone() {
-        let has_icon = session_state.peek().sessions.get(&id).map(|s| s.tab_emoji.is_some());
-        match has_icon {
-            Some(true) => return Some(id),
-            // Sessions from before the icon: give them one, once.
-            Some(false) => {
-                if let Some(s) = session_state.write().sessions.get_mut(&id) {
-                    s.tab_emoji = Some(SESSION_EMOJI.to_string());
-                }
-                SessionState::save_signal(&session_state, None);
-                return Some(id);
-            }
-            None => {}
-        }
+        let mut hydrated = session_state.peek().sessions.contains_key(&id);
         // One indexed row: fine on the UI thread (P-017).
-        if let Some(mut session) = crate::session_store::load_session(&id) {
-            session.tab_emoji.get_or_insert_with(|| SESSION_EMOJI.to_string());
-            session_state.write().sessions.insert(id.clone(), session);
+        if !hydrated {
+            if let Some(session) = crate::session_store::load_session(&id) {
+                session_state.write().sessions.insert(id.clone(), session);
+                hydrated = true;
+            }
+        }
+        if hydrated {
+            adopt_session(&mut session_state, &id);
             return Some(id);
         }
         tracing::info!("heartbeat: session {id} is gone; creating a new one");
@@ -213,11 +215,9 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
         }
         // A user-set name, so auto-titling never renames it (nor its icon).
         state.update_session_name_raw(&id, SESSION_TITLE.to_string());
-        if let Some(s) = state.sessions.get_mut(&id) {
-            s.tab_emoji = Some(SESSION_EMOJI.to_string());
-        }
         id
     };
+    adopt_session(&mut session_state, &id);
     SessionState::save_signal(&session_state, None);
     HEARTBEAT.write().session_id = Some(id.clone());
     *dirty = true;

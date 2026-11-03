@@ -98,6 +98,20 @@ pub enum VoiceCmd {
     Stop,
     /// A Heartbeat alert to speak while a conversation is live.
     HeartbeatAlert(String),
+    /// A result that reached the Voice tab on its own (dispatched work
+    /// finishing, a brain answer after the conversation ended): said as
+    /// "Excuse me…" in a live conversation, or in a short speaking-only
+    /// session (mic off) otherwise.
+    Announce(String),
+}
+
+/// How a session starts.
+#[derive(Clone, Debug, PartialEq)]
+enum Start {
+    /// The hotkey went down: mic open, tap or hold decided on release.
+    Press,
+    /// Hobbes speaks first, with the mic off; a press opens it.
+    Announce(String),
 }
 
 /// The running controller's inbox (replaced if the root remounts).
@@ -135,14 +149,110 @@ pub fn use_voice(ctx: BuiltinToolCtx) {
 
 async fn controller_loop(ctx: BuiltinToolCtx, mut rx: mpsc::UnboundedReceiver<VoiceCmd>) {
     while let Some(cmd) = rx.recv().await {
-        if cmd == VoiceCmd::Press {
-            run_session(ctx, &mut rx).await;
+        let start = match cmd {
+            VoiceCmd::Press => Start::Press,
+            VoiceCmd::Announce(text) => {
+                let s = ctx.settings.peek();
+                if !crate::voice::voice_active(&s) || !s.voice.announce_results {
+                    continue;
+                }
+                Start::Announce(text)
+            }
+            // Release / Stop / alerts while idle: nothing to do.
+            _ => continue,
+        };
+        {
+            run_session(ctx, &mut rx, start).await;
             // Keep the last error (read before the write: one borrow at a time).
             let error = VOICE_UI.peek().error.clone();
             *VOICE_UI.write() = VoiceUi { error, ..VoiceUi::default() };
         }
-        // Release / Stop / alerts while idle: nothing to do.
     }
+}
+
+/// What to say for a finished Voice-tab turn: the reply after its trigger
+/// (the last message not written by Hobbes), whether that trigger was a
+/// voice request, and whether the turn is held on an approval.
+#[derive(Debug, PartialEq)]
+pub struct TurnNews {
+    pub voice_request: bool,
+    pub reply: String,
+    pub needs_approval: bool,
+}
+
+pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNews> {
+    let trigger = messages.iter().rposition(|m| m.author != "Hobbes")?;
+    let voice_request = messages[trigger]
+        .content
+        .get_text_content()
+        .is_some_and(|t| brain::is_voice_request(t.trim()));
+    Some(TurnNews {
+        voice_request,
+        reply: brain::collect_reply(messages, trigger),
+        needs_approval: crate::heartbeat::wake::has_pending_approval(&messages[trigger + 1..]),
+    })
+}
+
+/// Whether a finished Voice-tab turn should be spoken. A voice request the
+/// live conversation is still waiting on is delivered by that wait; with no
+/// conversation, a turn in the tab the person is looking at is theirs (they
+/// typed it), unless it answers an earlier voice request.
+pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, viewing: bool) -> bool {
+    if news.reply.is_empty() && !news.needs_approval {
+        return false;
+    }
+    if live && news.voice_request && waits_in_flight > 0 {
+        return false;
+    }
+    !(!live && viewing && !news.voice_request)
+}
+
+/// Called when any turn ends (stream_manager): speak Voice-tab news.
+pub fn on_turn_end(
+    session_state: Signal<crate::session::SessionState>,
+    settings: Signal<crate::settings::Settings>,
+    session_id: &str,
+) {
+    if session::VOICE_SESSION_ID.peek().as_deref() != Some(session_id) {
+        return;
+    }
+    {
+        let s = settings.peek();
+        if !crate::voice::voice_active(&s) || !s.voice.announce_results {
+            return;
+        }
+    }
+    let (news, viewing) = {
+        let state = session_state.peek();
+        let Some(news) = state.sessions.get(session_id).and_then(|s| turn_news(&s.messages)) else {
+            return;
+        };
+        (news, state.active_session_id == session_id)
+    };
+    if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing) {
+        return;
+    }
+    let text = if news.needs_approval {
+        "The brain needs your approval in the Voice tab before it can continue.".to_string()
+    } else {
+        news.reply
+    };
+    tracing::info!("voice: announcing a Voice-tab result ({} chars)", text.chars().count());
+    send(VoiceCmd::Announce(text));
+}
+
+/// The instruction wrapped around an announced result.
+pub fn announce_prompt(text: &str, mid_conversation: bool) -> String {
+    let how = if mid_conversation {
+        "A result just came back from work handed off earlier. Politely get their attention — \
+         start with \"Excuse me\" — and tell them in one or two short spoken sentences, then \
+         carry on with them."
+    } else {
+        "You are interrupting the person to deliver news: a result just came back from work \
+         handed off earlier. Start with \"Excuse me\", tell them in one or two short spoken \
+         sentences, then stop. Only ask something if the result needs their decision."
+    };
+    format!("[{how} If there's more, say it's in the Voice tab.]\n\n{}", text.trim())
 }
 
 /// Mic / speaker problems and provider failures end up here.
@@ -251,9 +361,13 @@ fn tail_of(session_state: Signal<crate::session::SessionState>, peer: session::P
 }
 
 /// One live conversation, from the press that opened it to its end.
-async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<VoiceCmd>) {
+async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<VoiceCmd>, start: Start) {
     let pressed_at = Instant::now();
-    let mut ui = VoiceUi { phase: Phase::Connecting, held: true, ..VoiceUi::default() };
+    let announcing_text = match &start {
+        Start::Announce(t) => Some(t.clone()),
+        Start::Press => None,
+    };
+    let mut ui = VoiceUi { phase: Phase::Connecting, held: announcing_text.is_none(), ..VoiceUi::default() };
     *VOICE_UI.write() = ui.clone();
 
     let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, input_device, echo } = match resolve(ctx) {
@@ -288,8 +402,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let (mic_tx, mut mic_rx) = mpsc::unbounded_channel::<Vec<i16>>();
     // Opening and starting the engine blocks for a second or two (VPIO
     // setup): off the UI thread.
+    let mic_first = announcing_text.is_none();
     let started = tokio::task::spawn_blocking(move || -> Result<audio::Opened, String> {
         let mut o = audio::open(input_device.as_deref(), echo).map_err(|e| format!("Couldn't open the microphone: {e}"))?;
+        // An announcement starts with the mic off (a press opens it).
+        o.io.set_capture(mic_first);
         o.io.start(mic_tx).map_err(|e| format!("Couldn't start audio on {}: {e}", o.input_name))?;
         Ok(o)
     })
@@ -308,7 +425,6 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
             return;
         }
     };
-    audio_io.set_mic_enabled(true);
     ui.echo_safe = audio_io.echo_safe();
 
     setup.system_instruction = system_instruction(
@@ -328,13 +444,20 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let live_at = Instant::now();
     // The mic device is open from the press; push-to-talk releases it
     // between holds (see the end of the loop).
-    let mut capture_on = true;
+    let mut capture_on = announcing_text.is_none();
+    let mut ever_captured = capture_on;
+    // Speaking-only until the person presses the key.
+    let mut announcing = announcing_text.is_some();
+    if let Some(text) = &announcing_text {
+        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(text, false), respond: true });
+    }
     let mut stats = Stats::default();
     let mut level_window = 0.0f32;
 
-    // Until the key comes up we don't know tap vs hold; treat as held.
-    let mut mode: Option<Mode> = None;
-    let mut held = true;
+    // Until the key comes up we don't know tap vs hold; treat as held. An
+    // announcement behaves like push-to-talk between holds.
+    let mut mode: Option<Mode> = announcing_text.as_ref().map(|_| Mode::PushToTalk);
+    let mut held = announcing_text.is_none();
     let mut last_activity = Instant::now();
     let mut heard_buf = String::new();
     let mut spoke_buf = String::new();
@@ -490,7 +613,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 let Some(cmd) = cmd else { break "app closing".to_string() };
                 match cmd {
                     // In a conversation a press is decided on release.
-                    VoiceCmd::Press => held = true,
+                    VoiceCmd::Press => {
+                        held = true;
+                        announcing = false;
+                    }
                     VoiceCmd::Release { held_ms } => {
                         // Speech captured while the key was down (including
                         // during the connect) goes out before the release.
@@ -519,6 +645,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         last_activity = Instant::now();
                     }
                     VoiceCmd::Stop => break "stopped".to_string(),
+                    VoiceCmd::Announce(text) => {
+                        last_activity = Instant::now();
+                        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(&text, true), respond: true });
+                    }
                     VoiceCmd::HeartbeatAlert(text) => {
                         if speak_heartbeat {
                             let _ = rt.control.send(RealtimeControl::InjectContext {
@@ -537,6 +667,13 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 }
                 if ui.phase == Phase::Speaking && !audio_io.is_playing() {
                     ui.phase = Phase::Listening;
+                }
+                // An announcement nobody answered: hang up once it's said.
+                if announcing {
+                    let said = stats.turns >= 1 && !audio_io.is_playing() && last_activity.elapsed() >= Duration::from_secs(5);
+                    if said || live_at.elapsed() > Duration::from_secs(60) {
+                        break "announced".to_string();
+                    }
                 }
                 if let Some(at) = ending_at {
                     // Let the goodbye arrive and play out (it may come after
@@ -568,6 +705,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         if want_capture != capture_on {
             audio_io.set_capture(want_capture);
             capture_on = want_capture;
+            ever_captured |= want_capture;
             if !want_capture {
                 level_window = 0.0;
                 ui.level = 0.0;
@@ -596,11 +734,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     }
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
     tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
-    if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic).filter(|_| stats.mic_frames == 0 || capture_on) {
+    if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic).filter(|_| ever_captured) {
         fail(w);
         return;
     }
-    if !matches!(close_reason.as_str(), "ended" | "stopped" | "goodbye" | "idle" | "app closing") {
+    if !matches!(close_reason.as_str(), "ended" | "stopped" | "goodbye" | "idle" | "app closing" | "announced") {
         fail(format!("The voice conversation ended: {close_reason}"));
     }
 }
@@ -709,6 +847,54 @@ mod tests {
         assert!(s.contains("CI is red") && s.contains("🎙 hi"));
         let bare = system_instruction(now, "", "");
         assert!(!bare.contains("Heartbeat notes"));
+    }
+
+    fn msg(author: &str, text: &str) -> crate::components::chat::Message {
+        let mut m = session::transcript_message(author == "User", "x");
+        m.author = author.into();
+        m.content = crate::components::shared::MessageContent::Text {
+            content: text.into(),
+            thought_signature: None,
+            thought_summary: None,
+            signature_provider: None,
+        };
+        m
+    }
+
+    #[test]
+    fn dispatched_work_coming_back_is_announced() {
+        let msgs = vec![
+            msg("User", "The background agent you dispatched for \"rollup\" has finished."),
+            msg("Hobbes", "The rollup is done: 14 items filed."),
+        ];
+        let news = turn_news(&msgs).unwrap();
+        assert!(!news.voice_request);
+        assert_eq!(news.reply, "The rollup is done: 14 items filed.");
+        // Live conversation: say it now. Not live and not looking: announce.
+        assert!(should_announce(&news, true, 0, false));
+        assert!(should_announce(&news, false, 0, false));
+        // Not live but looking at the Voice tab: they typed it; stay quiet.
+        assert!(!should_announce(&news, false, 0, true));
+    }
+
+    #[test]
+    fn voice_requests_are_left_to_the_live_wait() {
+        let msgs = vec![msg("User", &brain::framed_request("check CI")), msg("Hobbes", "CI is green.")];
+        let news = turn_news(&msgs).unwrap();
+        assert!(news.voice_request);
+        // The live conversation's wait delivers it.
+        assert!(!should_announce(&news, true, 1, false));
+        // The conversation ended first: announce it, even in the Voice tab.
+        assert!(should_announce(&news, false, 0, true));
+        // Nothing to say: nothing announced.
+        let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false };
+        assert!(!should_announce(&empty, true, 0, false));
+    }
+
+    #[test]
+    fn announcements_start_with_excuse_me() {
+        assert!(announce_prompt("CI is green.", true).contains("Excuse me"));
+        assert!(announce_prompt("CI is green.", false).ends_with("CI is green."));
     }
 
     #[test]

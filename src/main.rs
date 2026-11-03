@@ -53,6 +53,7 @@ mod session;
 mod session_events;
 mod session_store;
 mod str_utils;
+mod system_sessions;
 mod tab_list;
 mod tab_tidy;
 #[cfg(test)]
@@ -873,7 +874,15 @@ fn app() -> Element {
                             .get(id)
                             .map(|p| p.asks_person())
                             .unwrap_or(false);
-                        if s.asks_person() && !was {
+                        // The Voice tab's news is spoken by the voice itself
+                        // (an approval it can't grant still toasts).
+                        let voice_speaks = voice::session::VOICE_SESSION_ID.peek().as_deref() == Some(id.as_str())
+                            && s.pending_gate.is_none()
+                            && {
+                                let st = settings.peek();
+                                voice::voice_active(&st) && st.voice.announce_results
+                            };
+                        if s.asks_person() && !was && !voice_speaks {
                             flash_timer_toast(format!("🛰 {} needs your attention", s.name));
                         }
                     }
@@ -2275,6 +2284,8 @@ fn app() -> Element {
         };
         voice::controller::use_voice(voice_ctx);
         voice::hotkey::use_voice_hotkey();
+        // Restore the Voice tab's icon / drop a stray project tag at launch.
+        use_hook(|| voice::session::repair_on_startup(session_state));
     }
 
     // Persist tab state to UiState (Pattern 12 & 13)
@@ -2580,6 +2591,9 @@ fn app() -> Element {
     let apply_tidy_fn = move |apply: components::tab_tidy::TidyApply| {
         if !apply.tag.is_empty() {
             for (sid, pid) in &apply.tag {
+                if crate::system_sessions::is_system(sid) {
+                    continue;
+                }
                 {
                     let mut state = session_state.write();
                     if let Some(s) = state.sessions.get_mut(sid) {

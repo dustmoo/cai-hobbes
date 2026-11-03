@@ -26,6 +26,10 @@ pub fn ProjectChip() -> Element {
     }
 
     let session_id = session_state.read().active_session_id.clone();
+    // Heartbeat and Voice belong to the app, not to a project.
+    if crate::system_sessions::is_system(&session_id) {
+        return rsx! {};
+    }
     let current: Option<String> = session_state
         .read()
         .sessions

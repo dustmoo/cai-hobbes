@@ -247,7 +247,15 @@ fn build_streams(
     }?;
 
     let denied = |e: cpal::PlayStreamError| AudioError::Backend(format!("start stream: {e}"));
-    in_stream.play().map_err(denied)?;
+    // Capture may start off (an announcement): the device stays closed
+    // until `set_capture(true)`. cpal on macOS starts the input unit as soon
+    // as the stream is built, so it must be paused explicitly
+    // (`capture_toggle_releases_the_mic` checks this on hardware).
+    if shared.mic_enabled.load(Ordering::Acquire) {
+        in_stream.play().map_err(denied)?;
+    } else {
+        in_stream.pause().map_err(|e| AudioError::Backend(format!("pause input: {e}")))?;
+    }
     out_stream.play().map_err(denied)?;
     shared
         .out_rate

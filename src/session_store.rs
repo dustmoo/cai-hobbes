@@ -216,6 +216,11 @@ pub fn is_available() -> bool {
 /// Borrow the shared connection. `pub(crate)` so sibling domains (the planner,
 /// `todo::store`) persist through this one connection rather than opening a
 /// second writer on the same file.
+/// Whether the store has been opened (`init`).
+pub(crate) fn is_ready() -> bool {
+    CONN.get().is_some()
+}
+
 pub(crate) fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
     let conn = CONN.get().ok_or("session store not initialized")?;
     let guard = conn.lock().map_err(|_| "session store lock poisoned")?;

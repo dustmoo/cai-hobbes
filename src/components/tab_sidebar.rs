@@ -294,8 +294,9 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     onclick: move |_| on_select.call(idx),
                                     onmouseup: move |evt| if is_middle_click(&evt) { on_close.call(idx) },
                                     match glyph {
-                                        RailGlyph::Emoji(_) if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalHeart { size: 15 } },
-                                        RailGlyph::Emoji(_) if voice_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalMouth { size: 15 } },
+                                        // System tabs: the icon follows the id, whatever the emoji.
+                                        _ if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalHeart { size: 15 } },
+                                        _ if voice_id.read().as_deref() == Some(tab.session_id.as_str()) => rsx! { MetalMouth { size: 15 } },
                                         RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
                                         RailGlyph::Letter(l) => rsx! {
                                             span {
@@ -574,14 +575,12 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                                     title: "{crate::timers::waiting_title(at)}",
                                                 }
                                             }
-                                            if let Some(e) = &tab.emoji {
-                                                if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) {
-                                                    MetalHeart {}
-                                                } else if voice_id.read().as_deref() == Some(tab.session_id.as_str()) {
-                                                    MetalMouth {}
-                                                } else {
-                                                    span { class: "text-[13px] leading-none shrink-0", "{e}" }
-                                                }
+                                            if heartbeat_id.read().as_deref() == Some(tab.session_id.as_str()) {
+                                                MetalHeart {}
+                                            } else if voice_id.read().as_deref() == Some(tab.session_id.as_str()) {
+                                                MetalMouth {}
+                                            } else if let Some(e) = &tab.emoji {
+                                                span { class: "text-[13px] leading-none shrink-0", "{e}" }
                                             }
                                             span {
                                                 class: if is_active { "flex-1 min-w-0 truncate text-xs text-fg font-medium" } else { "flex-1 min-w-0 truncate text-xs text-fg-muted" },

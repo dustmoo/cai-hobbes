@@ -981,6 +981,11 @@ pub struct VoiceSettings {
     /// Bluetooth headsets into call mode; see [`VoiceEcho`].
     #[serde(default)]
     pub echo: VoiceEcho,
+    /// Results that reach the Voice tab later (dispatched work finishing, a
+    /// brain answer after the conversation ended) are spoken: "Excuse me…"
+    /// mid-conversation, or a short announcement with the mic off.
+    #[serde(default = "default_true")]
+    pub announce_results: bool,
 }
 
 /// How voice keeps the model from hearing itself.
@@ -1020,6 +1025,7 @@ impl Default for VoiceSettings {
             speak_heartbeat: true,
             input_device_uid: None,
             echo: VoiceEcho::Auto,
+            announce_results: true,
         }
     }
 }

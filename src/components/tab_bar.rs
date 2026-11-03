@@ -147,7 +147,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     let topic = props.tab_topic.get(idx).cloned().flatten();
                     let profile = props.tab_profile.get(idx).cloned().flatten();
                     let has_summary = emoji.is_some() || topic.is_some();
-                    let show_emoji = emoji.is_some();
+                    // System tabs always show their metal icon, emoji or not.
+                    let show_emoji = emoji.is_some() || crate::system_sessions::is_system(session_id);
                     // Collapsed tabs keep the full identity in the tooltip,
                     // regardless of what the collapsed layers show.
                     let tooltip = {

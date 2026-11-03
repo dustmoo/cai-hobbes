@@ -14,7 +14,7 @@ pub const SESSION_TITLE: &str = "Voice";
 /// Its tab emoji (the tab components draw a metal mouth in its place).
 pub const SESSION_EMOJI: &str = "👄";
 /// `session_store` meta key holding the session id across launches.
-const META_KEY: &str = "voice_session_id";
+pub const META_KEY: &str = "voice_session_id";
 
 /// The Voice session's id once known (cached from the store at first use).
 pub static VOICE_SESSION_ID: GlobalSignal<Option<String>> =
@@ -34,12 +34,15 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<S
     }
     let known = VOICE_SESSION_ID.peek().clone();
     if let Some(id) = known {
-        if session_state.peek().sessions.contains_key(&id) {
-            return Some(id);
+        let mut hydrated = session_state.peek().sessions.contains_key(&id);
+        if !hydrated {
+            if let Some(session) = crate::session_store::load_session(&id) {
+                session_state.write().sessions.insert(id.clone(), session);
+                hydrated = true;
+            }
         }
-        if let Some(mut session) = crate::session_store::load_session(&id) {
-            session.tab_emoji.get_or_insert_with(|| SESSION_EMOJI.to_string());
-            session_state.write().sessions.insert(id.clone(), session);
+        if hydrated {
+            adopt(&mut session_state, &id);
             return Some(id);
         }
         tracing::info!("voice: session {id} is gone; creating a new one");
@@ -53,18 +56,31 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<S
         }
         // A user-set name, so auto-titling never renames it.
         state.update_session_name_raw(&id, SESSION_TITLE.to_string());
-        if let Some(s) = state.sessions.get_mut(&id) {
-            s.tab_emoji = Some(SESSION_EMOJI.to_string());
-        }
         id
     };
-    SessionState::save_signal(&session_state, None);
+    adopt(&mut session_state, &id);
     if let Err(e) = crate::session_store::meta_set(META_KEY, &id) {
         tracing::warn!("voice: could not persist the session id: {e}");
     }
     *VOICE_SESSION_ID.write() = Some(id.clone());
     tracing::info!("voice: created session {id}");
     Some(id)
+}
+
+/// Mark `id` as the Voice system session and repair its icon / project tag.
+fn adopt(session_state: &mut Signal<SessionState>, id: &str) {
+    crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, id);
+    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI) {
+        SessionState::save_signal(session_state, None);
+    }
+}
+
+/// Startup: repair the Voice session if its tab is open (hydrated).
+pub fn repair_on_startup(mut session_state: Signal<SessionState>) {
+    let Some(id) = VOICE_SESSION_ID.peek().clone() else { return };
+    if session_state.peek().sessions.contains_key(&id) {
+        adopt(&mut session_state, &id);
+    }
 }
 
 /// A transcript line as a chat message.

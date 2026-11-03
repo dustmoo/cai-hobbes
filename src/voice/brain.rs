@@ -108,7 +108,35 @@ pub struct BrainHandle {
     pub detach: Arc<AtomicBool>,
 }
 
+/// Brain waits in progress (not detached). While one is running, a turn
+/// that answers a voice request is the wait's to deliver, not an
+/// announcement (see `controller::on_turn_end`).
+static WAITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn waits_in_flight() -> usize {
+    WAITS.load(Ordering::SeqCst)
+}
+
+struct WaitGuard;
+impl WaitGuard {
+    fn new() -> Self {
+        WAITS.fetch_add(1, Ordering::SeqCst);
+        WaitGuard
+    }
+}
+impl Drop for WaitGuard {
+    fn drop(&mut self) {
+        WAITS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether `text` is a request the voice layer queued (see [`framed_request`]).
+pub fn is_voice_request(text: &str) -> bool {
+    text.starts_with(crate::voice::session::HEARD_PREFIX) && text.contains("[Voice request, relayed by Hobbes' voice layer")
+}
+
 /// Queue `request` into the Voice session and wait for the brain's turn.
+/// Logs the outcome (kind, duration, reply length; never content).
 /// `streaming` reports whether a session is mid-turn. Runs on the Dioxus
 /// runtime (it peeks signals); no guard crosses an await.
 ///
@@ -118,6 +146,28 @@ pub struct BrainHandle {
 /// not a finished turn. A turn that never visibly streams is accepted once
 /// it has a reply and has been quiet for [`NO_STREAM_GRACE`].
 pub async fn run(
+    session_state: Signal<SessionState>,
+    session_id: String,
+    request: String,
+    handle: BrainHandle,
+    streaming: fn(&str) -> bool,
+) -> BrainOutcome {
+    let started = Instant::now();
+    let outcome = {
+        let _wait = WaitGuard::new();
+        run_inner(session_state, session_id, request, handle, streaming).await
+    };
+    let (kind, chars) = match &outcome {
+        BrainOutcome::Done(t) => ("done", t.chars().count()),
+        BrainOutcome::NeedsApproval(_) => ("needs approval", 0),
+        BrainOutcome::Failed(_) => ("failed", 0),
+        BrainOutcome::Cancelled => ("cancelled / detached", 0),
+    };
+    tracing::info!("voice: brain {kind} after {:.0}s ({chars} chars)", started.elapsed().as_secs_f32());
+    outcome
+}
+
+async fn run_inner(
     session_state: Signal<SessionState>,
     session_id: String,
     request: String,
@@ -246,6 +296,8 @@ mod tests {
     #[test]
     fn framing_keeps_the_request() {
         assert!(framed_request("  email Sam ").starts_with("🎙 email Sam\n"));
+        assert!(is_voice_request(&framed_request("email Sam")));
+        assert!(!is_voice_request("🎙 a heard transcript line"));
     }
 
     #[test]

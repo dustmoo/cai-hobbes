@@ -1901,6 +1901,9 @@ impl StreamManagerContext {
                 &session_id,
                 crate::fleet::bridge::HobbesSignal::TurnCompleted,
             );
+            // Voice-tab news (dispatched work back, a late brain answer) is
+            // spoken rather than left for the Fleet toast.
+            crate::voice::controller::on_turn_end(self.session_state, self.settings, &session_id);
             tracing::debug!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion

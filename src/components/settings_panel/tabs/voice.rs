@@ -320,6 +320,19 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                     }
                 }
                 div {
+                    class: "flex items-center justify-between mb-4",
+                    div {
+                        label { class: "text-sm font-medium text-fg-muted", "Speak results that come back later" }
+                        p { class: "text-xs text-fg-muted", "When dispatched work finishes or the brain answers after you've hung up, Hobbes says \"Excuse me…\" and tells you, with the mic off, instead of flagging the Voice tab." }
+                    }
+                    input {
+                        r#type: "checkbox",
+                        class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                        checked: "{s.voice.announce_results}",
+                        onchange: move |e| { local_settings.write().voice.announce_results = e.value() == "true"; }
+                    }
+                }
+                div {
                     class: "mb-4",
                     label { class: "block text-sm font-medium text-fg-muted mb-1", "Microphone input" }
                     p { class: "text-xs text-fg-muted mb-1", "Which microphone voice listens on. A device that's unplugged falls back to the system default." }

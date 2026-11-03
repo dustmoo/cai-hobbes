@@ -187,7 +187,7 @@ pub fn apply_tab_identity_from_summary(
     session: &mut Session,
     summary: &ConversationSummary,
 ) -> Option<(Option<String>, Option<String>)> {
-    if session.name_user_set {
+    if session.name_user_set || crate::system_sessions::is_system(&session.id) {
         return None;
     }
     let user_messages = session.user_message_count();
