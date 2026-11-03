@@ -89,8 +89,10 @@ fn heartbeat_briefing_events(session_id: &str) -> Vec<crate::heartbeat::Heartbea
     if state.session_id.as_deref() == Some(session_id) {
         return Vec::new();
     }
+    // A rotated system session (Voice) also owns what its archives dispatched.
+    let ids = crate::system_sessions::lineage_of(session_id);
     state
-        .events_for_session_since(session_id, since)
+        .events_for_session_since(&ids, since)
         .into_iter()
         .cloned()
         .collect()
@@ -384,6 +386,12 @@ pub fn ChatWindow(
         has_pending_approvals.write().clear();
 
         for owning_id in pending {
+            // An archived system session is read-only: no approved call or
+            // continuation resumes there (session_rotation).
+            if crate::system_sessions::is_archive(&owning_id) {
+                tracing::info!(session_id = %owning_id, "resume skipped: archived system session");
+                continue;
+            }
             spawn(async move {
                 let mut session_state = session_state;
                 let mcp_manager = mcp_manager;
@@ -729,6 +737,11 @@ pub fn ChatWindow(
     // session, so the send path must never infer its target from the active tab.
     let send_message = std::rc::Rc::new(
         move |(user_message, attachments, target_id): (String, Vec<Attachment>, String)| {
+            // An archived system session is read-only (session_rotation).
+            if crate::system_sessions::is_archive(&target_id) {
+                tracing::warn!(session_id = %target_id, "send refused: archived system session");
+                return;
+            }
             spawn({
                 let mut session_state = session_state;
                 let settings = settings;
@@ -1207,6 +1220,10 @@ pub fn ChatWindow(
         let mut trigger = stream_update_trigger;
         let message_id_str = message_id.to_string();
         let active_session_id = current_target_id.read().clone();
+        // An archived system session is read-only (rewind, delete, Esc).
+        if crate::system_sessions::is_archive(&active_session_id) {
+            return;
+        }
         {
             let mut state = session_state.write();
             crate::session_events::rewind_session_state(
@@ -1220,6 +1237,9 @@ pub fn ChatWindow(
     };
 
     let delete_message = move |message_id: Uuid| {
+        if crate::system_sessions::is_archive(&current_target_id.read()) {
+            return;
+        }
         let confirm = settings.read().confirm_on_message_edit;
         if confirm {
             if let Some(index) = session_state
@@ -1250,6 +1270,9 @@ pub fn ChatWindow(
     // by id, preserving attachments/comments/usage.
     let edit_message_save = move |(message_id, new_text): (Uuid, String)| {
         let session_id = current_target_id.read().clone();
+        if crate::system_sessions::is_archive(&session_id) {
+            return;
+        }
         let mut applied = false;
         {
             let mut state = session_state.write();
@@ -1285,6 +1308,9 @@ pub fn ChatWindow(
         let send_message = send_message.clone();
         move |(message_id, new_text): (Uuid, String)| {
             let session_id = current_target_id.read().clone();
+            if crate::system_sessions::is_archive(&session_id) {
+                return;
+            }
             let attachments = session_state
                 .read()
                 .sessions
@@ -1355,6 +1381,10 @@ pub fn ChatWindow(
 
     // Forget Modal Logic
     let on_forget_apply = move |(new_context, summary): (ActiveContext, String)| {
+        // An archived system session is read-only (session_rotation).
+        if crate::system_sessions::is_archive(&current_target_id.read()) {
+            return;
+        }
         let routing_target = *optimization_target.read();
         match routing_target {
             OptimizationTarget::Session => {
@@ -2230,6 +2260,8 @@ pub fn MessageBubble(
                                         // The original `message_id` is captured by the outer scope.
                                         let message_id = message.id; // Re-capture message_id from the outer scope
                                         move |comment_id: String| {
+                                            // An archived system session is read-only.
+                                            if crate::system_sessions::is_archive(&session_state.peek().active_session_id) { return; }
                                             // Delete the comment from session state
                                             let mut state = session_state.write();
                                             let session_id = state.active_session_id.clone();
@@ -2348,6 +2380,8 @@ pub fn MessageBubble(
                                 position_left: selection_data.read().left,
                                 draft: comment_draft,
                                 on_save: move |comment_text: String| {
+                                    // An archived system session is read-only.
+                                    if crate::system_sessions::is_archive(&session_state.peek().active_session_id) { return; }
                                     let text = selection_data.read().text.clone();
                                     let new_comment = Comment {
                                         id: Uuid::new_v4().to_string(),
@@ -2394,6 +2428,8 @@ pub fn MessageBubble(
                                 position_left: selection_data.read().left,
                                 draft: comment_draft,
                                 on_save: move |new_comment_text: String| {
+                                    // An archived system session is read-only.
+                                    if crate::system_sessions::is_archive(&session_state.peek().active_session_id) { return; }
                                     if let Some(comment_id) = editing_comment_id.read().clone() {
                                         // Update the comment in session state
                                         let mut state = session_state.write();

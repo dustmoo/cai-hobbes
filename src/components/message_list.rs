@@ -562,6 +562,10 @@ pub fn MessageList(
                                                                             move |_exec_id: String| {
                                                                                 let msg_id = message_id;
                                                                                 let session_id = session_id.clone();
+                                                                                // An archived system session is read-only.
+                                                                                if crate::system_sessions::is_archive(&session_id) {
+                                                                                    return;
+                                                                                }
                                                                                 spawn(async move {
                                                                                     // Get session's profile for profile-scoped MCP context
                                                                                     let (skill_call_clone, profile_id) = {
@@ -654,6 +658,9 @@ pub fn MessageList(
                                                                             move |_exec_id: String| {
                                                                                 let msg_id = message_id;
                                                                                 let session_id = session_id.clone();
+                                                                                if crate::system_sessions::is_archive(&session_id) {
+                                                                                    return;
+                                                                                }
                                                                                 // Mark skill as denied
                                                                                 let mut state = session_state.write();
                                                                                 let mut denied_snapshot: Option<crate::components::chat::Message> = None;

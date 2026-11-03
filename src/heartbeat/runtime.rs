@@ -63,6 +63,7 @@ struct Pacer {
     ci_task: Option<tokio::task::JoinHandle<Vec<CiRun>>>,
     last_save: Option<DateTime<Utc>>,
     last_agent_sync: Option<DateTime<Utc>>,
+    last_rotation_check: Option<DateTime<Utc>>,
     ended_rows: crate::components::planner_view::agent_lane::EndedRowCache,
 }
 
@@ -89,6 +90,18 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
     let now = Utc::now();
     let active = super::heartbeat_active(&settings);
     let mut dirty = false;
+
+    // Rotate an oversized system session (Heartbeat or Voice) at a quiet
+    // moment (`session_rotation`). Here because this tick runs whether or
+    // not the Heartbeat is on; before `ensure_session`, so a rotated
+    // Heartbeat's successor is adopted on this same tick.
+    if pacer
+        .last_rotation_check
+        .is_none_or(|t| now - t >= Duration::minutes(crate::session_rotation::CHECK_EVERY_MINUTES))
+    {
+        pacer.last_rotation_check = Some(now);
+        crate::session_rotation::check_all(deps.session_state, &settings, streaming);
+    }
 
     let session_id = if active {
         ensure_session(deps, &settings, &mut dirty)
@@ -294,8 +307,26 @@ fn salience_ctx(deps: HeartbeatDeps, settings: &Settings, session_id: Option<&st
         ctx.intention_todo_ids =
             intention_todo_ids(state.sessions.values().flat_map(|s| s.scheduled_timers.iter()));
         if let Some(sid) = session_id {
-            let messages = state.sessions.get(sid).map(|s| s.messages.as_slice()).unwrap_or(&[]);
-            ctx.heartbeat_todo_ids = wake::heartbeat_todo_ids(&deps.fleet.peek(), sid, messages);
+            let session = state.sessions.get(sid);
+            let messages = session.map(|s| s.messages.as_slice()).unwrap_or(&[]);
+            let mut lineage = crate::system_sessions::lineage(crate::system_sessions::SystemSession::Heartbeat);
+            if !lineage.iter().any(|id| id == sid) {
+                lineage.push(sid.to_string());
+            }
+            ctx.heartbeat_todo_ids = wake::heartbeat_todo_ids(&deps.fleet.peek(), &lineage, messages);
+            // Chat workers it dispatched, before a rotation too (the worker
+            // list is carried over; the HOBBES_DISPATCH calls are not).
+            if let Some(s) = session.filter(|s| !s.dispatched_workers.is_empty()) {
+                ctx.heartbeat_todo_ids.extend(
+                    deps.planner
+                        .peek()
+                        .todos
+                        .iter()
+                        .filter(|t| t.linked_fleet_session.as_ref().is_some_and(|w| s.dispatched_workers.contains(w)))
+                        .map(|t| t.id.clone()),
+                );
+            }
+            ctx.heartbeat_archived_ids = lineage.into_iter().filter(|id| id != sid).collect();
             ctx.relayed_todo_ids =
                 crate::todo::relay::relayed_todo_ids(&state, &deps.planner.peek(), settings, sid);
         }

@@ -266,6 +266,10 @@ pub fn approve_held_call(
     session_id: &str,
     execution_id: &str,
 ) -> bool {
+    // An archived system session is read-only: nothing in it resumes.
+    if crate::system_sessions::is_archive(session_id) {
+        return false;
+    }
     let found = resolve_held_call(
         &mut session_state.write(),
         session_id,
@@ -293,6 +297,9 @@ pub fn deny_held_call(
     execution_id: &str,
     text: &str,
 ) -> bool {
+    if crate::system_sessions::is_archive(session_id) {
+        return false;
+    }
     let found = resolve_held_call(
         &mut session_state.write(),
         session_id,

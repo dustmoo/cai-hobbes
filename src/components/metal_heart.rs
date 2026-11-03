@@ -9,6 +9,24 @@ pub fn use_heartbeat_session_id() -> Memo<Option<String>> {
     use_memo(|| crate::heartbeat::HEARTBEAT.read().session_id.clone())
 }
 
+/// Which system icon a tab shows: the live Heartbeat / Voice session (read
+/// through the memos, so the tab re-renders when either id changes), or a
+/// rotated-out archive of one (`system_sessions`), which keeps its icon.
+pub fn system_icon(
+    heartbeat_id: Memo<Option<String>>,
+    voice_id: Memo<Option<String>>,
+    session_id: &str,
+) -> Option<crate::system_sessions::SystemSession> {
+    use crate::system_sessions::SystemSession;
+    if heartbeat_id.read().as_deref() == Some(session_id) {
+        Some(SystemSession::Heartbeat)
+    } else if voice_id.read().as_deref() == Some(session_id) {
+        Some(SystemSession::Voice)
+    } else {
+        crate::system_sessions::kind(session_id)
+    }
+}
+
 #[component]
 pub fn MetalHeart(#[props(default = 13)] size: u32) -> Element {
     rsx! {

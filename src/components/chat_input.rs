@@ -860,6 +860,10 @@ pub fn ChatInput(
         let user_message = draft.read().clone();
         let atts = attachments.read().clone();
         let session_id = current_session_id.read().clone();
+        if crate::system_sessions::is_archive(&session_id) {
+            tracing::debug!("'send_message' blocked: archived system session is read-only.");
+            return;
+        }
         if user_message.is_empty()
             && atts.is_empty()
             && !has_new_comments.read().contains(&session_id)
@@ -897,9 +901,9 @@ pub fn ChatInput(
     };
 
     // Drain one queued message per idle session — the active tab AND any
-    // background tab whose turn has finished. `dispatching` is keyed by session
-    // so one tab's async gap can't block another's drain.
-    let mut dispatching = use_signal(HashSet::<String>::new);
+    // background tab whose turn has finished. `chat_queue::DISPATCHING` is
+    // keyed by session so one tab's async gap can't block another's drain
+    // (global so session rotation can see a popped message still in flight).
     use_effect(move || {
         // Re-run on any stream state change, active-session switch, or explicit
         // drain request (e.g. a fired timer enqueuing for a session).
@@ -918,12 +922,12 @@ pub fn ChatInput(
             if stream_manager.is_session_streaming(&session_id) {
                 // The message we dispatched has started streaming — release
                 // this session's guard.
-                if dispatching.peek().contains(&session_id) {
-                    dispatching.write().remove(&session_id);
+                if chat_queue::DISPATCHING.peek().contains(&session_id) {
+                    chat_queue::DISPATCHING.write().remove(&session_id);
                 }
                 continue;
             }
-            if dispatching.peek().contains(&session_id) {
+            if chat_queue::DISPATCHING.peek().contains(&session_id) {
                 continue;
             }
             // Don't pop for a session that isn't in state: deleted, or not yet
@@ -942,7 +946,7 @@ pub fn ChatInput(
             // borrowed.
             let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
             if let Some(qm) = popped {
-                dispatching.write().insert(session_id.clone());
+                chat_queue::DISPATCHING.write().insert(session_id.clone());
                 match qm.relay {
                     // A waking dispatch relay: append it and start a turn
                     // with no user message (todo::relay). Never resets the
@@ -968,11 +972,20 @@ pub fn ChatInput(
                 // streams.
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    dispatching.write().remove(&session_id);
+                    chat_queue::DISPATCHING.write().remove(&session_id);
                 });
             }
         }
     });
+
+    // A rotated-out Heartbeat / Voice session is a read-only archive: its
+    // successor carries on the conversation (session_rotation).
+    let archived = crate::system_sessions::is_archive(&current_session_id.read());
+    let placeholder = if archived {
+        "Archived — read-only. The conversation continues in the current tab."
+    } else {
+        "Type your message..."
+    };
 
     rsx! {
         if !attachments.read().is_empty() {
@@ -1113,7 +1126,8 @@ pub fn ChatInput(
                         class: "w-full min-h-[44px] px-4 pt-3 pb-1.5 bg-transparent border-0 text-fg placeholder-gray-500 focus:outline-none focus:ring-0 resize-none overflow-y-auto",
                         style: "max-height: 50vh;",
                         rows: "1",
-                        placeholder: "Type your message...",
+                        placeholder: "{placeholder}",
+                        disabled: archived,
                         // UNCONTROLLED on purpose: a controlled `value` binding races
                         // the IPC round-trip and snaps the caret to the end mid-typing.
                         // Programmatic writes go through shared::set_chat_draft, which

@@ -63,6 +63,11 @@ pub static CHAT_QUEUE: GlobalSignal<HashMap<String, VecDeque<QueuedMessage>>> =
 /// enqueues a prompt for the session that is *already* active.
 pub static QUEUE_DRAIN_TICK: GlobalSignal<u64> = Signal::global(|| 0);
 
+/// Sessions whose queued message was popped and handed to `submit`, until
+/// its stream starts (or a 5 s failsafe): the drain's in-flight guard.
+pub static DISPATCHING: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
 /// Ask the active session's queue to drain on the next reactive tick.
 pub fn request_drain() {
     *QUEUE_DRAIN_TICK.write() += 1;
@@ -79,7 +84,13 @@ pub fn queue_push(
     session_id: &str,
     msg: QueuedMessage,
 ) {
-    map.entry(session_id.to_string())
+    // A rotated-out system session is a read-only archive: whatever is
+    // still addressed to it runs in its successor (`system_sessions`).
+    let target = crate::system_sessions::current_for(session_id);
+    if target != session_id {
+        tracing::debug!(from = session_id, to = %target, "chat queue: archived system session; queued in its successor");
+    }
+    map.entry(target)
         .or_default()
         .push_back(msg);
 }

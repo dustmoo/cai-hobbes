@@ -185,10 +185,14 @@ pub const META_KEY: &str = "heartbeat_state";
 
 /// Read the persisted state; missing or unreadable state starts fresh.
 pub fn load() -> HeartbeatState {
-    match crate::session_store::meta_get(META_KEY) {
+    let mut state = match crate::session_store::meta_get(META_KEY) {
         Some(raw) => from_json(&raw),
         None => HeartbeatState::default(),
-    }
+    };
+    // A pointer a stale save left on a rotated-out archive moves forward to
+    // its successor (`session_rotation`).
+    state.session_id = state.session_id.map(|id| crate::system_sessions::resolve_successor(&id));
+    state
 }
 
 /// Parse persisted JSON, falling back to a fresh state (logged) on error.

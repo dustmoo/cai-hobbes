@@ -54,15 +54,16 @@ pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<St
         .or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
 }
 
-/// The profiles `session_id` can act in, home first. Only system sessions
-/// (Heartbeat, Voice) reach beyond home in phase 1; with no home profile
-/// there is nothing to anchor to, so no reach either.
+/// The profiles `session_id` can act in, home first. Only the live system
+/// sessions (Heartbeat, Voice) reach beyond home in phase 1 — not their
+/// rotated-out archives, which are read-only; with no home profile there is
+/// nothing to anchor to, so no reach either.
 pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<&str>) -> Vec<ReachProfile> {
     let Some(home) = home_id.and_then(|id| settings.composio_profiles.iter().find(|p| p.id == id)) else {
         return Vec::new();
     };
     let mut out = vec![ReachProfile { id: home.id.clone(), name: home.name.clone() }];
-    if crate::system_sessions::is_system(session_id) {
+    if crate::system_sessions::is_current(session_id) {
         out.extend(
             settings
                 .composio_profiles
@@ -342,7 +343,9 @@ pub fn resume_profile(
     }
     // Only system sessions route; everything else keeps its own pin. (Not
     // `reach.len()`: a system session whose other profiles dropped out must
-    // still refuse a call routed to one of them.)
+    // still refuse a call routed to one of them. An archive counts here, so
+    // a stale held call in it is refused rather than run at home: its reach
+    // is home only.)
     if !crate::system_sessions::is_system(session_id) {
         return Ok(session_profile.map(str::to_string));
     }
@@ -368,25 +371,83 @@ pub fn resume_profile(
 /// one read doesn't hold every write in a long-lived session for good.
 pub const READ_WINDOW: chrono::Duration = chrono::Duration::hours(2);
 
-/// Profiles this session has read Composio results from within
-/// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
-/// model's context.
-pub fn session_read_profiles(settings: &Settings, messages: &[Message], now: chrono::DateTime<chrono::Utc>) -> BTreeSet<String> {
+/// The Composio reads in `messages` within [`READ_WINDOW`] of `now`: which
+/// profile, and when.
+pub fn recent_reads(
+    settings: &Settings,
+    messages: &[Message],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::session::CarriedRead> {
     messages
         .iter()
         .filter_map(|m| match &m.content {
             MessageContent::ToolCall(tc)
-                if tc.status == ToolCallStatus::Completed
-                    && is_composio_native(&tc.server_name)
-                    && now - tc.completed_at.unwrap_or(m.created_at) <= READ_WINDOW =>
+                if tc.status == ToolCallStatus::Completed && is_composio_native(&tc.server_name) =>
             {
-                tc.profile_id
+                let read_at = tc.completed_at.unwrap_or(m.created_at);
+                if now - read_at > READ_WINDOW {
+                    return None;
+                }
+                let profile_id = tc
+                    .profile_id
                     .clone()
-                    .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string))
+                    .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string))?;
+                Some(crate::session::CarriedRead { profile_id, read_at })
             }
             _ => None,
         })
         .collect()
+}
+
+/// `reads` still inside [`READ_WINDOW`] of `now`, newest per profile (sorted
+/// by profile id, so equal inputs give equal lists).
+pub fn merge_reads(
+    reads: impl IntoIterator<Item = crate::session::CarriedRead>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::session::CarriedRead> {
+    let mut newest: std::collections::BTreeMap<String, chrono::DateTime<chrono::Utc>> = Default::default();
+    for r in reads.into_iter().filter(|r| now - r.read_at <= READ_WINDOW) {
+        let at = newest.entry(r.profile_id).or_insert(r.read_at);
+        if r.read_at > *at {
+            *at = r.read_at;
+        }
+    }
+    newest
+        .into_iter()
+        .map(|(profile_id, read_at)| crate::session::CarriedRead { profile_id, read_at })
+        .collect()
+}
+
+/// A session's reads still in play: those in its own messages and those it
+/// carries, newest per profile.
+pub fn session_recent_reads(
+    settings: &Settings,
+    session: &crate::session::Session,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<crate::session::CarriedRead> {
+    merge_reads(recent_reads(settings, &session.messages, now).into_iter().chain(session.carried_reads.iter().cloned()), now)
+}
+
+/// Profiles this session has read Composio results from within
+/// [`READ_WINDOW`] of `now` — across messages, since read data stays in the
+/// model's context — plus reads a rotated system session carried over from
+/// the session it replaced (`Session::carried_reads`; the data may be in
+/// the carried summary).
+pub fn session_read_profiles(
+    settings: &Settings,
+    session: &crate::session::Session,
+    now: chrono::DateTime<chrono::Utc>,
+) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> =
+        recent_reads(settings, &session.messages, now).into_iter().map(|r| r.profile_id).collect();
+    out.extend(
+        session
+            .carried_reads
+            .iter()
+            .filter(|r| now - r.read_at <= READ_WINDOW)
+            .map(|r| r.profile_id.clone()),
+    );
+    out
 }
 
 /// Whether a call changes something outside. Composio meta tools that only
@@ -725,10 +786,12 @@ mod tests {
             mk("Hobbes", "terminal", Some("x"), ToolCallStatus::Completed), // not Composio
         ];
         let now = chrono::Utc::now();
-        let read = session_read_profiles(&settings, &msgs, now);
+        let mut session = crate::session_events::blank_session();
+        session.messages = msgs;
+        let read = session_read_profiles(&settings, &session, now);
         assert_eq!(read.into_iter().collect::<Vec<_>>(), ["cm", "pg"]);
         // Reads age out of the window.
-        assert!(session_read_profiles(&settings, &msgs, now + READ_WINDOW + chrono::Duration::minutes(1)).is_empty());
+        assert!(session_read_profiles(&settings, &session, now + READ_WINDOW + chrono::Duration::minutes(1)).is_empty());
     }
 
     fn settings_with(profiles: &[(&str, &str, bool)]) -> Settings {

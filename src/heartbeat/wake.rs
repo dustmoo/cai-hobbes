@@ -503,13 +503,16 @@ pub fn wake_completion(
     Some((cost, outcome))
 }
 
-/// To-dos the Heartbeat dispatched: Fleet runs launched from its session,
-/// and to-dos named by a `HOBBES_DISPATCH` call that completed in it.
-pub fn heartbeat_todo_ids(fleet: &crate::fleet::FleetState, session_id: &str, messages: &[Message]) -> HashSet<String> {
+/// To-dos the Heartbeat dispatched: Fleet runs launched from any of its
+/// sessions (`lineage`: the current one and those it rotated out of), and
+/// to-dos named by a `HOBBES_DISPATCH` call that completed in the current
+/// one (`messages`). Chat workers dispatched before a rotation are found by
+/// the caller through the carried-over worker list.
+pub fn heartbeat_todo_ids(fleet: &crate::fleet::FleetState, lineage: &[String], messages: &[Message]) -> HashSet<String> {
     let mut out: HashSet<String> = fleet
         .sessions
         .values()
-        .filter(|s| s.dispatched_from.as_deref() == Some(session_id))
+        .filter(|s| s.dispatched_from.as_ref().is_some_and(|f| lineage.contains(f)))
         .filter_map(|s| s.dispatched_todo.clone())
         .collect();
     for m in messages {
@@ -1124,15 +1127,20 @@ mod tests {
         };
         let run = row("run-1", "t-fleet", "hb");
         let other = row("run-2", "t-other", "chat");
+        // Launched from the session the Heartbeat rotated out of.
+        let before = row("run-3", "t-before", "hb-old");
         fleet.sessions.insert("run-1".into(), run);
         fleet.sessions.insert("run-2".into(), other);
+        fleet.sessions.insert("run-3".into(), before);
         use crate::components::shared::ToolCallStatus as S;
         let msgs = vec![
             msg_at("Hobbes", MessageContent::ToolCall(tool("HOBBES_DISPATCH", r#"{"todo_id":"t-chat"}"#, S::Completed)), now()),
             msg_at("Hobbes", MessageContent::ToolCall(tool("HOBBES_DISPATCH", r#"{"todo_id":"t-err"}"#, S::Error)), now()),
             msg_at("Hobbes", MessageContent::PermissionRequest(tool("HOBBES_DISPATCH", r#"{"todo_id":"t-held"}"#, S::Running)), now()),
         ];
-        let ids = heartbeat_todo_ids(&fleet, "hb", &msgs);
+        let ids = heartbeat_todo_ids(&fleet, &["hb".to_string()], &msgs);
         assert_eq!(ids, HashSet::from(["t-fleet".to_string(), "t-chat".to_string()]));
+        let ids = heartbeat_todo_ids(&fleet, &["hb-old".to_string(), "hb".to_string()], &msgs);
+        assert_eq!(ids, HashSet::from(["t-fleet".to_string(), "t-chat".to_string(), "t-before".to_string()]));
     }
 }

@@ -47,6 +47,19 @@ pub struct StreamManagerContext {
 }
 
 impl StreamManagerContext {
+    /// Every session with turn machinery in flight: streaming, a stream
+    /// mapped to it (set before `streaming_sessions` on start, and kept
+    /// through the gap before a continuation), a continuation in flight, or
+    /// a proactive summarization running. Reads subscribe the caller (the
+    /// `StreamBridge` mirror for `session_rotation`).
+    pub fn turn_activity(&self) -> HashSet<String> {
+        let mut out = self.streaming_sessions.read().clone();
+        out.extend(self.stream_session_map.read().values().cloned());
+        out.extend(self.summarizing_sessions.read().iter().cloned());
+        out.extend(self.continuation_controller.read().in_flight_sessions());
+        out
+    }
+
     /// Report this session's lifecycle into the fleet (no-op while the
     /// bridge is disarmed). Name lookup peeks — never subscribes. Turn
     /// completions carry the conversation summary so the fleet row gets a
@@ -640,7 +653,7 @@ impl StreamManagerContext {
                                 let state = self.session_state.peek();
                                 let session = state.sessions.get(&session_id);
                                 let read_from = session
-                                    .map(|s| reach_mod::session_read_profiles(&settings_read, &s.messages, chrono::Utc::now()))
+                                    .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
                                     .unwrap_or_default();
                                 let write = match target {
                                     Some(_) => reach_mod::is_write(&tool_call.tool_name, &args),

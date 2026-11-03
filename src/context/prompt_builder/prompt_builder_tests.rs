@@ -43,6 +43,7 @@ fn create_test_session() -> Session {
         context_ledger: Vec::new(),
         dispatch_link: None,
         dispatched_workers: Vec::new(),
+        carried_reads: Vec::new(),
     }
 }
 
@@ -3080,6 +3081,28 @@ fn briefing_lists_changes_to_dispatched_work() {
     let listed: Vec<&str> = b.lines().filter(|l| l.starts_with("Work you dispatched")).collect();
     assert_eq!(listed.len(), 5, "{b}");
     assert!(listed[0].contains("run 4 ended") && listed[4].contains("run 8 ended"), "{b}");
+}
+
+#[test]
+fn a_rotated_session_s_predecessor_work_is_not_work_it_dispatched() {
+    use super::briefing::turn_briefing_in;
+    let session = create_test_session();
+    let prior = finished_turn_at(utc(0));
+    let lineage = vec!["old_session".to_string(), "test_session".to_string()];
+    // The predecessor's own to-do (it was the worker): not dispatched work.
+    let mut own = hb_event("worker_done", "Agent finished \"old own task\"", utc(70));
+    own.session_id = Some("old_session".into());
+    // A run the predecessor dispatched: still this chat's dispatched work.
+    let mut ran = hb_event("run_ended", "Fleet: dispatched run before rotation ended", utc(80));
+    ran.dispatched_from = Some("old_session".into());
+    let b = turn_briefing_in(&session, &lineage, &prior, &[own.clone(), ran], fixed_clock(120));
+    assert_eq!(
+        b,
+        format!("{BRIEFING_HEADER}\nWork you dispatched: Fleet: dispatched run before rotation ended ({}).", hhmm(utc(80)))
+    );
+    // Without the lineage the predecessor's own work would leak in.
+    assert!(turn_briefing_in(&session, &["test_session".to_string()], &prior, &[own], fixed_clock(120))
+        .contains("old own task"));
 }
 
 #[test]

@@ -4,7 +4,8 @@ use crate::components::stream_manager::StreamManagerContext;
 use crate::session::SessionState;
 use crate::settings::UiState;
 use dioxus::prelude::*;
-use crate::components::metal_heart::{use_heartbeat_session_id, MetalHeart};
+use crate::components::metal_heart::{system_icon, use_heartbeat_session_id, MetalHeart};
+use crate::system_sessions::SystemSession;
 use crate::components::metal_mouth::{use_voice_session_id, MetalMouth};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
@@ -292,9 +293,9 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                         }
                                     },
                                     if show_emoji {
-                                        if heartbeat_id.read().as_deref() == Some(session_id.as_str()) {
+                                        if system_icon(heartbeat_id, voice_id, session_id) == Some(SystemSession::Heartbeat) {
                                             MetalHeart {}
-                                        } else if voice_id.read().as_deref() == Some(session_id.as_str()) {
+                                        } else if system_icon(heartbeat_id, voice_id, session_id) == Some(SystemSession::Voice) {
                                             MetalMouth {}
                                         } else {
                                             span {

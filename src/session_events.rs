@@ -152,6 +152,9 @@ pub enum SessionEvent {
     DispatchLinked { link: Option<crate::todo::relay::DispatchLink> },
     /// A chat worker was dispatched from this chat.
     WorkerAdded { worker_session_id: String },
+    /// A rotated system session took over its predecessor's recent Composio
+    /// reads (`session_rotation`), so the cross-company hold still sees them.
+    ReadsCarried { reads: Vec<crate::session::CarriedRead> },
 }
 
 impl SessionEvent {
@@ -187,6 +190,7 @@ impl SessionEvent {
             SessionEvent::Relay { .. } => "Relay",
             SessionEvent::DispatchLinked { .. } => "DispatchLinked",
             SessionEvent::WorkerAdded { .. } => "WorkerAdded",
+            SessionEvent::ReadsCarried { .. } => "ReadsCarried",
         }
     }
 }
@@ -218,7 +222,7 @@ pub fn log_event_sync(session_id: &str, event: SessionEvent) {
 /// A deterministic, empty session shell for `project(None, …)`. No clocks,
 /// no settings: `last_updated` starts at the epoch and is advanced to each
 /// applied event's row timestamp.
-fn blank_session() -> Session {
+pub(crate) fn blank_session() -> Session {
     Session {
         id: String::new(),
         name: String::new(),
@@ -250,6 +254,7 @@ fn blank_session() -> Session {
         context_ledger: Vec::new(),
         dispatch_link: None,
         dispatched_workers: Vec::new(),
+        carried_reads: Vec::new(),
     }
 }
 
@@ -314,6 +319,7 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
                 session.dispatched_workers.push(worker_session_id.clone());
             }
         }
+        E::ReadsCarried { reads } => session.carried_reads = reads.clone(),
         E::ScratchpadSet { content } => session.scratchpad = content.clone(),
         E::HandoffWritten { note } => session.handoff = Some(note.clone()),
         E::SkillLoaded { name, payload } => {

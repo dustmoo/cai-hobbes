@@ -381,6 +381,19 @@ pub struct Session {
     /// Dispatch relay, parent side: worker tabs dispatched from this chat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dispatched_workers: Vec<String>,
+    /// Composio reads a rotated system session carried over from the
+    /// session it replaced (`session_rotation`): the cross-company hold
+    /// (`profile_reach::session_read_profiles`) counts them like reads in
+    /// this session's own messages until they age out of the read window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_reads: Vec<CarriedRead>,
+}
+
+/// One Composio read carried into a rotated system session's successor.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CarriedRead {
+    pub profile_id: String,
+    pub read_at: DateTime<Utc>,
 }
 
 /// What a [`LedgerEntry`] records.
@@ -1753,6 +1766,7 @@ impl SessionState {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -2358,6 +2372,7 @@ mod tests {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
             }
         }
 
@@ -3208,6 +3223,7 @@ mod tests {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
             messages: vec![
                 Message {
                     id: msg1_id,

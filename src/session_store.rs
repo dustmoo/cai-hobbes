@@ -457,7 +457,9 @@ pub fn build_row(session: &Session, seq: i64) -> Result<SessionRow, serde_json::
         message_count: session.messages.len() as i64,
         total_cost: session.total_cost(),
         total_tokens: session.total_tokens() as i64,
-        has_timers: !session.scheduled_timers.is_empty(),
+        // Pending only: startup hydrates these rows, and a session whose
+        // timers all fired (a rotated-out system session, say) needn't load.
+        has_timers: session.next_pending_timer().is_some(),
         summary,
         search_text,
         project_id: session.project_id.clone(),
@@ -687,6 +689,23 @@ pub fn contains(id: &str) -> bool {
             .map(|o| o.is_some())
     })
     .unwrap_or(false)
+}
+
+/// The stored size of a session's `data` blob in bytes (what every save of
+/// that session rewrites), without reading it. `None` when there is no row.
+pub fn row_bytes(id: &str) -> Option<u64> {
+    with_conn(|conn| {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT length(CAST(data AS BLOB)) FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+    })
+    .ok()
+    .flatten()
+    .map(|n| n.max(0) as u64)
 }
 
 pub fn session_ids_with_timers() -> Vec<String> {
