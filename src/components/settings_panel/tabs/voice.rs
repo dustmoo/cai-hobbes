@@ -425,14 +425,29 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                                             setup.system_instruction = "This is an audio sound check. Answer in one short sentence.".into();
                                             setup.tools.clear();
                                             match tokio::task::spawn_blocking(|| crate::voice::probe::synth_speech(crate::voice::probe::TEST_QUESTION)).await {
-                                                Ok(Ok(speech)) => match crate::voice::probe::speech_round_trip(provider.as_ref(), setup, speech).await {
-                                                    Ok(r) => format!(
-                                                        "Working. Heard: “{}”. Replied: “{}” ({:.1} s of speech, first sound after {:.1} s).",
-                                                        r.heard,
-                                                        r.replied,
-                                                        r.reply_secs,
-                                                        r.first_audio_after.unwrap_or_default().as_secs_f32()
-                                                    ),
+                                                Ok(Ok(speech)) => match crate::voice::probe::speech_round_trip(provider.as_ref(), setup.clone(), speech).await {
+                                                    Ok(r) => {
+                                                        let speech_line = format!(
+                                                            "Working. Heard: “{}”. Replied: “{}” ({:.1} s of speech, first sound after {:.1} s).",
+                                                            r.heard,
+                                                            r.replied,
+                                                            r.reply_secs,
+                                                            r.first_audio_after.unwrap_or_default().as_secs_f32()
+                                                        );
+                                                        test_result.set(Some(format!("{speech_line} Now checking the brain handoff…")));
+                                                        let handoff = match crate::voice::probe::brain_handoff_round_trip(provider.as_ref(), setup).await {
+                                                            Ok(h) => {
+                                                                let holding = [h.before_call.as_str(), h.holding.as_str()].join(" ").trim().to_string();
+                                                                if holding.is_empty() {
+                                                                    format!("Brain handoff: the result came through (“{}”) but the voice stayed silent while waiting.", h.result)
+                                                                } else {
+                                                                    format!("Brain handoff: said “{holding}” while waiting, then “{}”.", h.result)
+                                                                }
+                                                            }
+                                                            Err(e) => format!("Brain handoff test failed: {e}"),
+                                                        };
+                                                        format!("{speech_line} {handoff}")
+                                                    }
                                                     Err(e) => format!("The voice model test failed: {e}"),
                                                 },
                                                 Ok(Err(e)) => format!("Couldn't make the test speech: {e}"),

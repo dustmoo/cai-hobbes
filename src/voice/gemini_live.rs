@@ -202,7 +202,7 @@ pub fn control_json(c: &RealtimeControl) -> Option<Value> {
         RealtimeControl::ActivityStart => json!({"realtimeInput": {"activityStart": {}}}),
         RealtimeControl::ActivityEnd => json!({"realtimeInput": {"activityEnd": {}}}),
         RealtimeControl::AudioStreamEnd => json!({"realtimeInput": {"audioStreamEnd": true}}),
-        RealtimeControl::ToolResponse { id, name, response, scheduling } => {
+        RealtimeControl::ToolResponse { id, name, response, scheduling, will_continue } => {
             let mut obj = match response {
                 Value::Object(m) => m.clone(),
                 other => {
@@ -219,9 +219,13 @@ pub fn control_json(c: &RealtimeControl) -> Option<Value> {
                 };
                 obj.insert("scheduling".into(), json!(s));
             }
-            json!({"toolResponse": {"functionResponses": [
-                {"id": id, "name": name, "response": Value::Object(obj)}
-            ]}})
+            let mut fr = json!({"id": id, "name": name, "response": Value::Object(obj)});
+            // A FunctionResponse field (not inside `response`); only sent on
+            // interim responses so final ones keep their proven shape.
+            if *will_continue {
+                fr["willContinue"] = json!(true);
+            }
+            json!({"toolResponse": {"functionResponses": [fr]}})
         }
         RealtimeControl::InjectContext { text, respond } => json!({"clientContent": {
             "turns": [{"role": "user", "parts": [{"text": text}]}],
@@ -712,8 +716,34 @@ mod tests {
     }
 
     #[test]
-    fn tool_response_scheduling_and_wrap() {
+    fn interim_tool_responses_continue_at_the_function_response_level() {
         let v = control_json(&RealtimeControl::ToolResponse {
+            id: "c1".into(),
+            name: "VOICE_ASK_BRAIN".into(),
+            response: json!({"status": "working"}),
+            scheduling: Some(Scheduling::WhenIdle),
+            will_continue: true,
+        })
+        .unwrap();
+        let fr = &v["toolResponse"]["functionResponses"][0];
+        assert_eq!(fr["willContinue"], true);
+        assert_eq!(fr["response"]["status"], "working");
+        assert_eq!(fr["response"]["scheduling"], "WHEN_IDLE");
+        // Final responses keep their shape (no willContinue at all).
+        let v = control_json(&RealtimeControl::ToolResponse {
+            id: "c1".into(),
+            name: "VOICE_ASK_BRAIN".into(),
+            response: json!({"result": "done"}),
+            scheduling: Some(Scheduling::WhenIdle),
+            will_continue: false,
+        })
+        .unwrap();
+        assert!(v["toolResponse"]["functionResponses"][0].get("willContinue").is_none());
+    }
+
+    #[test]
+    fn tool_response_scheduling_and_wrap() {
+        let v = control_json(&RealtimeControl::ToolResponse { will_continue: false,
             id: "i".into(),
             name: "n".into(),
             response: json!({"ok": true}),
@@ -725,7 +755,7 @@ mod tests {
         assert_eq!(r["name"], "n");
         assert_eq!(r["response"], json!({"ok": true, "scheduling": "WHEN_IDLE"}));
 
-        let v = control_json(&RealtimeControl::ToolResponse {
+        let v = control_json(&RealtimeControl::ToolResponse { will_continue: false,
             id: "i".into(),
             name: "n".into(),
             response: json!("done"),
@@ -735,7 +765,7 @@ mod tests {
         assert_eq!(v["toolResponse"]["functionResponses"][0]["response"], json!({"result": "done"}));
 
         for (s, w) in [(Scheduling::Interrupt, "INTERRUPT"), (Scheduling::Silent, "SILENT")] {
-            let v = control_json(&RealtimeControl::ToolResponse {
+            let v = control_json(&RealtimeControl::ToolResponse { will_continue: false,
                 id: "i".into(),
                 name: "n".into(),
                 response: json!(5),
@@ -904,7 +934,7 @@ mod tests {
                 RealtimeEvent::ToolCall { id, name, args } => {
                     println!("tool call {name} {args}");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    s.control.send(RealtimeControl::ToolResponse {
+                    s.control.send(RealtimeControl::ToolResponse { will_continue: false,
                         id, name, response: serde_json::json!({"result": "Sunny, 21 degrees"}),
                         scheduling: Some(Scheduling::WhenIdle),
                     }).unwrap();
@@ -919,6 +949,20 @@ mod tests {
         }
         println!("\ntool result spoken: {spoke_after} samples");
         s.control.send(RealtimeControl::Close).unwrap();
+    }
+
+    /// The brain handoff: interim `willContinue` response, then the result.
+    /// `GEMINI_API_KEY=… cargo test --release gemini_live_brain_handoff -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn gemini_live_brain_handoff() {
+        let key = std::env::var("GEMINI_API_KEY").expect("set GEMINI_API_KEY");
+        let model = std::env::var("GEMINI_LIVE_MODEL").unwrap_or_else(|_| "gemini-3.8-live".into());
+        let setup = RealtimeSetup { model, ..Default::default() };
+        let h = crate::voice::probe::brain_handoff_round_trip(&GeminiLive::new(key), setup).await.expect("handoff");
+        println!("{h:?}");
+        assert!(!(h.before_call.is_empty() && h.holding.is_empty()), "silent while the tool ran");
+        assert!(!h.result.is_empty());
     }
 
     /// The mic path's protocol: real (synthesized) speech streamed as

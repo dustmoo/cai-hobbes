@@ -101,6 +101,9 @@ pub enum RealtimeControl {
         response: Value,
         /// Only meaningful for `non_blocking` tools.
         scheduling: Option<Scheduling>,
+        /// An interim response: more will follow for this call (non-blocking
+        /// tools only; e.g. "working on it" now, the result later).
+        will_continue: bool,
     },
     /// Add text to the conversation mid-session (a Heartbeat alert, a brain
     /// result that arrived outside a tool call). `respond` = the model should

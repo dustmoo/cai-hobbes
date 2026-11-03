@@ -226,7 +226,9 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, voice_tail: &str
          else — doing or changing things, email, files, code, dispatching work, or questions \
          that need careful thought — call {brain} with a complete request (the brain cannot \
          hear the conversation), tell them briefly that you're on it, and keep talking with \
-         them. When the result comes back, summarise it naturally. Never read out code, URLs \
+         them. As you hand something to the brain, say a short holding phrase out loud — \
+         \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
+         silence. When the result comes back, summarise it naturally. Never read out code, URLs \
          or long ids; say it's in the Voice tab. When they say goodbye, call {end}.\n\n\
          It is {time}.",
         brain = tools::ASK_BRAIN,
@@ -420,6 +422,14 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                     if brain_cancel.is_empty() {
                                         flush_lines(ctx, &voice_session, &mut pending_lines, false);
                                     }
+                                    // Say "one moment" now; the result follows on this call.
+                                    let _ = rt.control.send(RealtimeControl::ToolResponse {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        response: brain_started_response(),
+                                        scheduling: Some(Scheduling::WhenIdle),
+                                        will_continue: true,
+                                    });
                                     let handle = BrainHandle::default();
                                     brain_cancel.insert(id.clone(), handle.clone());
                                     ui.brain_busy = brain_cancel.len();
@@ -647,7 +657,21 @@ fn respond(control: &mpsc::UnboundedSender<RealtimeControl>, id: &str, name: &st
         name: name.to_string(),
         response,
         scheduling,
+        will_continue: false,
     });
+}
+
+/// The interim answer to `VOICE_ASK_BRAIN`, sent the moment the brain
+/// starts: it prompts the voice to say it's thinking (instead of going
+/// quiet), and keeps the call open for the real result (`willContinue`).
+pub fn brain_started_response() -> Value {
+    json!({
+        "status": "working",
+        "note": "The brain is working on this; it can take a minute. Say a few words to let them \
+                 know you're thinking about it and will be right back (for example \"Let me \
+                 think about that, one moment.\"). Don't guess the answer. The result arrives \
+                 later on this same call.",
+    })
 }
 
 /// Write buffered transcript lines into the Voice session, unless its turn
@@ -685,6 +709,15 @@ mod tests {
         assert!(s.contains("CI is red") && s.contains("🎙 hi"));
         let bare = system_instruction(now, "", "");
         assert!(!bare.contains("Heartbeat notes"));
+    }
+
+    #[test]
+    fn the_brain_handoff_is_announced() {
+        let s = system_instruction(chrono::Local::now(), "", "");
+        assert!(s.contains("holding phrase"));
+        let r = brain_started_response();
+        assert_eq!(r["status"], "working");
+        assert!(r["note"].as_str().unwrap().contains("one moment"));
     }
 
     #[test]

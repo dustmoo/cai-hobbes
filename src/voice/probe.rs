@@ -261,7 +261,7 @@ pub async fn speech_round_trip(
                     }
                     RealtimeEvent::TurnComplete if reply_samples > 0 => break Ok(()),
                     RealtimeEvent::ToolCall { id, name, .. } => {
-                        let _ = s.control.send(RealtimeControl::ToolResponse {
+                        let _ = s.control.send(RealtimeControl::ToolResponse { will_continue: false,
                             id, name, response: serde_json::json!({"result": "unavailable in the test"}), scheduling: None,
                         });
                     }
@@ -282,6 +282,114 @@ pub async fn speech_round_trip(
         out.reply_secs,
         out.replied.chars().count(),
         out.first_audio_after
+    );
+    result.map(|()| out)
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Handoff {
+    /// Speech before the slow tool was called.
+    pub before_call: String,
+    /// Speech after the interim "working" response (the holding phrase).
+    pub holding: String,
+    /// Speech after the final result.
+    pub result: String,
+}
+
+/// The brain handoff as a conversation runs it: a question that needs a
+/// slow (non-blocking) tool, an interim "working" response with
+/// `willContinue`, then the result. Checks the voice fills the wait and
+/// still speaks the result.
+pub async fn brain_handoff_round_trip(provider: &dyn RealtimeVoice, mut setup: RealtimeSetup) -> Result<Handoff, String> {
+    use crate::voice::realtime::{Scheduling, ToolDecl};
+    const TOOL: &str = "look_up";
+    setup.system_instruction = format!(
+        "This is a sound check of a slow tool. For any question, call {TOOL}. As you call it, say a \
+         short holding phrase out loud. When the result comes back, say it in one sentence."
+    );
+    setup.tools = vec![ToolDecl {
+        name: TOOL.into(),
+        description: "Look something up. Slow: takes a while.".into(),
+        parameters: serde_json::json!({"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}),
+        non_blocking: true,
+    }];
+    let mut s = provider.connect(setup).await?;
+    s.control
+        .send(RealtimeControl::InjectContext { text: "Did last night's build pass?".into(), respond: true })
+        .map_err(|_| "the connection ended".to_string())?;
+    #[derive(PartialEq)]
+    enum Stage {
+        BeforeCall,
+        Holding,
+        Result,
+    }
+    let mut stage = Stage::BeforeCall;
+    let mut out = Handoff::default();
+    let mut call: Option<(String, String)> = None;
+    let mut result_audio = 0usize;
+    let mut final_due: Option<tokio::time::Instant> = None;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let result = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break Err(match stage {
+                Stage::BeforeCall => "the model never called the slow tool".to_string(),
+                Stage::Holding => "no reply after the interim response".to_string(),
+                Stage::Result => "the result was never spoken".to_string(),
+            });
+        }
+        let due = final_due.unwrap_or_else(|| tokio::time::Instant::now() + left);
+        tokio::select! {
+            _ = tokio::time::sleep_until(due), if final_due.is_some() => {
+                final_due = None;
+                if let Some((id, name)) = call.clone() {
+                    stage = Stage::Result;
+                    let _ = s.control.send(RealtimeControl::ToolResponse {
+                        id, name,
+                        response: serde_json::json!({"result": "Yes, last night's build passed."}),
+                        scheduling: Some(Scheduling::WhenIdle),
+                        will_continue: false,
+                    });
+                }
+            }
+            ev = tokio::time::timeout(left, s.events.recv()) => match ev {
+                Err(_) => continue,
+                Ok(None) => break Err("the connection ended".into()),
+                Ok(Some(ev)) => match ev {
+                    RealtimeEvent::ToolCall { id, name, .. } if call.is_none() => {
+                        call = Some((id.clone(), name.clone()));
+                        stage = Stage::Holding;
+                        let _ = s.control.send(RealtimeControl::ToolResponse {
+                            id, name,
+                            response: crate::voice::controller::brain_started_response(),
+                            scheduling: Some(Scheduling::WhenIdle),
+                            will_continue: true,
+                        });
+                        // The "brain" answers a few seconds later.
+                        final_due = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+                    }
+                    RealtimeEvent::OutputTranscript(t) => match stage {
+                        Stage::BeforeCall => out.before_call.push_str(&t),
+                        Stage::Holding => out.holding.push_str(&t),
+                        Stage::Result => out.result.push_str(&t),
+                    },
+                    RealtimeEvent::Audio { pcm, .. } if stage == Stage::Result => result_audio += pcm.len(),
+                    RealtimeEvent::TurnComplete if stage == Stage::Result && result_audio > 0 => break Ok(()),
+                    RealtimeEvent::Closed { reason } => break Err(format!("the connection closed: {reason}")),
+                    _ => {}
+                },
+            },
+        }
+    };
+    let _ = s.control.send(RealtimeControl::Close);
+    out.before_call = out.before_call.trim().to_string();
+    out.holding = out.holding.trim().to_string();
+    out.result = out.result.trim().to_string();
+    tracing::info!(
+        "voice: handoff check: before call {} chars, holding {} chars, result {} chars",
+        out.before_call.chars().count(),
+        out.holding.chars().count(),
+        out.result.chars().count()
     );
     result.map(|()| out)
 }
