@@ -41,6 +41,7 @@ use crate::voice::brain::{self, BrainHandle, BrainOutcome};
 use crate::voice::realtime::{
     RealtimeControl, RealtimeEvent, RealtimeSetup, RealtimeVoice, Scheduling,
 };
+use crate::voice::transcript::PendingLine;
 use crate::voice::{session, tools};
 
 /// What the voice is doing (drives the indicator).
@@ -467,7 +468,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut last_activity = Instant::now();
     let mut heard_buf = String::new();
     let mut spoke_buf = String::new();
-    let mut pending_lines: Vec<(bool, String)> = Vec::new();
+    // When the utterance in each buffer began: a line is placed in the
+    // session by when it was said, not when it is written (see transcript.rs).
+    let mut heard_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut spoke_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    let mut pending_lines: Vec<PendingLine> = Vec::new();
     let mut brain_cancel: HashMap<String, BrainHandle> = HashMap::new();
     let mut abandoned: HashSet<String> = HashSet::new();
     let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<(String, BrainOutcome)>();
@@ -502,7 +507,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     RealtimeEvent::Audio { pcm, sample_rate } => {
                         stats.model_audio_ms += (pcm.len() as u64 * 1000) / sample_rate.max(1) as u64;
                         if !heard_buf.trim().is_empty() {
-                            pending_lines.push((true, std::mem::take(&mut heard_buf)));
+                            pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
                         }
                         audio_io.play(&pcm, sample_rate);
                         last_activity = Instant::now();
@@ -511,6 +516,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     }
                     RealtimeEvent::InputTranscript(t) => {
                         stats.heard_fragments += 1;
+                        if heard_buf.trim().is_empty() {
+                            heard_at = Some(chrono::Utc::now());
+                        }
                         heard_buf.push_str(&t);
                         last_activity = Instant::now();
                         ui.heard = live_tail(&heard_buf);
@@ -518,12 +526,16 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     }
                     RealtimeEvent::OutputTranscript(t) => {
                         stats.spoke_fragments += 1;
+                        if spoke_buf.trim().is_empty() {
+                            spoke_at = Some(chrono::Utc::now());
+                        }
                         spoke_buf.push_str(&t);
                     }
                     RealtimeEvent::Interrupted => {
                         audio_io.flush();
                         if !spoke_buf.trim().is_empty() {
-                            pending_lines.push((false, format!("{} —", std::mem::take(&mut spoke_buf).trim_end())));
+                            let text = format!("{} —", std::mem::take(&mut spoke_buf).trim_end());
+                            pending_lines.push(PendingLine::new(false, text, spoke_at.take()));
                         }
                         ui.phase = Phase::Listening;
                         last_activity = Instant::now();
@@ -531,10 +543,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     RealtimeEvent::TurnComplete => {
                         stats.turns += 1;
                         if !heard_buf.trim().is_empty() {
-                            pending_lines.push((true, std::mem::take(&mut heard_buf)));
+                            pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
                         }
                         if !spoke_buf.trim().is_empty() {
-                            pending_lines.push((false, std::mem::take(&mut spoke_buf)));
+                            pending_lines.push(PendingLine::new(false, std::mem::take(&mut spoke_buf), spoke_at.take()));
                         }
                         ui.heard.clear();
                         last_activity = Instant::now();
@@ -740,10 +752,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     audio_io.flush();
     audio_io.stop();
     if !heard_buf.trim().is_empty() {
-        pending_lines.push((true, heard_buf));
+        pending_lines.push(PendingLine::new(true, heard_buf, heard_at));
     }
     if !spoke_buf.trim().is_empty() {
-        pending_lines.push((false, spoke_buf));
+        pending_lines.push(PendingLine::new(false, spoke_buf, spoke_at));
     }
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
     tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
@@ -845,15 +857,14 @@ pub fn brain_started_response() -> Value {
 }
 
 /// Write buffered transcript lines into the Voice session, unless its turn
-/// is streaming (appending mid-turn would interleave with the brain's
-/// messages) — `force` writes regardless (session end).
-fn flush_lines(ctx: BuiltinToolCtx, session_id: &str, lines: &mut Vec<(bool, String)>, force: bool) {
+/// is streaming — `force` writes regardless (session end). Each line goes in
+/// at the time it was said, between turns: before the brain's request it
+/// preceded, never inside a turn (see `transcript::insert_between_turns`).
+fn flush_lines(ctx: BuiltinToolCtx, session_id: &str, lines: &mut Vec<PendingLine>, force: bool) {
     if lines.is_empty() || (!force && crate::session_streaming(session_id)) {
         return;
     }
-    for (heard, text) in lines.drain(..) {
-        session::append_transcript(ctx.session_state, session_id, heard, &text);
-    }
+    crate::voice::transcript::write_lines(ctx.session_state, session_id, std::mem::take(lines));
 }
 
 /// The last ~80 characters of the live transcript, for the indicator.

@@ -104,26 +104,6 @@ pub fn transcript_message(heard: bool, text: &str) -> Message {
     }
 }
 
-/// Append a transcript line to the Voice session and persist.
-pub fn append_transcript(mut session_state: Signal<SessionState>, session_id: &str, heard: bool, text: &str) {
-    if text.trim().is_empty() {
-        return;
-    }
-    let appended = {
-        let mut state = session_state.write();
-        match state.sessions.get_mut(session_id) {
-            Some(s) => {
-                s.messages.push(transcript_message(heard, text));
-                true
-            }
-            None => false,
-        }
-    };
-    if appended {
-        SessionState::save_signal(&session_state, None);
-    }
-}
-
 /// The plain text of the last `limit` messages of `messages`, oldest first,
 /// as "Author: text" lines (tool calls summarised), capped at `max_chars`
 /// (keeping the newest).
