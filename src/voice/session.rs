@@ -28,7 +28,9 @@ pub const SPOKE_PREFIX: &str = "🔊 ";
 /// The Voice session's id, hydrating it if it is only on disk and creating
 /// it if it never existed or was deleted. Never touches the active session
 /// or the open tabs. `None` when the store is unwritable.
-pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<String>) -> Option<String> {
+/// `profile`: the Composio profile a new session starts with; `home`:
+/// Hobbes' home profile, which an existing session is moved to when set.
+pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<String>, home: Option<&str>) -> Option<String> {
     if session_state.peek().save_disabled {
         return None;
     }
@@ -42,7 +44,7 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<S
             }
         }
         if hydrated {
-            adopt(&mut session_state, &id);
+            adopt(&mut session_state, &id, home);
             return Some(id);
         }
         tracing::info!("voice: session {id} is gone; creating a new one");
@@ -58,7 +60,7 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<S
         state.update_session_name_raw(&id, SESSION_TITLE.to_string());
         id
     };
-    adopt(&mut session_state, &id);
+    adopt(&mut session_state, &id, home);
     if let Err(e) = crate::session_store::meta_set(META_KEY, &id) {
         tracing::warn!("voice: could not persist the session id: {e}");
     }
@@ -68,18 +70,18 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, profile: Option<S
 }
 
 /// Mark `id` as the Voice system session and repair its icon / project tag.
-fn adopt(session_state: &mut Signal<SessionState>, id: &str) {
+fn adopt(session_state: &mut Signal<SessionState>, id: &str, home: Option<&str>) {
     crate::system_sessions::register(crate::system_sessions::SystemSession::Voice, id);
-    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI) {
+    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI, home) {
         SessionState::save_signal(session_state, None);
     }
 }
 
 /// Startup: repair the Voice session if its tab is open (hydrated).
-pub fn repair_on_startup(mut session_state: Signal<SessionState>) {
+pub fn repair_on_startup(mut session_state: Signal<SessionState>, home: Option<String>) {
     let Some(id) = VOICE_SESSION_ID.peek().clone() else { return };
     if session_state.peek().sessions.contains_key(&id) {
-        adopt(&mut session_state, &id);
+        adopt(&mut session_state, &id, home.as_deref());
     }
 }
 

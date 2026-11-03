@@ -157,7 +157,27 @@ pub fn ChatWindow(
                 .await;
         }
 
-        let fresh = mcp_manager.read().get_mcp_context(profile_id).await;
+        let mut fresh = mcp_manager.read().get_mcp_context(profile_id.clone()).await;
+        // Multi-profile reach (Heartbeat / Voice): the other reachable
+        // profiles' Composio tools join the home set, each call naming its
+        // profile (mcp::manager::profile_reach).
+        let reach = crate::mcp::manager::profile_reach::reach_for_session(
+            &settings_snapshot,
+            &target_id,
+            profile_id.as_deref(),
+        );
+        if reach.len() > 1 {
+            let mut others = Vec::new();
+            for p in &reach[1..] {
+                let _ = mcp_manager
+                    .read()
+                    .ensure_native_client_for_profile(&p.id, &settings_snapshot)
+                    .await;
+                let ctx = mcp_manager.read().get_mcp_context(Some(p.id.clone())).await;
+                others.push((p.clone(), ctx));
+            }
+            fresh = crate::mcp::manager::profile_reach::merge_reach(fresh, &reach[0], &others);
+        }
         {
             let mut state = session_state.write();
             if let Some(session) = state.sessions.get_mut(&target_id) {
@@ -241,6 +261,12 @@ pub fn ChatWindow(
                 session.active_context.mcp_tools.as_ref(),
                 profile_id.as_deref(),
                 profile_name,
+            );
+            // A refresh carries only the home profile: keep the session's
+            // reach tools (no-op for single-profile sessions).
+            let scoped = crate::mcp::manager::profile_reach::carry_reach(
+                scoped,
+                session.active_context.mcp_tools.as_ref(),
             );
 
             if !scoped.servers.is_empty() {
@@ -511,13 +537,24 @@ pub fn ChatWindow(
                                     }
                                 })
                             };
+                            // A call routed to another reachable profile runs
+                            // there, not in the tab's home profile.
+                            let call_profile = {
+                                let settings_read = settings.peek();
+                                crate::mcp::manager::profile_reach::resume_profile(
+                                    &settings_read,
+                                    &owning_id,
+                                    composio_profile.as_deref(),
+                                    &tool_call,
+                                )
+                            };
                             let result_receiver = manager
                                 .use_mcp_tool(
                                     &tool_call.server_name,
                                     &tool_call.tool_name,
                                     args_json,
                                     true,
-                                    composio_profile.clone(),
+                                    call_profile.clone(),
                                     session_ctx,
                                 )
                                 .await;
@@ -565,7 +602,7 @@ pub fn ChatWindow(
                             profile_color: {
                                 let settings_read = settings.read();
                                 crate::components::shared::resolve_profile_color(
-                                    composio_profile.as_ref(),
+                                    tool_call.profile_id.as_ref().or(composio_profile.as_ref()),
                                     &settings_read,
                                 )
                             },

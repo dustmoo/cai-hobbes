@@ -244,6 +244,24 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                 p { class: "text-xs text-fg-muted mb-4", "While a conversation is live, your microphone audio streams to the selected provider." }
                 div {
                     class: "mb-4",
+                    label { class: "block text-sm font-medium text-fg-muted mb-1", "Hobbes home profile" }
+                    p { class: "text-xs text-fg-muted mb-1",
+                        "The Composio profile the Heartbeat and Voice tabs act in by default, as your own company. They can also use your other profiles; a write that lands outside home, or carries one company's data into another's, asks you first."
+                    }
+                    select {
+                        class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+                        onchange: move |e| {
+                            let v = e.value();
+                            local_settings.write().home_composio_profile = if v.is_empty() { None } else { Some(v) };
+                        },
+                        option { value: "", selected: s.home_composio_profile.is_none(), "Not set (each keeps its own)" }
+                        for p in s.composio_profiles.iter() {
+                            option { value: "{p.id}", selected: s.home_composio_profile.as_deref() == Some(p.id.as_str()), "{p.name}" }
+                        }
+                    }
+                }
+                div {
+                    class: "mb-4",
                     label { class: "block text-sm font-medium text-fg-muted mb-1", "Voice profile" }
                     select {
                         class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",

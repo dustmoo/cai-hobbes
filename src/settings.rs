@@ -443,6 +443,11 @@ pub struct Settings {
     #[serde(default)]
     pub composio_profiles: Vec<ComposioProfile>,
     pub active_composio_profile: Option<String>,
+    /// Hobbes' own home profile: the Heartbeat and Voice tabs act here by
+    /// default and reach the other profiles from it (profile_reach). `None`
+    /// = each keeps the profile it was created with.
+    #[serde(default)]
+    pub home_composio_profile: Option<String>,
     // Legacy fields for migration (will be removed in future)
     #[serde(skip_serializing)]
     pub composio_base_url: Option<String>,
@@ -1237,6 +1242,7 @@ impl Default for Settings {
             composio_profiles: Vec::new(),
             hotkeys: HotkeySettings::default(),
             active_composio_profile: None,
+            home_composio_profile: None,
             // Legacy fields for migration
             composio_base_url: None,
             composio_entity_id: None,

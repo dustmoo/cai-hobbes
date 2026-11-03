@@ -172,9 +172,9 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
 
 /// Mark `id` as the Heartbeat system session and repair its icon (journaled)
 /// and project tag. Cheap when nothing needs fixing (runs every tick).
-fn adopt_session(session_state: &mut dioxus::prelude::Signal<SessionState>, id: &str) {
+fn adopt_session(session_state: &mut dioxus::prelude::Signal<SessionState>, id: &str, home: Option<&str>) {
     crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, id);
-    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI) {
+    if crate::system_sessions::repair(session_state, id, SESSION_EMOJI, home) {
         SessionState::save_signal(session_state, None);
     }
 }
@@ -198,13 +198,16 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
             }
         }
         if hydrated {
-            adopt_session(&mut session_state, &id);
+            adopt_session(&mut session_state, &id, settings.home_composio_profile.as_deref());
             return Some(id);
         }
         tracing::info!("heartbeat: session {id} is gone; creating a new one");
     }
     // Like every other new tab: the active Composio profile.
-    let profile = settings.get_active_profile().map(|p| p.id.clone());
+    let profile = settings
+        .home_composio_profile
+        .clone()
+        .or_else(|| settings.get_active_profile().map(|p| p.id.clone()));
     let id = {
         let mut state = session_state.write();
         // create_session_raw makes the new session active; put it back.
@@ -217,7 +220,7 @@ fn ensure_session(deps: HeartbeatDeps, settings: &Settings, dirty: &mut bool) ->
         state.update_session_name_raw(&id, SESSION_TITLE.to_string());
         id
     };
-    adopt_session(&mut session_state, &id);
+    adopt_session(&mut session_state, &id, settings.home_composio_profile.as_deref());
     SessionState::save_signal(&session_state, None);
     HEARTBEAT.write().session_id = Some(id.clone());
     *dirty = true;

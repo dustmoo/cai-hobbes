@@ -97,6 +97,7 @@ mod tests {
                     model: None,
                     round_id: None,
                     cancelled: None,
+                    hold_reason: None,
                 },
                 result: ToolResult {
                     status: ToolCallStatus::Completed,
@@ -179,6 +180,7 @@ mod tests {
                 model: None,
                 round_id: None,
                 cancelled: None,
+                hold_reason: None,
             },
             result: ToolResult {
                 status: ToolCallStatus::Completed,

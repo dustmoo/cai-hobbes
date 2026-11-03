@@ -1657,6 +1657,7 @@ mod tests {
             model: None,
             round_id: None,
             cancelled: None,
+            hold_reason: None,
         }
     }
 

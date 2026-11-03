@@ -469,6 +469,9 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             }
             div {
                 class: "mt-4 pt-4 border-t border-yellow-800 space-y-2 text-yellow-200",
+                if let Some(reason) = tool_call.hold_reason.clone() {
+                    p { class: "font-medium text-yellow-100", "{reason}" }
+                }
                 p {
                     "The AI wants to use the tool "
                     span { class: "font-mono text-sm", "{tool_call.tool_name}" }

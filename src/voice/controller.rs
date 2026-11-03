@@ -270,6 +270,8 @@ struct Resolved {
     idle: Duration,
     speak_heartbeat: bool,
     profile: Option<String>,
+    /// Hobbes' home profile (system sessions are kept on it).
+    home: Option<String>,
     input_device: Option<String>,
     echo: VoiceEcho,
 }
@@ -286,7 +288,11 @@ fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
         threshold_ms: settings.voice.hold_threshold_ms.max(100),
         idle: Duration::from_secs(settings.voice.idle_timeout_secs.max(15)),
         speak_heartbeat: settings.voice.speak_heartbeat,
-        profile: settings.get_active_profile().map(|p| p.id.clone()),
+        profile: settings
+            .home_composio_profile
+            .clone()
+            .or_else(|| settings.get_active_profile().map(|p| p.id.clone())),
+        home: settings.home_composio_profile.clone(),
         input_device: settings.voice.input_device_uid.clone(),
         echo: settings.voice.echo,
     })
@@ -370,7 +376,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut ui = VoiceUi { phase: Phase::Connecting, held: announcing_text.is_none(), ..VoiceUi::default() };
     *VOICE_UI.write() = ui.clone();
 
-    let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, input_device, echo } = match resolve(ctx) {
+    let Resolved { provider, mut setup, threshold_ms, idle, speak_heartbeat, profile, home, input_device, echo } = match resolve(ctx) {
         Ok(r) => r,
         Err(e) => {
             fail(e);
@@ -393,7 +399,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         }
     }
 
-    let Some(voice_session) = session::ensure_session(ctx.session_state, profile) else {
+    let Some(voice_session) = session::ensure_session(ctx.session_state, profile, home.as_deref()) else {
         fail("The Voice session couldn't be created.");
         return;
     };

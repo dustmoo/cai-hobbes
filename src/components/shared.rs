@@ -181,6 +181,11 @@ pub struct ToolCall {
     /// "cancelled" only for these, never for a call still in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled: Option<String>,
+    /// Why Hobbes held this call for approval when it isn't the usual
+    /// permission prompt (e.g. a write crossing company profiles); shown in
+    /// the approval bubble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
 }
 
 /// Stop reason for a call cut off by the user's Stop.
@@ -259,6 +264,7 @@ impl ToolCall {
             model: None,
             round_id: None,
             cancelled: None,
+            hold_reason: None,
         }
     }
 

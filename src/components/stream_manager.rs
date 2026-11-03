@@ -618,6 +618,62 @@ impl StreamManagerContext {
                         // so the prompt builder can find the latest round.
                         tool_call.round_id = Some(message_id.to_string());
 
+                        // Multi-profile reach (profile_reach): route a Composio
+                        // call to the profile it names, restamping it before it
+                        // is stored, and hold a write that crosses companies
+                        // unless a trust rule already allows it.
+                        let route = {
+                            let settings_read = self.settings.peek();
+                            let reach = crate::mcp::manager::profile_reach::reach_for_session(
+                                &settings_read,
+                                &session_id,
+                                profile_id.as_deref(),
+                            );
+                            let route = crate::mcp::manager::profile_reach::route_tool_call(&reach, &mut tool_call);
+                            if let crate::mcp::manager::profile_reach::Route::To(target) = &route {
+                                let args: serde_json::Value =
+                                    serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+                                let state = self.session_state.peek();
+                                let session = state.sessions.get(&session_id);
+                                let read_from = session
+                                    .map(|s| crate::mcp::manager::profile_reach::turn_read_profiles(&settings_read, &s.messages))
+                                    .unwrap_or_default();
+                                let reason = crate::mcp::manager::profile_reach::cross_company_reason(
+                                    target,
+                                    &reach[0],
+                                    &read_from,
+                                    &reach,
+                                    crate::mcp::manager::profile_reach::is_write(&tool_call.tool_name, &args),
+                                );
+                                if let Some(reason) = reason {
+                                    let project_id = session.and_then(|s| s.project_id.clone());
+                                    let rule = crate::context::trust::evaluate(
+                                        &settings_read.permission_settings.trust_rules,
+                                        &tool_call.server_name,
+                                        &tool_call.tool_name,
+                                        &args,
+                                        &crate::context::trust::TrustCtx { project_id: project_id.as_deref() },
+                                    )
+                                    .map(|r| r.id.clone());
+                                    match rule {
+                                        Some(rule_id) => crate::context::trust_store::log_decision(
+                                            crate::context::trust_store::TrustDecision::new(
+                                                crate::context::trust_store::DecisionKind::RuleHit,
+                                                &tool_call.server_name,
+                                                &tool_call.tool_name,
+                                                crate::context::trust_store::arg_summary(&args),
+                                                Some(session_id.clone()),
+                                                project_id,
+                                                Some(rule_id),
+                                            ),
+                                        ),
+                                        None => tool_call.hold_reason = Some(reason),
+                                    }
+                                }
+                            }
+                            route
+                        };
+
                         tool_call_count += 1;
                         let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
                         let tool_call_message_id = {
@@ -690,7 +746,11 @@ impl StreamManagerContext {
                             let args_json: serde_json::Value =
                                 serde_json::from_str(&tool_call.arguments)
                                     .unwrap_or(serde_json::Value::Null);
-                            let profile_id = profile_id_inner;
+                            // A routed call runs in its target profile.
+                            let profile_id = match &route {
+                                crate::mcp::manager::profile_reach::Route::To(p) => Some(p.id.clone()),
+                                _ => profile_id_inner,
+                            };
 
                             // Built-in tools run here, before MCP dispatch — they
                             // need SessionState and the skill/permission registries
@@ -725,7 +785,7 @@ impl StreamManagerContext {
                             // path in chat.rs runs the same gate. The
                             // Heartbeat session gets the same scope rules
                             // (`scope_gates` runs both gates).
-                            let agent_time_gate =
+                            let mut agent_time_gate =
                                 crate::components::builtin_tools::scope_gates(
                                     builtin_ctx,
                                     &tool_call,
@@ -733,6 +793,19 @@ impl StreamManagerContext {
                                     &session_id_inner,
                                     false,
                                 );
+                            // Reach: an unknown profile is refused; a write
+                            // crossing companies is held (hold_reason above).
+                            match &route {
+                                crate::mcp::manager::profile_reach::Route::Refused(msg) => {
+                                    agent_time_gate = crate::components::builtin_tools::AgentTimeGate::Refuse(msg.clone());
+                                }
+                                _ if tool_call.hold_reason.is_some()
+                                    && agent_time_gate == crate::components::builtin_tools::AgentTimeGate::Proceed =>
+                                {
+                                    agent_time_gate = crate::components::builtin_tools::AgentTimeGate::ForceApproval;
+                                }
+                                _ => {}
+                            }
                             if agent_time_gate
                                 == crate::components::builtin_tools::AgentTimeGate::ForceApproval
                                 || (agent_time_gate

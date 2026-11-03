@@ -399,14 +399,32 @@ impl<'a> PromptBuilder<'a> {
                 .and_then(|id| self.settings.profile_name_for_id(id))
                 .unwrap_or("Default");
 
-            system_context_map.insert(
-                "composio_context".to_string(),
-                json!({
-                    "info": "You have access to external tools via Composio. Integrations are managed through 'Profiles'.",
-                    "active_profile": active_profile_name,
-                    "instruction": format!("The currently active profile determining your available tool connections is: '{}'.", active_profile_name)
-                })
+            let reach = crate::mcp::manager::profile_reach::reach_for_session(
+                self.settings,
+                &self.session.id,
+                profile_id,
             );
+            if reach.len() > 1 {
+                let others: Vec<&str> = reach[1..].iter().map(|p| p.name.as_str()).collect();
+                system_context_map.insert(
+                    "composio_context".to_string(),
+                    json!({
+                        "info": "You have access to external tools via Composio. Each profile is a separate company's connected accounts.",
+                        "home_profile": active_profile_name,
+                        "reachable_profiles": others,
+                        "instruction": crate::mcp::manager::profile_reach::reach_instruction(active_profile_name, &others),
+                    })
+                );
+            } else {
+                system_context_map.insert(
+                    "composio_context".to_string(),
+                    json!({
+                        "info": "You have access to external tools via Composio. Integrations are managed through 'Profiles'.",
+                        "active_profile": active_profile_name,
+                        "instruction": format!("The currently active profile determining your available tool connections is: '{}'.", active_profile_name)
+                    })
+                );
+            }
         }
 
         // Extract active skill context from messages and inject into system instruction

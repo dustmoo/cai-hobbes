@@ -85,14 +85,19 @@ pub fn repair(
     session_state: &mut dioxus::prelude::Signal<crate::session::SessionState>,
     id: &str,
     emoji: &str,
+    home_profile: Option<&str>,
 ) -> bool {
     use dioxus::prelude::{Readable, Writable};
     use crate::session_events::{log_event, SessionEvent};
-    let (needs_emoji, tagged) = match session_state.peek().sessions.get(id) {
-        Some(s) => (s.tab_emoji.as_deref() != Some(emoji), s.project_id.is_some()),
+    let (needs_emoji, tagged, rehome) = match session_state.peek().sessions.get(id) {
+        Some(s) => (
+            s.tab_emoji.as_deref() != Some(emoji),
+            s.project_id.is_some(),
+            home_profile.filter(|h| s.composio_profile.as_deref() != Some(*h)).map(str::to_string),
+        ),
         None => return false,
     };
-    if !needs_emoji && !tagged {
+    if !needs_emoji && !tagged && rehome.is_none() {
         return false;
     }
     {
@@ -105,7 +110,14 @@ pub fn repair(
                 s.project_id = None;
                 s.project_tag_user_set = false;
             }
+            if let Some(home) = &rehome {
+                s.composio_profile = Some(home.clone());
+            }
         }
+    }
+    if let Some(home) = rehome {
+        tracing::info!(session_id = id, "system session: moved to Hobbes' home profile");
+        log_event(id, SessionEvent::ComposioProfileSet { profile: Some(home) });
     }
     if needs_emoji {
         log_event(id, SessionEvent::TabTitled { emoji: Some(emoji.to_string()), title: None });
