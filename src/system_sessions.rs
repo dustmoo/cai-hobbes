@@ -49,9 +49,28 @@ pub struct Archives {
     pub heartbeat: Vec<String>,
     #[serde(default)]
     pub voice: Vec<String>,
+    /// Archived id → the session that replaced it. Written in the same
+    /// transaction as the rows and the feature's pointer, so a pointer that
+    /// a late, older write set back to an archive is followed forward again
+    /// at the next load ([`resolve_successor`]).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub successors: std::collections::BTreeMap<String, String>,
 }
 
 impl Archives {
+    /// Follow `id` through the recorded rotations to the newest session.
+    pub fn resolve(&self, id: &str) -> String {
+        let mut cur = id.to_string();
+        // Bounded: a corrupt map with a cycle can't spin.
+        for _ in 0..=self.successors.len() {
+            match self.successors.get(&cur) {
+                Some(next) if next != &cur => cur = next.clone(),
+                _ => break,
+            }
+        }
+        cur
+    }
+
     fn of(&self, kind: SystemSession) -> &Vec<String> {
         match kind {
             SystemSession::Heartbeat => &self.heartbeat,
@@ -140,9 +159,12 @@ impl Ids {
 
     /// Rotate: `old` joins the archives, `new` becomes current.
     pub fn rotate(&mut self, kind: SystemSession, old: &str, new: &str) {
-        let archives = self.archives.of_mut(kind);
-        if !old.is_empty() && old != new && !archives.iter().any(|a| a == old) {
-            archives.push(old.to_string());
+        if !old.is_empty() && old != new {
+            let archives = self.archives.of_mut(kind);
+            if !archives.iter().any(|a| a == old) {
+                archives.push(old.to_string());
+            }
+            self.archives.successors.insert(old.to_string(), new.to_string());
         }
         self.set_current(kind, new);
     }
@@ -166,12 +188,17 @@ fn seed() {
     let archives: Archives = crate::session_store::meta_get(ARCHIVES_META_KEY)
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default();
+    let heartbeat = heartbeat.map(|id| archives.resolve(&id));
+    let voice = voice.map(|id| archives.resolve(&id));
     if let Ok(mut ids) = registry().write() {
         if ids.heartbeat.is_none() {
             ids.heartbeat = heartbeat;
         }
         if ids.voice.is_none() {
             ids.voice = voice;
+        }
+        for (old, new) in &archives.successors {
+            ids.archives.successors.entry(old.clone()).or_insert_with(|| new.clone());
         }
         for kind in SystemSession::ALL {
             for a in archives.of(kind) {
@@ -196,25 +223,32 @@ pub fn register(kind: SystemSession, id: &str) {
     }
 }
 
-/// Record a rotation (`old` archived, `new` current) and persist the archive
-/// list. The caller persists the feature's own current id.
-pub fn record_rotation(kind: SystemSession, old: &str, new: &str) {
+/// The archive list as it will be after rotating `old` out for `new`, for
+/// the caller to persist (in the rotation's transaction) before
+/// [`apply_rotation`]. Nothing changes here.
+pub fn archives_after_rotation(kind: SystemSession, old: &str, new: &str) -> Archives {
     seed();
-    let archives = match registry().write() {
-        Ok(mut ids) => {
-            ids.rotate(kind, old, new);
-            ids.archives.clone()
-        }
-        Err(_) => return,
-    };
-    match serde_json::to_string(&archives) {
-        Ok(json) => {
-            if let Err(e) = crate::session_store::meta_set(ARCHIVES_META_KEY, &json) {
-                tracing::warn!("system sessions: could not persist the archive list: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("system sessions: could not serialize the archive list: {e}"),
+    let mut ids = registry().read().map(|ids| ids.clone()).unwrap_or_default();
+    ids.rotate(kind, old, new);
+    ids.archives
+}
+
+/// Record a rotation in memory, once it is persisted.
+pub fn apply_rotation(kind: SystemSession, old: &str, new: &str) {
+    seed();
+    if let Ok(mut ids) = registry().write() {
+        ids.rotate(kind, old, new);
     }
+}
+
+/// Follow a persisted pointer forward through recorded rotations: a feature
+/// loading its session id calls this, so a pointer left on an archive (a
+/// crash between the rotation's commit and a stale async save) recovers.
+pub fn resolve_successor(id: &str) -> String {
+    crate::session_store::meta_get(ARCHIVES_META_KEY)
+        .and_then(|json| serde_json::from_str::<Archives>(&json).ok())
+        .map(|a| a.resolve(id))
+        .unwrap_or_else(|| id.to_string())
 }
 
 /// Which system session `id` is (current or archived), if any.
@@ -367,5 +401,26 @@ mod tests {
         assert_eq!(serde_json::from_str::<Archives>(&json).unwrap(), ids.archives);
         let partial: Archives = serde_json::from_str(r#"{"voice":["v-0"]}"#).unwrap();
         assert!(partial.heartbeat.is_empty());
+    }
+
+    #[test]
+    fn a_pointer_left_on_an_archive_resolves_forward() {
+        let mut ids = Ids::default();
+        ids.rotate(SystemSession::Heartbeat, "hb-1", "hb-2");
+        ids.rotate(SystemSession::Heartbeat, "hb-2", "hb-3");
+        let a = &ids.archives;
+        // A late, older save set the Heartbeat's pointer back to hb-1 (or
+        // hb-2) after the rotation committed: loading follows it forward.
+        assert_eq!(a.resolve("hb-1"), "hb-3");
+        assert_eq!(a.resolve("hb-2"), "hb-3");
+        assert_eq!(a.resolve("hb-3"), "hb-3");
+        assert_eq!(a.resolve("a-chat"), "a-chat");
+        // The map survives the round trip; a cycle can't spin.
+        let back: Archives = serde_json::from_str(&serde_json::to_string(a).unwrap()).unwrap();
+        assert_eq!(back.resolve("hb-1"), "hb-3");
+        let mut cyclic = Archives::default();
+        cyclic.successors.insert("x".into(), "y".into());
+        cyclic.successors.insert("y".into(), "x".into());
+        let _ = cyclic.resolve("x");
     }
 }

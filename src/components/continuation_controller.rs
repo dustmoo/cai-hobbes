@@ -65,6 +65,11 @@ impl ContinuationController {
         }
     }
 
+    /// Sessions with a continuation in flight (subscribes the caller).
+    pub fn in_flight_sessions(&self) -> HashSet<String> {
+        self.in_flight.read().clone()
+    }
+
     /// Reset the in-flight guard for a specific session after its continuation
     /// stream completes. Called from the `on_complete` handler.
     pub fn clear_in_flight(&mut self, session_id: &str) {

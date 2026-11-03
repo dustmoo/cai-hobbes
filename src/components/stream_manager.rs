@@ -47,6 +47,19 @@ pub struct StreamManagerContext {
 }
 
 impl StreamManagerContext {
+    /// Every session with turn machinery in flight: streaming, a stream
+    /// mapped to it (set before `streaming_sessions` on start, and kept
+    /// through the gap before a continuation), a continuation in flight, or
+    /// a proactive summarization running. Reads subscribe the caller (the
+    /// `StreamBridge` mirror for `session_rotation`).
+    pub fn turn_activity(&self) -> HashSet<String> {
+        let mut out = self.streaming_sessions.read().clone();
+        out.extend(self.stream_session_map.read().values().cloned());
+        out.extend(self.summarizing_sessions.read().iter().cloned());
+        out.extend(self.continuation_controller.read().in_flight_sessions());
+        out
+    }
+
     /// Report this session's lifecycle into the fleet (no-op while the
     /// bridge is disarmed). Name lookup peeks — never subscribes. Turn
     /// completions carry the conversation summary so the fleet row gets a

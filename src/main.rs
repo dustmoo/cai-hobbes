@@ -177,16 +177,20 @@ fn drain_pending_tab_replacements() -> Vec<(String, String)> {
 }
 
 /// `tabs` with `old` replaced by `new` in place (`old` dropped if `new` is
-/// already open). `None` when `old` isn't open.
-fn replace_tab(tabs: &[String], old: &str, new: &str) -> Option<Vec<String>> {
+/// already open), and where the active tab is now: the tab that was active
+/// keeps focus, `new` taking it when `old` had it. `None` when `old` isn't
+/// open.
+fn replace_tab(tabs: &[String], active: usize, old: &str, new: &str) -> Option<(Vec<String>, usize)> {
     let pos = tabs.iter().position(|t| t == old)?;
+    let active_id = tabs.get(active).map(|id| if id == old { new } else { id.as_str() }).unwrap_or(new).to_string();
     let mut out = tabs.to_vec();
     if out.iter().any(|t| t == new) {
         out.remove(pos);
     } else {
         out[pos] = new.to_string();
     }
-    Some(out)
+    let idx = out.iter().position(|t| *t == active_id).unwrap_or(0).min(out.len().saturating_sub(1));
+    Some((out, idx))
 }
 
 /// One entry in the visible tab strip, in `tab_bar.rs`'s left-to-right render
@@ -339,13 +343,21 @@ mod tab_cycle_tests {
 
     #[test]
     fn a_rotated_session_s_tab_is_replaced_in_place() {
-        let tabs: Vec<String> = ["a", "hb-old", "c"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(replace_tab(&tabs, "hb-old", "hb-new").unwrap(), vec!["a", "hb-new", "c"]);
+        let v = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let tabs = v(&["a", "hb-old", "c"]);
+        // In place; the active tab (old or not) keeps its position.
+        assert_eq!(replace_tab(&tabs, 1, "hb-old", "hb-new").unwrap(), (v(&["a", "hb-new", "c"]), 1));
+        assert_eq!(replace_tab(&tabs, 2, "hb-old", "hb-new").unwrap(), (v(&["a", "hb-new", "c"]), 2));
         // Not open: nothing to do.
-        assert_eq!(replace_tab(&tabs, "elsewhere", "hb-new"), None);
-        // The successor already open: the archive's tab just goes.
-        let both: Vec<String> = ["hb-old", "hb-new"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(replace_tab(&both, "hb-old", "hb-new").unwrap(), vec!["hb-new"]);
+        assert_eq!(replace_tab(&tabs, 0, "elsewhere", "hb-new"), None);
+        // The successor already open: the archive's tab goes and focus
+        // follows the tab that had it.
+        let both = v(&["hb-new", "x", "hb-old", "y"]);
+        // The archive was active: focus moves to the successor.
+        assert_eq!(replace_tab(&both, 2, "hb-old", "hb-new").unwrap(), (v(&["hb-new", "x", "y"]), 0));
+        // Another tab to its right was active: it stays active, one left.
+        assert_eq!(replace_tab(&both, 3, "hb-old", "hb-new").unwrap(), (v(&["hb-new", "x", "y"]), 2));
+        assert_eq!(replace_tab(&both, 1, "hb-old", "hb-new").unwrap(), (v(&["hb-new", "x", "y"]), 1));
     }
 
     #[test]
@@ -3017,11 +3029,11 @@ fn app() -> Element {
         // same position (see `PENDING_TAB_REPLACE`).
         for (old, new) in drain_pending_tab_replacements() {
             let tabs = open_tabs.peek().clone();
-            if let Some(next) = replace_tab(&tabs, &old, &new) {
-                let len = next.len();
+            let active = *active_tab_index.peek();
+            if let Some((next, idx)) = replace_tab(&tabs, active, &old, &new) {
                 open_tabs.set(next);
-                if *active_tab_index.peek() >= len {
-                    active_tab_index.set(len.saturating_sub(1));
+                if idx != active {
+                    active_tab_index.set(idx);
                 }
             }
             if *current_session_id.peek() == old {
@@ -3958,6 +3970,14 @@ fn StreamBridge() -> Element {
         // machinery) for nothing.
         if *STREAMING_SESSIONS.peek() != sessions {
             *STREAMING_SESSIONS.write() = sessions;
+        }
+    });
+    // Wider than streaming: everything that means a turn is under way, for
+    // session rotation's quiet-moment check (which runs outside the tree).
+    use_effect(move || {
+        let busy = stream_manager.turn_activity();
+        if *crate::session_rotation::TURN_ACTIVITY.peek() != busy {
+            *crate::session_rotation::TURN_ACTIVITY.write() = busy;
         }
     });
     // Reverse direction: root-scope code (delete_session_fn) can't call

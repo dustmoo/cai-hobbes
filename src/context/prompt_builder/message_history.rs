@@ -7,6 +7,9 @@ use super::types::{ToolResultPosition, unwrap_json_strings};
 use crate::session::{LedgerEntry, LedgerKind};
 use std::collections::HashMap;
 
+/// The user turn placed ahead of a chat that opens with an assistant message.
+pub(crate) const OPENING_USER_TURN: &str = "[Chat opened.]";
+
 /// Decide whether a stored `thought_signature` may be replayed to the provider
 /// this prompt is being built for.
 ///
@@ -451,6 +454,22 @@ impl<'a> PromptBuilder<'a> {
             })
             .collect();
         let mut turn_scoped: Vec<usize> = Vec::new();
+
+        // A chat that opens with Hobbes' own message (a dispatch intro, a
+        // rotated system session's continuation note) gets a fixed user turn
+        // ahead of it: the providers expect a conversation to start with the
+        // user. Fixed text, so the prefix stays byte-stable between builds.
+        if pinned_above.is_none()
+            && start_index == 0
+            && session_messages
+                .first()
+                .is_some_and(|m| m.author != "User" && matches!(m.content, MessageContent::Text { .. }))
+        {
+            messages.push(ChatMessage {
+                role: ChatRole::User,
+                content: vec![ContentBlock::Text { text: OPENING_USER_TURN.to_string() }],
+            });
+        }
 
         // The pinned first message renders above a trimmed window, followed
         // by its own entries and then the trim snapshot. When the window

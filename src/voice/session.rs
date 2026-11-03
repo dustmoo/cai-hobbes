@@ -17,8 +17,12 @@ pub const SESSION_EMOJI: &str = "👄";
 pub const META_KEY: &str = "voice_session_id";
 
 /// The Voice session's id once known (cached from the store at first use).
-pub static VOICE_SESSION_ID: GlobalSignal<Option<String>> =
-    Signal::global(|| crate::session_store::meta_get(META_KEY).filter(|s| !s.is_empty()));
+pub static VOICE_SESSION_ID: GlobalSignal<Option<String>> = Signal::global(|| {
+    crate::session_store::meta_get(META_KEY)
+        .filter(|s| !s.is_empty())
+        // Past any rotation the pointer missed (session_rotation).
+        .map(|id| crate::system_sessions::resolve_successor(&id))
+});
 
 /// Prefix on transcript lines of what the person said.
 pub const HEARD_PREFIX: &str = "🎙 ";

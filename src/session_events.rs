@@ -218,7 +218,7 @@ pub fn log_event_sync(session_id: &str, event: SessionEvent) {
 /// A deterministic, empty session shell for `project(None, …)`. No clocks,
 /// no settings: `last_updated` starts at the epoch and is advanced to each
 /// applied event's row timestamp.
-fn blank_session() -> Session {
+pub(crate) fn blank_session() -> Session {
     Session {
         id: String::new(),
         name: String::new(),

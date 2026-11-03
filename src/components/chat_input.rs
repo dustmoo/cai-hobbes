@@ -901,9 +901,9 @@ pub fn ChatInput(
     };
 
     // Drain one queued message per idle session — the active tab AND any
-    // background tab whose turn has finished. `dispatching` is keyed by session
-    // so one tab's async gap can't block another's drain.
-    let mut dispatching = use_signal(HashSet::<String>::new);
+    // background tab whose turn has finished. `chat_queue::DISPATCHING` is
+    // keyed by session so one tab's async gap can't block another's drain
+    // (global so session rotation can see a popped message still in flight).
     use_effect(move || {
         // Re-run on any stream state change, active-session switch, or explicit
         // drain request (e.g. a fired timer enqueuing for a session).
@@ -922,12 +922,12 @@ pub fn ChatInput(
             if stream_manager.is_session_streaming(&session_id) {
                 // The message we dispatched has started streaming — release
                 // this session's guard.
-                if dispatching.peek().contains(&session_id) {
-                    dispatching.write().remove(&session_id);
+                if chat_queue::DISPATCHING.peek().contains(&session_id) {
+                    chat_queue::DISPATCHING.write().remove(&session_id);
                 }
                 continue;
             }
-            if dispatching.peek().contains(&session_id) {
+            if chat_queue::DISPATCHING.peek().contains(&session_id) {
                 continue;
             }
             // Don't pop for a session that isn't in state: deleted, or not yet
@@ -946,7 +946,7 @@ pub fn ChatInput(
             // borrowed.
             let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
             if let Some(qm) = popped {
-                dispatching.write().insert(session_id.clone());
+                chat_queue::DISPATCHING.write().insert(session_id.clone());
                 match qm.relay {
                     // A waking dispatch relay: append it and start a turn
                     // with no user message (todo::relay). Never resets the
@@ -972,7 +972,7 @@ pub fn ChatInput(
                 // streams.
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    dispatching.write().remove(&session_id);
+                    chat_queue::DISPATCHING.write().remove(&session_id);
                 });
             }
         }
