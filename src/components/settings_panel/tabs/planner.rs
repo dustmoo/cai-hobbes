@@ -239,10 +239,14 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                     }
 
                                     // The Hobbes tab reading other conversations
-                                    // (hobbes_tabs). Read live at every call, so
+                                    // (hobbes_tabs). Saved the moment it is
+                                    // flipped, not with the panel's Save: the gate
+                                    // reads the live setting at every call, so
                                     // switching it off revokes at once.
                                     {
                                         let read_tabs = local_settings.read().hobbes_read_tabs;
+                                        let mut global_settings = ctx.settings;
+                                        let settings_manager = ctx.settings_manager;
                                         rsx! {
                                             h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mt-6 mb-3", "Hobbes tab" }
                                             div {
@@ -256,7 +260,16 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                                     class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                                                     checked: "{read_tabs}",
                                                     onchange: move |e| {
-                                                        local_settings.write().hobbes_read_tabs = e.value() == "true";
+                                                        let on = e.value() == "true";
+                                                        local_settings.write().hobbes_read_tabs = on;
+                                                        // Only this field is saved; like any change
+                                                        // from outside the draft, the panel then
+                                                        // resyncs its draft from the saved settings.
+                                                        global_settings.write().hobbes_read_tabs = on;
+                                                        let snapshot = global_settings.peek().clone();
+                                                        if let Err(e) = settings_manager.read().save(&snapshot) {
+                                                            tracing::error!("settings save failed: {e}");
+                                                        }
                                                     }
                                                 }
                                             }
