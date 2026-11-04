@@ -183,6 +183,48 @@ pub const TAB_TITLE_MATURE_USER_MESSAGES: usize = 3;
 /// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
 /// carried no proposal, the tab's identity is locked (user-set or a final AI
 /// title), the tab is still too short to retitle, or it has no user message.
+/// A tab emoji and title to journal as `TabTitled`.
+pub type TabIdentity = (Option<String>, Option<String>);
+
+/// The key under which a `SummaryComputed` journal entry carries
+/// `Session::summary_sources` beside the summary's own fields.
+pub const SUMMARY_SOURCES_KEY: &str = "source_profiles";
+
+/// Adopt a freshly computed summary into `session`: record which
+/// companies' data it may hold (`Session::summary_sources`, harness-set —
+/// the model has no say), apply its tab identity, and store it. Returns the
+/// payload to journal as `SummaryComputed` (the summary plus its sources)
+/// and the tab identity to journal as `TabTitled`. Every site that computes
+/// a summary goes through here.
+///
+/// `generated_from` is `profile_reach::summary_sources` of the snapshot the
+/// summary was written from, taken before the LLM call: an undo while it
+/// was in flight removes reads from the live session, but not from the
+/// summary that comes back, so the sources are the union of both.
+pub fn adopt_summary(
+    session: &mut Session,
+    summary: ConversationSummary,
+    generated_from: &[String],
+) -> (Value, Option<TabIdentity>) {
+    let mut sources: std::collections::BTreeSet<String> =
+        crate::mcp::manager::profile_reach::summary_sources(session).into_iter().collect();
+    sources.extend(generated_from.iter().cloned());
+    session.summary_sources = sources.into_iter().collect();
+    let titled = apply_tab_identity_from_summary(session, &summary);
+    let value = summary_payload(&summary, &session.summary_sources);
+    session.active_context.conversation_summary = summary;
+    (value, titled)
+}
+
+/// The `SummaryComputed` payload: the summary plus its sources.
+pub fn summary_payload(summary: &ConversationSummary, sources: &[String]) -> Value {
+    let mut value = serde_json::to_value(summary).unwrap_or(Value::Null);
+    if let (Some(map), false) = (value.as_object_mut(), sources.is_empty()) {
+        map.insert(SUMMARY_SOURCES_KEY.into(), serde_json::json!(sources));
+    }
+    value
+}
+
 pub fn apply_tab_identity_from_summary(
     session: &mut Session,
     summary: &ConversationSummary,
@@ -387,6 +429,22 @@ pub struct Session {
     /// this session's own messages until they age out of the read window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_reads: Vec<CarriedRead>,
+    /// Multi-profile reach, phase 2: the other Composio profiles (ids) this
+    /// ordinary tab may also act in, ticked on its profile chip. Its pin
+    /// (`composio_profile`) stays home. Empty = single-profile, as before.
+    /// Resolved by `profile_reach::session_reach` (deleted profiles drop out
+    /// there); ignored for system sessions. Journaled as `ProfileReachSet`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_reach: Vec<String>,
+    /// The Composio profiles whose data the conversation summary may hold
+    /// (profile ids, or a `composio-native:{name}` server name for an
+    /// unstamped call). Set only by `adopt_summary`, never from model
+    /// output, and kept off the summary itself so it never reaches the
+    /// prompt. The cross-company hold counts these in an ordinary tab after
+    /// the messages they came from are gone. Journaled inside
+    /// `SummaryComputed`; cleared with the summary on rewind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary_sources: Vec<String>,
     /// Who started the turn now running (or last run) in this session —
     /// set only by the harness when a turn starts (`chat.rs` send path, the
     /// queue drain), never from model output. Every tool call the turn
@@ -394,6 +452,18 @@ pub struct Session {
     /// read the call's stamp, so a resumed approval keeps its turn's rules.
     #[serde(default, skip_serializing_if = "TurnOrigin::is_user")]
     pub turn_origin: TurnOrigin,
+}
+
+impl Session {
+    /// After a repin: the new home leaves the tab's reach list (it is home,
+    /// not reach). Returns the new list when it changed, for the caller to
+    /// journal as `ProfileReachSet`.
+    pub fn drop_home_from_reach(&mut self) -> Option<Vec<String>> {
+        let home = self.composio_profile.as_deref()?;
+        let i = self.profile_reach.iter().position(|p| p == home)?;
+        self.profile_reach.remove(i);
+        Some(self.profile_reach.clone())
+    }
 }
 
 /// Who started a turn. Trust follows the turn, not the session: the Hobbes
@@ -670,6 +740,7 @@ impl Session {
 
         if count > 0 {
             self.active_context.conversation_summary = Default::default();
+            self.summary_sources.clear();
             tracing::debug!(
                 "Reset conversation_summary after undo ({} messages removed)",
                 count
@@ -1800,6 +1871,8 @@ impl SessionState {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
         };
         // Birth event: a journal that starts with SessionCreated is
@@ -2407,6 +2480,8 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
             }
         }
@@ -3259,6 +3334,8 @@ mod tests {
             dispatch_link: None,
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
             messages: vec![
                 Message {

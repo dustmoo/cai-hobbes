@@ -1204,9 +1204,13 @@ mod tests {
         assert!(cross_company_hold(Some(&reach[1]), &home, &read_from, &reach, true)
             .is_none_or(|h| !h.reason.contains("has read")));
 
-        // It ages out with the window.
+        // It ages out with the window (the system-session rule; an
+        // ordinary tab's carried reads have no clock).
         let later = now + READ_WINDOW;
-        let aged = session_read_profiles(&settings, &p.successor, later);
+        crate::system_sessions::register("reach-test-hb");
+        let mut registered = p.successor.clone();
+        registered.id = "reach-test-hb".into();
+        let aged = session_read_profiles(&settings, &registered, later);
         assert!(aged.is_empty(), "{aged:?}");
         assert!(cross_company_hold(Some(&home), &home, &aged, &reach, true).is_none());
 

@@ -3985,6 +3985,10 @@ video {
   padding-right: 0.625rem;
 }
 
+.pr-4 {
+  padding-right: 1rem;
+}
+
 .pr-7 {
   padding-right: 1.75rem;
 }

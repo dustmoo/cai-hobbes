@@ -44,6 +44,8 @@ fn create_test_session() -> Session {
         dispatch_link: None,
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
+        summary_sources: Vec::new(),
         turn_origin: Default::default(),
     }
 }
@@ -88,6 +90,41 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
         full_text.contains("external tools via Composio"),
         "System prompt should explain Composio"
     );
+}
+
+/// Multi-profile reach, phase 2: an ordinary tab's ticked profiles add the
+/// reach instruction; nothing ticked (or only deleted profiles) leaves the
+/// prompt exactly as a single-profile tab's.
+#[test]
+fn test_ordinary_tab_reach_changes_the_prompt_only_when_ticked() {
+    use crate::settings::ComposioProfile;
+    let profile = |id: &str, name: &str| ComposioProfile {
+        id: id.to_string(),
+        name: name.to_string(),
+        user_id: Some("u".to_string()),
+        api_key: Some("k".to_string()),
+        ..Default::default()
+    };
+    let settings = Settings {
+        composio_profiles: vec![profile("cm", "Clearmirror"), profile("pg", "Puget")],
+        active_composio_profile: Some("cm".to_string()),
+        ..Default::default()
+    };
+    let system = |reach: &[&str]| {
+        let mut session = create_test_session();
+        session.composio_profile = Some("cm".to_string());
+        session.profile_reach = reach.iter().map(|s| s.to_string()).collect();
+        PromptBuilder::new(&session, &settings).build_prompt("Hello".to_string()).prompt.system.unwrap()
+    };
+    for plain in [system(&[]), system(&["deleted-profile"])] {
+        assert!(plain.contains("The currently active profile determining your available tool connections is: 'Clearmirror'"));
+        assert!(!plain.contains("hobbes_profile"));
+        assert!(!plain.contains("reachable_profiles"));
+    }
+    let reach = system(&["pg"]);
+    assert!(reach.contains("Your home profile is 'Clearmirror'"));
+    assert!(reach.contains("reachable_profiles"));
+    assert!(reach.contains("Puget"));
 }
 
 #[test]

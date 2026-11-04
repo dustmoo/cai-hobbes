@@ -399,10 +399,11 @@ impl<'a> PromptBuilder<'a> {
                 .and_then(|id| self.settings.profile_name_for_id(id))
                 .unwrap_or("Default");
 
-            let reach = crate::mcp::manager::profile_reach::reach_for_session(
+            let reach = crate::mcp::manager::profile_reach::session_reach(
                 self.settings,
                 &self.session.id,
                 profile_id,
+                &self.session.profile_reach,
             );
             if reach.len() > 1 {
                 let others: Vec<&str> = reach[1..].iter().map(|p| p.name.as_str()).collect();

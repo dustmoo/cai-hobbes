@@ -200,12 +200,16 @@ pub fn ChatWindow(
         // A session with no pinned profile uses the global active one —
         // `get_mcp_context(None)` would return every profile's Composio
         // server, whose tools collide by name at the provider.
-        let profile_id = session_state
-            .read()
-            .sessions
-            .get(&target_id)
-            .and_then(|s| s.composio_profile.clone())
-            .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone()));
+        let (profile_id, selected_reach) = {
+            let state = session_state.read();
+            let session = state.sessions.get(&target_id);
+            (
+                session
+                    .and_then(|s| s.composio_profile.clone())
+                    .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone())),
+                session.map(|s| s.profile_reach.clone()).unwrap_or_default(),
+            )
+        };
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
@@ -216,13 +220,15 @@ pub fn ChatWindow(
         }
 
         let mut fresh = mcp_manager.read().get_mcp_context(profile_id.clone()).await;
-        // Multi-profile reach (Heartbeat / Voice): the other reachable
-        // profiles' Composio tools join the home set, each call naming its
-        // profile (mcp::manager::profile_reach).
-        let reach = crate::mcp::manager::profile_reach::reach_for_session(
+        // Multi-profile reach (Heartbeat / Voice, and ordinary tabs with
+        // profiles ticked on their chip): the other reachable profiles'
+        // Composio tools join the home set, each call naming its profile
+        // (mcp::manager::profile_reach).
+        let reach = crate::mcp::manager::profile_reach::session_reach(
             &settings_snapshot,
             &target_id,
             profile_id.as_deref(),
+            &selected_reach,
         );
         if reach.len() > 1 {
             let mut others = Vec::new();
@@ -283,6 +289,10 @@ pub fn ChatWindow(
     // New Chat with Memory Modal State
     let mut show_new_chat_memory_modal = use_signal(|| false);
     let mut modal_initial_context = use_signal(ActiveContext::default);
+    // The tab the "new chat with memory" modal copied its context from,
+    // recorded when it opens: the new tab inherits that tab's summary
+    // sources, even if another tab is active by the time Start is clicked.
+    let mut modal_source_session = use_signal(|| None::<String>);
 
     // Forget Memory Modal State
     let mut show_forget_memory_modal = use_signal(|| false);
@@ -322,10 +332,11 @@ pub fn ChatWindow(
             );
             // A refresh carries only the home profile: keep the session's
             // reach tools (no-op for single-profile sessions).
-            let reach_names: Vec<String> = crate::mcp::manager::profile_reach::reach_for_session(
+            let reach_names: Vec<String> = crate::mcp::manager::profile_reach::session_reach(
                 &settings_read,
                 &target_id,
                 profile_id.as_deref(),
+                &session.profile_reach,
             )
             .into_iter()
             .map(|p| p.name)
@@ -648,10 +659,17 @@ pub fn ChatWindow(
                             // there, not in the tab's home profile.
                             let call_profile = {
                                 let settings_read = settings.peek();
-                                crate::mcp::manager::profile_reach::resume_profile(
+                                let selected: Vec<String> = session_state
+                                    .peek()
+                                    .sessions
+                                    .get(&owning_id)
+                                    .map(|s| s.profile_reach.clone())
+                                    .unwrap_or_default();
+                                crate::mcp::manager::profile_reach::resume_profile_in(
                                     &settings_read,
                                     &owning_id,
                                     composio_profile.as_deref(),
+                                    &selected,
                                     &tool_call,
                                 )
                             };
@@ -1643,6 +1661,7 @@ pub fn ChatWindow(
                     on_new_chat_with_memory: move |_| {
                         if let Some(session) = session_state.read().sessions.get(&*current_target_id.read()) {
                             modal_initial_context.set(session.active_context.clone());
+                            modal_source_session.set(Some(session.id.clone()));
                             show_new_chat_memory_modal.set(true);
                         }
                     },
@@ -1653,11 +1672,30 @@ pub fn ChatWindow(
                     initial_context: modal_initial_context.read().clone(),
                     optimization_summary: modal_optimization_summary,
                     on_start_chat: move |new_context: ActiveContext| {
+                         // The copied summary may hold any company's data the
+                         // old tab read: the new tab inherits those sources,
+                         // so the cross-company hold still sees them there.
+                         let sources = {
+                             let state = session_state.peek();
+                             modal_source_session
+                                 .peek()
+                                 .as_ref()
+                                 .and_then(|id| state.sessions.get(id))
+                                 .map(|old| crate::mcp::manager::profile_reach::inherited_sources(&settings.peek(), old))
+                                 .unwrap_or_default()
+                         };
                          // Create new session with memory
                          let new_session_id = session_state.write().create_session(settings.peek().get_active_profile().map(|p| p.id.clone()));
                          // Update context of the new session
-                         if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
+                         let payload = session_state.write().sessions.get_mut(&new_session_id).map(|session| {
                              session.active_context = new_context;
+                             session.summary_sources = sources;
+                             crate::session::summary_payload(&session.active_context.conversation_summary, &session.summary_sources)
+                         });
+                         // Journal the seeded summary with its sources, and save.
+                         if let Some(summary) = payload {
+                             log_event(&new_session_id, SessionEvent::SummaryComputed { summary });
+                             crate::session::SessionState::save_async(&session_state.read(), None);
                          }
                          // Open the new session in a tab via the command bus
                          chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_session_id)));

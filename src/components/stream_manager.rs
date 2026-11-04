@@ -670,27 +670,38 @@ impl StreamManagerContext {
                         let route = {
                             use crate::mcp::manager::profile_reach as reach_mod;
                             let settings_read = self.settings.peek();
+                            let state = self.session_state.peek();
+                            let session = state.sessions.get(&session_id);
                             let home = reach_mod::home_profile(&settings_read, profile_id.as_deref());
-                            let reach = reach_mod::reach_for_session(&settings_read, &session_id, home.as_deref());
+                            // Phase 2: an ordinary tab's ticked profiles join its reach.
+                            let selected: &[String] = session.map_or(&[], |s| s.profile_reach.as_slice());
+                            let reach = reach_mod::session_reach(&settings_read, &session_id, home.as_deref(), selected);
                             let route = reach_mod::route_tool_call(&reach, &mut tool_call);
-                            if reach.len() >= 2 && !matches!(route, reach_mod::Route::Refused(_)) {
+                            let read_from = session
+                                .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
+                                .unwrap_or_default();
+                            // Checked with reach, or with another company's data
+                            // in play (reach since narrowed, or an earlier home).
+                            if reach_mod::flow_checked(&reach, &read_from) && !matches!(route, reach_mod::Route::Refused(_)) {
                                 let target = match &route {
                                     reach_mod::Route::To(t) => Some(t),
+                                    // Narrowed to home: a Composio call still lands at home.
+                                    reach_mod::Route::Unchanged
+                                        if crate::mcp::manager::is_composio_native(&tool_call.server_name) =>
+                                    {
+                                        Some(&reach[0])
+                                    }
                                     _ => None,
                                 };
                                 let mut args: serde_json::Value =
                                     serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                                 reach_mod::strip_profile_arg(&tool_call.tool_name, &mut args);
-                                let state = self.session_state.peek();
-                                let session = state.sessions.get(&session_id);
-                                let read_from = session
-                                    .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
-                                    .unwrap_or_default();
                                 let write = match target {
                                     Some(_) => reach_mod::is_write(&tool_call.tool_name, &args),
                                     None => reach_mod::local_write(&tool_call.server_name, &tool_call.tool_name, &args),
                                 };
-                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &reach, write);
+                                let named = reach_mod::all_profiles(&settings_read);
+                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &named, write);
                                 if let Some(hold) = hold {
                                     let project_id = session.and_then(|s| s.project_id.clone());
                                     let rule = crate::context::trust::evaluate(
@@ -1655,6 +1666,10 @@ impl StreamManagerContext {
                                     &active_session.active_context.conversation_summary,
                                 )
                                 .unwrap_or_else(|_| "{}".to_string());
+                                // Before the call: an undo in flight must not
+                                // drop sources from the summary it returns.
+                                let generated_from =
+                                    crate::mcp::manager::profile_reach::summary_sources(&active_session);
 
                                 // Format last 5 messages for the summarizer
                                 let messages_text: Vec<String> = active_session
@@ -1713,29 +1728,24 @@ impl StreamManagerContext {
                                                     summary_json
                                                 ) {
                                                     tracing::info!(session_id = %session_id_clone, "Proactive summary updated (background)");
-                                                    let summary_value =
-                                                        serde_json::to_value(&summary)
-                                                            .unwrap_or(serde_json::Value::Null);
                                                     // Tab identity (emoji/topic) rides the same
                                                     // background summary — no extra LLM call.
                                                     // See `apply_tab_identity_from_summary`'s
                                                     // doc comment: every caller that computes a
                                                     // ConversationSummary must call this, or a
                                                     // tab's emoji/topic silently never gets set.
-                                                    let tab_titled = {
+                                                    // Stamps the companies whose data the
+                                                    // summary may hold (crate::session::adopt_summary).
+                                                    let (summary_value, tab_titled) = {
                                                         let mut state = session_state.write();
-                                                        state
-                                                            .sessions
-                                                            .get_mut(&session_id_clone)
-                                                            .and_then(|session| {
-                                                                let titled = crate::session::apply_tab_identity_from_summary(
-                                                                    session, &summary,
-                                                                );
-                                                                session
-                                                                    .active_context
-                                                                    .conversation_summary = summary;
-                                                                titled
-                                                            })
+                                                        match state.sessions.get_mut(&session_id_clone) {
+                                                            Some(session) => crate::session::adopt_summary(session, summary, &generated_from),
+                                                            None => (
+                                                                serde_json::to_value(&summary)
+                                                                    .unwrap_or(serde_json::Value::Null),
+                                                                None,
+                                                            ),
+                                                        }
                                                     };
                                                     log_event(
                                                         &session_id_clone,
