@@ -343,6 +343,66 @@ body {
     }
 }
 
+/* The Hobbes tab's tiger (hobbes_icon.rs). Frames (blink, ears up, mouth
+ * open) are swapped in Rust; these add the light motion per state:
+ * a slow breath while the Heartbeat is on, a soft blue glow while the voice
+ * mic is live or speaking, a green pulse while a Heartbeat wake streams.
+ * Reduced motion keeps the glows, drops the movement. */
+.hobbes-tab-tiger {
+    display: inline-flex;
+    flex-shrink: 0;
+    transform-origin: 50% 90%;
+}
+
+@keyframes hobbes-tab-breath-anim {
+    0%, 100% {
+        transform: scale(1);
+    }
+    50% {
+        transform: scale(1.08);
+    }
+}
+
+.hobbes-tab-breath {
+    animation: hobbes-tab-breath-anim 4.5s ease-in-out infinite;
+}
+
+@keyframes hobbes-tab-listening-anim {
+    0%, 100% {
+        filter: drop-shadow(0 0 1px #60a5fa) drop-shadow(0 0 2px #60a5fa);
+    }
+    50% {
+        filter: drop-shadow(0 0 1.5px #60a5fa) drop-shadow(0 0 4px #60a5fa);
+    }
+}
+
+.hobbes-tab-listening {
+    filter: drop-shadow(0 0 1.5px #60a5fa) drop-shadow(0 0 3px #60a5fa);
+    animation: hobbes-tab-listening-anim 1.6s ease-in-out infinite;
+}
+
+@keyframes hobbes-tab-waking-anim {
+    0%, 100% {
+        filter: drop-shadow(0 0 0.5px #34d399);
+    }
+    50% {
+        filter: drop-shadow(0 0 1.5px #34d399) drop-shadow(0 0 3px #34d399);
+    }
+}
+
+.hobbes-tab-waking {
+    filter: drop-shadow(0 0 1.5px #34d399);
+    animation: hobbes-tab-waking-anim 1.2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .hobbes-tab-breath,
+    .hobbes-tab-listening,
+    .hobbes-tab-waking {
+        animation: none;
+    }
+}
+
 /* Empty-chat bubble: the three pixel dots drift up and down in turn, a slow
  * idle "breathing" rather than the quick pulse of an active typing
  * indicator. Each dot is staggered by an inline `animation-delay`. */

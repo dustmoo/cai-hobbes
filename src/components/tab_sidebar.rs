@@ -294,7 +294,7 @@ pub fn TabSidebar(props: TabSidebarProps) -> Element {
                                     match glyph {
                                         // System tabs: the icon follows the id, whatever the emoji.
                                         _ if is_system_tab(hobbes_id, &tab.session_id) => rsx! {
-                                            SystemTabIcon { session_id: tab.session_id.clone(), emoji: tab.emoji.clone(), size: 15, overlay: true }
+                                            SystemTabIcon { session_id: tab.session_id.clone(), emoji: tab.emoji.clone(), size: 15 }
                                         },
                                         RailGlyph::Emoji(e) => rsx! { span { class: "text-[15px] leading-none", "{e}" } },
                                         RailGlyph::Letter(l) => rsx! {
