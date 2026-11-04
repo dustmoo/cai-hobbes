@@ -1145,4 +1145,42 @@ mod tests {
             assert_eq!(row(title, user_set).display_title(), s.display_title(), "{title:?} {user_set}");
         }
     }
+
+    /// The one-time clear: system sessions' summaries recorded every
+    /// Composio read before tab reads existed; those must not start counting
+    /// with no clock now that the system path counts `summary_sources`.
+    #[test]
+    fn system_summary_sources_are_cleared_once_and_journaled() {
+        crate::session_store::test_support::with_test_db(|conn| {
+            let mut state = SessionState::default();
+            let sys = state.create_session_raw(Some("cm".into()));
+            let plain = state.create_session_raw(None);
+            for (id, src) in [(&sys, "acme"), (&plain, "pg")] {
+                let s = state.sessions.get_mut(id).unwrap();
+                s.summary_sources = vec![src.to_string()];
+                s.active_context.conversation_summary.summary = "kept".into();
+                crate::session_store::test_support::upsert(conn, s);
+            }
+            let cleared = crate::session_store::clear_summary_sources_conn(conn, std::slice::from_ref(&sys)).unwrap();
+            assert_eq!(cleared.len(), 1);
+            let peek = |id: &str| crate::session_store::peek_session_conn(conn, id).unwrap().unwrap();
+            assert!(peek(&sys).summary_sources.is_empty());
+            assert_eq!(peek(&sys).active_context.conversation_summary.summary, "kept");
+            assert_eq!(peek(&plain).summary_sources, ["pg"], "ordinary tabs untouched");
+            // The journaled event replays to the same state.
+            let mut replayed = state.sessions[&sys].clone();
+            crate::session_events::apply_for_test(
+                &mut replayed,
+                &crate::session_events::SessionEvent::SummaryComputed { summary: cleared[0].1.clone() },
+            );
+            assert!(replayed.summary_sources.is_empty());
+            assert_eq!(replayed.active_context.conversation_summary.summary, "kept");
+            // Once only: a later tab-read source survives the next startup.
+            let mut s = peek(&sys);
+            s.summary_sources = vec!["pg".into()];
+            crate::session_store::test_support::upsert(conn, &s);
+            assert!(crate::session_store::clear_summary_sources_conn(conn, std::slice::from_ref(&sys)).unwrap().is_empty());
+            assert_eq!(peek(&sys).summary_sources, ["pg"]);
+        });
+    }
 }

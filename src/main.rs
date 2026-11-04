@@ -631,6 +631,10 @@ fn main() {
     if let Err(e) = session_store::init() {
         tracing::error!("Failed to initialize session store: {e}");
     }
+    // One-time: system sessions' summaries stop carrying the Composio
+    // reads they recorded before tab reads (profile_reach counts a system
+    // session's summary sources now). Before any hydration.
+    system_sessions::clear_legacy_summary_sources();
 
     // Read persisted window size (meta only — no session hydration)
     let (initial_width, initial_height) = session::SessionState::load_window_dims();

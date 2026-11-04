@@ -1164,6 +1164,60 @@ pub(crate) fn peek_session_conn(conn: &Connection, id: &str) -> rusqlite::Result
     Ok(peek_data_conn(conn, id)?.and_then(|d| parse_session(id, &d)))
 }
 
+/// `meta` key set once system sessions' legacy summary sources are cleared
+/// ([`clear_system_summary_sources_once`]).
+pub const SYSTEM_SUMMARY_SOURCES_CLEARED_KEY: &str = "system_summary_sources_cleared";
+
+/// One-time, at startup before any hydration: clear `summary_sources` on
+/// the system sessions `ids` (the Hobbes lineage). Before tab reads, a
+/// system session's summary recorded every Composio read, which the
+/// cross-company hold ignored there; it now counts a system session's
+/// `summary_sources` with no clock (they hold only tab-read sources from
+/// here on, `profile_reach::durable_summary_sources`), so the old entries
+/// must go rather than hold writes for good. Guarded by
+/// [`SYSTEM_SUMMARY_SOURCES_CLEARED_KEY`], written in the same transaction
+/// as the rows; each clear is journaled as a `SummaryComputed` without
+/// sources, so a replay matches.
+pub fn clear_system_summary_sources_once(ids: &[String]) {
+    match with_conn(|conn| clear_summary_sources_conn(conn, ids)) {
+        Ok(cleared) => {
+            if !cleared.is_empty() {
+                tracing::info!(sessions = cleared.len(), "Cleared legacy summary sources on system sessions");
+            }
+            for (id, summary) in cleared {
+                crate::session_events::log_event(&id, crate::session_events::SessionEvent::SummaryComputed { summary });
+            }
+        }
+        Err(e) => tracing::error!("clearing system summary sources failed (will retry next launch): {e}"),
+    }
+}
+
+/// [`clear_system_summary_sources_once`] against a connection: the cleared
+/// sessions with the `SummaryComputed` payload to journal for each.
+pub(crate) fn clear_summary_sources_conn(
+    conn: &Connection,
+    ids: &[String],
+) -> rusqlite::Result<Vec<(String, serde_json::Value)>> {
+    if meta_get_conn(conn, SYSTEM_SUMMARY_SOURCES_CLEARED_KEY)?.is_some() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(mut session) = peek_data_conn(&tx, id)?.and_then(|d| parse_session(id, &d)) else { continue };
+        if session.summary_sources.is_empty() {
+            continue;
+        }
+        session.summary_sources.clear();
+        let row = build_row(&session, next_seq()).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        upsert_row(&tx, &row)?;
+        out.push((id.clone(), crate::session::summary_payload(&session.active_context.conversation_summary, &[])));
+    }
+    meta_set_conn(&tx, SYSTEM_SUMMARY_SOURCES_CLEARED_KEY, "1", next_seq())?;
+    tx.commit()?;
+    Ok(out)
+}
+
 pub fn session_count() -> i64 {
     with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
         .unwrap_or(0)

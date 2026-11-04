@@ -174,6 +174,16 @@ fn registry() -> &'static RwLock<Ids> {
     REG.get_or_init(|| RwLock::new(Ids::default()))
 }
 
+/// Startup, once the store is open and before any session hydrates: the
+/// one-time clear of the lineage's legacy summary sources
+/// (`session_store::clear_system_summary_sources_once`).
+pub fn clear_legacy_summary_sources() {
+    if !crate::session_store::is_ready() {
+        return;
+    }
+    crate::session_store::clear_system_summary_sources_once(&lineage());
+}
+
 #[cfg(test)]
 fn registry() -> &'static RwLock<Ids> {
     thread_local! {
