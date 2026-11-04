@@ -1556,11 +1556,29 @@ pub fn ChatWindow(
                     initial_context: modal_initial_context.read().clone(),
                     optimization_summary: modal_optimization_summary,
                     on_start_chat: move |new_context: ActiveContext| {
+                         // The copied summary may hold any company's data the
+                         // old tab read: the new tab inherits those sources,
+                         // so the cross-company hold still sees them there.
+                         let sources = {
+                             let state = session_state.peek();
+                             state
+                                 .sessions
+                                 .get(&*current_target_id.peek())
+                                 .map(|old| crate::mcp::manager::profile_reach::inherited_sources(&settings.peek(), old))
+                                 .unwrap_or_default()
+                         };
                          // Create new session with memory
                          let new_session_id = session_state.write().create_session(settings.peek().get_active_profile().map(|p| p.id.clone()));
                          // Update context of the new session
-                         if let Some(session) = session_state.write().sessions.get_mut(&new_session_id) {
+                         let payload = session_state.write().sessions.get_mut(&new_session_id).map(|session| {
                              session.active_context = new_context;
+                             session.summary_sources = sources;
+                             crate::session::summary_payload(&session.active_context.conversation_summary, &session.summary_sources)
+                         });
+                         // Journal the seeded summary with its sources, and save.
+                         if let Some(summary) = payload {
+                             log_event(&new_session_id, SessionEvent::SummaryComputed { summary });
+                             crate::session::SessionState::save_async(&session_state.read(), None);
                          }
                          // Open the new session in a tab via the command bus
                          chat_command.set(Some(super::chat_input::ChatCommand::SwitchToSession(new_session_id)));

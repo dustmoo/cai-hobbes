@@ -1631,6 +1631,10 @@ impl StreamManagerContext {
                                     &active_session.active_context.conversation_summary,
                                 )
                                 .unwrap_or_else(|_| "{}".to_string());
+                                // Before the call: an undo in flight must not
+                                // drop sources from the summary it returns.
+                                let generated_from =
+                                    crate::mcp::manager::profile_reach::summary_sources(&active_session);
 
                                 // Format last 5 messages for the summarizer
                                 let messages_text: Vec<String> = active_session
@@ -1700,7 +1704,7 @@ impl StreamManagerContext {
                                                     let (summary_value, tab_titled) = {
                                                         let mut state = session_state.write();
                                                         match state.sessions.get_mut(&session_id_clone) {
-                                                            Some(session) => crate::session::adopt_summary(session, summary),
+                                                            Some(session) => crate::session::adopt_summary(session, summary, &generated_from),
                                                             None => (
                                                                 serde_json::to_value(&summary)
                                                                     .unwrap_or(serde_json::Value::Null),

@@ -196,18 +196,33 @@ pub const SUMMARY_SOURCES_KEY: &str = "source_profiles";
 /// payload to journal as `SummaryComputed` (the summary plus its sources)
 /// and the tab identity to journal as `TabTitled`. Every site that computes
 /// a summary goes through here.
+///
+/// `generated_from` is `profile_reach::summary_sources` of the snapshot the
+/// summary was written from, taken before the LLM call: an undo while it
+/// was in flight removes reads from the live session, but not from the
+/// summary that comes back, so the sources are the union of both.
 pub fn adopt_summary(
     session: &mut Session,
     summary: ConversationSummary,
+    generated_from: &[String],
 ) -> (Value, Option<TabIdentity>) {
-    session.summary_sources = crate::mcp::manager::profile_reach::summary_sources(session);
+    let mut sources: std::collections::BTreeSet<String> =
+        crate::mcp::manager::profile_reach::summary_sources(session).into_iter().collect();
+    sources.extend(generated_from.iter().cloned());
+    session.summary_sources = sources.into_iter().collect();
     let titled = apply_tab_identity_from_summary(session, &summary);
-    let mut value = serde_json::to_value(&summary).unwrap_or(Value::Null);
-    if let (Some(map), false) = (value.as_object_mut(), session.summary_sources.is_empty()) {
-        map.insert(SUMMARY_SOURCES_KEY.into(), serde_json::json!(session.summary_sources));
-    }
+    let value = summary_payload(&summary, &session.summary_sources);
     session.active_context.conversation_summary = summary;
     (value, titled)
+}
+
+/// The `SummaryComputed` payload: the summary plus its sources.
+pub fn summary_payload(summary: &ConversationSummary, sources: &[String]) -> Value {
+    let mut value = serde_json::to_value(summary).unwrap_or(Value::Null);
+    if let (Some(map), false) = (value.as_object_mut(), sources.is_empty()) {
+        map.insert(SUMMARY_SOURCES_KEY.into(), serde_json::json!(sources));
+    }
+    value
 }
 
 pub fn apply_tab_identity_from_summary(

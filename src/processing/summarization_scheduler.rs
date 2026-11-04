@@ -67,6 +67,7 @@ pub fn use_summarization_scheduler() {
                         // while its summary is being written.
                         let _summarizing = crate::session_rotation::summarizing(&active_session.id);
 
+                        let generated_from = crate::mcp::manager::profile_reach::summary_sources(&active_session);
                         let processor_guard = processor.read();
                         if let Some(summary) = processor_guard
                             .generate_summary(&active_session, &settings_guard)
@@ -89,7 +90,7 @@ pub fn use_summarization_scheduler() {
                             let (summary_value, tab_titled) = {
                                 let mut state = session_state.write();
                                 match state.sessions.get_mut(&active_session.id) {
-                                    Some(session) => crate::session::adopt_summary(session, summary),
+                                    Some(session) => crate::session::adopt_summary(session, summary, &generated_from),
                                     None => (serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null), None),
                                 }
                             };
@@ -143,6 +144,7 @@ pub fn use_summarization_scheduler() {
                         {
                             tracing::info!("Inactivity detected. Summarizing conversation.");
                             let _summarizing = crate::session_rotation::summarizing(&active_session.id);
+                            let generated_from = crate::mcp::manager::profile_reach::summary_sources(&active_session);
                             let processor_guard = processor.read();
                             if let Some(summary) = processor_guard
                                 .generate_summary(&active_session, &settings_guard)
@@ -168,7 +170,7 @@ pub fn use_summarization_scheduler() {
                                 let (summary_value, tab_titled) = {
                                     let mut state = session_state.write();
                                     match state.sessions.get_mut(&active_session.id) {
-                                        Some(session) => crate::session::adopt_summary(session, summary),
+                                        Some(session) => crate::session::adopt_summary(session, summary, &generated_from),
                                         None => (serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null), None),
                                     }
                                 };

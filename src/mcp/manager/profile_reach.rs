@@ -181,6 +181,17 @@ pub fn resume_profile_in(
     }
 }
 
+/// The summary sources a new chat seeded with `old`'s memory ("New chat
+/// with memory") starts with: what `old`'s summary holds, its home, every
+/// Composio result still in its messages and every read it carried — no
+/// clock, since the copied summary may hold any of it.
+pub fn inherited_sources(settings: &Settings, old: &crate::session::Session) -> Vec<String> {
+    let mut out: BTreeSet<String> = summary_sources(old).into_iter().collect();
+    out.extend(old.carried_reads.iter().map(|r| r.profile_id.clone()));
+    out.extend(home_profile(settings, old.composio_profile.as_deref()));
+    out.into_iter().collect()
+}
+
 /// Whether the cross-company hold applies to a call: the session has reach,
 /// or it holds data read from a profile other than its current `home` —
 /// through reach since narrowed, or at an earlier home before a repin. A
@@ -572,15 +583,15 @@ pub fn session_recent_reads(
 /// - **Ordinary tabs**: no clock. A tab keeps its history in context for
 ///   days, so every Composio result still in its messages counts, and so
 ///   does every profile its conversation summary holds data from
-///   (`Session::summary_sources`), after the messages are gone. Reads
-///   carried in from elsewhere (`carried_reads`) keep their window.
+///   (`Session::summary_sources`), after the messages are gone, and every
+///   read carried in from elsewhere (`carried_reads`).
 pub fn session_read_profiles(
     settings: &Settings,
     session: &crate::session::Session,
     now: chrono::DateTime<chrono::Utc>,
 ) -> BTreeSet<String> {
     if !crate::system_sessions::is_system(&session.id) {
-        let carried = session.carried_reads.iter().filter(|r| now - r.read_at <= READ_WINDOW).map(|r| r.profile_id.clone());
+        let carried = session.carried_reads.iter().map(|r| r.profile_id.clone());
         return summary_sources(session)
             .into_iter()
             .filter_map(|s| {
@@ -1161,7 +1172,7 @@ mod tests {
         assert_eq!(h.rule_key, "profile-flow:pg>cm");
 
         // Summarised, then the messages are gone: the summary still counts.
-        let (value, _) = crate::session::adopt_summary(&mut session, Default::default());
+        let (value, _) = crate::session::adopt_summary(&mut session, Default::default(), &[]);
         assert_eq!(value[crate::session::SUMMARY_SOURCES_KEY], json!(["pg"]), "journaled with the summary");
         assert!(
             serde_json::to_value(&session.active_context.conversation_summary).unwrap().get(crate::session::SUMMARY_SOURCES_KEY).is_none(),
@@ -1170,7 +1181,7 @@ mod tests {
         session.messages.clear();
         assert_eq!(session_read_profiles(&settings, &session, now), BTreeSet::from(["pg".to_string()]));
         // The next summary keeps it (it was written from this one).
-        let _ = crate::session::adopt_summary(&mut session, Default::default());
+        let _ = crate::session::adopt_summary(&mut session, Default::default(), &[]);
         assert_eq!(session.summary_sources, ["pg"]);
         // A replay rebuild keeps it.
         let mut replayed = crate::session_events::blank_session();
@@ -1234,6 +1245,67 @@ mod tests {
         // System sessions: no editing.
         crate::system_sessions::register(crate::system_sessions::SystemSession::Heartbeat, "reach-test-hb");
         assert!(!chip_reach(&settings, &tab("reach-test-hb", "cm", &[])).editable);
+    }
+
+    /// A. "New chat with memory": the copied summary keeps the old tab's
+    /// sources (its summary's, its reads and its home), journaled.
+    #[test]
+    fn a_new_chat_with_memory_keeps_the_sources() {
+        let settings = reach_settings();
+        let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
+        let now = chrono::Utc::now();
+        let mut old = tab("p2-mem-old", "pg", &[]);
+        old.summary_sources = vec!["ac".into()];
+        old.messages.push(read_at_home(&pg, now - chrono::Duration::days(2)));
+        let sources = inherited_sources(&settings, &old);
+        assert_eq!(sources, ["ac", "pg"]);
+        // The new tab (no messages) starts at Clearmirror.
+        let mut fresh = tab("p2-mem-new", "cm", &[]);
+        fresh.summary_sources = sources;
+        let read_from = session_read_profiles(&settings, &fresh, now);
+        assert!(read_from.contains("pg"));
+        assert!(flow_checked(&reach_of(&settings, &fresh), &read_from));
+        assert_eq!(
+            cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap().rule_key,
+            "profile-flow:ac+pg>cm"
+        );
+        // Journaled with the seeded summary, so a replay keeps it.
+        let payload = crate::session::summary_payload(&fresh.active_context.conversation_summary, &fresh.summary_sources);
+        let mut replayed = crate::session_events::blank_session();
+        crate::session_events::apply_for_test(&mut replayed, &crate::session_events::SessionEvent::SummaryComputed { summary: payload });
+        assert_eq!(replayed.summary_sources, fresh.summary_sources);
+    }
+
+    /// B. An undo while the summary is being written doesn't drop the
+    /// sources of the data it was written from.
+    #[test]
+    fn an_undo_during_summarising_keeps_the_sources() {
+        let settings = reach_settings();
+        let pg = p("pg", "Puget");
+        let now = chrono::Utc::now();
+        let mut session = tab("p2-undo-inflight", "cm", &[]);
+        session.messages.push(read_at_home(&pg, now));
+        // Snapshot taken before the LLM call…
+        let generated_from = summary_sources(&session);
+        // …the user undoes past the read while it is in flight…
+        let id = session.messages[0].id.to_string();
+        session.truncate_from_message(&id);
+        assert!(session_read_profiles(&settings, &session, now).is_empty());
+        // …and the summary of that read arrives.
+        let _ = crate::session::adopt_summary(&mut session, Default::default(), &generated_from);
+        assert_eq!(session.summary_sources, ["pg"]);
+        assert!(session_read_profiles(&settings, &session, now).contains("pg"));
+    }
+
+    /// Carried reads have no clock in an ordinary tab either.
+    #[test]
+    fn carried_reads_never_age_out_in_an_ordinary_tab() {
+        let settings = reach_settings();
+        let now = chrono::Utc::now();
+        let mut session = tab("p2-carried", "cm", &[]);
+        session.carried_reads =
+            vec![crate::session::CarriedRead { profile_id: "pg".into(), read_at: now - chrono::Duration::hours(3) }];
+        assert!(session_read_profiles(&settings, &session, now).contains("pg"));
     }
 
     /// 5. Repinning to a ticked profile takes it out of the reach list.
