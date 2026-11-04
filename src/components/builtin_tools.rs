@@ -1246,17 +1246,39 @@ mod tests {
         let mut m = crate::voice::session::transcript_message(false, "x");
         m.content = MessageContent::ToolCall(mine);
         s.messages.push(m);
+        use crate::components::continuation_controller::{record_approval_origin, ApprovalKey};
         // The wake's skill, approved now: its own origin, not the newest turn's.
-        crate::components::continuation_controller::set_continuation_origin(&id, TurnOrigin::Heartbeat);
+        record_approval_origin(&id, ApprovalKey::Message(uuid::Uuid::new_v4()), TurnOrigin::Heartbeat);
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
+        // ... and an "analyse now" while it waited doesn't loosen it.
+        record_approval_origin(&id, ApprovalKey::Message(uuid::Uuid::new_v4()), TurnOrigin::Heartbeat);
+        record_approval_origin(&id, ApprovalKey::AnalyseNow, TurnOrigin::User);
         assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
         // Taken once: an "analyse now" from the person after a wake is theirs.
         s.messages.reverse(); // newest stamp is now the wake's
-        crate::components::continuation_controller::set_continuation_origin(&id, TurnOrigin::User);
+        record_approval_origin(&id, ApprovalKey::AnalyseNow, TurnOrigin::User);
         assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::User);
         // Nothing handed over (legacy, unstamped skill): the scan decides.
         assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
         s.messages.reverse();
         assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::User);
+    }
+
+    #[test]
+    fn a_tools_resume_consumes_recorded_approval_origins() {
+        use crate::components::continuation_controller::{record_approval_origin, ApprovalKey};
+        use crate::session::TurnOrigin;
+        let id = "tools-resume-consumes";
+        // A skill approval recorded, but the resume found tool calls to run.
+        record_approval_origin(id, ApprovalKey::Message(uuid::Uuid::new_v4()), TurnOrigin::Heartbeat);
+        let mut mine = call("HOBBES_TODO_LIST");
+        stamp_turn_origin(&mut mine, TurnOrigin::User);
+        // The strict side wins for this continuation ...
+        assert_eq!(crate::components::chat::tools_resume_origin([&mine], id), TurnOrigin::Heartbeat);
+        // ... and nothing is left for a later, unstamped legacy skill to pick up.
+        let mut legacy = SessionState::default();
+        let sid = legacy.create_session_raw(None);
+        assert_eq!(crate::components::chat::no_tools_continuation_origin(id, legacy.sessions.get(&sid)), TurnOrigin::User);
     }
 
     #[test]

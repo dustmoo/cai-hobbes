@@ -633,7 +633,11 @@ pub fn MessageList(
                                                                                                 // skill's own origin (unstamped legacy: the
                                                                                                 // resume path's fallback scan decides).
                                                                                                 if let Some(origin) = sc.origin {
-                                                                                                    crate::components::continuation_controller::set_continuation_origin(&session_id, origin);
+                                                                                                    crate::components::continuation_controller::record_approval_origin(
+                                                                                                        &session_id,
+                                                                                                        crate::components::continuation_controller::ApprovalKey::Message(msg_id),
+                                                                                                        origin,
+                                                                                                    );
                                                                                                 }
                                                                                                 has_pending_approvals.write().insert(session_id.clone());
                                                                                             }

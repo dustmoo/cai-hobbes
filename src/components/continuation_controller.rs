@@ -86,25 +86,47 @@ impl ContinuationController {
     }
 }
 
-/// The origin of an approval-driven continuation that has no tool calls
-/// left to resume (an approved skill, "analyse now"), keyed by session: set
-/// by whoever hands the session to the resume path, taken by its
-/// no-tools branch ([`take_continuation_origin`]). The approved skill
-/// carries its own stamp here, so the continuation can't be decided by
-/// whichever turn happens to be newest in the session.
-static CONTINUATION_ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<String, crate::session::TurnOrigin>>> =
-    std::sync::Mutex::new(None);
+/// What an approval handed to the resume path is: an approved message (a
+/// skill), or the person's "analyse now".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ApprovalKey {
+    Message(uuid::Uuid),
+    AnalyseNow,
+}
 
-/// Record the origin a no-tools continuation of `session_id` runs under.
-pub fn set_continuation_origin(session_id: &str, origin: crate::session::TurnOrigin) {
-    if let Ok(mut m) = CONTINUATION_ORIGINS.lock() {
-        m.get_or_insert_with(Default::default).insert(session_id.to_string(), origin);
+type ApprovalOrigins = std::collections::HashMap<String, std::collections::HashMap<ApprovalKey, crate::session::TurnOrigin>>;
+
+/// The origins of approvals waiting for the resume path, per session and
+/// per approved message — so a second approval (or "analyse now") while the
+/// first is deferred adds an entry instead of overwriting it. Every resume of
+/// the session takes them all ([`take_approval_origins`]), whichever branch
+/// it runs, so none outlives its resume.
+static APPROVAL_ORIGINS: std::sync::Mutex<Option<ApprovalOrigins>> = std::sync::Mutex::new(None);
+
+/// Record the origin of the approval `key` in `session_id`.
+pub fn record_approval_origin(session_id: &str, key: ApprovalKey, origin: crate::session::TurnOrigin) {
+    if let Ok(mut m) = APPROVAL_ORIGINS.lock() {
+        m.get_or_insert_with(Default::default)
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(key, origin);
     }
 }
 
-/// Take the recorded origin, if any.
-pub fn take_continuation_origin(session_id: &str) -> Option<crate::session::TurnOrigin> {
-    CONTINUATION_ORIGINS.lock().ok().and_then(|mut m| m.as_mut().and_then(|m| m.remove(session_id)))
+/// Consume every recorded approval origin of `session_id` (the resume is
+/// handling all of them).
+pub fn take_approval_origins(session_id: &str) -> Vec<crate::session::TurnOrigin> {
+    APPROVAL_ORIGINS
+        .lock()
+        .ok()
+        .and_then(|mut m| m.as_mut().and_then(|m| m.remove(session_id)))
+        .map(|e| e.into_values().collect())
+        .unwrap_or_default()
+}
+
+/// The strictest of `origins` (unattended wins), if any.
+pub fn strictest(origins: impl IntoIterator<Item = crate::session::TurnOrigin>) -> Option<crate::session::TurnOrigin> {
+    origins.into_iter().reduce(|a, b| if a.is_unattended() { a } else { b })
 }
 
 /// Holds a session's continuation in-flight guard for one run of the
@@ -132,10 +154,27 @@ impl InFlightGuard {
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if self.armed {
-            if let Ok(mut c) = self.controller.try_write() {
+        if !self.armed {
+            return;
+        }
+        let cleared = match self.controller.try_write() {
+            Ok(mut c) => {
                 c.clear_in_flight(&self.session_id);
+                true
             }
+            Err(_) => false,
+        };
+        if !cleared {
+            // Borrowed right now (dropped mid-write): clear on the next
+            // tick instead of skipping it. No runtime left means the app is
+            // shutting down and nothing waits on the flag.
+            let mut controller = self.controller;
+            let session_id = std::mem::take(&mut self.session_id);
+            let _ = dioxus::prelude::spawn_forever(async move {
+                if let Ok(mut c) = controller.try_write() {
+                    c.clear_in_flight(&session_id);
+                }
+            });
         }
     }
 }
@@ -143,6 +182,54 @@ impl Drop for InFlightGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guard dropped while the controller is borrowed still clears the
+    /// flag (on the next tick) instead of silently leaving the chat busy.
+    #[tokio::test]
+    async fn a_guard_dropped_mid_write_still_clears() {
+        thread_local! {
+            static CTRL: std::cell::Cell<Option<Signal<ContinuationController>>> = const { std::cell::Cell::new(None) };
+        }
+        let mut dom = VirtualDom::new(|| {
+            let mut c = use_signal(ContinuationController::new);
+            use_hook(|| {
+                c.write().register_callback(Rc::new(|_, _| {}));
+                c.write().trigger_continuation("s".into(), crate::session::TurnOrigin::User);
+                {
+                    let guard = InFlightGuard::new(c, "s".into());
+                    let mut alias = c; // Signals are Copy: borrow through a copy
+                    let _held = alias.write();
+                    drop(guard);
+                }
+                assert!(c.peek().is_in_flight("s"), "deferred, not done in the drop");
+                CTRL.with(|x| x.set(Some(c)));
+            });
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+        for _ in 0..5 {
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(50), dom.wait_for_work()).await;
+            dom.render_immediate(&mut dioxus::dioxus_core::NoOpMutations);
+        }
+        let c = CTRL.with(|x| x.get()).unwrap();
+        assert!(!dom.in_runtime(|| c.peek().is_in_flight("s")), "cleared on the next tick");
+    }
+
+    #[test]
+    fn approval_origins_are_per_message_and_taken_together() {
+        use crate::session::TurnOrigin;
+        let wake_skill = ApprovalKey::Message(uuid::Uuid::new_v4());
+        // A wake's skill approved while a turn ran (deferred), then the
+        // person's "analyse now" in the same chat: both kept.
+        record_approval_origin("ao", wake_skill, TurnOrigin::Heartbeat);
+        record_approval_origin("ao", ApprovalKey::AnalyseNow, TurnOrigin::User);
+        let got = take_approval_origins("ao");
+        assert_eq!(got.len(), 2);
+        assert_eq!(strictest(got), Some(TurnOrigin::Heartbeat));
+        // Taken once: nothing left for a later resume.
+        assert!(take_approval_origins("ao").is_empty());
+        assert_eq!(strictest(Vec::new()), None);
+    }
 
     #[test]
     fn a_continuation_that_never_streams_releases_its_guard() {
