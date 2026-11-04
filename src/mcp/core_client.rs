@@ -215,4 +215,47 @@ impl CoreClient {
             ).with_title("Message Worker"),
         ]
     }
+    /// The Hobbes tab's read-only view of the person's other conversations
+    /// (`hobbes_tabs`). Deliberately NOT in [`list_tools`](Self::list_tools):
+    /// the prompt builder offers them only to the live Hobbes session
+    /// (`hobbes_tabs::tab_tools_offered`), and dispatch refuses them anywhere
+    /// else. Fixed descriptions, independent of the `hobbes_read_tabs`
+    /// setting, so the cached tool prefix never changes with it.
+    pub fn tab_tools() -> Vec<Tool> {
+        vec![
+            Tool::new(
+                crate::hobbes_tabs::TAB_LIST,
+                "List the user's other conversations (chat tabs), newest activity first: id, \
+                    title, emoji, project, Composio profile, last activity and message count. \
+                    Metadata only, read-only. Use it to find a conversation to read with \
+                    HOBBES_TAB_READ. May need the user's approval.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "query": { "type": "string", "description": "Optional text to search for in titles, summaries and messages." },
+                            "project": { "type": "string", "description": "Optional project id or title to filter by." },
+                            "limit": { "type": "integer", "description": "How many to list (default 20, at most 50)." }
+                        }
+                    })).unwrap_or_default(),
+            ).with_title("List Tabs"),
+            Tool::new(
+                crate::hobbes_tabs::TAB_READ,
+                "Read another of the user's conversations (read-only): its conversation \
+                    summary and a window of its messages (role, time, text, and tool calls \
+                    in short). By default the last 20 messages; pass `before` (a message \
+                    number from an earlier read) to page back, and `query` to keep only \
+                    messages containing that text. May need the user's approval.",
+                serde_json::from_value::<JsonObject>(serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "session_id": { "type": "string", "description": "The conversation's id, from HOBBES_TAB_LIST." },
+                            "last": { "type": "integer", "description": "How many messages to return (default 20, at most 60)." },
+                            "before": { "type": "integer", "description": "Optional: only messages numbered below this (to page back)." },
+                            "query": { "type": "string", "description": "Optional: only messages containing this text (case-insensitive)." }
+                        },
+                        "required": ["session_id"]
+                    })).unwrap_or_default(),
+            ).with_title("Read Tab"),
+        ]
+    }
 }

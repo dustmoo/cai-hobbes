@@ -56,6 +56,7 @@ mod str_utils;
 mod session_rotation;
 mod system_sessions;
 mod hobbes_session;
+mod hobbes_tabs;
 mod tab_list;
 mod tab_tidy;
 #[cfg(test)]

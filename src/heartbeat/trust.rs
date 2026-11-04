@@ -12,6 +12,8 @@
 //!   decision only adds to the person's queue; answering one stays denied.
 //!
 //! `HOBBES_AGENT_TIME` is denied outright: the Heartbeat is not agent time.
+//! `HOBBES_TAB_LIST` / `HOBBES_TAB_READ` are reads (Allow) here; whether
+//! they need the person is the tab-read gate's call (`hobbes_tabs`).
 
 use crate::todo::agent_time::{agent_time_scope, ScopeVerdict};
 
@@ -22,6 +24,10 @@ pub fn heartbeat_scope(tool: &str, args: &serde_json::Value) -> ScopeVerdict {
         "HOBBES_DISPATCH" => ScopeVerdict::NeedsApproval,
         "HOBBES_DECISIONS" if action == "ask" => ScopeVerdict::Allow,
         "HOBBES_AGENT_TIME" => ScopeVerdict::Deny,
+        // Reading the person's other conversations: in scope like any
+        // read. The tab-read gate (`hobbes_tabs::tab_gate`) runs after this
+        // one and holds it for the person while the setting is off.
+        "HOBBES_TAB_LIST" | "HOBBES_TAB_READ" => ScopeVerdict::Allow,
         _ => agent_time_scope(tool, args).0,
     }
 }

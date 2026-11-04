@@ -3421,3 +3421,36 @@ fn relay_tools_are_offered_only_on_a_link() {
     assert!(names(&session, DispatchRelayMode::Report).is_empty());
     assert_eq!(names(&session, DispatchRelayMode::TwoWay), vec!["HOBBES_MESSAGE_WORKER"]);
 }
+
+/// The tab tools ride only on the live Hobbes session; the setting reaches
+/// the model as a live key, never through the cached system prefix or the
+/// tool definitions.
+#[test]
+fn tab_tools_are_offered_only_in_the_hobbes_session_and_the_setting_stays_out_of_the_prefix() {
+    let tab_names = |r: &super::system_context::SystemContextResult| -> Vec<String> {
+        r.tools.iter().map(|t| t.name.clone()).filter(|n| crate::hobbes_tabs::is_tab_tool(n)).collect()
+    };
+    let session = create_test_session();
+    let off = Settings::default();
+    let on = Settings { hobbes_read_tabs: true, ..Settings::default() };
+    // An ordinary chat: neither tool, no note.
+    let plain = PromptBuilder::new(&session, &on).build_system_context();
+    assert!(tab_names(&plain).is_empty());
+    assert!(!plain.volatile.contains_key("other_tabs"));
+
+    crate::system_sessions::register(&session.id);
+    let asks = PromptBuilder::new(&session, &off).build_system_context();
+    let free = PromptBuilder::new(&session, &on).build_system_context();
+    assert_eq!(tab_names(&asks), vec!["HOBBES_TAB_LIST", "HOBBES_TAB_READ"]);
+    assert_eq!(tab_names(&free), tab_names(&asks));
+    // Same prefix and tool definitions either way ...
+    assert_eq!(asks.system, free.system);
+    let defs = |r: &super::system_context::SystemContextResult| {
+        r.tools.iter().filter(|t| crate::hobbes_tabs::is_tab_tool(&t.name)).map(|t| format!("{t:?}")).collect::<Vec<_>>()
+    };
+    assert_eq!(defs(&asks), defs(&free));
+    // ... and the live note says whether it asks.
+    assert!(asks.volatile["other_tabs"].as_str().unwrap().contains("asks the user first"));
+    assert!(!free.volatile["other_tabs"].as_str().unwrap().contains("asks the user first"));
+    assert!(!asks.system.contains("other_tabs"));
+}

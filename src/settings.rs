@@ -590,6 +590,13 @@ pub struct Settings {
     /// also applies the availability gate.
     #[serde(default)]
     pub heartbeat_enabled: bool,
+    /// The Hobbes tab may list and read the person's other conversations
+    /// (`HOBBES_TAB_LIST` / `HOBBES_TAB_READ`, `hobbes_tabs`). Off by
+    /// default: the tools are still offered there, but every call is held
+    /// for the person's approval ("always" on that prompt turns this on).
+    /// Read live at every call, so turning it off revokes at once.
+    #[serde(default)]
+    pub hobbes_read_tabs: bool,
     /// Voice: a realtime speech layer that orchestrates through the harness.
     #[serde(default)]
     pub voice: VoiceSettings,
@@ -1276,6 +1283,7 @@ impl Default for Settings {
             dispatch_relay_mode: DispatchRelayMode::default(),
             terminal_enabled: false,
             heartbeat_enabled: false,
+            hobbes_read_tabs: false,
             voice: VoiceSettings::default(),
             heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
             heartbeat_daily_usd: default_heartbeat_daily_usd(),

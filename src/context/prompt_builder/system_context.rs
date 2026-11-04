@@ -182,6 +182,19 @@ impl<'a> PromptBuilder<'a> {
                     .map(|tool| ToolDefinition::from_mcp(tool, crate::mcp::manager::HOBBES_CORE_SERVER)),
             );
         }
+        // The Hobbes tab reading other conversations (hobbes_tabs): offered
+        // only to the live Hobbes session, whatever the setting says (with it
+        // off, each call asks the person). Fixed definitions, so the cached
+        // tool prefix never changes with the setting.
+        tools.retain(|t: &ToolDefinition| !crate::hobbes_tabs::is_tab_tool(&t.name));
+        let tab_tools_offered = crate::hobbes_tabs::tab_tools_offered(&self.session.id);
+        if tab_tools_offered {
+            tools.extend(
+                crate::mcp::core_client::CoreClient::tab_tools()
+                    .iter()
+                    .map(|tool| ToolDefinition::from_mcp(tool, crate::mcp::manager::HOBBES_CORE_SERVER)),
+            );
+        }
         let mut tools = sort_and_dedupe_tools(tools);
         // HOBBES_DISPATCH names the models the user allows for a chat worker.
         // Derived from settings only (sorted), so the cached prefix holds.
@@ -380,6 +393,16 @@ impl<'a> PromptBuilder<'a> {
             system_context_map.insert(
                 "handoff_guidance".to_string(),
                 json!(HANDOFF_GUIDANCE_NOTE),
+            );
+        }
+
+        // Whether the tab tools need the person's approval: a live key (not
+        // in STABLE_CONTEXT_KEYS), so flipping the setting reaches the model
+        // through the context ledger instead of rewriting the cached prefix.
+        if tab_tools_offered {
+            system_context_map.insert(
+                "other_tabs".to_string(),
+                json!(crate::hobbes_tabs::context_note(self.settings.hobbes_read_tabs)),
             );
         }
 

@@ -66,6 +66,8 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_DECISIONS",
     "HOBBES_TIME_GOALS",
     "HOBBES_AGENT_TIME",
+    "HOBBES_TAB_LIST",
+    "HOBBES_TAB_READ",
 ];
 
 #[allow(dead_code)]
@@ -291,9 +293,33 @@ pub fn heartbeat_gate(
     }
 }
 
-/// Both scope gates in order: agent time first, then (when it proceeds) the
-/// Heartbeat's. The one entry point the two tool-call sites use, so neither
-/// can run one gate without the other.
+/// **The tab-read gate** (`hobbes_tabs`): `HOBBES_TAB_LIST` / `_READ` run
+/// only in the live Hobbes session (refused anywhere else), freely while
+/// `Settings::hobbes_read_tabs` is on, and are held for the person's
+/// approval (`ForceApproval`) while it is off — a Heartbeat wake's call
+/// too, so an unattended turn never reads silently. Everything it reads is
+/// harness state (the setting, the session id, `user_approved` from the
+/// resume path), never the model's output. A no-op for every other tool.
+pub fn tab_read_gate(deps: BuiltinToolCtx, tool_call: &ToolCall, session_id: &str, user_approved: bool) -> AgentTimeGate {
+    let read_tabs = deps.settings.peek().hobbes_read_tabs;
+    match crate::hobbes_tabs::tab_gate(
+        &tool_call.tool_name,
+        crate::hobbes_tabs::tab_tools_offered(session_id),
+        read_tabs,
+        user_approved,
+    ) {
+        crate::hobbes_tabs::TabGate::Proceed => AgentTimeGate::Proceed,
+        crate::hobbes_tabs::TabGate::Ask => AgentTimeGate::ForceApproval,
+        crate::hobbes_tabs::TabGate::Refuse(message) => {
+            tracing::info!(session_id, tool = %tool_call.tool_name, "Tab-read gate refused a tool call");
+            AgentTimeGate::Refuse(message)
+        }
+    }
+}
+
+/// All scope gates in order: agent time first, then (when it proceeds) the
+/// Heartbeat's, then the tab-read gate. The one entry point the two
+/// tool-call sites use, so neither can run one gate without the others.
 pub fn scope_gates(
     deps: BuiltinToolCtx,
     tool_call: &ToolCall,
@@ -302,7 +328,10 @@ pub fn scope_gates(
     user_approved: bool,
 ) -> AgentTimeGate {
     match agent_time_gate(deps, tool_call, args_json, session_id, user_approved) {
-        AgentTimeGate::Proceed => heartbeat_gate(tool_call, args_json, session_id, user_approved),
+        AgentTimeGate::Proceed => match heartbeat_gate(tool_call, args_json, session_id, user_approved) {
+            AgentTimeGate::Proceed => tab_read_gate(deps, tool_call, session_id, user_approved),
+            other => other,
+        },
         other => other,
     }
 }
@@ -671,6 +700,15 @@ pub async fn dispatch_builtin_tool(
         "HOBBES_MESSAGE_WORKER" => {
             let (status, response) =
                 crate::todo::relay::handle_message_worker(deps, args_json, session_id);
+            Some(BuiltinOutcome { status, response, persist: true })
+        }
+
+        // The Hobbes tab reading other conversations (hobbes_tabs):
+        // read-only; the gate is re-checked inside. Persisted: a read
+        // carries the tab's company sources into this session.
+        "HOBBES_TAB_LIST" | "HOBBES_TAB_READ" => {
+            let (status, response) =
+                crate::hobbes_tabs::dispatch(deps, &tool_call.tool_name, args_json, session_id, user_approved).await;
             Some(BuiltinOutcome { status, response, persist: true })
         }
 
@@ -1336,6 +1374,123 @@ mod tests {
         crate::test_support::rebuild_or_fail(&mut dom);
     }
 
+    // ── The Hobbes tab reading other tabs (hobbes_tabs) ──
+
+    fn read_tabs_settings(on: bool) -> Settings {
+        let mut settings = Settings { hobbes_read_tabs: on, ..Default::default() };
+        for (id, name) in [("cm", "Clearmirror"), ("pg", "Puget")] {
+            settings.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        settings.active_composio_profile = Some("cm".into());
+        settings
+    }
+
+    /// The setting gate on both tool-call paths (stream: `user_approved`
+    /// false; approval resume: true), for typed and unattended turns, the
+    /// "always" switch, revoking, and refusal outside the Hobbes tab; then
+    /// dispatch end to end, which re-checks the gate and carries the read
+    /// tab's companies into the Hobbes session.
+    #[test]
+    fn tab_reads_follow_the_setting_on_both_paths_and_only_in_hobbes() {
+        use crate::session::TurnOrigin;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut dom = VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                read_tabs_settings(false),
+            );
+            let (hobbes, puget, other) = {
+                let mut state = ctx.session_state.clone();
+                let mut state = state.write();
+                let hobbes = state.create_session_raw(Some("cm".into()));
+                let puget = state.create_session_raw(Some("pg".into()));
+                let other = state.create_session_raw(None);
+                let mut m = crate::voice::session::transcript_message(true, "PUGET-SECRET plan");
+                m.author = "User".into();
+                state.sessions.get_mut(&puget).unwrap().messages.push(m);
+                (hobbes, puget, other)
+            };
+            crate::system_sessions::register(&hobbes);
+            let args = serde_json::json!({ "session_id": puget });
+            let stamped = |tool: &str, origin: TurnOrigin| {
+                let mut tc = ToolCall::new("hobbes-core".into(), tool.into(), args.clone(), None, None);
+                stamp_turn_origin(&mut tc, origin);
+                tc
+            };
+            let gate = |tool: &str, origin: TurnOrigin, sid: &str, approved: bool| {
+                scope_gates(ctx, &stamped(tool, origin), &args, sid, approved)
+            };
+            for tool in [crate::hobbes_tabs::TAB_LIST, crate::hobbes_tabs::TAB_READ] {
+                for origin in [TurnOrigin::User, TurnOrigin::Heartbeat] {
+                    // Off: held for the person on the stream path (an
+                    // unattended turn too: never a silent read) ...
+                    assert_eq!(gate(tool, origin, &hobbes, false), AgentTimeGate::ForceApproval, "{tool} {origin:?}");
+                    // ... and runs once approved (allow once, resume path).
+                    assert_eq!(gate(tool, origin, &hobbes, true), AgentTimeGate::Proceed, "{tool} {origin:?}");
+                    // Never outside the Hobbes tab, approved or not.
+                    assert!(matches!(gate(tool, origin, &other, false), AgentTimeGate::Refuse(_)));
+                    assert!(matches!(gate(tool, origin, &other, true), AgentTimeGate::Refuse(_)));
+                }
+            }
+            // Not held by anything else: no always-ask, no skill approval.
+            assert!(!builtin_needs_approval(ctx, &stamped(crate::hobbes_tabs::TAB_READ, TurnOrigin::User), &args, &hobbes));
+
+            let handle = tokio::runtime::Handle::current();
+            let run = |tc: &ToolCall, sid: &str, approved: bool| {
+                handle.block_on(dispatch_builtin_tool(ctx, tc, &args, sid, None, approved)).expect("a built-in")
+            };
+            let read = stamped(crate::hobbes_tabs::TAB_READ, TurnOrigin::User);
+            // Dispatch re-checks: unapproved with the setting off reads nothing.
+            let out = run(&read, &hobbes, false);
+            assert_eq!(out.status, ToolCallStatus::Error);
+            assert!(!out.response.contains("PUGET-SECRET"));
+            assert!(ctx.session_state.peek().sessions[&hobbes].carried_reads.is_empty());
+            // Outside the Hobbes tab: refused even "approved".
+            let out = run(&read, &other, true);
+            assert_eq!(out.status, ToolCallStatus::Error);
+            assert_eq!(out.response, crate::hobbes_tabs::NOT_HOBBES_REFUSAL);
+            // Allow once: reads, and the Puget tab's company is now in play.
+            let out = run(&read, &hobbes, true);
+            assert_eq!(out.status, ToolCallStatus::Completed, "{}", out.response);
+            assert!(out.response.contains("PUGET-SECRET"));
+            assert!(out.persist);
+            let carried: Vec<String> =
+                ctx.session_state.peek().sessions[&hobbes].carried_reads.iter().map(|r| r.profile_id.clone()).collect();
+            assert_eq!(carried, ["pg"]);
+            // Reading the Hobbes tab itself is refused.
+            let own = serde_json::json!({ "session_id": hobbes });
+            let out = handle.block_on(dispatch_builtin_tool(ctx, &read, &own, &hobbes, None, true)).unwrap();
+            assert_eq!(out.status, ToolCallStatus::Error);
+            // The listing never includes the Hobbes tab, and carries nothing.
+            let list = stamped(crate::hobbes_tabs::TAB_LIST, TurnOrigin::User);
+            let out = handle.block_on(dispatch_builtin_tool(ctx, &list, &serde_json::json!({}), &hobbes, None, true)).unwrap();
+            assert_eq!(out.status, ToolCallStatus::Completed, "{}", out.response);
+            assert!(out.response.contains(&puget) && out.response.contains(&other));
+            assert!(!out.response.contains(&hobbes));
+            assert!(!out.response.contains("PUGET-SECRET"));
+
+            // "Always" turns the setting on: both paths and both origins run.
+            assert!(crate::hobbes_tabs::allow_always(&mut ctx.settings.clone().write()));
+            for origin in [TurnOrigin::User, TurnOrigin::Heartbeat] {
+                assert_eq!(gate(crate::hobbes_tabs::TAB_READ, origin, &hobbes, false), AgentTimeGate::Proceed);
+                assert_eq!(gate(crate::hobbes_tabs::TAB_READ, origin, &hobbes, true), AgentTimeGate::Proceed);
+                assert!(matches!(gate(crate::hobbes_tabs::TAB_READ, origin, &other, false), AgentTimeGate::Refuse(_)));
+            }
+            assert_eq!(run(&read, &hobbes, false).status, ToolCallStatus::Completed);
+            // Revoked in Settings: the next call asks again.
+            ctx.settings.clone().write().hobbes_read_tabs = false;
+            assert_eq!(gate(crate::hobbes_tabs::TAB_READ, TurnOrigin::Heartbeat, &hobbes, false), AgentTimeGate::ForceApproval);
+            assert_eq!(run(&read, &hobbes, false).status, ToolCallStatus::Error);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
     #[test]
     fn unload_removes_only_the_named_skill() {
         let mut state = SessionState::default();
@@ -1373,7 +1528,8 @@ mod tests {
     #[test]
     fn every_core_client_tool_is_dispatchable() {
         let relay = crate::mcp::core_client::CoreClient::relay_tools();
-        for tool in crate::mcp::core_client::CoreClient::new().list_tools().into_iter().chain(relay) {
+        let tabs = crate::mcp::core_client::CoreClient::tab_tools();
+        for tool in crate::mcp::core_client::CoreClient::new().list_tools().into_iter().chain(relay).chain(tabs) {
             assert!(
                 is_builtin_tool(&tool.name),
                 "CoreClient advertises '{}' but BUILTIN_TOOLS does not list it — \
