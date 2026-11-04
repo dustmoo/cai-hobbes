@@ -15,6 +15,9 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let settings = use_context::<Signal<Settings>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
+    // The Hobbes tab (and its archives) draw their fixed icon, never the
+    // stored emoji, same as the tab strip and sidebar.
+    let hobbes_id = crate::components::hobbes_icon::use_hobbes_session_id();
 
     // Pagination and Filtering State
     let mut filter_query = use_signal(String::new);
@@ -165,6 +168,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                         let session_id = session.id.clone();
                         let session_name = session.display_title();
                         let session_emoji = session.display_emoji().map(str::to_string);
+                        let is_system = crate::components::hobbes_icon::is_system_tab(hobbes_id, &session.id);
                         let session_summary = session.summary.clone();
                         let session_date = format_session_date(&session.last_updated);
 
@@ -191,7 +195,15 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                     // chats that have no emoji yet.
                                     span {
                                         class: "w-5 shrink-0 text-center text-[13px] leading-5",
-                                        if let Some(e) = &session_emoji { "{e}" }
+                                        if is_system {
+                                            span {
+                                                class: "inline-flex h-5 items-center justify-center",
+                                                crate::components::hobbes_icon::SystemTabIcon {
+                                                    session_id: session_id.clone(),
+                                                    emoji: session_emoji.clone(),
+                                                }
+                                            }
+                                        } else if let Some(e) = &session_emoji { "{e}" }
                                     }
                                     div {
                                         class: "min-w-0 flex-1",
