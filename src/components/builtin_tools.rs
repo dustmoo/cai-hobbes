@@ -264,6 +264,9 @@ pub fn effective_origin(tool_call: &ToolCall, session_id: &str) -> crate::sessio
 /// the call carried: the origin is the harness's to say, never the model's.
 pub fn stamp_turn_origin(tool_call: &mut ToolCall, origin: crate::session::TurnOrigin) {
     tool_call.origin = Some(origin);
+    // Like the origin, a tab read's sources are the harness's to stamp
+    // (`hobbes_tabs::stamp_read_sources`), never carried in from a mint.
+    tool_call.read_sources.clear();
 }
 
 /// **The Heartbeat scope gate**, run by BOTH tool-call sites right after
@@ -708,7 +711,15 @@ pub async fn dispatch_builtin_tool(
         // carries the tab's company sources into this session.
         "HOBBES_TAB_LIST" | "HOBBES_TAB_READ" => {
             let (status, response) =
-                crate::hobbes_tabs::dispatch(deps, &tool_call.tool_name, args_json, session_id, user_approved).await;
+                crate::hobbes_tabs::dispatch(
+                deps,
+                &tool_call.tool_name,
+                args_json,
+                session_id,
+                &tool_call.execution_id,
+                user_approved,
+            )
+            .await;
             Some(BuiltinOutcome { status, response, persist: true })
         }
 
@@ -1445,11 +1456,29 @@ mod tests {
                 handle.block_on(dispatch_builtin_tool(ctx, tc, &args, sid, None, approved)).expect("a built-in")
             };
             let read = stamped(crate::hobbes_tabs::TAB_READ, TurnOrigin::User);
+            // The call's message, as the stream path stores it.
+            {
+                let mut m = crate::voice::session::transcript_message(false, "x");
+                m.content = crate::components::shared::MessageContent::ToolCall(read.clone());
+                ctx.session_state.clone().write().sessions.get_mut(&hobbes).unwrap().messages.push(m);
+            }
+            let stamped_sources = || {
+                ctx.session_state.peek().sessions[&hobbes]
+                    .messages
+                    .iter()
+                    .find_map(|m| match &m.content {
+                        crate::components::shared::MessageContent::ToolCall(tc) if tc.execution_id == read.execution_id => {
+                            Some(tc.read_sources.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
             // Dispatch re-checks: unapproved with the setting off reads nothing.
             let out = run(&read, &hobbes, false);
             assert_eq!(out.status, ToolCallStatus::Error);
             assert!(!out.response.contains("PUGET-SECRET"));
-            assert!(ctx.session_state.peek().sessions[&hobbes].carried_reads.is_empty());
+            assert!(stamped_sources().is_empty());
             // Outside the Hobbes tab: refused even "approved".
             let out = run(&read, &other, true);
             assert_eq!(out.status, ToolCallStatus::Error);
@@ -1459,20 +1488,42 @@ mod tests {
             assert_eq!(out.status, ToolCallStatus::Completed, "{}", out.response);
             assert!(out.response.contains("PUGET-SECRET"));
             assert!(out.persist);
-            let carried: Vec<String> =
-                ctx.session_state.peek().sessions[&hobbes].carried_reads.iter().map(|r| r.profile_id.clone()).collect();
-            assert_eq!(carried, ["pg"]);
+            // Stamped on the read's own call; once the call site marks it
+            // done, the hold counts it for as long as the message stays.
+            assert_eq!(stamped_sources(), ["pg"]);
+            {
+                let mut state = ctx.session_state.clone();
+                let mut state = state.write();
+                for m in &mut state.sessions.get_mut(&hobbes).unwrap().messages {
+                    if let crate::components::shared::MessageContent::ToolCall(tc) = &mut m.content {
+                        tc.status = ToolCallStatus::Completed;
+                    }
+                }
+            }
+            let later = chrono::Utc::now() + chrono::Duration::days(1);
+            let settings = ctx.settings.peek().clone();
+            assert!(crate::mcp::manager::profile_reach::session_read_profiles(
+                &settings,
+                &ctx.session_state.peek().sessions[&hobbes],
+                later
+            )
+            .contains("pg"));
+            assert!(ctx.session_state.peek().sessions[&hobbes].carried_reads.is_empty());
             // Reading the Hobbes tab itself is refused.
             let own = serde_json::json!({ "session_id": hobbes });
             let out = handle.block_on(dispatch_builtin_tool(ctx, &read, &own, &hobbes, None, true)).unwrap();
             assert_eq!(out.status, ToolCallStatus::Error);
-            // The listing never includes the Hobbes tab, and carries nothing.
+            // The listing never includes the Hobbes tab or message text; its
+            // titles carry the other company's home for the read window.
             let list = stamped(crate::hobbes_tabs::TAB_LIST, TurnOrigin::User);
             let out = handle.block_on(dispatch_builtin_tool(ctx, &list, &serde_json::json!({}), &hobbes, None, true)).unwrap();
             assert_eq!(out.status, ToolCallStatus::Completed, "{}", out.response);
             assert!(out.response.contains(&puget) && out.response.contains(&other));
             assert!(!out.response.contains(&hobbes));
             assert!(!out.response.contains("PUGET-SECRET"));
+            let carried: Vec<String> =
+                ctx.session_state.peek().sessions[&hobbes].carried_reads.iter().map(|r| r.profile_id.clone()).collect();
+            assert_eq!(carried, ["pg"]);
 
             // "Always" turns the setting on: both paths and both origins run.
             assert!(crate::hobbes_tabs::allow_always(&mut ctx.settings.clone().write()));

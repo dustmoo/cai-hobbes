@@ -99,6 +99,7 @@ mod tests {
                     cancelled: None,
                     hold_reason: None,
                     hold_rule_key: None,
+                    read_sources: Vec::new(),
                     origin: None,
                 },
                 result: ToolResult {
@@ -184,6 +185,7 @@ mod tests {
                 cancelled: None,
                 hold_reason: None,
                 hold_rule_key: None,
+                read_sources: Vec::new(),
                 origin: None,
             },
             result: ToolResult {

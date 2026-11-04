@@ -1068,7 +1068,7 @@ impl TabRow {
     /// Mirrors `Session::display_title` for a non-hydrated row.
     pub fn display_title(&self) -> String {
         match (&self.tab_title, self.name_user_set) {
-            (Some(t), false) if !t.trim().is_empty() => t.clone(),
+            (Some(t), false) => t.clone(),
             _ => self.name.clone(),
         }
     }
@@ -1076,8 +1076,11 @@ impl TabRow {
 
 /// Newest-first conversation rows, skipping `exclude` (the Hobbes lineage
 /// and the hydrated sessions the caller lists from memory). `query`
-/// matches name, summary and message text like History search; `project_id`
-/// filters on the indexed column.
+/// matches the name and the AI title only; `project_id` filters on the
+/// indexed column. The selected `json_extract`s run only for the rows
+/// returned (the `last_updated` index walk stops at `LIMIT`); a query adds
+/// one per row whose name doesn't match, the same full scan History search
+/// already does over `search_text`.
 pub fn tab_rows(query: Option<&str>, project_id: Option<&str>, exclude: &[String], limit: i64) -> Vec<TabRow> {
     with_conn(|conn| tab_rows_conn(conn, query, project_id, exclude, limit)).unwrap_or_else(|e| {
         tracing::error!("tab_rows failed: {e}");
@@ -1098,9 +1101,12 @@ pub(crate) fn tab_rows_conn(
         let escaped = q.to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
         values.push(format!("%{escaped}%").into());
         let n = values.len();
+        // Name and title only (`hobbes_tabs::session_matches`): a listing
+        // must not search content. `OR` short-circuits, so the title is
+        // pulled out of the blob only for rows whose name didn't match.
         clauses.push(format!(
-            "(name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE OR summary LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
-             OR search_text LIKE ?{n} ESCAPE '\\')"
+            "(name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+             OR json_extract(data, '$.tab_title') LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)"
         ));
     }
     if let Some(p) = project_id {
@@ -1143,14 +1149,19 @@ pub(crate) fn tab_rows_conn(
 /// fingerprint recorded, no cut-off call ended or journalled. The result
 /// must never be put into `SessionState`.
 pub fn peek_session(id: &str) -> Option<Session> {
-    with_conn(|conn| peek_session_conn(conn, id)).ok().flatten()
+    // Only the fetch holds the connection lock; the parse runs after.
+    let data = with_conn(|conn| peek_data_conn(conn, id)).ok().flatten()?;
+    parse_session(id, &data)
 }
 
-pub(crate) fn peek_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
+fn peek_data_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
     use rusqlite::OptionalExtension;
-    let data: Option<String> =
-        conn.query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
-    Ok(data.and_then(|d| parse_session(id, &d)))
+    conn.query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).optional()
+}
+
+#[cfg(test)]
+pub(crate) fn peek_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
+    Ok(peek_data_conn(conn, id)?.and_then(|d| parse_session(id, &d)))
 }
 
 pub fn session_count() -> i64 {

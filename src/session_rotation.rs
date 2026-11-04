@@ -416,6 +416,9 @@ pub fn prepare(
     carry.apply(&mut successor);
     successor.scheduled_timers = moved.clone();
     successor.carried_reads = carried_reads(old, settings, now);
+    // The carried summary may hold other conversations Hobbes read: those
+    // count with no clock (`profile_reach::system_summary_sources`).
+    successor.summary_sources = crate::mcp::manager::profile_reach::system_summary_sources(old);
     // Stamped at the old session's last turn, not now: the turn briefing
     // measures "since your last turn here" from the newest non-User message,
     // so the successor's first briefing still reports the gap before the
@@ -450,7 +453,18 @@ pub fn prepare(
         successor_events.push(SessionEvent::ComposioProfileSet { profile: carry.composio_profile.clone() });
     }
     successor_events.push(SessionEvent::SessionRenamed { name: carry.name.clone() });
-    successor_events.extend(carry.events());
+    successor_events.extend(carry.events().into_iter().map(|e| match e {
+        // Replay must keep the carried summary's sources too.
+        SessionEvent::SummaryComputed { .. } if !successor.summary_sources.is_empty() => SessionEvent::SummaryComputed {
+            summary: crate::session::summary_payload(&carry.conversation_summary, &successor.summary_sources),
+        },
+        other => other,
+    }));
+    if carry.conversation_summary == ConversationSummary::default() && !successor.summary_sources.is_empty() {
+        successor_events.push(SessionEvent::SummaryComputed {
+            summary: crate::session::summary_payload(&carry.conversation_summary, &successor.summary_sources),
+        });
+    }
     successor_events.extend(moved.into_iter().map(|timer| SessionEvent::TimerCreated { timer }));
     if !successor.carried_reads.is_empty() {
         successor_events.push(SessionEvent::ReadsCarried { reads: successor.carried_reads.clone() });

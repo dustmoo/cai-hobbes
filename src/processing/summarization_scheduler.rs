@@ -67,7 +67,7 @@ pub fn use_summarization_scheduler() {
                         // while its summary is being written.
                         let _summarizing = crate::session_rotation::summarizing(&active_session.id);
 
-                        let generated_from = crate::mcp::manager::profile_reach::summary_sources(&active_session);
+                        let generated_from = crate::mcp::manager::profile_reach::durable_summary_sources(&active_session);
                         let processor_guard = processor.read();
                         if let Some(summary) = processor_guard
                             .generate_summary(&active_session, &settings_guard)
@@ -144,7 +144,7 @@ pub fn use_summarization_scheduler() {
                         {
                             tracing::info!("Inactivity detected. Summarizing conversation.");
                             let _summarizing = crate::session_rotation::summarizing(&active_session.id);
-                            let generated_from = crate::mcp::manager::profile_reach::summary_sources(&active_session);
+                            let generated_from = crate::mcp::manager::profile_reach::durable_summary_sources(&active_session);
                             let processor_guard = processor.read();
                             if let Some(summary) = processor_guard
                                 .generate_summary(&active_session, &settings_guard)

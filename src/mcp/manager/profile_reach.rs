@@ -210,6 +210,7 @@ pub fn flow_checked(reach: &[ReachProfile], read_from: &BTreeSet<String>) -> boo
 pub fn summary_sources(session: &crate::session::Session) -> Vec<String> {
     let mut out: BTreeSet<String> =
         session.summary_sources.iter().cloned().collect();
+    out.extend(tab_read_sources(&session.messages));
     for m in &session.messages {
         if let MessageContent::ToolCall(tc) = &m.content {
             if tc.status == ToolCallStatus::Completed && is_composio_native(&tc.server_name) {
@@ -217,6 +218,43 @@ pub fn summary_sources(session: &crate::session::Session) -> Vec<String> {
             }
         }
     }
+    out.into_iter().collect()
+}
+
+/// The profiles the completed `HOBBES_TAB_READ` calls in `messages` brought
+/// in (`ToolCall::read_sources`, harness-stamped). Unlike an ordinary
+/// Composio read in a system session, a tab read counts with no clock for
+/// as long as its message is in the session: it is a deliberate import of
+/// another conversation, kept verbatim in history.
+pub fn tab_read_sources(messages: &[Message]) -> BTreeSet<String> {
+    messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            MessageContent::ToolCall(tc) if tc.status == ToolCallStatus::Completed => Some(tc.read_sources.iter().cloned()),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+/// What a session's summary keeps holding after its messages are gone:
+/// for an ordinary tab, [`summary_sources`]; for a system session, only its
+/// stored summary sources and its tab reads ([`tab_read_sources`]) — its
+/// ordinary Composio reads keep the [`READ_WINDOW`] clock. Fed into
+/// `adopt_summary` and carried through rotation.
+pub fn durable_summary_sources(session: &crate::session::Session) -> Vec<String> {
+    if !crate::system_sessions::is_system(&session.id) {
+        return summary_sources(session);
+    }
+    system_summary_sources(session)
+}
+
+/// [`durable_summary_sources`] for a system session: its stored summary
+/// sources and its tab reads, never its clocked Composio reads. Rotation
+/// uses it directly (only system sessions rotate).
+pub fn system_summary_sources(session: &crate::session::Session) -> Vec<String> {
+    let mut out: BTreeSet<String> = session.summary_sources.iter().cloned().collect();
+    out.extend(tab_read_sources(&session.messages));
     out.into_iter().collect()
 }
 
@@ -579,7 +617,11 @@ pub fn session_recent_reads(
 ///   [`READ_WINDOW`] of `now` — across messages, since read data stays in
 ///   the model's context — plus reads a rotated session carried over from
 ///   the session it replaced (`Session::carried_reads`; the data may be in
-///   the carried summary).
+///   the carried summary). Other conversations read with `HOBBES_TAB_READ`
+///   count with no clock while their message stays
+///   ([`tab_read_sources`]), and so does the summary that kept them
+///   (`Session::summary_sources`, which for a system session holds only
+///   tab-read sources, [`durable_summary_sources`]).
 /// - **Ordinary tabs**: no clock. A tab keeps its history in context for
 ///   days, so every Composio result still in its messages counts, and so
 ///   does every profile its conversation summary holds data from
@@ -615,6 +657,16 @@ pub fn session_read_profiles(
             .filter(|r| now - r.read_at <= READ_WINDOW)
             .map(|r| r.profile_id.clone()),
     );
+    // Other conversations read in (no clock while the message stays), and
+    // what the summary kept of them.
+    out.extend(tab_read_sources(&session.messages));
+    out.extend(session.summary_sources.iter().map(|s| {
+        if s.starts_with(COMPOSIO_NATIVE_PREFIX) {
+            profile_for_server_name(settings, s).map(str::to_string).unwrap_or_else(|| s.clone())
+        } else {
+            s.clone()
+        }
+    }));
     out
 }
 

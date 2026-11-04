@@ -199,6 +199,14 @@ pub struct ToolCall {
     /// `builtin_tools::effective_origin`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<crate::session::TurnOrigin>,
+    /// The Composio profiles whose data a completed `HOBBES_TAB_READ`
+    /// brought into this session (`hobbes_tabs::read_sources`), stamped by
+    /// the harness when the read runs (cleared at mint, so the model can't
+    /// set it). The cross-company hold counts them for as long as this
+    /// message stays in the session, and its summary keeps them
+    /// (`profile_reach::tab_read_sources`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_sources: Vec<String>,
 }
 
 /// Stop reason for a call cut off by the user's Stop.
@@ -279,6 +287,7 @@ impl ToolCall {
             cancelled: None,
             hold_reason: None,
             hold_rule_key: None,
+            read_sources: Vec::new(),
             origin: None,
         }
     }

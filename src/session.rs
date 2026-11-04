@@ -197,7 +197,7 @@ pub const SUMMARY_SOURCES_KEY: &str = "source_profiles";
 /// and the tab identity to journal as `TabTitled`. Every site that computes
 /// a summary goes through here.
 ///
-/// `generated_from` is `profile_reach::summary_sources` of the snapshot the
+/// `generated_from` is `profile_reach::durable_summary_sources` of the snapshot the
 /// summary was written from, taken before the LLM call: an undo while it
 /// was in flight removes reads from the live session, but not from the
 /// summary that comes back, so the sources are the union of both.
@@ -207,7 +207,7 @@ pub fn adopt_summary(
     generated_from: &[String],
 ) -> (Value, Option<TabIdentity>) {
     let mut sources: std::collections::BTreeSet<String> =
-        crate::mcp::manager::profile_reach::summary_sources(session).into_iter().collect();
+        crate::mcp::manager::profile_reach::durable_summary_sources(session).into_iter().collect();
     sources.extend(generated_from.iter().cloned());
     session.summary_sources = sources.into_iter().collect();
     let titled = apply_tab_identity_from_summary(session, &summary);
@@ -3389,6 +3389,7 @@ mod tests {
                         cancelled: None,
                         hold_reason: None,
                         hold_rule_key: None,
+                        read_sources: Vec::new(),
                         origin: None,
                     }),
                     attachments: vec![],
@@ -3419,6 +3420,7 @@ mod tests {
                         cancelled: None,
                         hold_reason: None,
                         hold_rule_key: None,
+                        read_sources: Vec::new(),
                         origin: None,
                     }),
                     attachments: vec![],

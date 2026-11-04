@@ -380,6 +380,7 @@ fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<Strin
             cancelled: None,
             hold_reason: None,
             hold_rule_key: None,
+            read_sources: Vec::new(),
             origin: None,
         }),
         attachments: vec![],
