@@ -242,7 +242,7 @@ pub fn insert_between_turns(messages: &mut Vec<Message>, lines: Vec<Message>, ta
     inserted
 }
 
-/// Write `lines` into the Voice session at their chronological positions,
+/// Write `lines` into the Hobbes session at their chronological positions,
 /// journal them (so a rewind's replay keeps them) and persist.
 pub fn write_lines(mut session_state: Signal<SessionState>, session_id: &str, lines: Vec<PendingLine>) {
     let lines: Vec<Message> = lines

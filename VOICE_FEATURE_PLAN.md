@@ -49,9 +49,9 @@ listens. Each has its own session, and each can see the other.
    Harness: dispatch_builtin_tool + scope_gates            │                     │
      • VOICE_ASK_BRAIN(question)  → async turn on the global connector           │
      • fleet / planner reads, approve/deny gates, timers, dispatch               │
-     • VOICE_PEER_READ / message the Heartbeat session                           │
+     • the Hobbes tab: one timeline with typed turns and Heartbeat wakes        │
             ▲                                                                    │
-   Heartbeat: perception → salience → while Voice is live, wake-now = speak ─────┘
+   Heartbeat: perception → salience → wake in the Hobbes tab → news is spoken ──┘
 ```
 
 ### 2.1 Two tiers
@@ -60,7 +60,7 @@ listens. Each has its own session, and each can see the other.
   can answer ("what's blocked?"), confirms, and asks clarifying questions. It
   never runs long chains of tools itself.
 - **Brain tier (global connector).** Claude, Gemini, or whatever `active_connector_id`
-  points at. It runs a normal StreamManager turn in the Voice session, with the
+  points at. It runs a normal StreamManager turn in the Hobbes session, with the
   full prompt builder, MCP tools, skills and trust rules. It is invoked through
   `VOICE_ASK_BRAIN`.
 
@@ -79,7 +79,7 @@ assumption.
 
 ### 2.3 Where the brain's turns live
 
-The Voice session is a real `Session`. It records:
+The Hobbes session is a real `Session`. It records:
 - your utterances (the realtime model's input transcription) as user messages;
 - the voice's spoken replies (output transcription) as assistant messages,
   marked as voice;
@@ -90,29 +90,20 @@ far when it is asked something, because it is a normal turn in that session.
 
 ---
 
-## 3. The Voice session and its link to the Heartbeat
+## 3. The Hobbes tab (was: the Voice session and its link to the Heartbeat)
 
-- A dedicated session titled **"Voice"**, created on first use, like the
-  Heartbeat's (`SESSION_TITLE` / `SESSION_EMOJI` in `src/heartbeat/runtime.rs:34-37`).
-- **Icon: a polished-steel mouth.** A `MetalMouth` component next to `MetalHeart`
-  (`src/components/metal_heart.rs`): same gradient and highlight treatment, a lips
-  path. Drawn in the tab bar (`tab_bar.rs:293`) and the tab sidebar
-  (`tab_sidebar.rs:295, :576`) in place of the session emoji, through a
-  `use_voice_session_id()` memo mirroring `use_heartbeat_session_id()`.
-- **Mutual access.** Generalise the dispatch relay (`src/todo/relay.rs`) from
-  parent ↔ worker to a fixed **peer link** between Voice and Heartbeat, reusing
-  its visible relay messages, journaling, rate limits and no-ping-pong hop guard.
-  - Voice → Heartbeat: "watch this", "remind me when CI goes green", notes and
-    commitments made in conversation.
-  - Heartbeat → Voice: while a voice conversation is live, a salience `WakeNow`
-    becomes a relay into Voice, which speaks it ("the trust-dispatch session is
-    blocked on a permission"). When Voice is not live, nothing changes: the
-    Heartbeat wakes its own session as today.
-  - Read access: `HOBBES_PEER_READ` returns the other session's recent tail and,
-    for the Heartbeat, its briefing and ledger tail (`heartbeat/briefing.rs`,
-    `ledger.rs`). This is read-only and bounded.
-- **Seeding.** A new voice conversation starts with the Heartbeat's current
-  briefing, so it already knows the state of the world when you start talking.
+**Superseded.** The separate Voice and Heartbeat sessions, the peer link and
+`HOBBES_PEER_READ` were built and then replaced: voice and the Heartbeat are
+now capabilities of one permanent **Hobbes** tab (`src/hobbes_session.rs`).
+Voice transcripts, brain turns, typed messages and Heartbeat wakes share its
+one timeline, so there is no peer to read. Trust follows the turn
+(`Session::turn_origin`, stamped on each tool call): a wake's turn gets the
+Heartbeat's strict rules, a voice or typed turn the normal ones. A wake that
+finds something is spoken through the same announce path as returned results
+("Excuse me…"). A voice conversation starts with the end of the Hobbes tab as
+context. The tab shows the app icon with metal heart / lips badges. The
+pre-merge Voice and Heartbeat sessions became read-only archives on first run.
+See ARCHITECTURE.md, "The Hobbes tab".
 
 ---
 
@@ -179,7 +170,7 @@ pub struct RealtimeSession {
   realtime endpoint.
 - Tool calls from the realtime model go through `dispatch_builtin_tool`
   (`builtin_tools.rs:479`) and `scope_gates` (`builtin_tools.rs:271`), the same
-  path as the Heartbeat session (P-015). No new call-site dispatch.
+  path as every chat turn (P-015). No new call-site dispatch.
 
 ### 5.1 Voice tool surface
 
@@ -192,7 +183,7 @@ The realtime model gets a small, curated set; everything else goes through the b
 | `HOBBES_FLEET_STATUS`, `HOBBES_TODO_LIST`, `HOBBES_PLAN_DAY` (read) | Quick answers without the brain |
 | Gate approve / deny | "Approve that", same trust rules as clicking |
 | `HOBBES_SET_TIMER` / `LIST` / `CANCEL` | Reminders made in conversation |
-| `HOBBES_PEER_READ`, peer relay | Heartbeat access (§3) |
+| (none: the Hobbes tab's own tail) | Heartbeat context (§3) |
 
 ---
 
@@ -238,9 +229,9 @@ The realtime model gets a small, curated set; everything else goes through the b
 
 ## 7. Trust and privacy
 
-- Every voice tool call goes through `scope_gates`, like the Heartbeat session.
+- Every voice tool call goes through `scope_gates`, stamped as the person's turn.
 - Destructive or outward-facing actions confirm by voice ("Send it?") and are
-  logged in the Voice transcript.
+  logged in the Hobbes tab.
 - Heartbeat-triggered speech respects the Heartbeat's wake budget and a
   do-not-disturb toggle.
 - Local-first ends at the first audio byte sent. Settings → Voice states which
@@ -256,11 +247,11 @@ The realtime model gets a small, curated set; everything else goes through the b
    limits and async tool results.
 2. **Foundation.** `ConnectorRoles` + `VoiceProfile` + `voice_connector_id` with
    migration; Settings → Voice; hotkey (tap + hold); the Voice session with
-   `MetalMouth`; transcripts persisted; Pro gate.
+   `MetalMouth` (since merged into the Hobbes tab); transcripts persisted; Pro gate.
 3. **Conversation quality.** Voice Processing IO echo cancellation, so you can
    interrupt on speakers; idle timeouts; the visible-state indicator.
-4. **Heartbeat link.** Generalised peer relay, `HOBBES_PEER_READ`, briefing
-   seed, Heartbeat wake-now → speak while Voice is live.
+4. **Heartbeat link.** Done as the merged Hobbes tab (§3) instead of a peer
+   relay and `HOBBES_PEER_READ`.
 5. **More providers.** OpenAI Realtime; voice picker polish.
 6. **Later.** Windows audio; local STT/TTS offline fallback (Parakeet / Kokoro,
    from the 2026-11-02 research).
@@ -272,8 +263,8 @@ The realtime model gets a small, curated set; everything else goes through the b
 - Gemini Live: non-blocking tool calls and mid-session context injection
   (decides how §2.2 is built); current session caps; pricing per minute with
   tool use.
-- Does the brain's turn in the Voice session need a shorter, voice-shaped reply
+- Does the brain's turn in the Hobbes session need a shorter, voice-shaped reply
   style, or does the voice tier always paraphrase what the brain returns?
 - Should the voice speak brain results verbatim, summarise them, or only say
-  "it's in the Voice tab" for long or code-heavy answers?
-- Peer relay: does the Heartbeat's wake budget also cap relays *into* Voice?
+  "it's in the Hobbes tab" for long or code-heavy answers?
+- (Resolved by the merge: no peer relay.)

@@ -21,7 +21,7 @@
 //! a user message (`deliver_queued_relay`). Progress notes are appended
 //! quietly. A wake never resets the receiver's turn count (max-turns still
 //! apply), never runs while it has a call waiting on approval (the relay is
-//! appended and the next approved turn sees it), and in the Heartbeat session
+//! appended and the next approved turn sees it), and in the Hobbes session
 //! respects the Heartbeat's wake budget.
 //!
 //! **Guards.** [`RELAYS_PER_HOUR`] per link per direction; a turn a relay
