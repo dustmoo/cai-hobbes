@@ -166,7 +166,7 @@ fn answer(
         chat_queue::queue_push(
             &mut chat_queue::CHAT_QUEUE.write(),
             sid,
-            chat_queue::QueuedMessage::new(lanes::answer_message(&entry), vec![]),
+            chat_queue::QueuedMessage::new(lanes::answer_message(&entry), vec![], chat_queue::QueueOrigin::Person),
         );
         chat_queue::request_drain();
     }

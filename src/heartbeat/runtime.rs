@@ -515,7 +515,7 @@ fn fire_wake(
     chat_queue::queue_push(
         &mut chat_queue::CHAT_QUEUE.write(),
         session_id,
-        chat_queue::QueuedMessage::new(text, Vec::new()).with_origin(crate::session::TurnOrigin::Heartbeat),
+        chat_queue::QueuedMessage::new(text, Vec::new(), chat_queue::QueueOrigin::HeartbeatWake),
     );
     chat_queue::request_drain();
     tracing::info!("heartbeat: woke session {session_id}");

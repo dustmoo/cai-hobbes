@@ -117,6 +117,24 @@ pub(crate) fn resumed_turn_origin<'a>(
     }
 }
 
+/// The origin of the turn that raised the session's latest stamped call
+/// (a tool call, a held approval, a skill call): what a continuation with
+/// no calls left to run (an approved skill) continues under. Falls back to
+/// the session's recorded turn when nothing is stamped.
+pub(crate) fn raising_turn_origin(session: &crate::session::Session) -> crate::session::TurnOrigin {
+    use crate::components::shared::MessageContent as C;
+    session
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match &m.content {
+            C::ToolCall(tc) | C::PermissionRequest(tc) => tc.origin,
+            C::SkillCall(sc) | C::SkillPermissionRequest(sc) => sc.origin,
+            _ => None,
+        })
+        .unwrap_or(session.turn_origin)
+}
+
 // The main ChatWindow component
 #[component]
 pub fn ChatWindow(
@@ -482,9 +500,18 @@ pub fn ChatWindow(
                         &crate::agent_time_runtime::LEASED_CHATS.peek(),
                         &owning_id,
                     ) {
+                        // A skill continuation: the turn that raised the
+                        // approved skill keeps its origin (its stamp), not
+                        // whatever the session last ran.
+                        let origin = session_state
+                            .peek()
+                            .sessions
+                            .get(&owning_id)
+                            .map(raising_turn_origin)
+                            .unwrap_or_default();
                         continuation_controller
                             .write()
-                            .trigger_continuation(owning_id.clone());
+                            .trigger_continuation(owning_id.clone(), origin);
                     }
                     return;
                 }
@@ -492,14 +519,12 @@ pub fn ChatWindow(
                 // The resumed calls carry the origin of the turn that raised
                 // them (stamped when minted); the continuation that follows
                 // belongs to that turn too, whatever started in between.
-                {
-                    let resumed = resumed_turn_origin(
-                        tools_to_run.iter().map(|(_, tc)| tc),
-                        &owning_id,
-                    );
-                    if let Some(session) = session_state.write().sessions.get_mut(&owning_id) {
-                        session.turn_origin = resumed;
-                    }
+                let resumed_origin = resumed_turn_origin(
+                    tools_to_run.iter().map(|(_, tc)| tc),
+                    &owning_id,
+                );
+                if let Some(session) = session_state.write().sessions.get_mut(&owning_id) {
+                    session.turn_origin = resumed_origin;
                 }
 
                 // 2. Execute tools
@@ -713,7 +738,7 @@ pub fn ChatWindow(
                 }
                 continuation_controller
                     .write()
-                    .trigger_continuation(owning_id.clone());
+                    .trigger_continuation(owning_id.clone(), resumed_origin);
             });
         }
     });
@@ -723,7 +748,8 @@ pub fn ChatWindow(
         move |prompt_data: crate::llm::LlmPrompt,
               mcp_context: Option<crate::mcp::manager::McpContext>,
               hobbes_message_id: Uuid,
-              session_id: String| {
+              session_id: String,
+              origin: crate::session::TurnOrigin| {
             spawn(async move {
                 tracing::debug!(session_id = %session_id, "Stream lock ACQUIRED.");
 
@@ -755,6 +781,7 @@ pub fn ChatWindow(
                             .get(&session_id)
                             .and_then(|s| s.composio_profile.clone())
                     },
+                    origin,
                 );
 
                 rx.recv().await;
@@ -913,6 +940,7 @@ pub fn ChatWindow(
                                 mcp_context,
                                 hobbes_message_id,
                                 target_id.clone(),
+                                turn_origin,
                             );
                         }
                         return;
@@ -1096,6 +1124,7 @@ pub fn ChatWindow(
                         mcp_context,
                         hobbes_message_id,
                         target_id.clone(),
+                        turn_origin,
                     );
                 }
             });
@@ -1110,7 +1139,7 @@ pub fn ChatWindow(
     };
 
     let continue_prompt_flow = {
-        Rc::new(move |target_id: String| {
+        Rc::new(move |target_id: String, origin: crate::session::TurnOrigin| {
             tracing::debug!(
                 "continue_prompt_flow callback INVOKED for session '{}'",
                 target_id
@@ -1124,6 +1153,8 @@ pub fn ChatWindow(
                 {
                     let mut state = session_state.write();
                     if let Some(session) = state.sessions.get_mut(&target_id) {
+                        // The turn this round continues (carried with it).
+                        session.turn_origin = origin;
                         session.messages.push(Message {
                             id: hobbes_message_id,
                             author: "Hobbes".to_string(),
@@ -1217,6 +1248,7 @@ pub fn ChatWindow(
                     mcp_context,
                     hobbes_message_id,
                     target_id.clone(),
+                    origin,
                 );
             });
         })

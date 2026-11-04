@@ -995,7 +995,7 @@ fn app() -> Element {
                     crate::components::chat_queue::queue_push(
                         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
                         &c.parent_session_id,
-                        crate::components::chat_queue::QueuedMessage::new(text, Vec::new()),
+                        crate::components::chat_queue::QueuedMessage::new(text, Vec::new(), crate::components::chat_queue::QueueOrigin::Unattended),
                     );
                     crate::components::chat_queue::request_drain();
                     // The parent's tab may have been closed while the run was
@@ -2295,6 +2295,7 @@ fn app() -> Element {
                                         crate::components::chat_queue::QueuedMessage::new(
                                             prompt,
                                             Vec::new(),
+                                            crate::components::chat_queue::QueueOrigin::Unattended,
                                         ),
                                     );
                                     chat_command.set(Some(ChatCommand::SwitchToSession(

@@ -135,6 +135,17 @@ pub fn is_voice_request(text: &str) -> bool {
     text.starts_with(crate::voice::session::HEARD_PREFIX) && text.contains("[Voice request, relayed by Hobbes' voice layer")
 }
 
+/// Queue a framed voice request into `session_id` for the drain. The
+/// person asked for it out loud: their turn, under the normal interactive
+/// rules (never the Heartbeat's).
+pub fn queue_request(session_id: &str, framed: &str) -> uuid::Uuid {
+    let msg = chat_queue::QueuedMessage::new(framed.to_string(), Vec::new(), chat_queue::QueueOrigin::Person);
+    let id = msg.id;
+    chat_queue::queue_push(&mut chat_queue::CHAT_QUEUE.write(), session_id, msg);
+    chat_queue::request_drain();
+    id
+}
+
 /// Queue `request` into the Hobbes session and wait for the brain's turn.
 /// Logs the outcome (kind, duration, reply length; never content).
 /// `streaming` reports whether a session is mid-turn. Runs on the Dioxus
@@ -179,13 +190,7 @@ async fn run_inner(
         None => return BrainOutcome::Failed("The Hobbes session isn't loaded.".into()),
     };
     let framed = framed_request(&request);
-    let queued_id = {
-        let msg = chat_queue::QueuedMessage::new(framed.clone(), Vec::new());
-        let id = msg.id;
-        chat_queue::queue_push(&mut chat_queue::CHAT_QUEUE.write(), &session_id, msg);
-        id
-    };
-    chat_queue::request_drain();
+    let queued_id = queue_request(&session_id, &framed);
     tracing::info!("voice: brain request queued");
 
     let started_at = Instant::now();
@@ -261,6 +266,34 @@ const NO_START_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A voice request goes through the real queue and the drain's own
+    /// origin resolution into the Hobbes session as the person's turn —
+    /// never as an unattended (Heartbeat) one.
+    #[test]
+    fn a_voice_request_is_the_person_s_turn_through_the_queue() {
+        use crate::components::chat_queue::{self, CHAT_QUEUE};
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            *crate::hobbes_session::HOBBES_SESSION_ID.write() = Some("brain-hobbes".into());
+            let framed = framed_request("check CI");
+            let id = queue_request("brain-hobbes", &framed);
+            // The drain: pop, resolve the origin, hand it to the send.
+            let qm = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), "brain-hobbes").unwrap();
+            assert_eq!(qm.id, id);
+            let origin = chat_queue::drain_origin(&qm, "brain-hobbes");
+            assert_eq!(origin, TurnOrigin::User);
+            chat_queue::set_pending_origin("brain-hobbes", origin);
+            assert_eq!(chat_queue::take_turn_origin("brain-hobbes"), TurnOrigin::User);
+            // By contrast a fired timer queued into the same session is
+            // unattended there.
+            let timer = chat_queue::QueuedMessage::new("timer".into(), vec![], chat_queue::QueueOrigin::Unattended);
+            assert_eq!(chat_queue::drain_origin(&timer, "brain-hobbes"), TurnOrigin::Heartbeat);
+            assert_eq!(chat_queue::drain_origin(&timer, "an-ordinary-chat"), TurnOrigin::User);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
     use crate::voice::session::transcript_message;
 
     fn text(author: &str, t: &str) -> Message {

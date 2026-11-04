@@ -14,8 +14,11 @@ use std::rc::Rc;
 
 /// A function that can be called to re-trigger the LLM prompt flow.
 /// Accepts the `session_id` of the originating stream so the continuation
-/// always targets the correct tab, regardless of which tab is currently visible.
-pub type ContinuationCallback = Rc<dyn Fn(String)>;
+/// always targets the correct tab, regardless of which tab is currently
+/// visible, and the origin of the turn it continues: the origin travels with
+/// the turn, so nothing that lands in the session between rounds can change
+/// which rules the next round runs under.
+pub type ContinuationCallback = Rc<dyn Fn(String, crate::session::TurnOrigin)>;
 
 #[derive(Clone)]
 pub struct ContinuationController {
@@ -48,7 +51,7 @@ impl ContinuationController {
     /// Suppressed if a continuation is already in-flight for this session.
     /// `session_id` is the originating session so the callback targets
     /// the correct tab even if the user has switched away.
-    pub fn trigger_continuation(&mut self, session_id: String) {
+    pub fn trigger_continuation(&mut self, session_id: String, origin: crate::session::TurnOrigin) {
         if self.in_flight.read().contains(&session_id) {
             tracing::warn!(
                 session_id = %session_id,
@@ -59,10 +62,15 @@ impl ContinuationController {
         if let Some(cb) = self.callback.read().as_ref() {
             tracing::info!("Continuation triggered for session '{}'. Invoking callback.", session_id);
             self.in_flight.write().insert(session_id.clone());
-            (cb)(session_id);
+            (cb)(session_id, origin);
         } else {
             tracing::warn!("Continuation triggered, but no callback was registered.");
         }
+    }
+
+    /// Whether `session_id` has a continuation in flight (no subscription).
+    pub fn is_in_flight(&self, session_id: &str) -> bool {
+        self.in_flight.peek().contains(session_id)
     }
 
     /// Sessions with a continuation in flight (subscribes the caller).

@@ -516,6 +516,10 @@ pub fn ChatInput(
     // draft may hold unrelated live text; clearing it is the caller's job.
     let submit = use_callback(
         move |(user_message, atts, target_sid): (String, Vec<Attachment>, String)| {
+        // Who this submission's turn belongs to: what the drain resolved for
+        // a queued message, else the person. Taken once, here, so no branch
+        // (a /skill, /unload) can leave it for a later send to pick up.
+        let turn_origin = chat_queue::take_turn_origin(&target_sid);
         // Skill Command Detection
         {
             // /unload command — remove a loaded skill from session context.
@@ -639,6 +643,7 @@ pub fn ChatInput(
                         path: skill.path.clone(),
                         has_scripts: !skill.scripts.is_empty(),
                         raw_output: None,
+                        origin: Some(turn_origin),
                         profile_color: {
                             let settings_read = settings.read();
                             let profile_name =
@@ -838,6 +843,8 @@ pub fn ChatInput(
             user_message
         };
 
+        // The send path takes it back (`chat.rs` send_message).
+        chat_queue::set_pending_origin(&target_sid, turn_origin);
         on_send.call((user_message, atts, target_sid));
     },
     );
@@ -876,14 +883,16 @@ pub fn ChatInput(
             prompt_history::save(prompt_log.peek().clone());
         }
 
-        // If this session's turn is still in flight, queue the message instead of
-        // sending. The turn drains it on completion (see the drain effect below).
-        if stream_manager.is_session_streaming(&session_id) {
+        // If this session's turn is still in flight — streaming, or between
+        // rounds while a continuation builds its next prompt — queue the
+        // message instead of sending, so two turns never interleave. The
+        // turn drains it on completion (see the drain effect below).
+        if stream_manager.turn_in_flight(&session_id) {
             if !user_message.is_empty() || !atts.is_empty() {
                 chat_queue::queue_push(
                     &mut CHAT_QUEUE.write(),
                     &session_id,
-                    QueuedMessage::new(user_message, atts).with_origin(crate::session::TurnOrigin::User),
+                    QueuedMessage::new(user_message, atts, chat_queue::QueueOrigin::Person),
                 );
                 crate::components::shared::set_chat_draft(draft, String::new(), None, false);
                 attachments.set(Vec::new());
@@ -930,6 +939,12 @@ pub fn ChatInput(
             if chat_queue::DISPATCHING.peek().contains(&session_id) {
                 continue;
             }
+            // Between a tool round and its continuation's stream nothing is
+            // streaming, but the turn isn't over: popping now would start a
+            // second turn inside it.
+            if stream_manager.turn_in_flight(&session_id) {
+                continue;
+            }
             // Don't pop for a session that isn't in state: deleted, or not yet
             // hydrated (History opens it lazily). `queue_pop_next` removes the
             // message, and `submit` would have nowhere to put it — the message
@@ -950,25 +965,24 @@ pub fn ChatInput(
                 // Who this turn belongs to (trust follows the turn: an
                 // unattended one in the Hobbes session gets the Heartbeat's
                 // rules). Harness-decided here, never by the model.
-                let origin = chat_queue::resolve_origin(qm.origin, crate::hobbes_session::is_hobbes(&session_id));
+                let origin = chat_queue::drain_origin(&qm, &session_id);
                 match qm.relay {
                     // A waking dispatch relay: append it and start a turn
                     // with no user message (todo::relay). Never resets the
                     // turn count, and never runs a call awaiting approval.
                     Some(relay) => {
-                        if let Some(s) = session_state.write().sessions.get_mut(&session_id) {
-                            s.turn_origin = origin;
-                        }
                         let start = crate::todo::relay::deliver_queued_relay(
                             session_state,
                             &_planner_state.peek(),
                             &session_id,
                             relay,
                         );
+                        // Only a relay that starts a turn gives it an origin
+                        // (the continuation records it on the session).
                         if start {
                             continuation_controller
                                 .write()
-                                .trigger_continuation(session_id.clone());
+                                .trigger_continuation(session_id.clone(), origin);
                         }
                     }
                     None => {

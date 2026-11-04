@@ -315,7 +315,7 @@ pub fn dispatch_to_chat(
     crate::components::chat_queue::queue_push(
         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
         &new_id,
-        crate::components::chat_queue::QueuedMessage::new(prompt, vec![]),
+        crate::components::chat_queue::QueuedMessage::new(prompt, vec![], crate::components::chat_queue::QueueOrigin::Unattended),
     );
     // Every worker gets a tab, through the reopen set rather than the
     // single `chat_command` slot: a turn that dispatches twice would

@@ -643,7 +643,7 @@ pub async fn dispatch_builtin_tool(
 
         "HOBBES_INVOKE_SKILL" => {
             let (status, response) =
-                invoke_skill(deps, args_json, session_id, profile_id, user_approved).await;
+                invoke_skill(deps, args_json, session_id, profile_id, user_approved, tool_call.origin).await;
             Some(BuiltinOutcome {
                 status,
                 response,
@@ -910,6 +910,7 @@ fn deliver_decision(
                 crate::components::chat_queue::QueuedMessage::new(
                     crate::todo::lanes::answer_message(entry),
                     vec![],
+                    crate::components::chat_queue::QueueOrigin::Unattended,
                 ),
             );
             crate::components::chat_queue::request_drain();
@@ -968,6 +969,7 @@ async fn invoke_skill(
     session_id: &str,
     profile_id: Option<&String>,
     user_approved: bool,
+    origin: Option<crate::session::TurnOrigin>,
 ) -> (ToolCallStatus, String) {
     let mut session_state = deps.session_state;
 
@@ -1054,6 +1056,7 @@ async fn invoke_skill(
             let settings_read = deps.settings.read();
             crate::components::shared::resolve_profile_color(profile_id, &settings_read)
         },
+        origin,
     };
 
     // Use the reactively-synced McpContext signal
@@ -1202,6 +1205,28 @@ mod tests {
             rsx! { div {} }
         });
         crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
+    fn a_skill_continuation_keeps_the_raising_turn_s_origin() {
+        use crate::components::shared::{MessageContent, SkillCall};
+        use crate::session::TurnOrigin;
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        // A wake's turn raised a skill held for approval ...
+        let held = SkillCall { origin: Some(TurnOrigin::Heartbeat), ..Default::default() };
+        let mut m = crate::voice::session::transcript_message(false, "x");
+        m.content = MessageContent::SkillPermissionRequest(held);
+        s.messages.push(m);
+        // ... and something else set the session's turn to the person's
+        // since (a /unload, a leaked origin): the continuation after the
+        // approval still runs under the wake's rules.
+        s.turn_origin = TurnOrigin::User;
+        assert_eq!(crate::components::chat::raising_turn_origin(s), TurnOrigin::Heartbeat);
+        // Nothing stamped: the session's recorded turn.
+        s.messages.clear();
+        assert_eq!(crate::components::chat::raising_turn_origin(s), TurnOrigin::User);
     }
 
     #[test]

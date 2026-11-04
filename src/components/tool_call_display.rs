@@ -671,6 +671,7 @@ fn skill_call_from_invoke(tool_call: &ToolCall) -> super::shared::SkillCall {
         skill_name: field("name"),
         arguments: field("arguments"),
         status: super::shared::SkillCallStatus::Pending,
+        origin: tool_call.origin,
         ..Default::default()
     }
 }

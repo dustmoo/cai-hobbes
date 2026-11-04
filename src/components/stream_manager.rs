@@ -150,6 +150,17 @@ impl StreamManagerContext {
             .any(|v| v == session_id)
     }
 
+    /// Whether any part of a turn is in flight for `session_id`: streaming,
+    /// a stream mapped to it, or a continuation between rounds (the gap
+    /// after a tool round, while the next prompt is built). A new send must
+    /// wait for all of these, or two turns interleave. Peeks: no
+    /// subscription.
+    pub fn turn_in_flight(&self, session_id: &str) -> bool {
+        self.streaming_sessions.peek().contains(session_id)
+            || self.stream_session_map.peek().values().any(|v| v == session_id)
+            || self.continuation_controller.peek().is_in_flight(session_id)
+    }
+
     /// Find the active message_id for a given session (for cancel).
     /// Reverse-lookups stream_session_map: message_id → session_id.
     pub fn active_message_for_session(self, session_id: &str) -> Option<Uuid> {
@@ -250,6 +261,9 @@ impl StreamManagerContext {
         }
     }
 
+    // The turn's origin joined the turn-time inputs; a struct for them would
+    // touch every call site for no gain (one caller).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_stream(
         mut self,
         message_id: Uuid,
@@ -258,6 +272,7 @@ impl StreamManagerContext {
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
         profile_id: Option<String>,
+        origin: crate::session::TurnOrigin,
     ) {
         self.streaming_sessions.write().insert(session_id.clone());
         self.stream_session_map
@@ -282,18 +297,13 @@ impl StreamManagerContext {
         // later profile/connector switch must not relabel.
         let stream_connector_name = self.effective_connector(&session_id).map(|inst| inst.name);
         let stream_model = self.effective_model(&session_id);
-        // Who started the turn this stream belongs to (set by the harness
-        // when the turn began, kept across its continuations). Stamped on
-        // every tool call below, over anything the connector produced, so
-        // the scope gates — here and on the approval-resume path — see the
-        // turn's origin, not the model's say.
-        let stream_origin = self
-            .session_state
-            .peek()
-            .sessions
-            .get(&session_id)
-            .map(|s| s.turn_origin)
-            .unwrap_or_default();
+        // Who started the turn this stream belongs to, passed in with the
+        // turn (the send path, or the continuation that carries it) — never
+        // re-read from the session, which a send landing between rounds
+        // could change. Stamped on every tool call below, over anything the
+        // connector produced, so the scope gates — here and on the
+        // approval-resume path — see the turn's origin, not the model's say.
+        let stream_origin = origin;
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -1823,7 +1833,7 @@ impl StreamManagerContext {
 
                 self.continuation_controller
                     .write()
-                    .trigger_continuation(session_id.clone());
+                    .trigger_continuation(session_id.clone(), stream_origin);
                 return; // End this stream task. The continuation will start a new one.
             }
 
@@ -1831,7 +1841,7 @@ impl StreamManagerContext {
             // Before finalizing the turn, check for watch word matches
             // that indicate the model stalled mid-response (OpenAI-compat only).
             if self
-                .check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id)
+                .check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id, stream_origin)
                 .await
             {
                 return; // Watch word recovery triggered continuation — end this stream task.
@@ -1933,7 +1943,7 @@ impl StreamManagerContext {
                             ) {
                                 self.continuation_controller
                                     .write()
-                                    .trigger_continuation(session_id.clone());
+                                    .trigger_continuation(session_id.clone(), stream_origin);
                             }
                             return; // End this stream task. Continuation will retry.
                         }
@@ -2165,6 +2175,7 @@ impl StreamManagerContext {
         session_id: &str,
         final_text: &str,
         message_id: &Uuid,
+        origin: crate::session::TurnOrigin,
     ) -> bool {
         let watch_config = match self.watch_word_config(session_id) {
             Some(c) if !final_text.is_empty() => c,
@@ -2301,7 +2312,7 @@ impl StreamManagerContext {
 
         self.continuation_controller
             .write()
-            .trigger_continuation(session_id.to_string());
+            .trigger_continuation(session_id.to_string(), origin);
         true
     }
 
@@ -2677,6 +2688,76 @@ mod tests {
             stamps.windows(2).all(|w| w[0] <= w[1]),
             "vec order must stay created_at-monotonic"
         );
+    }
+
+    /// The gap between a tool round and its continuation's stream: nothing
+    /// is streaming, but the turn isn't over. A send must see it as busy,
+    /// and the origin travels with the continuation, not the session field
+    /// a send landing in the gap could change.
+    #[test]
+    fn a_continuation_carries_its_origin_and_counts_as_in_flight() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let session_state = use_context_provider(|| Signal::new(SessionState::new()));
+            let settings = use_context_provider(|| Signal::new(Settings::default()));
+            let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+            let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
+            let mcp_manager = use_context_provider(|| {
+                Signal::new(McpManager::new(PathBuf::new(), permission_manager, secret_manager, settings))
+            });
+            let mut continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+            let llm_connector = use_context_provider(|| {
+                Signal::new(Arc::new(crate::llm::GeminiConnector::new(settings.read().gemini_config.clone()))
+                    as Arc<dyn crate::llm::LlmConnector>)
+            });
+            let scheduler = use_coroutine(|_| async {});
+            let stream_manager = StreamManagerContext {
+                chat_command: Signal::new(None),
+                stream_receivers: Signal::new(HashMap::new()),
+                active_stream_handles: Signal::new(HashMap::new()),
+                llm_connector,
+                session_state,
+                mcp_manager,
+                tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+                settings,
+                continuation_controller,
+                scheduler,
+                permission_manager,
+                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+                mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                    servers: Vec::new(),
+                    connected_toolkit_slugs: Vec::new(),
+                }),
+                planner_state: Signal::new(crate::todo::PlannerState::default()),
+                stream_activity: Signal::new(0),
+                streaming_sessions: Signal::new(HashSet::new()),
+                stream_session_map: Signal::new(HashMap::new()),
+                content_generated: Signal::new(HashSet::new()),
+                save_error_signal: Signal::new(None),
+                usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+                summarizing_sessions: Signal::new(HashSet::new()),
+            };
+            let got: std::rc::Rc<std::cell::RefCell<Vec<(String, TurnOrigin)>>> = Default::default();
+            {
+                let got = got.clone();
+                continuation_controller
+                    .write()
+                    .register_callback(std::rc::Rc::new(move |sid, origin| got.borrow_mut().push((sid, origin))));
+            }
+            assert!(!stream_manager.turn_in_flight("wake-session"));
+            // A wake's tool round ended: its continuation is triggered with
+            // the wake's origin.
+            continuation_controller.write().trigger_continuation("wake-session".into(), TurnOrigin::Heartbeat);
+            // Nothing streams, yet the turn is in flight: a typed send or the
+            // drain queues instead of starting a second turn inside it.
+            assert!(!stream_manager.streaming_sessions.peek().contains("wake-session"));
+            assert!(stream_manager.turn_in_flight("wake-session"));
+            assert_eq!(&*got.borrow(), &[("wake-session".to_string(), TurnOrigin::Heartbeat)]);
+            continuation_controller.write().clear_in_flight("wake-session");
+            assert!(!stream_manager.turn_in_flight("wake-session"));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[tokio::test]

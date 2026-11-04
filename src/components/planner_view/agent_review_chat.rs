@@ -168,7 +168,7 @@ pub(crate) fn ChatRail(chat_ref: Signal<Option<ChatRef>>) -> Element {
             return;
         }
         let msg = chat_message(reference.as_ref().map(|r| r.title.as_str()), &text);
-        queue_push(&mut CHAT_QUEUE.write(), &chat_id, QueuedMessage::new(msg, vec![]));
+        queue_push(&mut CHAT_QUEUE.write(), &chat_id, QueuedMessage::new(msg, vec![], crate::components::chat_queue::QueueOrigin::Person));
         request_drain();
         draft.set(String::new());
         chat_ref.set(None);

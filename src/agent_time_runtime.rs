@@ -700,6 +700,7 @@ pub fn start_now(
         crate::components::chat_queue::QueuedMessage::new(
             seed_message(&budget, is_resume, &context, &owner),
             Vec::new(),
+            crate::components::chat_queue::QueueOrigin::Unattended,
         ),
     );
     crate::components::chat_queue::request_drain();
@@ -931,7 +932,7 @@ pub fn hand_to_run(
     crate::components::chat_queue::queue_push(
         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
         &chat_id,
-        crate::components::chat_queue::QueuedMessage::new(msg, Vec::new()),
+        crate::components::chat_queue::QueuedMessage::new(msg, Vec::new(), crate::components::chat_queue::QueueOrigin::Unattended),
     );
     crate::components::chat_queue::request_drain();
     tracing::info!(chat_id = %chat_id, todo_id, "Accepted to-do handed to the agent-time run");

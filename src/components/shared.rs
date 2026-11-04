@@ -373,6 +373,10 @@ pub struct SkillCall {
     pub raw_output: Option<String>, // Clean output for use_result
     #[serde(default)]
     pub profile_color: Option<String>, // Historical profile color for rendering
+    /// The origin of the turn that raised this skill call (harness-set; see
+    /// `ToolCall::origin`). A skill continuation resumes under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::session::TurnOrigin>,
 }
 
 impl SkillCall {
@@ -389,6 +393,7 @@ impl SkillCall {
             has_scripts: false,
             raw_output: None,
             profile_color: None,
+            origin: None,
         }
     }
 }
