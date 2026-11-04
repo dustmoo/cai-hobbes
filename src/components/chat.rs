@@ -124,16 +124,31 @@ pub(crate) fn split_resumable(waiting: Vec<String>, in_flight: impl Fn(&str) -> 
 }
 
 /// The origin a no-tools continuation (an approved skill, "analyse now")
-/// runs under: the one its approval handed over
-/// (`continuation_controller::set_continuation_origin`), else — an
-/// unstamped legacy skill — the newest stamped call ([`raising_turn_origin`]).
+/// runs under: the strictest its approvals recorded
+/// (`continuation_controller::record_approval_origin`, consumed here), else
+/// — an unstamped legacy skill — the newest stamped call
+/// ([`raising_turn_origin`]).
 pub(crate) fn no_tools_continuation_origin(
     session_id: &str,
     session: Option<&crate::session::Session>,
 ) -> crate::session::TurnOrigin {
-    crate::components::continuation_controller::take_continuation_origin(session_id)
+    use crate::components::continuation_controller::{strictest, take_approval_origins};
+    strictest(take_approval_origins(session_id))
         .or_else(|| session.map(raising_turn_origin))
         .unwrap_or_default()
+}
+
+/// The origin a resume with tool calls continues under: the calls' own
+/// stamps ([`resumed_turn_origin`]) and any approval recorded for the
+/// session meanwhile (consumed here, so none outlives this resume), the
+/// strictest winning.
+pub(crate) fn tools_resume_origin<'a>(
+    calls: impl IntoIterator<Item = &'a crate::components::shared::ToolCall>,
+    session_id: &str,
+) -> crate::session::TurnOrigin {
+    use crate::components::continuation_controller::{strictest, take_approval_origins};
+    let recorded = take_approval_origins(session_id);
+    strictest(std::iter::once(resumed_turn_origin(calls, session_id)).chain(recorded)).unwrap_or_default()
 }
 
 /// The origin of the turn that raised the session's latest stamped call
@@ -462,19 +477,21 @@ pub fn ChatWindow(
             // continuation resumes there (session_rotation).
             if crate::system_sessions::is_archive(&owning_id) {
                 tracing::info!(session_id = %owning_id, "resume skipped: archived system session");
+                let _ = crate::components::continuation_controller::take_approval_origins(&owning_id);
                 continue;
             }
+            // Indicate activity now, before the task runs, so the queue
+            // drain reacting to the same tick sees the chat busy and waits.
+            stream_manager
+                .streaming_sessions
+                .write()
+                .insert(owning_id.clone());
+            *stream_manager.stream_activity.write() += 1;
             spawn(async move {
                 let mut session_state = session_state;
                 let mcp_manager = mcp_manager;
                 let mut tools_to_run = Vec::new();
 
-                // Indicate activity immediately
-                stream_manager
-                    .streaming_sessions
-                    .write()
-                    .insert(owning_id.clone());
-                *stream_manager.stream_activity.write() += 1;
                 // Approval given: the fleet row stops waiting right away
                 // (continuation would report too, but only after the tools run).
                 if crate::fleet::bridge::enabled() {
@@ -552,7 +569,7 @@ pub fn ChatWindow(
                 // The resumed calls carry the origin of the turn that raised
                 // them (stamped when minted); the continuation that follows
                 // belongs to that turn too, whatever started in between.
-                let resumed_origin = resumed_turn_origin(
+                let resumed_origin = tools_resume_origin(
                     tools_to_run.iter().map(|(_, tc)| tc),
                     &owning_id,
                 );

@@ -502,8 +502,9 @@ pub fn ChatInput(
                     // create a second parallel LLM stream (double-turn regression).
                     let sid = current_session_id.read().clone();
                     // The person asked for it: their turn.
-                    crate::components::continuation_controller::set_continuation_origin(
+                    crate::components::continuation_controller::record_approval_origin(
                         &sid,
+                        crate::components::continuation_controller::ApprovalKey::AnalyseNow,
                         crate::session::TurnOrigin::User,
                     );
                     has_pending_approvals.write().insert(sid);
@@ -768,7 +769,11 @@ pub fn ChatInput(
                                     // injected skill context, on the invoking
                                     // session (not the active tab).
                                     if let Some(origin) = sc_clone.origin {
-                                        crate::components::continuation_controller::set_continuation_origin(&skill_sid, origin);
+                                        crate::components::continuation_controller::record_approval_origin(
+                                            &skill_sid,
+                                            crate::components::continuation_controller::ApprovalKey::Message(msg_id),
+                                            origin,
+                                        );
                                     }
                                     has_pending_approvals.write().insert(skill_sid.clone());
                                 }
@@ -945,6 +950,11 @@ pub fn ChatInput(
                 continue;
             }
             if chat_queue::DISPATCHING.peek().contains(&session_id) {
+                continue;
+            }
+            // An approval waiting to resume in this chat goes first: the
+            // resume and a queued message must not start on the same tick.
+            if has_pending_approvals.peek().contains(&session_id) {
                 continue;
             }
             // Between a tool round and its continuation's stream nothing is
