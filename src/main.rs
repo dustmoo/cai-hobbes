@@ -934,13 +934,11 @@ fn app() -> Element {
                             .map(|p| p.asks_person())
                             .unwrap_or(false);
                         // The Hobbes tab's news is spoken by the voice itself
-                        // (an approval it can't grant still toasts).
-                        let voice_speaks = crate::hobbes_session::is_hobbes(id)
-                            && s.pending_gate.is_none()
-                            && {
-                                let st = settings.peek();
-                                voice::voice_active(&st) && st.voice.announce_results
-                            };
+                        // when — and only when — it will actually be spoken
+                        // (the same decision the announcement makes); an
+                        // approval it can't grant still toasts.
+                        let voice_speaks = s.pending_gate.is_none()
+                            && voice::controller::pending_announcement(session_state, settings, id).is_some();
                         if s.asks_person() && !was && !voice_speaks {
                             flash_timer_toast(format!("🛰 {} needs your attention", s.name));
                         }

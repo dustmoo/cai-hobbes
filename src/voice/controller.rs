@@ -222,34 +222,35 @@ pub fn announce_kind(origin: crate::session::TurnOrigin, news: &TurnNews, speak_
     Some(AnnounceKind::Heartbeat)
 }
 
-/// Called when any turn ends (stream_manager): speak Hobbes-tab news —
-/// returned results and what a Heartbeat wake found — through the one
-/// announce path.
-pub fn on_turn_end(
+/// What the voice would say about the Hobbes session's latest finished
+/// turn right now, if anything: the one decision both the announcement
+/// ([`on_turn_end`]) and the Fleet toast's suppression (`main.rs`) use, so a
+/// toast is never swallowed for news that won't be spoken.
+pub fn pending_announcement(
     session_state: Signal<crate::session::SessionState>,
     settings: Signal<crate::settings::Settings>,
     session_id: &str,
-) {
+) -> Option<(String, AnnounceKind)> {
     if !crate::hobbes_session::is_hobbes(session_id) {
-        return;
+        return None;
     }
     let speak_heartbeat = {
         let s = settings.peek();
         if !crate::voice::voice_active(&s) || !s.voice.announce_results {
-            return;
+            return None;
         }
         s.voice.speak_heartbeat
     };
     let (news, viewing, origin) = {
         let state = session_state.peek();
-        let Some(session) = state.sessions.get(session_id) else { return };
-        let Some(news) = turn_news(&session.messages) else { return };
+        let session = state.sessions.get(session_id)?;
+        let news = turn_news(&session.messages)?;
         (news, state.active_session_id == session_id, session.turn_origin)
     };
     if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing) {
-        return;
+        return None;
     }
-    let Some(kind) = announce_kind(origin, &news, speak_heartbeat) else { return };
+    let kind = announce_kind(origin, &news, speak_heartbeat)?;
     let text = match (news.needs_approval, kind) {
         (true, AnnounceKind::Heartbeat) => {
             "The Heartbeat needs your approval in the Hobbes tab before it can continue.".to_string()
@@ -259,6 +260,18 @@ pub fn on_turn_end(
         }
         (false, _) => news.reply,
     };
+    Some((text, kind))
+}
+
+/// Called when any turn ends (stream_manager): speak Hobbes-tab news —
+/// returned results and what a Heartbeat wake found — through the one
+/// announce path.
+pub fn on_turn_end(
+    session_state: Signal<crate::session::SessionState>,
+    settings: Signal<crate::settings::Settings>,
+    session_id: &str,
+) {
+    let Some((text, kind)) = pending_announcement(session_state, settings, session_id) else { return };
     tracing::info!("voice: announcing Hobbes-tab news ({kind:?}, {} chars)", text.chars().count());
     send(VoiceCmd::Announce(text, kind));
 }

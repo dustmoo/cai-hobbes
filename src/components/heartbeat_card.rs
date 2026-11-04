@@ -286,7 +286,7 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
     // unattended (wake) turn is the Heartbeat working.
     let wake_turn = |id: &str| {
         try_consume_context::<Signal<crate::session::SessionState>>().is_some_and(|st| {
-            st.read().sessions.get(id).is_some_and(|s| s.turn_origin.is_unattended())
+            st.peek().sessions.get(id).is_some_and(|s| s.turn_origin.is_unattended())
         })
     };
     let streaming = match (
