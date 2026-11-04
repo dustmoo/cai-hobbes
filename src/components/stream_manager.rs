@@ -150,6 +150,17 @@ impl StreamManagerContext {
             .any(|v| v == session_id)
     }
 
+    /// Mark `session_id` as streaming `message_id`. From here the stream
+    /// maps cover the turn, so a continuation's in-flight guard is released
+    /// now rather than at the stream's end: a stream cut off by Stop never
+    /// reaches `on_complete`, and a guard held until then would leave the
+    /// chat looking busy for good ([`Self::turn_in_flight`]).
+    fn register_stream(&mut self, message_id: Uuid, session_id: &str) {
+        self.streaming_sessions.write().insert(session_id.to_string());
+        self.stream_session_map.write().insert(message_id, session_id.to_string());
+        self.continuation_controller.write().clear_in_flight(session_id);
+    }
+
     /// Whether any part of a turn is in flight for `session_id`: streaming,
     /// a stream mapped to it, or a continuation between rounds (the gap
     /// after a tool round, while the next prompt is built). A new send must
@@ -274,10 +285,7 @@ impl StreamManagerContext {
         profile_id: Option<String>,
         origin: crate::session::TurnOrigin,
     ) {
-        self.streaming_sessions.write().insert(session_id.clone());
-        self.stream_session_map
-            .write()
-            .insert(message_id, session_id.clone());
+        self.register_stream(message_id, &session_id);
         self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnStarted);
         tracing::debug!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
@@ -2453,6 +2461,9 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1; // Notify TabBar: stream cancelled
         self.stream_session_map.write().remove(message_id);
+        // Stop ends the turn: no continuation of it is in flight any more
+        // (a cancelled task never runs its `on_complete`).
+        self.continuation_controller.write().clear_in_flight(session_id);
         self.fleet_report(
             session_id,
             crate::fleet::bridge::HobbesSignal::TurnCompleted,
@@ -2690,6 +2701,104 @@ mod tests {
         );
     }
 
+    /// A stream manager over fresh signals, for tests that need one (call
+    /// inside a component: it uses hooks).
+    fn test_manager() -> (StreamManagerContext, Signal<ContinuationController>, Signal<SessionState>) {
+        let session_state = use_context_provider(|| Signal::new(SessionState::new()));
+        let settings = use_context_provider(|| Signal::new(Settings::default()));
+        let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+        let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
+        let mcp_manager = use_context_provider(|| {
+            Signal::new(McpManager::new(PathBuf::new(), permission_manager, secret_manager, settings))
+        });
+        let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+        let llm_connector = use_context_provider(|| {
+            Signal::new(Arc::new(crate::llm::GeminiConnector::new(settings.read().gemini_config.clone()))
+                as Arc<dyn crate::llm::LlmConnector>)
+        });
+        let scheduler = use_coroutine(|_| async {});
+        let manager = StreamManagerContext {
+            chat_command: Signal::new(None),
+            stream_receivers: Signal::new(HashMap::new()),
+            active_stream_handles: Signal::new(HashMap::new()),
+            llm_connector,
+            session_state,
+            mcp_manager,
+            tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+            settings,
+            continuation_controller,
+            scheduler,
+            permission_manager,
+            skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+            mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                servers: Vec::new(),
+                connected_toolkit_slugs: Vec::new(),
+            }),
+            planner_state: Signal::new(crate::todo::PlannerState::default()),
+            stream_activity: Signal::new(0),
+            streaming_sessions: Signal::new(HashSet::new()),
+            stream_session_map: Signal::new(HashMap::new()),
+            content_generated: Signal::new(HashSet::new()),
+            save_error_signal: Signal::new(None),
+            usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+            summarizing_sessions: Signal::new(HashSet::new()),
+        };
+        (manager, continuation_controller, session_state)
+    }
+
+    /// An approval for a chat whose turn is still in flight waits: it
+    /// resumes when the turn ends, never beside it, and is never dropped.
+    #[test]
+    fn an_approval_waits_for_the_turn_in_flight() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let (mut manager, mut continuation_controller, _) = test_manager();
+            continuation_controller.write().register_callback(std::rc::Rc::new(|_, _| {}));
+            continuation_controller.write().trigger_continuation("busy".into(), TurnOrigin::Heartbeat);
+            let waiting = vec!["busy".to_string(), "idle".to_string()];
+            let (now, later) = crate::components::chat::split_resumable(waiting, |id| manager.turn_in_flight(id));
+            assert_eq!((now, later.clone()), (vec!["idle".to_string()], vec!["busy".to_string()]));
+            // The turn ends (its stream registers, then completes): it resumes.
+            let msg = Uuid::new_v4();
+            manager.register_stream(msg, "busy");
+            manager.cancel_stream(&msg, "busy");
+            let (now, later) = crate::components::chat::split_resumable(later, |id| manager.turn_in_flight(id));
+            assert_eq!((now, later), (vec!["busy".to_string()], vec![]));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    /// Stop during a continuation ends the turn: the chat isn't left looking
+    /// busy (every later send queued for good, every wake held).
+    #[test]
+    fn stop_during_a_continuation_leaves_the_chat_free() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let (mut manager, mut continuation_controller, mut session_state) = test_manager();
+            continuation_controller.write().register_callback(std::rc::Rc::new(|_, _| {}));
+            let sid = session_state.write().create_session_raw(None);
+            // A tool round ended; its continuation is on its way ...
+            continuation_controller.write().trigger_continuation(sid.clone(), TurnOrigin::Heartbeat);
+            assert!(manager.turn_in_flight(&sid));
+            // ... its stream registers (the maps now cover the turn) ...
+            let msg = Uuid::new_v4();
+            manager.register_stream(msg, &sid);
+            assert!(!continuation_controller.peek().is_in_flight(&sid), "the stream took over the guard");
+            assert!(manager.turn_in_flight(&sid));
+            // ... and the person presses Stop: the task is aborted, its
+            // on_complete never runs, and nothing is left in flight.
+            manager.cancel_stream(&msg, &sid);
+            assert!(!manager.turn_in_flight(&sid));
+            // Stop in the gap before the stream registered, too.
+            continuation_controller.write().trigger_continuation(sid.clone(), TurnOrigin::User);
+            manager.cancel_stream(&Uuid::new_v4(), &sid);
+            assert!(!manager.turn_in_flight(&sid));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
     /// The gap between a tool round and its continuation's stream: nothing
     /// is streaming, but the turn isn't over. A send must see it as busy,
     /// and the origin travels with the continuation, not the session field
@@ -2698,45 +2807,7 @@ mod tests {
     fn a_continuation_carries_its_origin_and_counts_as_in_flight() {
         use crate::session::TurnOrigin;
         let mut dom = VirtualDom::new(|| {
-            let session_state = use_context_provider(|| Signal::new(SessionState::new()));
-            let settings = use_context_provider(|| Signal::new(Settings::default()));
-            let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
-            let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
-            let mcp_manager = use_context_provider(|| {
-                Signal::new(McpManager::new(PathBuf::new(), permission_manager, secret_manager, settings))
-            });
-            let mut continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
-            let llm_connector = use_context_provider(|| {
-                Signal::new(Arc::new(crate::llm::GeminiConnector::new(settings.read().gemini_config.clone()))
-                    as Arc<dyn crate::llm::LlmConnector>)
-            });
-            let scheduler = use_coroutine(|_| async {});
-            let stream_manager = StreamManagerContext {
-                chat_command: Signal::new(None),
-                stream_receivers: Signal::new(HashMap::new()),
-                active_stream_handles: Signal::new(HashMap::new()),
-                llm_connector,
-                session_state,
-                mcp_manager,
-                tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
-                settings,
-                continuation_controller,
-                scheduler,
-                permission_manager,
-                skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
-                mcp_context: Signal::new(crate::mcp::manager::McpContext {
-                    servers: Vec::new(),
-                    connected_toolkit_slugs: Vec::new(),
-                }),
-                planner_state: Signal::new(crate::todo::PlannerState::default()),
-                stream_activity: Signal::new(0),
-                streaming_sessions: Signal::new(HashSet::new()),
-                stream_session_map: Signal::new(HashMap::new()),
-                content_generated: Signal::new(HashSet::new()),
-                save_error_signal: Signal::new(None),
-                usage_log: Signal::new(crate::usage_log::UsageLog::default()),
-                summarizing_sessions: Signal::new(HashSet::new()),
-            };
+            let (stream_manager, mut continuation_controller, _) = test_manager();
             let got: std::rc::Rc<std::cell::RefCell<Vec<(String, TurnOrigin)>>> = Default::default();
             {
                 let got = got.clone();

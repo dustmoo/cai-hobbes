@@ -117,6 +117,12 @@ pub(crate) fn resumed_turn_origin<'a>(
     }
 }
 
+/// Approvals that can resume now, and those whose chat still has a turn in
+/// flight (they wait in the approval set and resume when it ends).
+pub(crate) fn split_resumable(waiting: Vec<String>, in_flight: impl Fn(&str) -> bool) -> (Vec<String>, Vec<String>) {
+    waiting.into_iter().partition(|id| !in_flight(id))
+}
+
 /// The origin of the turn that raised the session's latest stamped call
 /// (a tool call, a held approval, a skill call): what a continuation with
 /// no calls left to run (an approved skill) continues under. Falls back to
@@ -415,12 +421,28 @@ pub fn ChatWindow(
     // The approval signal carries owning session ids, so a tab switch while an
     // MCP call is in flight can never route the result into another chat.
     use_effect(move || {
-        let pending: Vec<String> = has_pending_approvals.read().iter().cloned().collect();
+        // Re-run when a turn ends or a continuation settles, so an approval
+        // deferred below resumes then.
+        let _ = stream_manager.stream_activity.read();
+        let _ = continuation_controller.read().in_flight_sessions();
+        let waiting: Vec<String> = has_pending_approvals.read().iter().cloned().collect();
+        if waiting.is_empty() {
+            return;
+        }
+        // An approval for a chat whose turn is still in flight waits for that
+        // turn to end (it stays in the set): resuming now would run beside
+        // it, and its continuation could be suppressed, leaving the approved
+        // results with no reply.
+        let (pending, deferred) = split_resumable(waiting, |id| stream_manager.turn_in_flight(id));
+        if !deferred.is_empty() {
+            tracing::debug!(sessions = deferred.len(), "approval resume deferred: a turn is in flight");
+        }
         if pending.is_empty() {
             return;
         }
-        // Clear up front; the re-run this write triggers sees an empty set.
-        has_pending_approvals.write().clear();
+        // Clear what runs now; the re-run this write triggers sees only the
+        // deferred ones (still busy: no write, no loop).
+        has_pending_approvals.write().retain(|id| !pending.contains(id));
 
         for owning_id in pending {
             // An archived system session is read-only: no approved call or
@@ -1146,6 +1168,11 @@ pub fn ChatWindow(
             );
             spawn(async move {
                 tracing::debug!(session_id = %target_id, "continue_prompt_flow task SPAWNED.");
+                // Released on any early exit; handed to the stream below.
+                let in_flight = crate::components::continuation_controller::InFlightGuard::new(
+                    continuation_controller,
+                    target_id.clone(),
+                );
                 let mut session_state = session_state;
                 let settings = settings.read().clone();
 
@@ -1243,6 +1270,7 @@ pub fn ChatWindow(
                     Some(fresh_mcp_context)
                 };
                 tracing::debug!("Sending continuation prompt to LLM.");
+                in_flight.hand_off();
                 send_prompt_to_llm(
                     prompt_data,
                     mcp_context,

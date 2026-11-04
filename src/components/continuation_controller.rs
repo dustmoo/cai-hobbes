@@ -85,3 +85,60 @@ impl ContinuationController {
         tracing::debug!(session_id = %session_id, "Continuation in_flight guard cleared.");
     }
 }
+
+/// Holds a session's continuation in-flight guard for one run of the
+/// continuation flow, from the trigger until the next stream is handed off
+/// ([`InFlightGuard::hand_off`]; `start_stream` then releases the guard once
+/// the stream maps cover the turn). Dropped any other way — an early return,
+/// an error, the task aborted — it releases the guard, so a continuation that
+/// never reached a stream can't leave the chat looking busy for good.
+pub struct InFlightGuard {
+    controller: Signal<ContinuationController>,
+    session_id: String,
+    armed: bool,
+}
+
+impl InFlightGuard {
+    pub fn new(controller: Signal<ContinuationController>, session_id: String) -> Self {
+        Self { controller, session_id, armed: true }
+    }
+
+    /// The flow reached its stream: the stream takes over the guard.
+    pub fn hand_off(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(mut c) = self.controller.try_write() {
+                c.clear_in_flight(&self.session_id);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_continuation_that_never_streams_releases_its_guard() {
+        let mut dom = VirtualDom::new(|| {
+            let mut controller = use_signal(ContinuationController::new);
+            controller.write().register_callback(Rc::new(|_, _| {}));
+            // Bailed out (session gone, an error, the task aborted).
+            controller.write().trigger_continuation("s".into(), crate::session::TurnOrigin::User);
+            assert!(controller.peek().is_in_flight("s"));
+            drop(InFlightGuard::new(controller, "s".into()));
+            assert!(!controller.peek().is_in_flight("s"));
+            // Handed to its stream: the stream releases it, not the flow.
+            controller.write().trigger_continuation("s".into(), crate::session::TurnOrigin::User);
+            InFlightGuard::new(controller, "s".into()).hand_off();
+            assert!(controller.peek().is_in_flight("s"));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+}
