@@ -1048,6 +1048,111 @@ pub fn metadata_by_ids(ids: &[String]) -> Vec<SessionMeta> {
     .unwrap_or_default()
 }
 
+/// A conversation row for the Hobbes tab's `HOBBES_TAB_LIST` (`hobbes_tabs`):
+/// metadata only, read with `json_extract` so no message blob is parsed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabRow {
+    pub id: String,
+    pub name: String,
+    pub tab_title: Option<String>,
+    pub tab_emoji: Option<String>,
+    pub name_user_set: bool,
+    pub project_id: Option<String>,
+    pub composio_profile: Option<String>,
+    /// RFC 3339 (the `last_updated` column).
+    pub last_updated: String,
+    pub message_count: i64,
+}
+
+impl TabRow {
+    /// Mirrors `Session::display_title` for a non-hydrated row.
+    pub fn display_title(&self) -> String {
+        match (&self.tab_title, self.name_user_set) {
+            (Some(t), false) if !t.trim().is_empty() => t.clone(),
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// Newest-first conversation rows, skipping `exclude` (the Hobbes lineage
+/// and the hydrated sessions the caller lists from memory). `query`
+/// matches name, summary and message text like History search; `project_id`
+/// filters on the indexed column.
+pub fn tab_rows(query: Option<&str>, project_id: Option<&str>, exclude: &[String], limit: i64) -> Vec<TabRow> {
+    with_conn(|conn| tab_rows_conn(conn, query, project_id, exclude, limit)).unwrap_or_else(|e| {
+        tracing::error!("tab_rows failed: {e}");
+        Vec::new()
+    })
+}
+
+pub(crate) fn tab_rows_conn(
+    conn: &Connection,
+    query: Option<&str>,
+    project_id: Option<&str>,
+    exclude: &[String],
+    limit: i64,
+) -> rusqlite::Result<Vec<TabRow>> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
+        let escaped = q.to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        values.push(format!("%{escaped}%").into());
+        let n = values.len();
+        clauses.push(format!(
+            "(name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE OR summary LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
+             OR search_text LIKE ?{n} ESCAPE '\\')"
+        ));
+    }
+    if let Some(p) = project_id {
+        values.push(p.to_string().into());
+        clauses.push(format!("project_id = ?{}", values.len()));
+    }
+    if !exclude.is_empty() {
+        let start = values.len();
+        let marks: Vec<String> = (0..exclude.len()).map(|i| format!("?{}", start + i + 1)).collect();
+        values.extend(exclude.iter().map(|id| rusqlite::types::Value::from(id.clone())));
+        clauses.push(format!("id NOT IN ({})", marks.join(", ")));
+    }
+    let where_clause = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
+    let sql = format!(
+        "SELECT id, name, json_extract(data, '$.tab_title'), json_extract(data, '$.tab_emoji'), \
+         coalesce(json_extract(data, '$.name_user_set'), 0), project_id, \
+         json_extract(data, '$.composio_profile'), last_updated, message_count \
+         FROM sessions {where_clause} ORDER BY last_updated DESC LIMIT {}",
+        limit.max(0)
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
+        Ok(TabRow {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            tab_title: r.get(2)?,
+            tab_emoji: r.get(3)?,
+            name_user_set: r.get::<_, i64>(4)? != 0,
+            project_id: r.get(5)?,
+            composio_profile: r.get(6)?,
+            last_updated: r.get(7)?,
+            message_count: r.get(8)?,
+        })
+    })?;
+    rows.collect()
+}
+
+/// Read one session for viewing only (`HOBBES_TAB_READ`): parsed from its
+/// row, with none of [`load_sessions`]' hydration side effects — no
+/// fingerprint recorded, no cut-off call ended or journalled. The result
+/// must never be put into `SessionState`.
+pub fn peek_session(id: &str) -> Option<Session> {
+    with_conn(|conn| peek_session_conn(conn, id)).ok().flatten()
+}
+
+pub(crate) fn peek_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
+    use rusqlite::OptionalExtension;
+    let data: Option<String> =
+        conn.query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+    Ok(data.and_then(|d| parse_session(id, &d)))
+}
+
 pub fn session_count() -> i64 {
     with_conn(|conn| conn.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get(0)))
         .unwrap_or(0)
