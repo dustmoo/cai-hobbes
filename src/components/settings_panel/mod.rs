@@ -336,9 +336,26 @@ pub fn SettingsPanel(
     // This is crucial for reflecting changes made elsewhere in the app (e.g., 'remember my choice' in a confirmation modal).
     // It uses .peek() to avoid creating a dependency on local_settings, preventing an infinite loop.
     // NOTE: This will discard any unsaved changes in the settings panel when external changes occur.
+    // The saved settings as the draft last synced from them: a change that
+    // only touches app-written fields (`shared::patch_draft`) is patched in,
+    // keeping the draft's other unsaved edits.
+    let mut synced_global = use_signal(|| settings.peek().clone());
     use_effect(move || {
         let global_settings = settings.read();
+        let prev = synced_global.peek().clone();
+        synced_global.set(global_settings.clone());
         if comparable(&global_settings) != comparable(&local_settings.peek()) {
+            let patched = {
+                let draft = local_settings.peek();
+                shared::patch_draft(&prev, &global_settings, &draft)
+                    .map(|p| (comparable(&p) != comparable(&draft), p))
+            };
+            if let Some((changed, patched)) = patched {
+                if changed {
+                    local_settings.set(patched);
+                }
+                return;
+            }
             let mut draft = global_settings.clone();
             // Re-load the selected connector's config into the editing mirrors
             let selected = selected_connector_id

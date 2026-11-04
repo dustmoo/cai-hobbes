@@ -262,9 +262,10 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                                     onchange: move |e| {
                                                         let on = e.value() == "true";
                                                         local_settings.write().hobbes_read_tabs = on;
-                                                        // Only this field is saved; like any change
-                                                        // from outside the draft, the panel then
-                                                        // resyncs its draft from the saved settings.
+                                                        // Only this field is saved; the panel's sync
+                                                        // patches it into the draft and keeps the
+                                                        // draft's other unsaved edits
+                                                        // (`shared::patch_draft`).
                                                         global_settings.write().hobbes_read_tabs = on;
                                                         let snapshot = global_settings.peek().clone();
                                                         if let Err(e) = settings_manager.read().save(&snapshot) {
