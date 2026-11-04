@@ -445,6 +445,25 @@ pub fn has_pending_approval(messages: &[Message]) -> bool {
     })
 }
 
+/// Whether a call waiting on approval holds a new wake back. The Hobbes
+/// session shares its history with typed and voice turns, so an approval
+/// anywhere in it can't count — a stale one the person never answered
+/// would silence the Heartbeat for good. It holds the wake when it is in
+/// the latest turn (the wake would interleave with that turn's resume), or
+/// it is a wake's own held call (Heartbeat-stamped, or unstamped legacy)
+/// newer than `stale_after` (one wake at a time waits on the person).
+pub fn approval_blocks_wake(messages: &[Message], now: DateTime<Utc>, stale_after: Duration) -> bool {
+    let turn_start = messages.iter().rposition(crate::voice::transcript::starts_turn).unwrap_or(0);
+    messages.iter().enumerate().any(|(i, m)| {
+        let origin = match &m.content {
+            MessageContent::PermissionRequest(tc) => tc.origin,
+            MessageContent::SkillPermissionRequest(sc) => sc.origin,
+            _ => return false,
+        };
+        i >= turn_start || (!origin.is_some_and(|o| o.is_user()) && now - m.created_at < stale_after)
+    })
+}
+
 /// A usage entry, as the attribution reads it.
 #[derive(Debug, Clone, Copy)]
 pub struct Spend<'a> {
@@ -1081,6 +1100,49 @@ mod tests {
         let (_, outcome) = wake_completion(&wake, None, "hb", &long, &[], false, now()).unwrap();
         assert_eq!(outcome.chars().count(), OUTCOME_MAX_CHARS);
         assert!(outcome.ends_with('…'));
+    }
+
+    #[test]
+    fn only_a_live_approval_holds_a_wake_back() {
+        use crate::session::TurnOrigin;
+        let t = now();
+        let stale = Duration::hours(24);
+        let held = |origin: TurnOrigin, at| {
+            let mut tc = tool("gmail_send_email", "{}", crate::components::shared::ToolCallStatus::Running);
+            tc.origin = Some(origin);
+            msg_at("Hobbes", MessageContent::PermissionRequest(tc), at)
+        };
+        // The person's approval from an earlier turn, two days old, never
+        // answered; they have moved on since. It must not silence the
+        // Heartbeat (it did: any approval anywhere held every wake).
+        let old_user = vec![
+            msg_at("User", text("Draft the Acme reply"), t - Duration::days(2)),
+            held(TurnOrigin::User, t - Duration::days(2) + Duration::minutes(1)),
+            msg_at("User", text("What's on today?"), t - Duration::hours(1)),
+            msg_at("Hobbes", text("Two meetings."), t - Duration::minutes(59)),
+        ];
+        assert!(!approval_blocks_wake(&old_user, t, stale));
+        // Even a recent one from an earlier turn of the person's.
+        let mut recent_user = old_user.clone();
+        recent_user[0].created_at = t - Duration::hours(3);
+        recent_user[1] = held(TurnOrigin::User, t - Duration::hours(3));
+        assert!(!approval_blocks_wake(&recent_user, t, stale));
+        // An approval in the latest turn holds it, whoever raised it.
+        let latest = vec![msg_at("User", text("Send it"), t - Duration::minutes(5)), held(TurnOrigin::User, t - Duration::minutes(4))];
+        assert!(approval_blocks_wake(&latest, t, stale));
+        // A previous wake's held call holds the next wake for a day, even
+        // after a typed turn, then lets go.
+        let wake_held = vec![
+            msg_at("User", text("[Heartbeat wake]"), t - Duration::hours(2)),
+            held(TurnOrigin::Heartbeat, t - Duration::hours(2)),
+            msg_at("User", text("hi"), t - Duration::hours(1)),
+        ];
+        assert!(approval_blocks_wake(&wake_held, t, stale));
+        assert!(!approval_blocks_wake(&wake_held, t + Duration::hours(23), stale));
+        // A voice transcript line after a held turn doesn't end that turn.
+        let mut spoken = latest.clone();
+        spoken.push(msg_at("User", text("🎙 hang on"), t - Duration::minutes(3)));
+        assert!(approval_blocks_wake(&spoken, t, stale));
     }
 
     #[test]

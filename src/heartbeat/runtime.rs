@@ -183,7 +183,8 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
 
 /// Mid-turn (a typed, voice or wake turn alike — the Hobbes session hosts
 /// all three), a message popped from its queue but not streaming yet, a
-/// message waiting in its queue, or a call waiting on approval. A wake
+/// message waiting in its queue, or a call waiting on approval in the latest
+/// turn (or a recent wake's own; `wake::approval_blocks_wake`). A wake
 /// waits for all of these, so it never interleaves with or aborts another
 /// turn.
 fn session_busy(deps: HeartbeatDeps, session_id: &str, streaming: &HashSet<String>) -> bool {
@@ -196,7 +197,13 @@ fn session_busy(deps: HeartbeatDeps, session_id: &str, streaming: &HashSet<Strin
             .peek()
             .sessions
             .get(session_id)
-            .is_some_and(|s| wake::has_pending_approval(&s.messages))
+            .is_some_and(|s| {
+                wake::approval_blocks_wake(
+                    &s.messages,
+                    Utc::now(),
+                    Duration::hours(crate::session_rotation::APPROVAL_STALE_HOURS),
+                )
+            })
 }
 
 // ── Perception helpers ──────────────────────────────────────────────────────
