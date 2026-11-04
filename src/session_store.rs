@@ -47,6 +47,8 @@ const META_JSON_MIGRATED: &str = "migrated_from_json";
 const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
 /// Set once the `project_id` column carries each row's `data.project_id`.
 const META_PROJECT_ID_COLUMN: &str = "project_id_column_backfilled";
+/// Set once `backfill_tab_title_column` has filled the `tab_title` column.
+const META_TAB_TITLE_COLUMN: &str = "tab_title_column_backfilled";
 
 fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
     FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -151,6 +153,7 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
          );",
     )?;
     ensure_project_id_column(conn)?;
+    ensure_tab_title_column(conn)?;
 
     // The planner and the fleet share this database and connection. Creating
     // their schemas here means test databases get their tables too.
@@ -197,6 +200,10 @@ pub fn init() -> Result<(), String> {
 
     if let Err(e) = backfill_search_tab_titles(&conn) {
         tracing::warn!("search_text tab_title backfill failed (will retry next launch): {e}");
+    }
+
+    if let Err(e) = backfill_tab_title_column(&conn) {
+        tracing::warn!("tab_title column backfill failed (will retry next launch): {e}");
     }
 
     if let Err(e) = backfill_project_id_column(&conn) {
@@ -287,6 +294,37 @@ fn backfill_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
         "backfilled the sessions.project_id column"
     );
     Ok(())
+}
+
+/// The `tab_title` column (a copy of `data.tab_title`, written by
+/// `upsert_row`), so the Hobbes tab's list query (`tab_rows`) matches titles
+/// without parsing every row's JSON under the connection lock. Added to
+/// databases created before it (`ADD COLUMN` is schema-only); filled once by
+/// `backfill_tab_title_column`.
+fn ensure_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'tab_title'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute("ALTER TABLE sessions ADD COLUMN tab_title TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// One-time: copy each row's `data.tab_title` into the `tab_title` column
+/// (in `init`, before the connection is shared). Leaves `data`, `seq` and
+/// fingerprints untouched.
+fn backfill_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
+    if meta_get_conn(conn, META_TAB_TITLE_COLUMN)?.is_some() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE sessions
+         SET tab_title = json_extract(data, '$.tab_title')
+         WHERE tab_title IS NOT json_extract(data, '$.tab_title')",
+        [],
+    )?;
+    meta_set_conn(conn, META_TAB_TITLE_COLUMN, "1", 0)
 }
 
 fn migrate_from_json_files(conn: &Connection) -> Result<(), String> {
@@ -416,6 +454,8 @@ pub struct SessionRow {
     pub search_text: String,
     /// `session.project_id`, mirrored into an indexed column.
     pub project_id: Option<String>,
+    /// `session.tab_title`, mirrored into its own column (`tab_rows`).
+    pub tab_title: Option<String>,
     pub seq: i64,
     pub data: String,
     pub data_hash: u64,
@@ -463,6 +503,7 @@ pub fn build_row(session: &Session, seq: i64) -> Result<SessionRow, serde_json::
         summary,
         search_text,
         project_id: session.project_id.clone(),
+        tab_title: session.tab_title.clone(),
         seq,
         data,
         data_hash,
@@ -473,8 +514,8 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO sessions
             (id, name, last_updated, message_count, total_cost, total_tokens,
-             has_timers, summary, search_text, seq, data, project_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             has_timers, summary, search_text, seq, data, project_id, tab_title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              last_updated = excluded.last_updated,
@@ -486,7 +527,8 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
              search_text = excluded.search_text,
              seq = excluded.seq,
              data = excluded.data,
-             project_id = excluded.project_id
+             project_id = excluded.project_id,
+             tab_title = excluded.tab_title
          WHERE excluded.seq >= sessions.seq",
         params![
             row.id,
@@ -501,6 +543,7 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
             row.seq,
             row.data,
             row.project_id,
+            row.tab_title,
         ],
     )?;
     Ok(())
@@ -1077,10 +1120,9 @@ impl TabRow {
 /// Newest-first conversation rows, skipping `exclude` (the Hobbes lineage
 /// and the hydrated sessions the caller lists from memory). `query`
 /// matches the name and the AI title only; `project_id` filters on the
-/// indexed column. The selected `json_extract`s run only for the rows
-/// returned (the `last_updated` index walk stops at `LIMIT`); a query adds
-/// one per row whose name doesn't match, the same full scan History search
-/// already does over `search_text`.
+/// indexed column. The query matches the `name` and `tab_title` columns, so
+/// no row's JSON is parsed to filter; the selected `json_extract`s run only
+/// for the rows returned (the `last_updated` index walk stops at `LIMIT`).
 pub fn tab_rows(query: Option<&str>, project_id: Option<&str>, exclude: &[String], limit: i64) -> Vec<TabRow> {
     with_conn(|conn| tab_rows_conn(conn, query, project_id, exclude, limit)).unwrap_or_else(|e| {
         tracing::error!("tab_rows failed: {e}");
@@ -1102,11 +1144,9 @@ pub(crate) fn tab_rows_conn(
         values.push(format!("%{escaped}%").into());
         let n = values.len();
         // Name and title only (`hobbes_tabs::session_matches`): a listing
-        // must not search content. `OR` short-circuits, so the title is
-        // pulled out of the blob only for rows whose name didn't match.
+        // must not search content. Both are columns: no JSON is parsed.
         clauses.push(format!(
-            "(name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE \
-             OR json_extract(data, '$.tab_title') LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)"
+            "(name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE OR tab_title LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)"
         ));
     }
     if let Some(p) = project_id {
@@ -1121,7 +1161,7 @@ pub(crate) fn tab_rows_conn(
     }
     let where_clause = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
     let sql = format!(
-        "SELECT id, name, json_extract(data, '$.tab_title'), json_extract(data, '$.tab_emoji'), \
+        "SELECT id, name, tab_title, json_extract(data, '$.tab_emoji'), \
          coalesce(json_extract(data, '$.name_user_set'), 0), project_id, \
          json_extract(data, '$.composio_profile'), last_updated, message_count \
          FROM sessions {where_clause} ORDER BY last_updated DESC LIMIT {}",
@@ -1704,6 +1744,11 @@ pub mod test_support {
 
     pub fn backfill_project_ids_for_test(conn: &Connection) {
         backfill_project_id_column(conn).unwrap();
+    }
+
+    pub fn backfill_tab_titles(conn: &Connection) {
+        conn.execute("DELETE FROM meta WHERE key = ?1", params![META_TAB_TITLE_COLUMN]).unwrap();
+        backfill_tab_title_column(conn).unwrap();
     }
 
     pub fn ensure_project_id_column_for_test(conn: &Connection) {

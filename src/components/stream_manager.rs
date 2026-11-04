@@ -16,6 +16,15 @@ use uuid::Uuid;
 
 use crate::processing::summarization_scheduler::SchedulerSignal;
 
+/// The sources a proactive summary of `session` is generated from (taken
+/// before the LLM call; `adopt_summary` unions them in). The durable set:
+/// for a system session only its tab reads and stored summary sources, so
+/// its clocked Composio reads never become permanent holds through the
+/// summary (`profile_reach::durable_summary_sources`).
+pub(crate) fn proactive_summary_sources(session: &crate::session::Session) -> Vec<String> {
+    crate::mcp::manager::profile_reach::durable_summary_sources(session)
+}
+
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
@@ -1668,8 +1677,7 @@ impl StreamManagerContext {
                                 .unwrap_or_else(|_| "{}".to_string());
                                 // Before the call: an undo in flight must not
                                 // drop sources from the summary it returns.
-                                let generated_from =
-                                    crate::mcp::manager::profile_reach::summary_sources(&active_session);
+                                let generated_from = proactive_summary_sources(&active_session);
 
                                 // Format last 5 messages for the summarizer
                                 let messages_text: Vec<String> = active_session
