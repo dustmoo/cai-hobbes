@@ -397,6 +397,38 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             tool_call.tool_name, tool_call.server_name
         ),
     };
+    // The Hobbes tab reading another conversation (hobbes_tabs): "always"
+    // turns the setting on instead of writing a trust rule, so the setting
+    // stays the one place that permission lives.
+    let tab_read = crate::hobbes_tabs::is_tab_tool(&tool_call.tool_name);
+    let allow_label = if tab_read { crate::hobbes_tabs::ALWAYS_LABEL.to_string() } else { allow_label };
+    let session_project = if tab_read { None } else { session_project };
+    // The tab being read, by name: from memory when it is open, else its
+    // row, looked up off the UI thread (P-017).
+    let mut tab_target = use_signal(|| None::<String>);
+    use_hook({
+        let target = tab_read
+            .then(|| parsed_args.as_ref().and_then(|a| a.get("session_id")).and_then(|v| v.as_str()).map(str::to_string))
+            .flatten();
+        move || {
+            if let Some(id) = target {
+                spawn(async move {
+                    let label = crate::hobbes_tabs::tab_label(session_state, &id).await;
+                    tab_target.set(Some(label));
+                });
+            }
+        }
+    });
+    let tab_description: Option<String> = tab_read.then(|| {
+        if tool_call.tool_name == crate::hobbes_tabs::TAB_LIST {
+            "Hobbes wants to list your other conversations (titles, projects and last activity).".to_string()
+        } else {
+            match tab_target.read().as_deref() {
+                Some(label) => format!("Hobbes wants to read your conversation {label}."),
+                None => "Hobbes wants to read another of your conversations.".to_string(),
+            }
+        }
+    });
     let mut make_rule = use_signal(|| false);
     let mut scope_to_project = use_signal(|| false);
 
@@ -536,6 +568,9 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 if let Some(desc) = merge_description {
                     p { class: "font-semibold text-yellow-100", "{desc}" }
                 }
+                if let Some(desc) = tab_description {
+                    p { class: "font-semibold text-yellow-100", "{desc}" }
+                }
                 p { "Do you want to allow this?" }
                 if always_asks {
                     p { class: "text-xs text-yellow-200/70", "Hobbes asks every time for this one; it can't be set to always allow." }
@@ -608,8 +643,20 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     class: "px-4 py-2 rounded-md bg-green-600 text-fg hover:bg-green-500",
                     onclick: move |_| {
                         let owning_session_id = owning_session_id_approve.clone();
-                        // Author the rule first (when asked), then approve.
-                        if *make_rule.peek() {
+                        // "Always" on a tab read turns the setting on (saved
+                        // like any settings edit) rather than writing a rule.
+                        if *make_rule.peek() && tab_read {
+                            crate::hobbes_tabs::allow_always(&mut settings.write());
+                            let snapshot = settings.peek().clone();
+                            if let Err(e) = settings_manager.read().save(&snapshot) {
+                                tracing::error!("settings save failed: {e}");
+                            }
+                            log_on_approve(
+                                crate::context::trust_store::DecisionKind::ApprovedRuleCreated,
+                                None,
+                            );
+                        } else if *make_rule.peek() {
+                            // Author the rule first (when asked), then approve.
                             let rule = crate::context::permissions::TrustRule {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 server: rule_server.clone(),

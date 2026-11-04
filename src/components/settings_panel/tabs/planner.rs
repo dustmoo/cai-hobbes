@@ -238,6 +238,31 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                         }
                                     }
 
+                                    // The Hobbes tab reading other conversations
+                                    // (hobbes_tabs). Read live at every call, so
+                                    // switching it off revokes at once.
+                                    {
+                                        let read_tabs = local_settings.read().hobbes_read_tabs;
+                                        rsx! {
+                                            h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mt-6 mb-3", "Hobbes tab" }
+                                            div {
+                                                class: "flex items-center justify-between mb-4",
+                                                div {
+                                                    label { class: "text-sm font-medium text-fg-muted", "Read other tabs" }
+                                                    p { class: "text-xs text-fg-muted", "Lets the Hobbes tab read your other conversations. Off: it asks you each time." }
+                                                }
+                                                input {
+                                                    r#type: "checkbox",
+                                                    class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                                    checked: "{read_tabs}",
+                                                    onchange: move |e| {
+                                                        local_settings.write().hobbes_read_tabs = e.value() == "true";
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     if crate::heartbeat::heartbeat_available() {
                                         {
                                             let hb = local_settings.read().clone();
