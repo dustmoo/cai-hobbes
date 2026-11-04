@@ -629,6 +629,12 @@ pub fn MessageList(
                                                                                                 // Trigger continuation on the session that actually ran the
                                                                                                 // skill, not whichever tab is active right now (see the
                                                                                                 // has_pending_approvals doc comment above).
+                                                                                                // The continuation runs under the approved
+                                                                                                // skill's own origin (unstamped legacy: the
+                                                                                                // resume path's fallback scan decides).
+                                                                                                if let Some(origin) = sc.origin {
+                                                                                                    crate::components::continuation_controller::set_continuation_origin(&session_id, origin);
+                                                                                                }
                                                                                                 has_pending_approvals.write().insert(session_id.clone());
                                                                                             }
                                                                                             Err(e) => {

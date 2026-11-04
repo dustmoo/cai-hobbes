@@ -501,6 +501,11 @@ pub fn ChatInput(
                     // DO NOT also call on_send / has_new_comments here — that would
                     // create a second parallel LLM stream (double-turn regression).
                     let sid = current_session_id.read().clone();
+                    // The person asked for it: their turn.
+                    crate::components::continuation_controller::set_continuation_origin(
+                        &sid,
+                        crate::session::TurnOrigin::User,
+                    );
                     has_pending_approvals.write().insert(sid);
                 }
             }
@@ -762,6 +767,9 @@ pub fn ChatInput(
                                     // Auto-trigger the LLM to respond with the
                                     // injected skill context, on the invoking
                                     // session (not the active tab).
+                                    if let Some(origin) = sc_clone.origin {
+                                        crate::components::continuation_controller::set_continuation_origin(&skill_sid, origin);
+                                    }
                                     has_pending_approvals.write().insert(skill_sid.clone());
                                 }
                                 Err(e) => {

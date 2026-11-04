@@ -123,6 +123,19 @@ pub(crate) fn split_resumable(waiting: Vec<String>, in_flight: impl Fn(&str) -> 
     waiting.into_iter().partition(|id| !in_flight(id))
 }
 
+/// The origin a no-tools continuation (an approved skill, "analyse now")
+/// runs under: the one its approval handed over
+/// (`continuation_controller::set_continuation_origin`), else — an
+/// unstamped legacy skill — the newest stamped call ([`raising_turn_origin`]).
+pub(crate) fn no_tools_continuation_origin(
+    session_id: &str,
+    session: Option<&crate::session::Session>,
+) -> crate::session::TurnOrigin {
+    crate::components::continuation_controller::take_continuation_origin(session_id)
+        .or_else(|| session.map(raising_turn_origin))
+        .unwrap_or_default()
+}
+
 /// The origin of the turn that raised the session's latest stamped call
 /// (a tool call, a held approval, a skill call): what a continuation with
 /// no calls left to run (an approved skill) continues under. Falls back to
@@ -522,15 +535,13 @@ pub fn ChatWindow(
                         &crate::agent_time_runtime::LEASED_CHATS.peek(),
                         &owning_id,
                     ) {
-                        // A skill continuation: the turn that raised the
-                        // approved skill keeps its origin (its stamp), not
-                        // whatever the session last ran.
-                        let origin = session_state
-                            .peek()
-                            .sessions
-                            .get(&owning_id)
-                            .map(raising_turn_origin)
-                            .unwrap_or_default();
+                        // A skill continuation: the approved skill's own
+                        // origin (handed over by the approval), not whatever
+                        // turn is newest in the session.
+                        let origin = {
+                            let state = session_state.peek();
+                            no_tools_continuation_origin(&owning_id, state.sessions.get(&owning_id))
+                        };
                         continuation_controller
                             .write()
                             .trigger_continuation(owning_id.clone(), origin);

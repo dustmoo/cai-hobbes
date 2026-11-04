@@ -1230,6 +1230,36 @@ mod tests {
     }
 
     #[test]
+    fn a_no_tools_continuation_runs_under_the_approved_skill_s_origin() {
+        use crate::components::chat::no_tools_continuation_origin;
+        use crate::components::shared::{MessageContent, SkillCall};
+        use crate::session::TurnOrigin;
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        let mut skill = crate::voice::session::transcript_message(false, "x");
+        skill.content = MessageContent::SkillCall(SkillCall { origin: Some(TurnOrigin::Heartbeat), ..Default::default() });
+        s.messages.push(skill);
+        // A newer turn of the person's, stamped User.
+        let mut mine = call("HOBBES_TODO_LIST");
+        stamp_turn_origin(&mut mine, TurnOrigin::User);
+        let mut m = crate::voice::session::transcript_message(false, "x");
+        m.content = MessageContent::ToolCall(mine);
+        s.messages.push(m);
+        // The wake's skill, approved now: its own origin, not the newest turn's.
+        crate::components::continuation_controller::set_continuation_origin(&id, TurnOrigin::Heartbeat);
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
+        // Taken once: an "analyse now" from the person after a wake is theirs.
+        s.messages.reverse(); // newest stamp is now the wake's
+        crate::components::continuation_controller::set_continuation_origin(&id, TurnOrigin::User);
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::User);
+        // Nothing handed over (legacy, unstamped skill): the scan decides.
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
+        s.messages.reverse();
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::User);
+    }
+
+    #[test]
     fn a_resumed_approval_keeps_its_turn_s_origin() {
         use crate::components::shared::MessageContent;
         use crate::session::TurnOrigin;

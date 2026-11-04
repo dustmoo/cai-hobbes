@@ -86,6 +86,27 @@ impl ContinuationController {
     }
 }
 
+/// The origin of an approval-driven continuation that has no tool calls
+/// left to resume (an approved skill, "analyse now"), keyed by session: set
+/// by whoever hands the session to the resume path, taken by its
+/// no-tools branch ([`take_continuation_origin`]). The approved skill
+/// carries its own stamp here, so the continuation can't be decided by
+/// whichever turn happens to be newest in the session.
+static CONTINUATION_ORIGINS: std::sync::Mutex<Option<std::collections::HashMap<String, crate::session::TurnOrigin>>> =
+    std::sync::Mutex::new(None);
+
+/// Record the origin a no-tools continuation of `session_id` runs under.
+pub fn set_continuation_origin(session_id: &str, origin: crate::session::TurnOrigin) {
+    if let Ok(mut m) = CONTINUATION_ORIGINS.lock() {
+        m.get_or_insert_with(Default::default).insert(session_id.to_string(), origin);
+    }
+}
+
+/// Take the recorded origin, if any.
+pub fn take_continuation_origin(session_id: &str) -> Option<crate::session::TurnOrigin> {
+    CONTINUATION_ORIGINS.lock().ok().and_then(|mut m| m.as_mut().and_then(|m| m.remove(session_id)))
+}
+
 /// Holds a session's continuation in-flight guard for one run of the
 /// continuation flow, from the trigger until the next stream is handed off
 /// ([`InFlightGuard::hand_off`]; `start_stream` then releases the guard once
