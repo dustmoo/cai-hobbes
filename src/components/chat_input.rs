@@ -1683,17 +1683,26 @@ pub fn ChatInput(
                                         None => (None, false, Vec::new(), Vec::new()),
                                     }
                                 };
-                                let active_profile = home.unwrap_or_else(|| profiles[0].clone());
+                                // No home (the pin points at a deleted profile, and no
+                                // global profile is set): say so, and list every
+                                // profile so one can be picked.
+                                let active_id: Option<String> = home.as_ref().map(|h| h.id.clone());
+                                let (active_name, active_color) = match &home {
+                                    Some(h) => (h.name.clone(), h.color.clone()),
+                                    None => ("No profile".to_string(), "bg-input".to_string()),
+                                };
                                 let reach_badge = (!reach_extra.is_empty()).then(|| format!("+{}", reach_extra.len()));
                                 let reach_title = if reach_extra.is_empty() {
                                     String::new()
                                 } else {
                                     format!(" · also reaches {}", reach_extra.join(", "))
                                 };
-                                let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                                let active_name = active_profile.name.clone();
-                                let active_id = active_profile.id.clone();
-                                let active_color = active_profile.color.clone();
+                                let active_initial = home
+                                    .as_ref()
+                                    .and_then(|h| h.name.chars().next())
+                                    .unwrap_or('?')
+                                    .to_uppercase()
+                                    .to_string();
                                 // The pill borrows the profile's colour for its border so the
                                 // tab's identity is legible without opening anything.
                                 let pill_class = format!(
@@ -1706,7 +1715,7 @@ pub fn ChatInput(
                                 );
                                 // A single profile is still shown — it is identity, not a
                                 // control — but there is nothing to pick, so no chevron.
-                                let interactive = profiles.len() > 1;
+                                let interactive = profiles.len() > 1 || home.is_none();
 
                                 rsx! {
                                     div {
@@ -1770,7 +1779,7 @@ pub fn ChatInput(
                                                             "w-full text-left px-4 py-2 text-sm text-fg-muted hover:text-fg transition-colors flex items-center justify-between"
                                                         };
 
-                                                        if profile.id != active_id {
+                                                        if active_id.as_deref() != Some(profile.id.as_str()) {
                                                             rsx! {
                                                                 div {
                                                                     class: "w-full flex items-center hover:bg-primary-900/50 transition-colors",
