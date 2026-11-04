@@ -233,6 +233,10 @@ pub fn ChatWindow(
     // New Chat with Memory Modal State
     let mut show_new_chat_memory_modal = use_signal(|| false);
     let mut modal_initial_context = use_signal(ActiveContext::default);
+    // The tab the "new chat with memory" modal copied its context from,
+    // recorded when it opens: the new tab inherits that tab's summary
+    // sources, even if another tab is active by the time Start is clicked.
+    let mut modal_source_session = use_signal(|| None::<String>);
 
     // Forget Memory Modal State
     let mut show_forget_memory_modal = use_signal(|| false);
@@ -1546,6 +1550,7 @@ pub fn ChatWindow(
                     on_new_chat_with_memory: move |_| {
                         if let Some(session) = session_state.read().sessions.get(&*current_target_id.read()) {
                             modal_initial_context.set(session.active_context.clone());
+                            modal_source_session.set(Some(session.id.clone()));
                             show_new_chat_memory_modal.set(true);
                         }
                     },
@@ -1561,9 +1566,10 @@ pub fn ChatWindow(
                          // so the cross-company hold still sees them there.
                          let sources = {
                              let state = session_state.peek();
-                             state
-                                 .sessions
-                                 .get(&*current_target_id.peek())
+                             modal_source_session
+                                 .peek()
+                                 .as_ref()
+                                 .and_then(|id| state.sessions.get(id))
                                  .map(|old| crate::mcp::manager::profile_reach::inherited_sources(&settings.peek(), old))
                                  .unwrap_or_default()
                          };
