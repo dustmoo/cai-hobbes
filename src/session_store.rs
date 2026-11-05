@@ -47,7 +47,7 @@ const META_JSON_MIGRATED: &str = "migrated_from_json";
 const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
 /// Set once the `project_id` column carries each row's `data.project_id`.
 const META_PROJECT_ID_COLUMN: &str = "project_id_column_backfilled";
-/// Set once `backfill_tab_title_column` has filled the `tab_title` column.
+/// Set once the background `tab_title` backfill (`spawn_tab_title_backfill`) has filled the column.
 const META_TAB_TITLE_COLUMN: &str = "tab_title_column_backfilled";
 
 fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
@@ -202,10 +202,6 @@ pub fn init() -> Result<(), String> {
         tracing::warn!("search_text tab_title backfill failed (will retry next launch): {e}");
     }
 
-    if let Err(e) = backfill_tab_title_column(&conn) {
-        tracing::warn!("tab_title column backfill failed (will retry next launch): {e}");
-    }
-
     if let Err(e) = backfill_project_id_column(&conn) {
         tracing::warn!("project_id column backfill failed (will retry next launch): {e}");
     }
@@ -213,6 +209,7 @@ pub fn init() -> Result<(), String> {
     seed_seq_from_db(&conn);
 
     let _ = CONN.set(Mutex::new(conn));
+    spawn_tab_title_backfill();
     Ok(())
 }
 
@@ -300,7 +297,7 @@ fn backfill_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
 /// `upsert_row`), so the Hobbes tab's list query (`tab_rows`) matches titles
 /// without parsing every row's JSON under the connection lock. Added to
 /// databases created before it (`ADD COLUMN` is schema-only); filled once by
-/// `backfill_tab_title_column`.
+/// `spawn_tab_title_backfill` in the background.
 fn ensure_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
     let has_column = conn
         .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'tab_title'")?
@@ -311,20 +308,83 @@ fn ensure_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// One-time: copy each row's `data.tab_title` into the `tab_title` column
-/// (in `init`, before the connection is shared). Leaves `data`, `seq` and
-/// fingerprints untouched.
+/// Rows per `tab_title` backfill batch: the connection lock is held for one
+/// batch at a time, so saves and History queries interleave with it.
+const TAB_TITLE_BACKFILL_BATCH: i64 = 100;
+
+/// One-time: copy each row's `data.tab_title` into the `tab_title` column.
+/// Runs on a background thread after `init`, in rowid batches, so a large
+/// store (every row's JSON is parsed) never holds the window back: until it
+/// finishes, older rows just don't match a title search in `tab_rows`.
+/// Interrupted runs resume from the start next launch (each batch is
+/// idempotent). Leaves `data`, `seq` and fingerprints untouched.
+fn spawn_tab_title_backfill() {
+    let done = with_conn(|c| meta_get_conn(c, META_TAB_TITLE_COLUMN)).ok().flatten().is_some();
+    if done {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("tab-title-backfill".into()).spawn(|| {
+        let started = std::time::Instant::now();
+        let mut cursor = 0i64;
+        loop {
+            match with_conn(|c| backfill_tab_title_batch(c, cursor, TAB_TITLE_BACKFILL_BATCH)) {
+                Ok(Some(next)) => cursor = next,
+                Ok(None) => {
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "backfilled the sessions.tab_title column"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("tab_title column backfill failed (will retry next launch): {e}");
+                    return;
+                }
+            }
+            // Let the UI's saves and queries take the lock between batches.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("tab_title column backfill not started: {e}");
+    }
+}
+
+/// One batch of the `tab_title` backfill: the next `batch` rows after rowid
+/// `after`. Returns the cursor for the next batch, or `None` once every row
+/// is done (and marks the backfill complete).
+fn backfill_tab_title_batch(conn: &Connection, after: i64, batch: i64) -> rusqlite::Result<Option<i64>> {
+    let last: Option<i64> = conn.query_row(
+        "SELECT max(rowid) FROM (SELECT rowid FROM sessions WHERE rowid > ?1 ORDER BY rowid LIMIT ?2)",
+        params![after, batch],
+        |r| r.get(0),
+    )?;
+    let Some(last) = last else {
+        meta_set_conn(conn, META_TAB_TITLE_COLUMN, "1", 0)?;
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE sessions
+         SET tab_title = json_extract(data, '$.tab_title')
+         WHERE rowid > ?1 AND rowid <= ?2
+           AND tab_title IS NOT json_extract(data, '$.tab_title')",
+        params![after, last],
+    )?;
+    Ok(Some(last))
+}
+
+/// The whole `tab_title` backfill on one connection (tests).
+#[cfg(test)]
 fn backfill_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
     if meta_get_conn(conn, META_TAB_TITLE_COLUMN)?.is_some() {
         return Ok(());
     }
-    conn.execute(
-        "UPDATE sessions
-         SET tab_title = json_extract(data, '$.tab_title')
-         WHERE tab_title IS NOT json_extract(data, '$.tab_title')",
-        [],
-    )?;
-    meta_set_conn(conn, META_TAB_TITLE_COLUMN, "1", 0)
+    let mut cursor = 0;
+    // A small batch so the tests cross batch boundaries.
+    while let Some(next) = backfill_tab_title_batch(conn, cursor, 2)? {
+        cursor = next;
+    }
+    Ok(())
 }
 
 fn migrate_from_json_files(conn: &Connection) -> Result<(), String> {

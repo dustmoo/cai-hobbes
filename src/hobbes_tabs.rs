@@ -1236,4 +1236,23 @@ mod tests {
             assert_eq!(hits[0].tab_title.as_deref(), Some("Quarterly Planning"));
         });
     }
+
+    #[test]
+    fn the_title_backfill_covers_every_row_across_batches() {
+        crate::session_store::test_support::with_test_db(|conn| {
+            let mut state = SessionState::default();
+            for i in 0..5 {
+                let id = state.create_session_raw(None);
+                let s = state.sessions.get_mut(&id).unwrap();
+                s.tab_title = Some(format!("Topic {i}"));
+                crate::session_store::test_support::upsert(conn, s);
+            }
+            conn.execute("UPDATE sessions SET tab_title = NULL", []).unwrap();
+            crate::session_store::test_support::backfill_tab_titles(conn);
+            let missing: i64 = conn
+                .query_row("SELECT count(*) FROM sessions WHERE tab_title IS NULL", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(missing, 0);
+        });
+    }
 }
