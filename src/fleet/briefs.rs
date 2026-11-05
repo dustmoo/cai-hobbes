@@ -92,6 +92,54 @@ pub fn collect_due(
     tasks
 }
 
+/// First retry delay after a failed brief generation; doubles per failure.
+pub const BRIEF_RETRY_BASE_SECS: i64 = 30;
+/// Longest a failing session waits between attempts.
+pub const BRIEF_RETRY_MAX_SECS: i64 = 30 * 60;
+
+/// Per-session exponential backoff for the brief supervisor. It takes one
+/// task per tick, oldest dirty first, so a task that keeps failing (a
+/// provider outage, a transcript the model chokes on) would sit at the head
+/// and starve every other session. A failed session waits out its backoff
+/// while the supervisor moves on to the next due task.
+#[derive(Debug, Default)]
+pub struct BriefBackoff {
+    /// session id → (consecutive failures, not before).
+    entries: std::collections::HashMap<String, (u32, DateTime<Utc>)>,
+}
+
+impl BriefBackoff {
+    /// The first due task not backing off. Forgets sessions that are no
+    /// longer due (briefed, or their dirty mark was cleared).
+    pub fn pick(&mut self, due: Vec<BriefTask>, now: DateTime<Utc>) -> Option<BriefTask> {
+        self.entries
+            .retain(|id, _| due.iter().any(|t| &t.session_id == id));
+        due.into_iter().find(|t| {
+            self.entries
+                .get(&t.session_id)
+                .is_none_or(|(_, not_before)| *not_before <= now)
+        })
+    }
+
+    /// Record a failed attempt: the next one waits
+    /// `BRIEF_RETRY_BASE_SECS · 2^(failures-1)`, capped at
+    /// [`BRIEF_RETRY_MAX_SECS`].
+    pub fn failed(&mut self, session_id: &str, now: DateTime<Utc>) {
+        let entry = self.entries.entry(session_id.to_string()).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        let shift = entry.0.saturating_sub(1).min(16);
+        let delay = BRIEF_RETRY_BASE_SECS
+            .saturating_mul(1i64 << shift)
+            .min(BRIEF_RETRY_MAX_SECS);
+        entry.1 = now + chrono::Duration::seconds(delay);
+    }
+
+    /// The session got a brief (or its dirty mark was cleared): reset.
+    pub fn succeeded(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+}
+
 /// `(previous_summary, recent_messages)` framing for
 /// `LlmConnector::generate_fleet_brief` — the connector's summarize prompt
 /// is fixed, so the brief instructions ride the recent-messages slot (the
@@ -713,6 +761,52 @@ mod tests {
         let live = FleetState { sessions: [(s.id.clone(), s.clone())].into(), ..Default::default() };
         let report = status_report(&live, &[], None, &[], now, date);
         assert!(report["sessions"][0]["brief"].get("blocked_on").is_none());
+    }
+
+    fn task(id: &str, dirty: &str) -> BriefTask {
+        BriefTask {
+            session_id: id.into(),
+            name: id.into(),
+            cwd: String::new(),
+            transcript_path: String::new(),
+            previous_brief: None,
+            dirty_at: utc(dirty),
+            is_final: false,
+            linked_todo: None,
+            background_active: false,
+        }
+    }
+
+    #[test]
+    fn a_failing_brief_backs_off_and_lets_the_others_through() {
+        let mut b = BriefBackoff::default();
+        let t0 = utc("2026-09-01T10:00:00Z");
+        let due = || vec![task("old", "2026-09-01T09:00:00Z"), task("new", "2026-09-01T09:30:00Z")];
+        assert_eq!(b.pick(due(), t0).unwrap().session_id, "old");
+        b.failed("old", t0);
+        // Next tick: the failing head is skipped, the next session runs.
+        let t1 = t0 + chrono::Duration::seconds(15);
+        assert_eq!(b.pick(due(), t1).unwrap().session_id, "new");
+        // Once its backoff runs out it gets another try.
+        let t2 = t0 + chrono::Duration::seconds(BRIEF_RETRY_BASE_SECS);
+        assert_eq!(b.pick(due(), t2).unwrap().session_id, "old");
+        // Delays double, capped.
+        b.failed("old", t2);
+        assert_eq!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], t2 + chrono::Duration::seconds(59)), None);
+        assert!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], t2 + chrono::Duration::seconds(60)).is_some());
+        for _ in 0..20 {
+            b.failed("old", t2);
+        }
+        let cap = t2 + chrono::Duration::seconds(BRIEF_RETRY_MAX_SECS);
+        assert!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], cap - chrono::Duration::seconds(1)).is_none());
+        assert!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], cap).is_some());
+        // Success resets; a session that's no longer due is forgotten.
+        b.succeeded("old");
+        assert_eq!(b.pick(due(), t2).unwrap().session_id, "old");
+        b.failed("new", t2);
+        b.pick(vec![task("old", "2026-09-01T09:00:00Z")], t2);
+        assert_eq!(b.pick(due(), t2).unwrap().session_id, "old");
+        assert_eq!(b.pick(vec![task("new", "2026-09-01T09:30:00Z")], t2).unwrap().session_id, "new", "forgotten once it left the due list");
     }
 
     #[test]

@@ -940,6 +940,21 @@ pub fn note_transcript_and_dirty(
     }
 }
 
+/// Clear a session's dirty mark when no new brief replaces the old one
+/// (unreadable transcript, empty digest, unusable reply). The dirty mark is
+/// what hid the old brief's blocker ([`FleetSession::blocked_on`]); clearing
+/// it alone would bring a question from before the latest turn back. So the
+/// blocker goes with it. A dirty mark newer than `started_at` (a turn that
+/// raced in) is left alone.
+pub fn clear_dirty_without_brief(s: &mut FleetSession, started_at: DateTime<Utc>) {
+    if s.brief_dirty_at.is_none_or(|d| d <= started_at) {
+        s.brief_dirty_at = None;
+        if let Some(b) = s.brief.as_mut() {
+            b.blocked_on = None;
+        }
+    }
+}
+
 /// How a held gate (a headless dispatched run's permission request) was
 /// resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1613,14 +1628,15 @@ impl FleetShared {
 
     /// Clear a LIVE session's dirty mark without writing a brief (unreadable
     /// transcript, empty digest) so the supervisor doesn't spin on it. Same
-    /// `started_at` race rule as [`Self::set_brief`]. Returns false when the
-    /// session isn't in the live map.
+    /// `started_at` race rule as [`Self::set_brief`]. The old brief's
+    /// blocker goes too ([`clear_dirty_without_brief`]). Returns false when
+    /// the session isn't in the live map.
     pub fn clear_brief_dirty(&self, session_id: &str, started_at: DateTime<Utc>) -> bool {
         let row = {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
             match state.sessions.get_mut(session_id) {
                 Some(s) if s.brief_dirty_at.is_some_and(|d| d <= started_at) => {
-                    s.brief_dirty_at = None;
+                    clear_dirty_without_brief(s, started_at);
                     Some(s.clone())
                 }
                 Some(_) => return true, // newer dirty mark: leave it
@@ -3179,11 +3195,22 @@ mod tests {
         {
             let mut state = shared.state.lock().unwrap();
             reduce(&mut state, &stop("s1"), t0);
-            state.sessions.get_mut("s1").unwrap().brief_dirty_at = Some(t0);
+            let s = state.sessions.get_mut("s1").unwrap();
+            s.brief_dirty_at = Some(t0);
+            // A brief from before the latest turn, still holding its question.
+            s.brief = Some(SessionBrief {
+                blocked_on: Some("pick a schema".into()),
+                ..brief_at(t0 - chrono::Duration::minutes(5), "h")
+            });
         }
+        assert!(shared.blocked_on_of("s1").is_none(), "hidden while dirty");
         let started = t0 + chrono::Duration::seconds(50);
         assert!(shared.clear_brief_dirty("s1", started));
         assert!(shared.state.lock().unwrap().sessions["s1"].brief_dirty_at.is_none());
+        assert!(
+            shared.blocked_on_of("s1").is_none(),
+            "clearing dirty without a new brief must not resurrect the old blocker"
+        );
 
         // Newer dirty mark stays.
         {

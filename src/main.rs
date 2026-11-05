@@ -1131,6 +1131,7 @@ fn app() -> Element {
         // Settings). One task per 15s tick — with the 45s quiet period this
         // is the debounce — keeps cost and concurrency trivially bounded.
         spawn(async move {
+            let mut backoff = fleet::briefs::BriefBackoff::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 let s = settings.peek().clone();
@@ -1157,17 +1158,18 @@ fn app() -> Element {
                 let ended = fleet::store::sessions_active_on(today);
                 let links = crate::todo::handlers::linked_session_pairs(&planner_state.peek());
                 let due = fleet::briefs::collect_due(&live, &ended, &links, chrono::Utc::now());
-                let Some(task) = due.into_iter().next() else {
+                // Oldest dirty first, past any session backing off after a
+                // failure — one failing task must not starve the rest.
+                let Some(task) = backoff.pick(due, chrono::Utc::now()) else {
                     continue;
                 };
 
                 let started_at = chrono::Utc::now();
+                // No new brief: clear the mark and the old blocker with it.
                 let clear_dirty = |task: &fleet::briefs::BriefTask| {
                     if !fleet::shared().clear_brief_dirty(&task.session_id, started_at) {
                         fleet::store::merge_session(&task.session_id, |row| {
-                            if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
-                                row.brief_dirty_at = None;
-                            }
+                            fleet::clear_dirty_without_brief(row, started_at);
                         });
                     }
                 };
@@ -1206,6 +1208,7 @@ fn app() -> Element {
                 .await
                 {
                     Ok(Ok(value)) => {
+                        backoff.succeeded(&task.session_id);
                         let Some(brief) = fleet::briefs::brief_from_summary_value(
                             &value,
                             chrono::Utc::now(),
@@ -1265,14 +1268,20 @@ fn app() -> Element {
                             }
                         }
                     }
-                    Ok(Err(e)) => tracing::warn!(
-                        "fleet briefs: generation failed for {}: {e}",
-                        task.session_id
-                    ),
-                    Err(_) => tracing::warn!(
-                        "fleet briefs: generation timed out for {}",
-                        task.session_id
-                    ),
+                    Ok(Err(e)) => {
+                        backoff.failed(&task.session_id, chrono::Utc::now());
+                        tracing::warn!(
+                            "fleet briefs: generation failed for {}: {e}",
+                            task.session_id
+                        )
+                    }
+                    Err(_) => {
+                        backoff.failed(&task.session_id, chrono::Utc::now());
+                        tracing::warn!(
+                            "fleet briefs: generation timed out for {}",
+                            task.session_id
+                        )
+                    }
                 }
             }
         });
