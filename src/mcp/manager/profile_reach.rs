@@ -47,6 +47,93 @@ pub struct ReachProfile {
     pub name: String,
 }
 
+/// Where a chat's home profile came from ([`ProfileScope::source`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScopeSource {
+    /// The tab's own pin, which names a configured profile.
+    Pinned,
+    /// No pin: the global active profile.
+    Global,
+    /// Nothing to act in: the pin names a profile that was removed
+    /// (`pinned_id`), or there is no pin and no valid global active
+    /// profile (`None`). A removed pin never falls back to the global
+    /// profile — that would move a tab holding one company's data into
+    /// another company's tools.
+    Missing { pinned_id: Option<String> },
+}
+
+/// Which Composio profile a chat acts in: its home, its reach (home first)
+/// and where the home came from. The one resolver behind the prompt, the
+/// summarizer's profile note, the flow guard, tool dispatch (streaming and
+/// approval resume) and the profile chip, so none of them can disagree.
+///
+/// Rules: the pin, if that profile still exists; else (no pin) the global
+/// active profile, if it exists; else [`ScopeSource::Missing`] — no home
+/// and no reach. Never a guess.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileScope {
+    pub home: Option<ReachProfile>,
+    pub reach: Vec<ReachProfile>,
+    pub source: ScopeSource,
+}
+
+impl ProfileScope {
+    /// The scope for `session_id` with pin `pin` and the profiles ticked on
+    /// its chip (`selected`), for call sites that hold only those.
+    pub fn resolve(settings: &Settings, session_id: &str, pin: Option<&str>, selected: &[String]) -> Self {
+        let pin = pin.filter(|p| !p.is_empty());
+        let as_reach = |p: &crate::settings::ComposioProfile| ReachProfile { id: p.id.clone(), name: p.name.clone() };
+        let (home, source) = match pin {
+            Some(id) => match settings.composio_profiles.iter().find(|p| p.id == id) {
+                Some(p) => (Some(as_reach(p)), ScopeSource::Pinned),
+                None => (None, ScopeSource::Missing { pinned_id: Some(id.to_string()) }),
+            },
+            None => match settings.get_active_profile() {
+                Some(p) => (Some(as_reach(p)), ScopeSource::Global),
+                None => (None, ScopeSource::Missing { pinned_id: None }),
+            },
+        };
+        let reach = session_reach(settings, session_id, home.as_ref().map(|h| h.id.as_str()), selected);
+        ProfileScope { home, reach, source }
+    }
+
+    /// The scope of a hydrated session.
+    pub fn for_session(settings: &Settings, session: &crate::session::Session) -> Self {
+        Self::resolve(settings, &session.id, session.composio_profile.as_deref(), &session.profile_reach)
+    }
+
+    pub fn home_id(&self) -> Option<&str> {
+        self.home.as_ref().map(|h| h.id.as_str())
+    }
+
+    pub fn home_name(&self) -> Option<&str> {
+        self.home.as_ref().map(|h| h.name.as_str())
+    }
+
+    pub fn is_missing(&self) -> bool {
+        matches!(self.source, ScopeSource::Missing { .. })
+    }
+
+    /// The tab's pin names a profile that no longer exists (the chip warns).
+    pub fn pin_removed(&self) -> bool {
+        matches!(self.source, ScopeSource::Missing { pinned_id: Some(_) })
+    }
+
+    /// The tool result a Composio call gets when there is no profile to run
+    /// it in; `None` when there is one.
+    pub fn missing_refusal(&self) -> Option<String> {
+        match &self.source {
+            ScopeSource::Missing { pinned_id: Some(_) } => Some(
+                "Not run: this tab's Composio profile was removed — pick one on the profile chip.".to_string(),
+            ),
+            ScopeSource::Missing { pinned_id: None } => Some(
+                "Not run: this tab has no Composio profile — pick one on the profile chip.".to_string(),
+            ),
+            _ => None,
+        }
+    }
+}
+
 /// The home profile a session acts in: its pin, else the global active
 /// profile (the same fallback the tool list and the prompt use).
 pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<String> {
@@ -1396,6 +1483,80 @@ mod tests {
         assert!(!eval("profile-flow:pg>cm", None));
         // The other direction is its own decision.
         assert!(!eval("profile-flow:cm>pg", Some("proj-cm")));
+    }
+
+    /// The tab states the resolver must cover, with the legacy
+    /// `home_profile` (pin passed through unvalidated, else the validated
+    /// global) beside the scope. Rows where the two differ are the
+    /// behaviour changes the later commits make at each call site.
+    #[test]
+    fn profile_scope_table() {
+        crate::system_sessions::set_current("scope-test-hobbes");
+        let base = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        let with_global = |g: Option<&str>| {
+            let mut s = base.clone();
+            s.active_composio_profile = g.map(str::to_string);
+            s
+        };
+        let cm = Some(p("cm", "Clearmirror"));
+        let pg = Some(p("pg", "Puget"));
+        struct Row {
+            what: &'static str,
+            pin: Option<&'static str>,
+            global: Option<&'static str>,
+            legacy_home: Option<&'static str>,
+            home: Option<ReachProfile>,
+            source: ScopeSource,
+        }
+        let rows = [
+            Row { what: "pinned, exists", pin: Some("pg"), global: Some("cm"), legacy_home: Some("pg"), home: pg.clone(), source: ScopeSource::Pinned },
+            Row {
+                what: "pinned, removed; global valid",
+                pin: Some("gone"),
+                global: Some("cm"),
+                // Legacy: the dead id was treated as home (no reach, and
+                // dispatch passed it through); never the global profile.
+                legacy_home: Some("gone"),
+                home: None,
+                source: ScopeSource::Missing { pinned_id: Some("gone".into()) },
+            },
+            Row { what: "pinned (empty string)", pin: Some(""), global: Some("cm"), legacy_home: Some(""), home: cm.clone(), source: ScopeSource::Global },
+            Row { what: "unpinned, global valid", pin: None, global: Some("cm"), legacy_home: Some("cm"), home: cm.clone(), source: ScopeSource::Global },
+            Row { what: "unpinned, global dangling", pin: None, global: Some("gone"), legacy_home: None, home: None, source: ScopeSource::Missing { pinned_id: None } },
+            Row { what: "unpinned, no global", pin: None, global: None, legacy_home: None, home: None, source: ScopeSource::Missing { pinned_id: None } },
+        ];
+        for r in rows {
+            let settings = with_global(r.global);
+            assert_eq!(home_profile(&settings, r.pin).as_deref(), r.legacy_home, "legacy: {}", r.what);
+            let scope = ProfileScope::resolve(&settings, "plain-tab", r.pin, &[]);
+            assert_eq!(scope.home, r.home, "home: {}", r.what);
+            assert_eq!(scope.source, r.source, "source: {}", r.what);
+            // Reach is anchored on home: none without one.
+            assert_eq!(scope.reach.first(), scope.home.as_ref(), "reach: {}", r.what);
+            assert_eq!(scope.is_missing(), scope.home.is_none(), "missing: {}", r.what);
+            assert_eq!(scope.missing_refusal().is_some(), scope.is_missing(), "refusal: {}", r.what);
+        }
+    }
+
+    #[test]
+    fn profile_scope_reach_and_refusals() {
+        crate::system_sessions::set_current("scope-test-hobbes");
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true), ("ac", "Acme", false)]);
+        settings.active_composio_profile = Some("cm".into());
+        // An ordinary tab: home plus the ticked profiles that are set up.
+        let s = ProfileScope::resolve(&settings, "plain-tab", Some("cm"), &["pg".into(), "ac".into()]);
+        assert_eq!(s.reach, vec![p("cm", "Clearmirror"), p("pg", "Puget")]);
+        // The Hobbes session reaches every set-up profile, ticks or not.
+        let h = ProfileScope::resolve(&settings, "scope-test-hobbes", Some("pg"), &[]);
+        assert_eq!(h.reach, vec![p("pg", "Puget"), p("cm", "Clearmirror")]);
+        // A removed pin: no reach even with ticks, and a refusal naming the chip.
+        let gone = ProfileScope::resolve(&settings, "plain-tab", Some("gone"), &["pg".into()]);
+        assert!(gone.reach.is_empty());
+        assert!(gone.pin_removed());
+        assert!(gone.missing_refusal().unwrap().contains("profile was removed"));
+        let none = ProfileScope::resolve(&Settings::default(), "plain-tab", None, &[]);
+        assert!(!none.pin_removed());
+        assert!(none.missing_refusal().unwrap().contains("no Composio profile"));
     }
 
     #[test]
