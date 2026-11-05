@@ -413,9 +413,9 @@ impl<'a> PromptBuilder<'a> {
             .iter()
             .any(|p| p.is_fully_configured())
         {
-            // The same resolution dispatch uses (profile_reach::ProfileScope),
+            // The turn's scope, as dispatch uses (profile_reach::turn_scope),
             // so the prompt never names a profile the tab's calls don't run in.
-            let scope = crate::mcp::manager::profile_reach::ProfileScope::for_session(self.settings, self.session);
+            let scope = crate::mcp::manager::profile_reach::turn_scope(self.settings, self.session);
             let active_profile_name = scope.home_name().unwrap_or("none");
             let reach = &scope.reach;
             if reach.len() > 1 {

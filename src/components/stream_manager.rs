@@ -321,17 +321,9 @@ impl StreamManagerContext {
         // connector produced, so the scope gates — here and on the
         // approval-resume path — see the turn's origin, not the model's say.
         let stream_origin = origin;
-        // The turn's Composio profile (profile_reach::ProfileScope), fixed
-        // for the turn: `profile_id` comes in as the tab's raw pin; a tab
-        // without one acts in the global profile as it is now, not wherever
-        // focus moves the global profile mid-turn.
-        let profile_id: Option<String> = {
-            let settings = self.settings.peek();
-            let state = self.session_state.peek();
-            let selected = state.sessions.get(&session_id).map(|s| s.profile_reach.clone()).unwrap_or_default();
-            crate::mcp::manager::profile_reach::ProfileScope::resolve(&settings, &session_id, profile_id.as_deref(), &selected)
-                .turn_pin()
-        };
+        // The turn's Composio profile is fixed when the turn starts
+        // (profile_reach::begin_turn, on the send path) and read per call
+        // below; `profile_id` (the tab's raw pin) is only its fallback.
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -679,7 +671,7 @@ impl StreamManagerContext {
                             let state = self.session_state.peek();
                             let selected: &[String] =
                                 state.sessions.get(&session_id).map_or(&[], |s| s.profile_reach.as_slice());
-                            crate::mcp::manager::profile_reach::ProfileScope::resolve(
+                            crate::mcp::manager::profile_reach::turn_scope_for(
                                 &settings_read,
                                 &session_id,
                                 profile_id.as_deref(),

@@ -159,6 +159,62 @@ pub fn profile_note_name(settings: &Settings, session: &crate::session::Session)
     ProfileScope::for_session(settings, session).home_name().unwrap_or("None").to_string()
 }
 
+// ── The turn's profile ──────────────────────────────────────────────────
+
+/// Session id → the pin its current turn runs under (`None` = no profile),
+/// fixed when the turn starts ([`begin_turn`]) and read by every round of
+/// it — the prompt, the tool list, the guard and dispatch — so a repin, or
+/// the global profile moving with focus, can't change companies mid-turn.
+#[cfg(not(test))]
+fn turn_pins() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+    static PINS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>> =
+        std::sync::OnceLock::new();
+    PINS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn turn_pins() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+    thread_local! {
+        static PINS: &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> =
+            Box::leak(Box::default());
+    }
+    PINS.with(|p| *p)
+}
+
+/// Start a turn in `session`: resolve its scope now and fix it for the turn.
+pub fn begin_turn(settings: &Settings, session: &crate::session::Session) -> ProfileScope {
+    let scope = ProfileScope::for_session(settings, session);
+    if let Ok(mut pins) = turn_pins().lock() {
+        pins.insert(session.id.clone(), scope.turn_pin());
+    }
+    scope
+}
+
+/// The scope of the current turn in `session_id`: from the pin fixed at
+/// [`begin_turn`], else (no turn started this run) the tab's own pin.
+pub fn turn_scope_for(settings: &Settings, session_id: &str, session_pin: Option<&str>, selected: &[String]) -> ProfileScope {
+    let fixed = turn_pins().lock().ok().and_then(|p| p.get(session_id).cloned());
+    match fixed {
+        Some(Some(pin)) => ProfileScope::resolve(settings, session_id, Some(&pin), selected),
+        // The turn started with no profile: it stays without one.
+        Some(None) => ProfileScope { home: None, reach: Vec::new(), source: ScopeSource::Missing { pinned_id: None } },
+        None => ProfileScope::resolve(settings, session_id, session_pin, selected),
+    }
+}
+
+/// [`turn_scope_for`] for a hydrated session.
+pub fn turn_scope(settings: &Settings, session: &crate::session::Session) -> ProfileScope {
+    turn_scope_for(settings, &session.id, session.composio_profile.as_deref(), &session.profile_reach)
+}
+
+/// `ctx` without any Composio server or toolkit: what a chat with no
+/// profile to act in is offered (its Composio calls would be refused).
+pub fn without_composio(mut ctx: McpContext) -> McpContext {
+    ctx.servers.retain(|s| !is_composio_native(&s.name));
+    ctx.connected_toolkit_slugs.clear();
+    ctx
+}
+
 /// The profile a tab's data belongs to, for counting where data came from:
 /// its [`ProfileScope`] home, else a removed pin's id (that company's data
 /// is still in the conversation). Not a profile to act in — use
@@ -1676,6 +1732,31 @@ mod tests {
         assert_eq!(hold.rule_key, "profile-flow:pg>local");
         assert!(hold.reason.contains("read Puget data"));
         assert!(cross_company_hold_in(None, None, &read_pg, &named, false).is_none());
+    }
+
+    /// A turn keeps the profile it started in: a repin (or the global
+    /// profile moving) mid-turn doesn't move its later rounds; the next turn
+    /// picks the change up. A turn that started with no profile stays so.
+    #[test]
+    fn a_turn_keeps_its_profile_across_rounds() {
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        settings.active_composio_profile = Some("cm".into());
+        let mut s = tab("turn-tab", "pg", &[]);
+        assert_eq!(turn_scope(&settings, &s).home_id(), Some("pg"), "no turn yet: the tab's pin");
+        begin_turn(&settings, &s);
+        s.composio_profile = Some("cm".into());
+        assert_eq!(turn_scope(&settings, &s).home_id(), Some("pg"));
+        assert_eq!(begin_turn(&settings, &s).home_id(), Some("cm"));
+        let mut none = tab("turn-none", "x", &[]);
+        none.composio_profile = None;
+        let empty = Settings::default();
+        begin_turn(&empty, &none);
+        // A global profile appearing mid-turn isn't picked up.
+        assert!(turn_scope(&settings, &none).home.is_none());
+        let ctx = without_composio(ctx("Clearmirror", &["A"]));
+        assert!(natives(&ctx).is_empty());
+        assert!(ctx.connected_toolkit_slugs.is_empty());
+        assert_eq!(ctx.servers.len(), 1, "other servers stay");
     }
 
     #[test]
