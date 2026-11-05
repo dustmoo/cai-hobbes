@@ -119,6 +119,18 @@ impl ProfileScope {
         matches!(self.source, ScopeSource::Missing { pinned_id: Some(_) })
     }
 
+    /// The pin a turn carries so its home stays put for the whole turn: the
+    /// home's id (a tab without a pin keeps the global profile it started
+    /// in, even if focus — and with it the global profile — moves), else
+    /// the removed pin (still [`ScopeSource::Missing`] when resolved again).
+    pub fn turn_pin(&self) -> Option<String> {
+        match (&self.home, &self.source) {
+            (Some(h), _) => Some(h.id.clone()),
+            (None, ScopeSource::Missing { pinned_id }) => pinned_id.clone(),
+            (None, _) => None,
+        }
+    }
+
     /// The tool result a Composio call gets when there is no profile to run
     /// it in; `None` when there is one.
     pub fn missing_refusal(&self) -> Option<String> {
@@ -603,6 +615,16 @@ pub fn route_tool_call(reach: &[ReachProfile], tool_call: &mut crate::components
     tool_call.server_name = server_name_for(&target);
     tool_call.profile_id = Some(target.id.clone());
     Route::To(target)
+}
+
+/// [`route_tool_call`] within a [`ProfileScope`]: with no profile to act in
+/// ([`ScopeSource::Missing`]) a Composio call is refused with the scope's
+/// reason, never left to the MCP manager to pick a client.
+pub fn route_in_scope(scope: &ProfileScope, tool_call: &mut crate::components::shared::ToolCall) -> Route {
+    match scope.missing_refusal() {
+        Some(refusal) if is_composio_native(&tool_call.server_name) => Route::Refused(refusal),
+        _ => route_tool_call(&scope.reach, tool_call),
+    }
 }
 
 /// The profile a held (then approved) call runs in on the resume path.
@@ -1578,6 +1600,31 @@ mod tests {
         assert_eq!(profile_note_name(&settings, &s), "Clearmirror");
         s.composio_profile = Some("gone".into());
         assert_eq!(profile_note_name(&settings, &s), "None");
+    }
+
+    /// Streaming dispatch: a tab whose profile doesn't resolve refuses its
+    /// Composio calls (it used to dispatch with the dead pin, or with no
+    /// profile at all for the manager to pick); other tools run.
+    #[test]
+    fn a_tab_without_a_profile_refuses_composio_calls() {
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        settings.active_composio_profile = Some("cm".into());
+        let gone = ProfileScope::resolve(&settings, "plain-tab", Some("gone"), &[]);
+        let mut c = call(json!({}));
+        match route_in_scope(&gone, &mut c) {
+            Route::Refused(m) => assert!(m.contains("profile was removed"), "{m}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        let mut terminal = call(json!({}));
+        terminal.server_name = "terminal".into();
+        assert_eq!(route_in_scope(&gone, &mut terminal), Route::Unchanged);
+        // Unpinned with a valid global profile: home is the global one.
+        let global = ProfileScope::resolve(&settings, "plain-tab", None, &[]);
+        assert_eq!(global.home_id(), Some("cm"));
+        assert_eq!(global.turn_pin().as_deref(), Some("cm"));
+        assert_eq!(route_in_scope(&global, &mut call(json!({}))), Route::Unchanged);
+        // A removed pin stays removed when the turn resolves it again.
+        assert_eq!(gone.turn_pin().as_deref(), Some("gone"));
     }
 
     #[test]
