@@ -257,7 +257,8 @@ pub fn data_profile(settings: &Settings, session_pin: Option<&str>) -> Option<St
 ///
 /// A tab without a pin gets (a) the profile its own most recent Composio
 /// call ran in (the call's `profile_id` stamp, else the profile its
-/// `composio-native:<id|name>` server name names), else (b) Hobbes' home
+/// `composio-native:<id|name>` server name names) — preferring a call made
+/// at home over one routed to a ticked profile — else (b) Hobbes' home
 /// profile, else (c) nothing — it stays unpinned. Never the global
 /// profile: that follows focus, so it says nothing about this tab.
 /// System sessions keep their own rules (the caller skips them).
@@ -266,16 +267,29 @@ pub fn pin_fix(settings: &Settings, session: &crate::session::Session) -> Option
         // A legacy name pin: its id. A removed pin stays as it is (Missing).
         return find_profile(settings, pin).filter(|p| p.id != pin).map(|p| p.id.clone());
     }
-    let from_calls = session.messages.iter().rev().find_map(|m| match &m.content {
-        MessageContent::ToolCall(tc) | MessageContent::PermissionRequest(tc) if is_composio_native(&tc.server_name) => tc
-            .profile_id
-            .as_deref()
-            .and_then(|id| find_profile(settings, id))
-            .map(|p| p.id.clone())
-            .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string)),
-        _ => None,
-    });
-    from_calls.or_else(|| settings.home_profile_id().map(str::to_string))
+    // The tab's Composio calls, newest first, with the profile each ran in.
+    let calls = || {
+        session.messages.iter().rev().filter_map(|m| match &m.content {
+            MessageContent::ToolCall(tc) | MessageContent::PermissionRequest(tc) if is_composio_native(&tc.server_name) => {
+                let profile = tc
+                    .profile_id
+                    .as_deref()
+                    .and_then(|id| find_profile(settings, id))
+                    .map(|p| p.id.clone())
+                    .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string))?;
+                let args: Value = serde_json::from_str(&tc.arguments).unwrap_or(Value::Null);
+                Some((profile, asked_profile(&tc.tool_name, &args).is_some()))
+            }
+            _ => None,
+        })
+    };
+    // A call made at home (not routed to a ticked profile with
+    // `hobbes_profile`) says where the tab lives; a routed one only if
+    // there is no other.
+    let at_home = calls().find(|(_, routed)| !routed).map(|(p, _)| p);
+    at_home
+        .or_else(|| calls().next().map(|(p, _)| p))
+        .or_else(|| settings.home_profile_id().map(str::to_string))
 }
 
 /// The profiles `session_id` can act in, home first. Only the live Hobbes
@@ -1869,7 +1883,19 @@ mod tests {
         }
         s.messages.push(read_at_home(&p("cm", "Clearmirror"), now));
         s.messages.push(by_name);
+        // The newest call was routed to Puget (a ticked profile): the call
+        // made at home, Clearmirror, says where the tab lives.
+        assert_eq!(pin_fix(&settings, &s), Some("cm".into()));
+        let mut at_home_pg = read_at_home(&p("pg", "Puget"), now);
+        if let MessageContent::ToolCall(tc) = &mut at_home_pg.content {
+            tc.profile_id = None;
+        }
+        s.messages.push(at_home_pg);
         assert_eq!(pin_fix(&settings, &s), Some("pg".into()));
+        // Only routed calls: the newest of them.
+        let mut routed_only = crate::session_events::blank_session();
+        routed_only.messages.push(read_via_reach(&p("pg", "Puget"), now));
+        assert_eq!(pin_fix(&settings, &routed_only), Some("pg".into()));
         // A stamp naming a removed profile is skipped.
         let mut gone = read_via_reach(&p("gone", "Gone"), now);
         if let MessageContent::ToolCall(tc) = &mut gone.content {
