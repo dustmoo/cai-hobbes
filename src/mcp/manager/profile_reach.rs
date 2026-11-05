@@ -161,43 +161,70 @@ pub fn profile_note_name(settings: &Settings, session: &crate::session::Session)
 
 // ── The turn's profile ──────────────────────────────────────────────────
 
-/// Session id → the pin its current turn runs under (`None` = no profile),
-/// fixed when the turn starts ([`begin_turn`]) and read by every round of
-/// it — the prompt, the tool list, the guard and dispatch — so a repin, or
-/// the global profile moving with focus, can't change companies mid-turn.
+/// A turn's fixed profile: the tab's pin when the turn started (or was last
+/// refreshed) and the pin the turn runs under (`None` = no profile).
+#[derive(Clone)]
+struct TurnPin {
+    tab_pin: Option<String>,
+    turn: Option<String>,
+}
+
+type TurnPins = std::sync::Mutex<std::collections::HashMap<String, TurnPin>>;
+
+/// Session id → its current turn's profile, fixed when the turn starts
+/// ([`begin_turn`]) and read by every round of it — the prompt, the tool
+/// list, the guard and dispatch — so the global profile moving with focus
+/// can't change companies mid-turn. A repin of the tab itself does: every
+/// read compares the tab's pin with the one the turn was fixed under, and
+/// a changed pin (the chip, a dispatch, the pin migration — any path)
+/// re-resolves the turn to it.
 #[cfg(not(test))]
-fn turn_pins() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
-    static PINS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Option<String>>>> =
-        std::sync::OnceLock::new();
+fn turn_pins() -> &'static TurnPins {
+    static PINS: std::sync::OnceLock<TurnPins> = std::sync::OnceLock::new();
     PINS.get_or_init(Default::default)
 }
 
 #[cfg(test)]
-fn turn_pins() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> {
+fn turn_pins() -> &'static TurnPins {
     thread_local! {
-        static PINS: &'static std::sync::Mutex<std::collections::HashMap<String, Option<String>>> =
-            Box::leak(Box::default());
+        static PINS: &'static TurnPins = Box::leak(Box::default());
     }
     PINS.with(|p| *p)
+}
+
+fn fix_turn(session_id: &str, tab_pin: Option<&str>, scope: &ProfileScope) {
+    if let Ok(mut pins) = turn_pins().lock() {
+        pins.insert(
+            session_id.to_string(),
+            TurnPin { tab_pin: tab_pin.map(str::to_string), turn: scope.turn_pin() },
+        );
+    }
 }
 
 /// Start a turn in `session`: resolve its scope now and fix it for the turn.
 pub fn begin_turn(settings: &Settings, session: &crate::session::Session) -> ProfileScope {
     let scope = ProfileScope::for_session(settings, session);
-    if let Ok(mut pins) = turn_pins().lock() {
-        pins.insert(session.id.clone(), scope.turn_pin());
-    }
+    fix_turn(&session.id, session.composio_profile.as_deref(), &scope);
     scope
 }
 
-/// The scope of the current turn in `session_id`: from the pin fixed at
-/// [`begin_turn`], else (no turn started this run) the tab's own pin.
+/// The scope of the current turn in `session_id` (whose pin is now
+/// `session_pin`): from the pin fixed at [`begin_turn`] while the tab's
+/// pin is unchanged; after a repin, or with no turn started this run, the
+/// tab's own pin (and a repinned turn is re-fixed to it).
 pub fn turn_scope_for(settings: &Settings, session_id: &str, session_pin: Option<&str>, selected: &[String]) -> ProfileScope {
     let fixed = turn_pins().lock().ok().and_then(|p| p.get(session_id).cloned());
     match fixed {
-        Some(Some(pin)) => ProfileScope::resolve(settings, session_id, Some(&pin), selected),
-        // The turn started with no profile: it stays without one.
-        Some(None) => ProfileScope { home: None, reach: Vec::new(), source: ScopeSource::Missing { pinned_id: None } },
+        Some(t) if t.tab_pin.as_deref() == session_pin => match t.turn {
+            Some(pin) => ProfileScope::resolve(settings, session_id, Some(&pin), selected),
+            // The turn started with no profile: it stays without one.
+            None => ProfileScope { home: None, reach: Vec::new(), source: ScopeSource::Missing { pinned_id: None } },
+        },
+        Some(_) => {
+            let scope = ProfileScope::resolve(settings, session_id, session_pin, selected);
+            fix_turn(session_id, session_pin, &scope);
+            scope
+        }
         None => ProfileScope::resolve(settings, session_id, session_pin, selected),
     }
 }
@@ -1762,19 +1789,22 @@ mod tests {
         assert!(cross_company_hold_in(None, None, &read_pg, &named, false).is_none());
     }
 
-    /// A turn keeps the profile it started in: a repin (or the global
-    /// profile moving) mid-turn doesn't move its later rounds; the next turn
-    /// picks the change up. A turn that started with no profile stays so.
+    /// A turn keeps the profile it started in while the global profile
+    /// moves with focus; a turn that started with no profile stays so.
     #[test]
     fn a_turn_keeps_its_profile_across_rounds() {
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let mut s = tab("turn-tab", "pg", &[]);
+        let s = tab("turn-tab", "pg", &[]);
         assert_eq!(turn_scope(&settings, &s).home_id(), Some("pg"), "no turn yet: the tab's pin");
         begin_turn(&settings, &s);
-        s.composio_profile = Some("cm".into());
-        assert_eq!(turn_scope(&settings, &s).home_id(), Some("pg"));
-        assert_eq!(begin_turn(&settings, &s).home_id(), Some("cm"));
+        // An unpinned tab keeps the global profile it started in while
+        // focus moves the global profile.
+        let mut unpinned = tab("turn-unpinned", "x", &[]);
+        unpinned.composio_profile = None;
+        begin_turn(&settings, &unpinned);
+        settings.active_composio_profile = Some("pg".into());
+        assert_eq!(turn_scope(&settings, &unpinned).home_id(), Some("cm"));
         let mut none = tab("turn-none", "x", &[]);
         none.composio_profile = None;
         let empty = Settings::default();
@@ -1785,6 +1815,31 @@ mod tests {
         assert!(natives(&ctx).is_empty());
         assert!(ctx.connected_toolkit_slugs.is_empty());
         assert_eq!(ctx.servers.len(), 1, "other servers stay");
+    }
+
+    /// A repin mid-turn moves the turn's later rounds (continuations after
+    /// an approval) to the new home, while a held call minted in the old
+    /// profile is still refused on resume.
+    #[test]
+    fn a_repin_mid_turn_moves_the_turn_and_refuses_the_old_call() {
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        settings.active_composio_profile = Some("cm".into());
+        let mut s = tab("repin-turn", "pg", &[]);
+        begin_turn(&settings, &s);
+        let mut held = call(json!({"to": "a@b.c"}));
+        held.profile_id = Some("pg".into());
+        // Repinned on the chip while the call waits for approval.
+        s.composio_profile = Some("cm".into());
+        let next = turn_scope(&settings, &s);
+        assert_eq!(next.home_id(), Some("cm"), "the next continuation acts in the new home");
+        assert_eq!(turn_scope_for(&settings, &s.id, Some("cm"), &[]).home_id(), Some("cm"), "re-fixed");
+        assert!(resume_profile_in(&settings, &s.id, Some("cm"), &[], &held).is_err());
+        // A repin from no pin (the migration) re-resolves too.
+        let mut m = tab("repin-migrated", "x", &[]);
+        m.composio_profile = None;
+        begin_turn(&settings, &m);
+        m.composio_profile = Some("pg".into());
+        assert_eq!(turn_scope(&settings, &m).home_id(), Some("pg"));
     }
 
     #[test]

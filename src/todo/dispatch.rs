@@ -739,16 +739,16 @@ pub(crate) mod tests {
             let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
             assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-cm"));
 
-            // Omitted, the parent repinned mid-turn: the turn's profile, not
-            // the new pin (nor the focus-driven global).
-            let (planner, id) = planner_with("Pull the Puget numbers");
+            // Omitted, an unpinned parent whose global profile moved with
+            // focus mid-turn: the profile its turn started in.
+            let (planner, id) = planner_with("Pull the ClearMirror numbers");
             let mut ctx = test_ctx_with(planner, settings_with_profiles());
-            let parent = ctx.session_state.write().create_session_raw(Some("p-puget".into()));
+            let parent = ctx.session_state.write().create_session_raw(None);
             crate::mcp::manager::profile_reach::begin_turn(&ctx.settings.peek(), &ctx.session_state.peek().sessions[&parent]);
-            ctx.session_state.write().sessions.get_mut(&parent).unwrap().composio_profile = Some("p-cm".into());
+            ctx.settings.write().active_composio_profile = Some("p-puget".into());
             handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&parent)).unwrap();
             let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
-            assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-puget"));
+            assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-cm"));
 
             // Omitted, the parent's profile removed: refused, nothing opened.
             let (planner, id) = planner_with("Anything");

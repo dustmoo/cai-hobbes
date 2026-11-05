@@ -669,14 +669,17 @@ impl StreamManagerContext {
                         let scope = {
                             let settings_read = self.settings.peek();
                             let state = self.session_state.peek();
-                            let selected: &[String] =
-                                state.sessions.get(&session_id).map_or(&[], |s| s.profile_reach.as_slice());
-                            crate::mcp::manager::profile_reach::turn_scope_for(
-                                &settings_read,
-                                &session_id,
-                                profile_id.as_deref(),
-                                selected,
-                            )
+                            // The tab's live pin, so a repin since the round
+                            // started re-resolves the turn (turn_scope_for).
+                            match state.sessions.get(&session_id) {
+                                Some(s) => crate::mcp::manager::profile_reach::turn_scope(&settings_read, s),
+                                None => crate::mcp::manager::profile_reach::turn_scope_for(
+                                    &settings_read,
+                                    &session_id,
+                                    profile_id.as_deref(),
+                                    &[],
+                                ),
+                            }
                         };
                         tool_call = tool_call.with_turn_provenance(
                             scope.home_id().map(str::to_string),
