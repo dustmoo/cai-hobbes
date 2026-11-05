@@ -2273,10 +2273,13 @@ pub fn MessageBubble(
                 "absolute bottom-[-10px] right-[-10px]"
             };
 
+            // Anchored on the bubble's outer edge and growing toward the open
+            // side of the window, so a short bubble's controls never run off
+            // the window (your messages sit right, Hobbes' left).
             let controls_position_class = if is_user {
-                "bottom-[-25px] left-[-25px]"
+                "bottom-[-25px] right-0"
             } else {
-                "bottom-[-25px] right-[-25px]"
+                "bottom-[-25px] left-0"
             };
 
             // AI bubbles leave room for the hover controls hanging off the

@@ -1693,7 +1693,7 @@ pub fn ChatInput(
                 // Row 2 — the identity footer: who is answering, with what,
                 // about what, then the actions.
                 div {
-                    class: "flex items-center gap-2 px-2.5 pb-2.5 pl-3",
+                    class: "flex flex-wrap items-center gap-2 px-2.5 pb-2.5 pl-3",
 
                     // 1. PROFILE PILL — this tab's Composio identity.
                     { if ui_state.read().show_profile_selector {
@@ -2208,8 +2208,9 @@ pub fn ChatInput(
                         }
                     }
 
-                    // 5. spacer — everything after this hugs the right edge.
-                    div { class: "flex-1" }
+                    // 5. Everything after this hugs the right edge as one group,
+                    // which wraps to its own line together on a narrow window.
+                    div { class: "ml-auto flex items-center gap-2 shrink-0",
 
                     // 6. COST
                     SessionCostIcon {}
@@ -2395,6 +2396,7 @@ pub fn ChatInput(
                             onclick: move |_| on_cancel.call(()),
                             "Stop"
                         }
+                    }
                     }
                 }
             }
