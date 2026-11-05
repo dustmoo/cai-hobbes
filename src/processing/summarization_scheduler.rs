@@ -94,6 +94,9 @@ pub fn use_summarization_scheduler() {
                                     None => (serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null), None),
                                 }
                             };
+                            // The tab's Fleet row picks up the new headline
+                            // (never the summary's blockers as an ask).
+                            crate::fleet::bridge::refresh_brief(&active_session.id, &summary_value);
                             crate::session_events::log_event(
                                 &active_session.id,
                                 crate::session_events::SessionEvent::SummaryComputed {
@@ -174,6 +177,7 @@ pub fn use_summarization_scheduler() {
                                         None => (serde_json::to_value(&summary).unwrap_or(serde_json::Value::Null), None),
                                     }
                                 };
+                                crate::fleet::bridge::refresh_brief(&active_session.id, &summary_value);
                                 crate::session_events::log_event(
                                     &active_session.id,
                                     crate::session_events::SessionEvent::SummaryComputed {

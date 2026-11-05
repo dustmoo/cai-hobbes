@@ -243,6 +243,108 @@ pub fn brief_from_summary_value(
     })
 }
 
+/// Longest question carried onto a Hobbes row's brief.
+pub const ASK_MAX_CHARS: usize = 160;
+
+/// The question a reply ends on, if it ends on one — the cheap "does this
+/// turn ask the person something" test for Hobbes chat rows (no LLM call).
+/// Looks at the last line only: its final sentence ending in `?`, or the
+/// one before it when a short sign-off follows ("Want me to ship it? Let me
+/// know."). A reply that ends in a code block asks nothing.
+pub fn question_in_reply(text: &str) -> Option<String> {
+    let t = text.trim_end();
+    if t.is_empty() || t.ends_with("```") {
+        return None;
+    }
+    let line = t.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let line = strip_line_marker(line);
+    let trim_wrap = |s: &str| -> String {
+        s.trim()
+            .trim_matches(|c: char| matches!(c, '*' | '_' | '`' | '(' | ')' | '"' | '\u{201C}' | '\u{201D}'))
+            .trim()
+            .to_string()
+    };
+    let sentences: Vec<String> = split_sentences(line)
+        .into_iter()
+        .map(|s| trim_wrap(&s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ask = match sentences.as_slice() {
+        [.., last] if last.ends_with('?') => last.clone(),
+        [.., q, last] if q.ends_with('?') && last.chars().count() <= 40 => q.clone(),
+        _ => return None,
+    };
+    // A bare "?" (or "??") is punctuation, not a question.
+    if ask.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+        return None;
+    }
+    Some(truncate_summary(&ask, ASK_MAX_CHARS))
+}
+
+/// Drop a leading Markdown marker: quote, heading, bullet, numbered item.
+fn strip_line_marker(line: &str) -> &str {
+    let mut l = line.trim_start_matches('>').trim_start();
+    l = l.trim_start_matches('#').trim_start();
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(rest) = l.strip_prefix(bullet) {
+            return rest.trim_start();
+        }
+    }
+    let digits = l.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &l[digits..];
+        if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return rest.trim_start();
+        }
+    }
+    l
+}
+
+/// Split at sentence ends: `.`, `!` or `?` followed by whitespace.
+fn split_sentences(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') && chars.peek().is_some_and(|n| n.is_whitespace()) {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The brief for a Hobbes chat row at a turn boundary: headline and bullets
+/// from the rolling conversation summary, but the blocker ONLY from the
+/// turn that just ended (`ask`). The summary's `entities.blockers` is a
+/// rolling list the summarizer is told to preserve — feeding it in as the
+/// row's ask kept answered questions on the board for days. With no
+/// summary yet, a question still makes a brief (its own headline).
+pub fn hobbes_turn_brief(
+    summary: Option<&serde_json::Value>,
+    ask: Option<String>,
+    now: DateTime<Utc>,
+    is_final: bool,
+) -> Option<SessionBrief> {
+    let ask = ask.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+    match summary.and_then(|v| brief_from_summary_value(v, now, is_final)) {
+        Some(mut b) => {
+            b.blocked_on = ask;
+            Some(b)
+        }
+        None => ask.map(|a| SessionBrief {
+            headline: truncate_summary(&a, HEADLINE_MAX_CHARS),
+            bullets: Vec::new(),
+            blocked_on: Some(a),
+            generated_at: now,
+            final_brief: is_final,
+        }),
+    }
+}
+
 /// A display-safe headline: prose passes through; text that is (or wraps) a
 /// JSON object is parsed and its `summary`/`current_task` taken, salvaging a
 /// truncated `"summary"` string; nothing recoverable gives `None`. Never
@@ -761,6 +863,38 @@ mod tests {
         let live = FleetState { sessions: [(s.id.clone(), s.clone())].into(), ..Default::default() };
         let report = status_report(&live, &[], None, &[], now, date);
         assert!(report["sessions"][0]["brief"].get("blocked_on").is_none());
+    }
+
+    #[test]
+    fn question_in_reply_reads_the_closing_question() {
+        assert_eq!(question_in_reply("All set. Want me to ship it?").as_deref(), Some("Want me to ship it?"));
+        assert_eq!(
+            question_in_reply("Two options:\n- A\n- B\n\n**Which one do you prefer?**").as_deref(),
+            Some("Which one do you prefer?")
+        );
+        assert_eq!(question_in_reply("Should I merge it? Let me know.").as_deref(), Some("Should I merge it?"));
+        assert_eq!(question_in_reply("> Deploy now?\n").as_deref(), Some("Deploy now?"));
+        assert_eq!(question_in_reply("1. Do you want the CSV too?").as_deref(), Some("Do you want the CSV too?"));
+        // Not a closing question.
+        assert_eq!(question_in_reply("Why did it fail? The cache was cold, so the first request timed out."), None);
+        assert_eq!(question_in_reply("Why did it fail?\n\nThe cache was cold."), None);
+        assert_eq!(question_in_reply("Done. The schedule is clear."), None);
+        assert_eq!(question_in_reply("```rust\nfn f() -> Option<u8>?\n```"), None);
+        assert_eq!(question_in_reply("???"), None);
+        assert_eq!(question_in_reply(""), None);
+        // Long questions are clipped.
+        let long = format!("{}?", "word ".repeat(80));
+        assert!(question_in_reply(&long).unwrap().chars().count() <= ASK_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn hobbes_turn_brief_without_a_summary_still_carries_the_ask() {
+        let now = utc("2026-09-01T10:00:00Z");
+        let b = hobbes_turn_brief(None, Some("Ship it?".into()), now, false).unwrap();
+        assert_eq!(b.blocked_on.as_deref(), Some("Ship it?"));
+        assert_eq!(b.generated_at, now);
+        assert!(hobbes_turn_brief(None, None, now, false).is_none());
+        assert!(hobbes_turn_brief(None, Some("  ".into()), now, false).is_none());
     }
 
     fn task(id: &str, dirty: &str) -> BriefTask {
