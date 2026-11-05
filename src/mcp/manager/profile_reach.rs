@@ -134,6 +134,13 @@ impl ProfileScope {
     }
 }
 
+/// The profile name the summarizer's profile note gives for `session`: its
+/// [`ProfileScope`] home, or "None" when nothing resolves — never the
+/// global profile for a tab pinned elsewhere.
+pub fn profile_note_name(settings: &Settings, session: &crate::session::Session) -> String {
+    ProfileScope::for_session(settings, session).home_name().unwrap_or("None").to_string()
+}
+
 /// The home profile a session acts in: its pin, else the global active
 /// profile (the same fallback the tool list and the prompt use).
 pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<String> {
@@ -1557,6 +1564,20 @@ mod tests {
         let none = ProfileScope::resolve(&Settings::default(), "plain-tab", None, &[]);
         assert!(!none.pin_removed());
         assert!(none.missing_refusal().unwrap().contains("no Composio profile"));
+    }
+
+    /// The summarizer's profile note follows the tab, not the focused tab's
+    /// (global) profile — it used to name the global profile always.
+    #[test]
+    fn summary_note_names_the_tabs_own_profile() {
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        settings.active_composio_profile = Some("cm".into());
+        let mut s = tab("plain-tab", "pg", &[]);
+        assert_eq!(profile_note_name(&settings, &s), "Puget");
+        s.composio_profile = None;
+        assert_eq!(profile_note_name(&settings, &s), "Clearmirror");
+        s.composio_profile = Some("gone".into());
+        assert_eq!(profile_note_name(&settings, &s), "None");
     }
 
     #[test]

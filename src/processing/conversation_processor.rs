@@ -21,7 +21,7 @@ impl ConversationProcessor {
     pub async fn generate_summary(
         &self,
         session: &Session,
-        _settings: &Settings,
+        settings: &Settings,
     ) -> Option<ConversationSummary> {
         // Nothing to summarize yet. The profile note below is always present,
         // so without this an empty tab (e.g. a profile switch's ForceRefresh
@@ -51,12 +51,8 @@ impl ConversationProcessor {
             .collect();
 
         // Inject active profile context to help the summarizer detect profile switches
-        let active_profile_name = _settings
-            .active_composio_profile
-            .as_deref()
-            .and_then(|id| _settings.profile_name_for_id(id))
-            .unwrap_or("None")
-            .to_string();
+        // This tab's profile (profile_reach::ProfileScope), not the global one.
+        let active_profile_name = crate::mcp::manager::profile_reach::profile_note_name(settings, session);
         let system_note = format!("[System Note: Current Active Composio Profile is '{}'. If this differs from the previous summary, update the summary to reflect the new profile.]", active_profile_name);
 
         let recent_history = std::iter::once(system_note)

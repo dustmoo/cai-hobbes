@@ -1691,12 +1691,11 @@ impl StreamManagerContext {
                                     })
                                     .collect();
 
-                                let active_profile_name = settings_snapshot
-                                    .active_composio_profile
-                                    .as_deref()
-                                    .and_then(|id| settings_snapshot.profile_name_for_id(id))
-                                    .unwrap_or("None")
-                                    .to_string();
+                                // This tab's profile, not the focused tab's (global) one.
+                                let active_profile_name = crate::mcp::manager::profile_reach::profile_note_name(
+                                    &settings_snapshot,
+                                    &active_session,
+                                );
                                 let system_note =
                                     format!("[System: Active Profile '{}']", active_profile_name);
                                 let recent = std::iter::once(system_note)
