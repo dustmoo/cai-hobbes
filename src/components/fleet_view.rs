@@ -1051,8 +1051,9 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
         })
     };
     // A finished turn at Claude Code's idle prompt asks nothing: it reads
-    // as idle, not "needs you" (`FleetSession::asks_person`).
-    let attention = session.asks_person();
+    // as idle, not "needs you". Same rule as the group the row sits in
+    // (`FleetSession::disposition`), so a decayed brief question isn't loud.
+    let attention = session.disposition(now) == fleet::Disposition::Decision;
     let (chip_label, chip_color) = if session.status.needs_attention() && !attention {
         status_chip(&FleetStatus::Idle)
     } else {
@@ -1551,6 +1552,14 @@ mod tests {
         let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
         assert_eq!(ids(Group::NeedsYou), vec!["blocked-old"]);
         assert_eq!(ids(Group::Idle), vec!["fresh", "older"]);
+
+        // Half a day later the brief's question has decayed: the row drops to
+        // Idle (where blocked rows still lead), and the header stops counting it.
+        let later = utc("2026-08-25T23:00:00Z");
+        let g = grouped_sessions(&state, later);
+        let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
+        assert!(ids(Group::NeedsYou).is_empty());
+        assert_eq!(ids(Group::Idle), vec!["blocked-old", "fresh", "older"]);
     }
 
     #[test]

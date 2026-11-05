@@ -279,8 +279,9 @@ pub struct FleetSession {
 pub enum Disposition {
     /// Working now (foreground, background, or on its own timer).
     Active,
-    /// Waiting on an answer: a permission gate, or a finished turn whose
-    /// brief names what it's blocked on.
+    /// Waiting on an answer: a permission gate or another hook-raised
+    /// question, or a finished turn whose brief names what it's blocked on
+    /// (that last kind only until [`PARKED_ENDS_AFTER_HOURS`] of quiet).
     Decision,
     /// Finished its turn, prompt open, nothing asked.
     Parked,
@@ -288,7 +289,12 @@ pub enum Disposition {
     Ended,
 }
 
-/// A parked session quiet this long reads as ended.
+/// A parked session quiet this long reads as ended. A question the brief
+/// read into the transcript decays on the same clock: half a day without
+/// the session moving means the person dealt with it elsewhere or let it
+/// go, and a stale ask must not hold "Needs you" forever. Questions a hook
+/// raised (gates, permission and input prompts) never decay — Claude Code
+/// is provably still waiting on those.
 pub const PARKED_ENDS_AFTER_HOURS: i64 = 12;
 
 /// Notification kinds that ask nothing of the person: Claude Code's
@@ -325,21 +331,32 @@ impl FleetSession {
         if self.ended_at.is_some() {
             return false;
         }
+        self.hook_asks() || self.brief_asks()
+    }
+
+    /// A question Claude Code itself is holding open: a pending gate, a
+    /// permission request, or a notification that asks (not a bare idle
+    /// prompt). Exempt from decay.
+    fn hook_asks(&self) -> bool {
         if self.pending_gate.is_some() {
             return true;
         }
         match &self.status {
             FleetStatus::NeedsAttention(AttentionKind::Gate) => true,
-            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message })
-                if !is_parked_notification(kind, message) =>
-            {
-                true
-            }
-            FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) | FleetStatus::Idle => {
-                self.blocked_on().is_some()
+            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message }) => {
+                !is_parked_notification(kind, message)
             }
             _ => false,
         }
+    }
+
+    /// A finished turn (idle or at the idle prompt) whose current brief
+    /// names what it's blocked on.
+    fn brief_asks(&self) -> bool {
+        matches!(
+            self.status,
+            FleetStatus::Idle | FleetStatus::NeedsAttention(AttentionKind::Notification { .. })
+        ) && self.blocked_on().is_some()
     }
 
     /// What the session asks, in words, when [`Self::asks_person`]: the
@@ -374,11 +391,15 @@ impl FleetSession {
         ) {
             return Disposition::Active;
         }
-        if self.asks_person() {
+        if self.hook_asks() {
             return Disposition::Decision;
         }
+        // Brief-derived questions decay with the parked clock.
         if now - self.last_event_at >= chrono::Duration::hours(PARKED_ENDS_AFTER_HOURS) {
             return Disposition::Ended;
+        }
+        if self.brief_asks() {
+            return Disposition::Decision;
         }
         Disposition::Parked
     }
@@ -508,8 +529,14 @@ pub struct FleetState {
 }
 
 impl FleetState {
+    /// Sessions that need the person now ([`Disposition::Decision`]) — the
+    /// same rule the Fleet view's "Needs you" group counts by.
     pub fn attention_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.asks_person()).count()
+        let now = Utc::now();
+        self.sessions
+            .values()
+            .filter(|s| s.disposition(now) == Disposition::Decision)
+            .count()
     }
 }
 
@@ -881,11 +908,16 @@ pub fn note_transcript_and_dirty(
     now: DateTime<Utc>,
 ) {
     // PromptSubmit dirties too: the user answering is exactly when blockers
-    // die, so the next brief should regenerate against the fresh turn.
-    let mark_dirty = matches!(
-        ev,
-        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. }
-    );
+    // die, so the next brief should regenerate against the fresh turn. So
+    // does a compaction restart: the transcript the old brief read from was
+    // just summarised away.
+    let mark_dirty = match ev {
+        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. } => {
+            true
+        }
+        FleetEvent::SessionStart { source, .. } => source == "compact",
+        _ => false,
+    };
     let path = transcript_path.filter(|p| !p.is_empty());
     if !mark_dirty && path.is_none() {
         return;
@@ -1723,10 +1755,17 @@ mod tests {
         assert_eq!(row(serde_json::json!("Working"), Some("x")).disposition(now), Disposition::Active);
         assert_eq!(row(serde_json::json!("Idle"), None).disposition(now), Disposition::Parked);
 
-        // Parked past the cutoff reads as ended; a question never does.
+        // Parked past the cutoff reads as ended; so does a question the brief
+        // read into the transcript. A hook-raised question never decays.
         let later = utc("2026-10-23T20:00:00Z");
         assert_eq!(row(idle_prompt.clone(), None).disposition(later), Disposition::Ended);
-        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(later), Disposition::Decision);
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(utc("2026-10-23T19:59:00Z")), Disposition::Decision);
+        let much_later = utc("2026-10-23T21:00:00Z");
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(much_later), Disposition::Ended);
+        assert_eq!(row(serde_json::json!("Idle"), Some("pick one")).disposition(much_later), Disposition::Ended);
+        let permission_old = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "permission_prompt", "message": "Allow Bash?"}}});
+        assert_eq!(row(permission_old, None).disposition(much_later), Disposition::Decision);
+        assert_eq!(row(serde_json::json!({"NeedsAttention": "Gate"}), None).disposition(much_later), Disposition::Decision);
         let mut ended = row(idle_prompt.clone(), Some("pick one"));
         ended.ended_at = Some(now);
         assert_eq!(ended.disposition(now), Disposition::Ended);
@@ -3063,6 +3102,23 @@ mod tests {
         assert_eq!(changed[0].brief_dirty_at, Some(t1));
         // Path recorded earlier survives.
         assert_eq!(changed[0].transcript_path.as_deref(), Some("/t/s1.jsonl"));
+    }
+
+    #[test]
+    fn a_compaction_restart_dirties_the_brief() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        let compact = FleetEvent::SessionStart {
+            session_id: "s1".into(),
+            cwd: "/x/proj".into(),
+            source: "compact".into(),
+        };
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let mut changed = reduce(&mut state, &compact, t1);
+        note_transcript_and_dirty(&mut state, &mut changed, &compact, None, t1);
+        assert_eq!(state.sessions["s1"].brief_dirty_at, Some(t1));
+        assert_eq!(changed[0].brief_dirty_at, Some(t1));
     }
 
     #[test]
