@@ -1113,7 +1113,11 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
                     },
                     if is_open { "▾" } else { "▸" }
                 }
-                if let Some(e) = &row_emoji {
+                if is_hobbes && crate::system_sessions::is_system(&session.id) {
+                    // The Hobbes tab draws its tiger, never its stored emoji.
+                    span { class: "shrink-0 inline-flex w-4 justify-center",
+                        crate::components::hobbes_icon::SystemTabIcon { session_id: session.id.clone(), emoji: row_emoji.clone(), size: 14 } }
+                } else if let Some(e) = &row_emoji {
                     span { class: "shrink-0 text-[14px] leading-none w-4 text-center", "{e}" }
                 } else if is_hobbes {
                     Icon { width: 16, height: 16, icon: fi_icons::FiMessageSquare, class: "shrink-0" }

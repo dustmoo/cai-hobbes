@@ -293,6 +293,8 @@ fn tidy_inputs(
     use tab_tidy::TidyTodoStatus;
     let tabs = open_tabs
         .iter()
+        // The Hobbes tab is permanent: never closed or filed, so not tidied.
+        .filter(|id| !crate::system_sessions::is_system(id))
         .filter_map(|id| {
             let s = state.sessions.get(id)?;
             Some(tab_tidy::TidyTab {
