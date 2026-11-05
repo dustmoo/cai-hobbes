@@ -55,6 +55,11 @@ pub struct RealtimeSetup {
     /// Push-to-talk: the provider's own voice-activity detection is off and
     /// the controller marks speech with `ActivityStart` / `ActivityEnd`.
     pub manual_activity: bool,
+    /// Automatic activity only: the silence (ms) that ends the person's
+    /// turn, with the provider told to end turns less eagerly, so a
+    /// thinking pause doesn't hand the model half a sentence. `None` =
+    /// provider defaults.
+    pub end_of_turn_ms: Option<u32>,
 }
 
 /// Provider → controller.

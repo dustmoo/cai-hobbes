@@ -158,6 +158,16 @@ fn setup_json_with(setup: &RealtimeSetup, resume_handle: Option<&str>, modalitie
             "realtimeInputConfig".into(),
             json!({"automaticActivityDetection": {"disabled": true}}),
         );
+    } else if let Some(ms) = setup.end_of_turn_ms {
+        // Low end-of-speech sensitivity ends turns less often; the silence
+        // window is the person's setting (Settings → Voice).
+        s.insert(
+            "realtimeInputConfig".into(),
+            json!({"automaticActivityDetection": {
+                "endOfSpeechSensitivity": "END_SENSITIVITY_LOW",
+                "silenceDurationMs": ms,
+            }}),
+        );
     }
     s.insert("inputAudioTranscription".into(), json!({}));
     s.insert("outputAudioTranscription".into(), json!({}));
@@ -682,6 +692,21 @@ mod tests {
     }
 
     #[test]
+    fn setup_end_of_turn_tuning() {
+        let mut st = base();
+        st.end_of_turn_ms = Some(900);
+        let v = setup_json(&st, None);
+        let aad = &v["setup"]["realtimeInputConfig"]["automaticActivityDetection"];
+        assert_eq!(aad["endOfSpeechSensitivity"], "END_SENSITIVITY_LOW");
+        assert_eq!(aad["silenceDurationMs"], 900);
+        assert!(aad.get("disabled").is_none());
+        // Manual activity wins: detection off, no tuning.
+        st.manual_activity = true;
+        let v = setup_json(&st, None);
+        assert_eq!(v["setup"]["realtimeInputConfig"], json!({"automaticActivityDetection": {"disabled": true}}));
+    }
+
+    #[test]
     fn setup_language_only_and_top_level_modalities() {
         let mut st = base();
         st.language = Some("fr-FR".into());
@@ -908,6 +933,7 @@ mod tests {
                 non_blocking: true,
             }],
             manual_activity: false,
+            end_of_turn_ms: None,
         };
         let mut s = GeminiLive::new(key).connect(setup).await.expect("connect");
         let deadline = std::time::Duration::from_secs(30);

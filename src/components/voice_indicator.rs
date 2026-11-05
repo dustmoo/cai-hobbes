@@ -84,6 +84,8 @@ pub fn VoiceIndicator() -> Element {
                     span { class: "truncate text-amber-300", "{w}" }
                 } else if !ui.heard.is_empty() {
                     span { class: "truncate text-fg-muted", "“{ui.heard}”" }
+                } else if let Some(n) = ui.notice.clone() {
+                    span { class: "truncate text-amber-300", "{n}" }
                 }
             }
             div { class: "flex items-center gap-2 shrink-0",

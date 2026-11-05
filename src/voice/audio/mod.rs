@@ -77,7 +77,8 @@ pub trait AudioIo: Send {
     }
     /// Whether the model can't hear itself: the backend cancels speaker
     /// echo (macOS voice processing), or the output is headphones. When
-    /// false the controller mutes the mic while the voice speaks.
+    /// false the controller holds the mic back while the voice speaks,
+    /// sending it only when the person talks over it (`voice::floor`).
     fn echo_safe(&self) -> bool;
     /// Stop everything. Idempotent; also done on drop.
     fn stop(&mut self);

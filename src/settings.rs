@@ -999,6 +999,22 @@ pub struct VoiceSettings {
     /// mid-conversation, or a short announcement with the mic off.
     #[serde(default = "default_true")]
     pub announce_results: bool,
+    /// How long a silence ends the person's turn (ms): longer lets them
+    /// pause to think without Hobbes answering half a sentence. Read
+    /// through [`VoiceSettings::end_of_turn`].
+    #[serde(default = "default_voice_end_of_turn_ms")]
+    pub end_of_turn_ms: u64,
+}
+
+/// Bounds for [`VoiceSettings::end_of_turn_ms`].
+pub const VOICE_END_OF_TURN_MIN_MS: u64 = 300;
+pub const VOICE_END_OF_TURN_MAX_MS: u64 = 3000;
+
+impl VoiceSettings {
+    /// The end-of-turn silence, clamped to its bounds.
+    pub fn end_of_turn(&self) -> u32 {
+        self.end_of_turn_ms.clamp(VOICE_END_OF_TURN_MIN_MS, VOICE_END_OF_TURN_MAX_MS) as u32
+    }
 }
 
 /// How voice keeps the model from hearing itself.
@@ -1026,6 +1042,9 @@ fn default_voice_hold_threshold_ms() -> u64 {
 fn default_voice_idle_timeout_secs() -> u64 {
     120
 }
+fn default_voice_end_of_turn_ms() -> u64 {
+    900
+}
 
 impl Default for VoiceSettings {
     fn default() -> Self {
@@ -1039,6 +1058,7 @@ impl Default for VoiceSettings {
             input_device_uid: None,
             echo: VoiceEcho::Auto,
             announce_results: true,
+            end_of_turn_ms: default_voice_end_of_turn_ms(),
         }
     }
 }
@@ -3112,6 +3132,20 @@ mod tests {
         v.as_object_mut().unwrap().remove("voice");
         let s: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(s.voice, VoiceSettings::default());
+    }
+
+    #[test]
+    fn voice_end_of_turn_defaults_and_clamps() {
+        // Settings saved before the field existed load with the default.
+        let mut v = serde_json::to_value(VoiceSettings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("end_of_turn_ms");
+        let mut vs: VoiceSettings = serde_json::from_value(v).unwrap();
+        assert_eq!(vs.end_of_turn_ms, 900);
+        assert_eq!(vs.end_of_turn(), 900);
+        vs.end_of_turn_ms = 50;
+        assert_eq!(vs.end_of_turn(), 300);
+        vs.end_of_turn_ms = 10_000;
+        assert_eq!(vs.end_of_turn(), 3000);
     }
 
     #[test]

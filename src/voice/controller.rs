@@ -11,7 +11,14 @@
 //! **Barge-in.** The provider reports `Interrupted` when the person talks
 //! over the voice; playback is flushed immediately. When the model could
 //! hear itself (no echo cancellation and the output isn't headphones), the
-//! mic is muted while the voice speaks.
+//! mic isn't streamed while the voice speaks: the last moments are kept and
+//! a local detector (`floor::BargeIn`) stops playback and sends them when
+//! the person talks over it, so their words aren't lost.
+//!
+//! **Floor control.** Speech nobody just asked for — announcements, brain
+//! results — waits in a queue (`floor::SpeechQueue`) until the person has
+//! stopped talking and the model has finished its turn, then goes out one
+//! item at a time.
 //!
 //! **Pipes.** The strip shows which mic is live and its level, and warns
 //! within a few seconds when no audio (or only digital silence) arrives.
@@ -26,7 +33,7 @@
 //! awaits, never held across one.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,6 +43,7 @@ use tokio::sync::mpsc;
 
 use crate::components::builtin_tools::BuiltinToolCtx;
 use crate::voice::audio::{self, AudioIo, MicPermission, VoiceEcho};
+use crate::voice::floor::{self, BargeIn, Delivery, Floor, MicRing, NoiseGate, Pending, SpeechQueue};
 use crate::voice::probe;
 use crate::voice::brain::{self, BrainHandle, BrainOutcome};
 use crate::voice::realtime::{
@@ -82,6 +90,8 @@ pub struct VoiceUi {
     pub mic_on: bool,
     /// The mic isn't delivering audio (shown while the conversation runs).
     pub mic_warning: Option<String>,
+    /// A passing hint (shown where the mic warning goes, when there is none).
+    pub notice: Option<String>,
     /// Last problem worth showing (cleared on the next successful start).
     pub error: Option<String>,
 }
@@ -278,6 +288,11 @@ pub fn on_turn_end(
 
 /// The instruction wrapped around an announcement.
 pub fn announce_prompt(text: &str, mid_conversation: bool, kind: AnnounceKind) -> String {
+    announce_prompt_merged(text, mid_conversation, kind, 1)
+}
+
+/// As [`announce_prompt`], for `merged` queued notes folded into the newest.
+pub fn announce_prompt_merged(text: &str, mid_conversation: bool, kind: AnnounceKind, merged: usize) -> String {
     let what = match kind {
         AnnounceKind::Result => "a result just came back from work handed off earlier",
         AnnounceKind::Heartbeat => "the Heartbeat, checking on their day in the background, found something for them",
@@ -294,8 +309,23 @@ pub fn announce_prompt(text: &str, mid_conversation: bool, kind: AnnounceKind) -
              their decision."
         )
     };
-    format!("[{how} If there's more, say it's in the Hobbes tab.]\n\n{}", text.trim())
+    let earlier = if merged > 1 {
+        format!(
+            " This is the latest of {merged} updates while you were talking; it supersedes the \
+             earlier ones, so only say this one."
+        )
+    } else {
+        String::new()
+    };
+    format!("[{how}{earlier} If there's more, say it's in the Hobbes tab.]\n\n{}", text.trim())
 }
+
+/// Shown once per app run when a conversation starts without echo
+/// cancellation on speakers.
+pub const ECHO_HINT: &str = "Hobbes may not hear you while it talks on speakers. Headphones, or Echo cancellation \"On\" in Settings → Voice, fixes it.";
+/// How long the hint stays up.
+const ECHO_HINT_FOR: Duration = Duration::from_secs(20);
+static ECHO_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Mic / speaker problems and provider failures end up here.
 fn fail(msg: impl Into<String>) {
@@ -359,6 +389,7 @@ pub fn realtime_for(settings: &crate::settings::Settings) -> Result<(Box<dyn Rea
         language: vp.language.filter(|v| !v.trim().is_empty()),
         tools: tools::voice_tool_decls(settings.planner_enabled),
         manual_activity: false,
+        end_of_turn_ms: Some(settings.voice.end_of_turn()),
     };
     Ok((Box::new(crate::voice::gemini_live::GeminiLive::new(key)), setup))
 }
@@ -485,11 +516,25 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut ever_captured = capture_on;
     // Speaking-only until the person presses the key.
     let mut announcing = announcing_text.is_some();
-    if let Some((text, kind)) = &announcing_text {
-        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(text, false, *kind), respond: true });
-    }
     let mut stats = Stats::default();
     let mut level_window = 0.0f32;
+    // Who has the floor, and the speech waiting for it (see `floor.rs`).
+    let mut floor_state = Floor::default();
+    let mut queue = SpeechQueue::default();
+    let mut noise = NoiseGate::default();
+    // Echo-unsafe only: the muted mic while Hobbes talks, and the detector
+    // that notices the person talking over it.
+    let mut barge = BargeIn::default();
+    let mut ring = MicRing::default();
+    // After a local barge-in the rest of the interrupted turn is neither
+    // played nor transcribed, until the model ends it (`Interrupted` /
+    // `TurnComplete`); otherwise its next audio would mute the mic again.
+    let mut muting_turn = false;
+    if let Some((text, kind)) = &announcing_text {
+        // Speaking-only start: nobody is talking (the mic is off).
+        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(text, false, *kind), respond: true });
+        floor_state.model_active(Instant::now());
+    }
 
     // Until the key comes up we don't know tap vs hold; treat as held. An
     // announcement behaves like push-to-talk between holds.
@@ -513,6 +558,13 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // holding phrase in one turn and calls the brain in the next.
     let mut last_spoke: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
+    // Once per app run: on speakers without echo cancellation Hobbes only
+    // hears them over its own voice when they speak up.
+    let mut notice_until: Option<Instant> = None;
+    if !ui.echo_safe && announcing_text.is_none() && !ECHO_HINT_SHOWN.swap(true, Ordering::Relaxed) {
+        ui.notice = Some(ECHO_HINT.to_string());
+        notice_until = Some(Instant::now() + ECHO_HINT_FOR);
+    }
     ui.phase = Phase::Listening;
     ui.error = None;
     *VOICE_UI.write() = ui.clone();
@@ -528,7 +580,44 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 let mic_open = held || mode == Some(Mode::Conversation);
                 // Without echo cancellation or headphones the model would hear itself.
                 let echo_risk = !ui.echo_safe && audio_io.is_playing() && !held;
-                if mic_open && !echo_risk {
+                let now = Instant::now();
+                if !mic_open {
+                    // Push-to-talk between holds: nothing goes out.
+                } else if echo_risk {
+                    // Keep the muted frame; send it after all if the person
+                    // is talking over Hobbes.
+                    let ms = floor::frame_ms(frame.len());
+                    ring.push(frame);
+                    if barge.observe(p, ms) {
+                        audio_io.flush();
+                        muting_turn = true;
+                        stats.barge_ins += 1;
+                        if !spoke_buf.trim().is_empty() {
+                            let text = format!("{} —", std::mem::take(&mut spoke_buf).trim_end());
+                            pending_lines.push(PendingLine::new(false, text, spoke_at.take()));
+                        }
+                        let buffered = ring.drain();
+                        tracing::info!("voice: local barge-in; sending {} buffered mic frames", buffered.len());
+                        for f in buffered {
+                            stats.sent_frames += 1;
+                            let _ = rt.control.send(RealtimeControl::Audio(f));
+                        }
+                        floor_state.person_spoke(now);
+                        ui.phase = Phase::Listening;
+                        last_activity = now;
+                    }
+                } else {
+                    // Playback over without a barge-in: what was kept was
+                    // Hobbes' own echo.
+                    if !ring.is_empty() {
+                        stats.echo_frames_dropped += ring.clear() as u64;
+                        barge.playback_ended();
+                    }
+                    // The level counts toward the floor only when it can't
+                    // be Hobbes' own voice.
+                    if noise.is_speech(p) && (ui.echo_safe || !audio_io.is_playing()) {
+                        floor_state.person_spoke(now);
+                    }
                     stats.sent_frames += 1;
                     let _ = rt.control.send(RealtimeControl::Audio(frame));
                 }
@@ -538,17 +627,25 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 match ev {
                     RealtimeEvent::Ready | RealtimeEvent::Reconnected => {}
                     RealtimeEvent::Audio { pcm, sample_rate } => {
-                        last_spoke = Some(Instant::now());
-                        stats.model_audio_ms += (pcm.len() as u64 * 1000) / sample_rate.max(1) as u64;
-                        if !heard_buf.trim().is_empty() {
-                            pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
+                        floor_state.model_active(Instant::now());
+                        let audio_ms = (pcm.len() as u64 * 1000) / sample_rate.max(1) as u64;
+                        if muting_turn {
+                            // The rest of a turn the person talked over.
+                            stats.muted_model_ms += audio_ms;
+                        } else {
+                            last_spoke = Some(Instant::now());
+                            stats.model_audio_ms += audio_ms;
+                            if !heard_buf.trim().is_empty() {
+                                pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
+                            }
+                            audio_io.play(&pcm, sample_rate);
+                            last_activity = Instant::now();
+                            ui.phase = Phase::Speaking;
+                            ui.heard.clear();
                         }
-                        audio_io.play(&pcm, sample_rate);
-                        last_activity = Instant::now();
-                        ui.phase = Phase::Speaking;
-                        ui.heard.clear();
                     }
                     RealtimeEvent::InputTranscript(t) => {
+                        floor_state.person_transcript(Instant::now());
                         stats.heard_fragments += 1;
                         if heard_buf.trim().is_empty() {
                             heard_at = Some(chrono::Utc::now());
@@ -559,14 +656,21 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         ui.phase = Phase::Listening;
                     }
                     RealtimeEvent::OutputTranscript(t) => {
-                        last_spoke = Some(Instant::now());
-                        stats.spoke_fragments += 1;
-                        if spoke_buf.trim().is_empty() {
-                            spoke_at = Some(chrono::Utc::now());
+                        floor_state.model_active(Instant::now());
+                        // Not while muting a talked-over turn: those words
+                        // were never played (its line already ends in "—").
+                        if !muting_turn {
+                            last_spoke = Some(Instant::now());
+                            stats.spoke_fragments += 1;
+                            if spoke_buf.trim().is_empty() {
+                                spoke_at = Some(chrono::Utc::now());
+                            }
+                            spoke_buf.push_str(&t);
                         }
-                        spoke_buf.push_str(&t);
                     }
                     RealtimeEvent::Interrupted => {
+                        floor_state.model_turn_ended(Instant::now());
+                        muting_turn = false;
                         audio_io.flush();
                         if !spoke_buf.trim().is_empty() {
                             let text = format!("{} —", std::mem::take(&mut spoke_buf).trim_end());
@@ -576,6 +680,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         last_activity = Instant::now();
                     }
                     RealtimeEvent::TurnComplete => {
+                        floor_state.model_turn_ended(Instant::now());
+                        muting_turn = false;
                         stats.turns += 1;
                         if !heard_buf.trim().is_empty() {
                             pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
@@ -661,14 +767,13 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         BrainOutcome::NeedsApproval(t) | BrainOutcome::Failed(t) => t,
                         BrainOutcome::Cancelled => "Cancelled.".to_string(),
                     };
-                    if abandoned.remove(&id) {
-                        let _ = rt.control.send(RealtimeControl::InjectContext {
-                            text: format!("[Result of your earlier request to the brain] {text}"),
-                            respond: true,
-                        });
+                    // Either way it makes the voice speak: wait for the floor.
+                    let item = if abandoned.remove(&id) {
+                        Pending::Abandoned { text }
                     } else {
-                        respond(&rt.control, &id, tools::ASK_BRAIN, json!({"result": text}), Some(Scheduling::WhenIdle));
-                    }
+                        Pending::BrainResult { id, text }
+                    };
+                    queue.push(item, Instant::now());
                 }
             }
             cmd = rx.recv() => {
@@ -709,7 +814,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     VoiceCmd::Stop => break "stopped".to_string(),
                     VoiceCmd::Announce(text, kind) => {
                         last_activity = Instant::now();
-                        let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(&text, true, kind), respond: true });
+                        queue.push(Pending::Announce { text, kind }, Instant::now());
                     }
                 }
             }
@@ -719,12 +824,19 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 if capture_on {
                     ui.mic_warning = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic);
                 }
+                if notice_until.is_some_and(|t| Instant::now() >= t) {
+                    notice_until = None;
+                    ui.notice = None;
+                }
                 if ui.phase == Phase::Speaking && !audio_io.is_playing() {
                     ui.phase = Phase::Listening;
                 }
                 // An announcement nobody answered: hang up once it's said.
                 if announcing {
-                    let said = stats.turns >= 1 && !audio_io.is_playing() && last_activity.elapsed() >= Duration::from_secs(5);
+                    let said = stats.turns >= 1
+                        && queue.is_empty()
+                        && !audio_io.is_playing()
+                        && last_activity.elapsed() >= Duration::from_secs(5);
                     if said || live_at.elapsed() > Duration::from_secs(60) {
                         break "announced".to_string();
                     }
@@ -737,7 +849,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         break "goodbye".to_string();
                     }
                 }
-                let busy = !brain_cancel.is_empty() || audio_io.is_playing() || held;
+                let busy = !brain_cancel.is_empty() || !queue.is_empty() || audio_io.is_playing() || held;
                 if !busy && last_activity.elapsed() > idle {
                     break "idle".to_string();
                 }
@@ -749,6 +861,36 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 // Transcript lines wait while the brain's turn is running.
                 if brain_cancel.is_empty() {
                     flush_lines(ctx, &voice_session, &mut pending_lines, false);
+                }
+            }
+        }
+        // Speech that waited for the floor: one item, once it's free.
+        let now = Instant::now();
+        let free = floor_state.is_free(held, audio_io.is_playing(), now);
+        if let Some(d) = queue.next(free, now) {
+            stats.queued_out += 1;
+            last_activity = now;
+            match d {
+                Delivery::Announce { text, kind, merged } => {
+                    tracing::info!("voice: queued news out ({kind:?}, {merged} merged, {} still queued)", queue.len());
+                    let text = announce_prompt_merged(&text, !announcing, kind, merged);
+                    let _ = rt.control.send(RealtimeControl::InjectContext { text, respond: true });
+                    floor_state.model_active(now);
+                }
+                Delivery::Abandoned { text } => {
+                    let _ = rt.control.send(RealtimeControl::InjectContext {
+                        text: format!("[Result of your earlier request to the brain] {text}"),
+                        respond: true,
+                    });
+                    floor_state.model_active(now);
+                }
+                Delivery::BrainResult { id, text, forced } => {
+                    if forced {
+                        tracing::info!("voice: brain result held {}s for the floor; sending anyway", floor::BRAIN_RESULT_CAP.as_secs());
+                    } else {
+                        floor_state.model_active(now);
+                    }
+                    respond(&rt.control, &id, tools::ASK_BRAIN, json!({"result": text}), Some(Scheduling::WhenIdle));
                 }
             }
         }
@@ -787,6 +929,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         pending_lines.push(PendingLine::new(false, spoke_buf, spoke_at));
     }
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
+    if !queue.is_empty() {
+        // Their text is in the Hobbes tab already.
+        tracing::info!("voice: {} queued item(s) not spoken before the end", queue.len());
+    }
     tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
     if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic).filter(|_| ever_captured) {
         fail(w);
@@ -808,20 +954,32 @@ struct Stats {
     spoke_fragments: u64,
     turns: u64,
     tool_calls: u64,
+    /// Local barge-ins (echo-unsafe only).
+    barge_ins: u64,
+    /// Muted mic frames discarded as Hobbes' own echo.
+    echo_frames_dropped: u64,
+    /// Model audio not played: the rest of talked-over turns.
+    muted_model_ms: u64,
+    /// Items that waited for the floor and went out.
+    queued_out: u64,
 }
 
 impl Stats {
     fn summary(&self) -> String {
         format!(
-            "mic frames {} (sent {}), peak {:.3}, model audio {:.1}s, heard/spoke fragments {}/{}, turns {}, tool calls {}",
+            "mic frames {} (sent {}, echo dropped {}), peak {:.3}, model audio {:.1}s (cut {:.1}s), heard/spoke fragments {}/{}, turns {}, tool calls {}, barge-ins {}, queued out {}",
             self.mic_frames,
             self.sent_frames,
+            self.echo_frames_dropped,
             self.max_peak,
             self.model_audio_ms as f32 / 1000.0,
+            self.muted_model_ms as f32 / 1000.0,
             self.heard_fragments,
             self.spoke_fragments,
             self.turns,
             self.tool_calls,
+            self.barge_ins,
+            self.queued_out,
         )
     }
 }
