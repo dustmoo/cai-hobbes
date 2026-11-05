@@ -27,22 +27,6 @@ use serde::{Deserialize, Serialize};
 /// `meta` key holding the archived ids (JSON [`Archives`]).
 pub const ARCHIVES_META_KEY: &str = "system_session_archives";
 
-/// The kinds of system session. One since the Heartbeat and Voice tabs
-/// merged into the Hobbes tab.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SystemSession {
-    Hobbes,
-}
-
-impl SystemSession {
-    /// The session's fixed title.
-    pub fn title(self) -> &'static str {
-        match self {
-            SystemSession::Hobbes => crate::hobbes_session::SESSION_TITLE,
-        }
-    }
-}
-
 /// Archived (rotated-out) ids, oldest first. Persisted.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Archives {
@@ -111,17 +95,14 @@ impl Ids {
         self.current.as_deref()
     }
 
-    /// Which system session `id` is — current or archived.
-    pub fn kind(&self, id: &str) -> Option<SystemSession> {
-        if id.is_empty() {
-            return None;
-        }
-        (self.current() == Some(id) || self.archives.hobbes.iter().any(|a| a == id)).then_some(SystemSession::Hobbes)
+    /// `id` is the Hobbes session, current or archived.
+    pub fn is_system(&self, id: &str) -> bool {
+        !id.is_empty() && (self.current() == Some(id) || self.archives.hobbes.iter().any(|a| a == id))
     }
 
     /// `id` is a rotated-out archive (and not, by some race, also current).
     pub fn is_archive(&self, id: &str) -> bool {
-        self.kind(id).is_some() && self.current() != Some(id)
+        self.is_system(id) && self.current() != Some(id)
     }
 
     /// `id` is the live session.
@@ -262,15 +243,10 @@ pub fn resolve_successor(id: &str) -> String {
     stored_archives().resolve(id)
 }
 
-/// Which system session `id` is (current or archived), if any.
-pub fn kind(id: &str) -> Option<SystemSession> {
-    read(|ids| ids.kind(id)).flatten()
-}
-
 /// A system session, current or archived: keeps its icon, stays out of
 /// projects and is never retitled.
 pub fn is_system(id: &str) -> bool {
-    kind(id).is_some()
+    read(|ids| ids.is_system(id)).unwrap_or(false)
 }
 
 /// The live Hobbes session (not an archive).
@@ -362,7 +338,7 @@ mod tests {
     #[test]
     fn registered_sessions_are_recognised() {
         register("test-hobbes-session");
-        assert_eq!(kind("test-hobbes-session"), Some(SystemSession::Hobbes));
+        assert!(is_system("test-hobbes-session"));
         assert!(is_current("test-hobbes-session"));
         assert!(!is_system("an-ordinary-chat"));
     }
@@ -376,7 +352,7 @@ mod tests {
         ids.rotate(&["h-1"], "h-2");
         ids.rotate(&["h-2"], "h-3");
         // Archives keep their kind (icon, no project, no retitle) ...
-        assert_eq!(ids.kind("h-1"), Some(SystemSession::Hobbes));
+        assert!(ids.is_system("h-1"));
         assert!(ids.is_archive("h-1") && ids.is_archive("h-2"));
         assert!(!ids.is_current("h-1") && ids.is_current("h-3"));
         // ... and whatever is addressed to them lands in the current one.
@@ -386,7 +362,7 @@ mod tests {
         assert_eq!(ids.lineage(), vec!["h-1", "h-2", "h-3"]);
         // Ordinary chats pass through untouched.
         assert_eq!(ids.current_for("a-chat"), "a-chat");
-        assert_eq!(ids.kind(""), None);
+        assert!(!ids.is_system(""));
     }
 
     #[test]

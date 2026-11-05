@@ -47,7 +47,7 @@ use crate::components::chat::Message;
 use crate::components::shared::MessageContent;
 use crate::session::{ConversationSummary, Session, SessionState};
 use crate::session_events::SessionEvent;
-use crate::system_sessions::{self, SystemSession};
+use crate::system_sessions;
 use crate::timers::TimerStatus;
 
 /// Rotate past this many messages. The Heartbeat measured 287 messages /
@@ -406,7 +406,7 @@ pub fn prepare(
 ) -> Prepared {
     let carry = CarryOver::from_session(old);
     let ArchiveOf { title: archive_title, archive, events: archive_events, moved_timers: moved } =
-        archive_of(SystemSession::Hobbes.title(), old, new_id);
+        archive_of(crate::hobbes_session::SESSION_TITLE, old, new_id);
 
     let mut successor = crate::session_events::blank_session();
     successor.id = new_id.to_string();

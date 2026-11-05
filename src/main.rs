@@ -2600,8 +2600,7 @@ fn app() -> Element {
             // one's summary), not an abandoned tab.
             {
                 let state = session_state.read();
-                let is_system = crate::hobbes_session::is_hobbes(&closing_session_id)
-                    || crate::system_sessions::is_current(&closing_session_id);
+                let is_system = crate::system_sessions::is_current(&closing_session_id);
                 let is_empty = !is_system
                     && state.sessions.get(&closing_session_id)
                         .map(|s| s.messages.is_empty())
