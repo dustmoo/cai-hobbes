@@ -281,7 +281,7 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
         (s.heartbeat_enabled, budget::Budget::from_settings(&s))
     };
     let hb = HEARTBEAT.read();
-    let session_id = crate::hobbes_session::HOBBES_SESSION_ID.read().clone();
+    let session_id = crate::system_sessions::current_reactive();
     // The Hobbes session also runs typed and voice turns: only an
     // unattended (wake) turn is the Heartbeat working.
     let wake_turn = |id: &str| {

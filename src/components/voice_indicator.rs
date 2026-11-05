@@ -107,7 +107,7 @@ pub fn VoiceIndicator() -> Element {
                 button {
                     class: "px-2 py-0.5 text-xs bg-primary-800 hover:bg-primary-700 rounded transition-colors",
                     onclick: move |_| {
-                        let id = crate::hobbes_session::current_id();
+                        let id = crate::system_sessions::current();
                         if let Some(id) = id {
                             chat_command.set(Some(ChatCommand::SwitchToSession(id)));
                         }

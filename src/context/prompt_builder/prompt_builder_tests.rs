@@ -3439,7 +3439,7 @@ fn tab_tools_are_offered_only_in_the_hobbes_session_and_the_setting_stays_out_of
     assert!(tab_names(&plain).is_empty());
     assert!(!plain.volatile.contains_key("other_tabs"));
 
-    crate::system_sessions::register(&session.id);
+    crate::system_sessions::set_current(&session.id);
     let asks = PromptBuilder::new(&session, &off).build_system_context();
     let free = PromptBuilder::new(&session, &on).build_system_context();
     assert_eq!(tab_names(&asks), vec!["HOBBES_TAB_LIST", "HOBBES_TAB_READ"]);

@@ -382,7 +382,7 @@ fn worker_title(planner: &PlannerState, worker: &Session) -> String {
 /// the Heartbeat's rules) fits the Heartbeat's budget (always true for any
 /// other session).
 fn heartbeat_budget_allows(settings: &Settings, receiver: &str, now: DateTime<Utc>) -> bool {
-    if !crate::hobbes_session::is_hobbes(receiver) {
+    if !crate::system_sessions::is_current(receiver) {
         return true;
     }
     let hb = crate::heartbeat::HEARTBEAT.peek();
@@ -497,7 +497,7 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
             crate::components::chat_queue::QueuedMessage::relay(incoming),
         );
         crate::components::chat_queue::request_drain();
-        if !crate::hobbes_session::is_hobbes(out.to) {
+        if !crate::system_sessions::is_current(out.to) {
             crate::request_tab_reopen(out.to);
         }
     } else {

@@ -89,7 +89,7 @@ pub fn resolve_origin(stated: QueueOrigin, is_hobbes_session: bool) -> crate::se
 /// The origin the drain gives the queued message `qm` popped for
 /// `session_id` (the one call the drain makes; tests use it too).
 pub fn drain_origin(qm: &QueuedMessage, session_id: &str) -> crate::session::TurnOrigin {
-    resolve_origin(qm.origin, crate::hobbes_session::is_hobbes(session_id))
+    resolve_origin(qm.origin, crate::system_sessions::is_current(session_id))
 }
 
 /// Origins the drain resolved for messages it handed to `submit`, keyed by

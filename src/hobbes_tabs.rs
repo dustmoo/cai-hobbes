@@ -880,7 +880,7 @@ mod tests {
             let settings = two_companies();
             let mut state = SessionState::new();
             let hobbes = state.create_session_raw(Some("cm".into()));
-            crate::system_sessions::register(&hobbes);
+            crate::system_sessions::set_current(&hobbes);
             // A Puget tab that read Puget mail days ago (an ordinary tab keeps
             // it in context with no clock).
             let puget = state.create_session_raw(Some("pg".into()));
@@ -1015,7 +1015,7 @@ mod tests {
     fn hobbes_with_tab_read(sources: &[&str], at: chrono::DateTime<chrono::Utc>) -> (SessionState, String) {
         let mut state = SessionState::default();
         let id = state.create_session_raw(Some("cm".into()));
-        crate::system_sessions::register(&id);
+        crate::system_sessions::set_current(&id);
         let mut tc = ToolCall::new("hobbes-core".into(), TAB_READ.into(), serde_json::json!({"session_id": "x"}), None, None);
         tc.status = ToolCallStatus::Completed;
         tc.completed_at = Some(at);

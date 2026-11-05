@@ -104,7 +104,7 @@ fn tick(deps: HeartbeatDeps, streaming: &HashSet<String>, ci_runs: Option<Vec<Ci
     let session_id = if active {
         crate::hobbes_session::ensure_session(deps.session_state, &settings)
     } else {
-        crate::hobbes_session::current_id()
+        crate::system_sessions::current()
     };
     // Finished wakes are read back even when the Heartbeat was just turned
     // off, so the trail doesn't keep a wake open forever.
@@ -329,7 +329,7 @@ fn maybe_wake(
 fn day_view(deps: HeartbeatDeps, settings: &Settings, now: DateTime<Utc>) -> Option<DayView> {
     (settings.planner_enabled && settings.heartbeat_source_planner).then(|| {
         let mut day = DayView::capture(&deps.planner.peek(), settings, now);
-        let heartbeat_session = crate::hobbes_session::current_id();
+        let heartbeat_session = crate::system_sessions::current();
         day.fleet =
             housekeeping::fleet_digest(&deps.fleet.peek(), &deps.planner.peek(), heartbeat_session.as_deref(), now);
         day

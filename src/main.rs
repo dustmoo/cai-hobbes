@@ -1003,7 +1003,7 @@ fn app() -> Element {
                     // park the id for the ChatCommand handler to reopen.
                     // The Hobbes session stays out of the tab strip: its
                     // turn runs in the background like a wake.
-                    if !crate::hobbes_session::is_hobbes(&c.parent_session_id) {
+                    if !crate::system_sessions::is_current(&c.parent_session_id) {
                         PENDING_TAB_REOPEN
                             .write()
                             .insert(c.parent_session_id.clone());

@@ -275,7 +275,7 @@ mod tests {
         use crate::components::chat_queue::{self, CHAT_QUEUE};
         use crate::session::TurnOrigin;
         let mut dom = VirtualDom::new(|| {
-            *crate::hobbes_session::HOBBES_SESSION_ID.write() = Some("brain-hobbes".into());
+            crate::system_sessions::set_current("brain-hobbes");
             let framed = framed_request("check CI");
             let id = queue_request("brain-hobbes", &framed);
             // The drain: pop, resolve the origin, hand it to the send.

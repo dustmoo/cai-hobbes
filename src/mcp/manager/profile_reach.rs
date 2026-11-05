@@ -1006,7 +1006,7 @@ mod tests {
             mk("Hobbes", "terminal", Some("x"), ToolCallStatus::Completed), // not Composio
         ];
         let now = chrono::Utc::now();
-        crate::system_sessions::register("reach-test-voice");
+        crate::system_sessions::set_current("reach-test-voice");
         let mut session = crate::session_events::blank_session();
         session.id = "reach-test-voice".into();
         session.messages = msgs;
@@ -1033,7 +1033,7 @@ mod tests {
 
     #[test]
     fn approval_never_moves_a_call_to_another_company() {
-        crate::system_sessions::register("reach-test-voice");
+        crate::system_sessions::set_current("reach-test-voice");
         let settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         let mut held = call(json!({"hobbes_profile": "Puget"}));
         held.server_name = "composio-native:Puget".into();
@@ -1050,7 +1050,7 @@ mod tests {
 
     #[test]
     fn an_unpinned_system_session_still_routes() {
-        crate::system_sessions::register("reach-test-hb");
+        crate::system_sessions::set_current("reach-test-hb");
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
         let home = home_profile(&settings, None);
@@ -1082,7 +1082,7 @@ mod tests {
         // Only deleted profiles ticked: still single-profile.
         assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &["gone".to_string()]).len(), 1);
         // System sessions keep their own reach; the tab list is ignored.
-        crate::system_sessions::register("reach-test-hb");
+        crate::system_sessions::set_current("reach-test-hb");
         assert_eq!(
             session_reach(&settings, "reach-test-hb", Some("cm"), &["gone".to_string()]),
             reach_for_session(&settings, "reach-test-hb", Some("cm"))
@@ -1248,7 +1248,7 @@ mod tests {
         assert!(session_read_profiles(&settings, &session, now).is_empty());
 
         // A system session keeps the 2 h window exactly.
-        crate::system_sessions::register("reach-test-voice");
+        crate::system_sessions::set_current("reach-test-voice");
         let mut voice = tab("reach-test-voice", "cm", &[]);
         voice.messages.push(read_via_reach(&pg, then));
         assert!(session_read_profiles(&settings, &voice, now).is_empty());
@@ -1295,7 +1295,7 @@ mod tests {
         unpinned.composio_profile = None;
         assert_eq!(chip_reach(&settings, &unpinned).home.as_deref(), Some("cm"));
         // System sessions: no editing.
-        crate::system_sessions::register("reach-test-hb");
+        crate::system_sessions::set_current("reach-test-hb");
         assert!(!chip_reach(&settings, &tab("reach-test-hb", "cm", &[])).editable);
     }
 

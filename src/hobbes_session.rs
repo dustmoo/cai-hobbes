@@ -5,7 +5,7 @@
 //! setting.
 //!
 //! - **One pointer, one creator.** The id lives in one `meta` key
-//!   ([`META_KEY`]) and in [`HOBBES_SESSION_ID`]. Both the Heartbeat tick and
+//!   ([`META_KEY`]) and in `system_sessions`' registry (the single source of truth; written only by `system_sessions::set_current` / `apply_rotation`). Both the Heartbeat tick and
 //!   the voice controller get it from [`ensure_session`]; it is synchronous
 //!   and runs on the Dioxus thread, so the two can't both create one.
 //! - **Trust follows the turn.** Being the Hobbes session decides nothing
@@ -42,21 +42,6 @@ const LEGACY_VOICE_META_KEY: &str = "voice_session_id";
 /// The persisted pointer, if any (not resolved through rotations).
 pub fn stored_pointer() -> Option<String> {
     crate::session_store::meta_get(META_KEY).filter(|s| !s.is_empty())
-}
-
-/// The Hobbes session's id once known (from the store at first use, past
-/// any rotation the pointer missed).
-pub static HOBBES_SESSION_ID: GlobalSignal<Option<String>> =
-    Signal::global(|| stored_pointer().map(|id| crate::system_sessions::resolve_successor(&id)));
-
-/// The Hobbes session's id, if it exists (peeked: no subscription).
-pub fn current_id() -> Option<String> {
-    HOBBES_SESSION_ID.peek().clone()
-}
-
-/// Whether `id` is the live Hobbes session.
-pub fn is_hobbes(id: &str) -> bool {
-    HOBBES_SESSION_ID.peek().as_deref() == Some(id)
 }
 
 /// The pre-merge Heartbeat and Voice session ids (resolved past their own
@@ -96,7 +81,7 @@ fn new_session_profile(settings: &Settings) -> Option<String> {
 /// Mark `id` as the Hobbes system session and repair its icon (journaled),
 /// project tag and home profile. Cheap when nothing needs fixing.
 fn adopt(session_state: &mut Signal<SessionState>, id: &str, home: Option<&str>) {
-    crate::system_sessions::register(id);
+    crate::system_sessions::set_current(id);
     if crate::system_sessions::repair(session_state, id, SESSION_EMOJI, home) {
         SessionState::save_signal(session_state, None);
     }
@@ -116,7 +101,7 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, settings: &Settin
         return None;
     }
     let home = settings.home_profile_id();
-    if let Some(id) = current_id() {
+    if let Some(id) = crate::system_sessions::current() {
         // One indexed row: fine on the UI thread (P-017).
         if SessionState::ensure_hydrated(session_state, &id) {
             adopt(&mut session_state, &id, home);
@@ -149,7 +134,7 @@ fn create(mut session_state: Signal<SessionState>, settings: &Settings) -> Optio
     if let Err(e) = crate::session_store::meta_set(META_KEY, &id) {
         tracing::warn!("hobbes tab: could not persist the session id: {e}");
     }
-    *HOBBES_SESSION_ID.write() = Some(id.clone());
+    crate::system_sessions::set_current(&id);
     tracing::info!("hobbes tab: created session {id}");
     Some(id)
 }
@@ -162,7 +147,7 @@ fn create(mut session_state: Signal<SessionState>, settings: &Settings) -> Optio
 /// transaction as the archives, so it never runs twice. `None` when there
 /// is nothing to merge (or the write failed: everything stays as it was).
 pub fn migrate(session_state: Signal<SessionState>, settings: &Settings, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    if current_id().is_some() || session_state.peek().save_disabled {
+    if crate::system_sessions::current().is_some() || session_state.peek().save_disabled {
         return None;
     }
     let olds: Vec<(&'static str, crate::session::Session)> = legacy_sessions()
@@ -194,7 +179,7 @@ pub fn startup(mut session_state: Signal<SessionState>, settings: &Settings) {
     if session_state.peek().save_disabled {
         return;
     }
-    match current_id() {
+    match crate::system_sessions::current() {
         Some(id) => {
             if session_state.peek().sessions.contains_key(&id) {
                 adopt(&mut session_state, &id, settings.home_profile_id());

@@ -29,7 +29,7 @@ use crate::voice::controller::{Phase, VOICE_UI};
 /// The Hobbes session's id, as a memo: a tab re-renders when the id is
 /// assigned or rotated, not on unrelated writes.
 pub fn use_hobbes_session_id() -> Memo<Option<String>> {
-    use_memo(|| crate::hobbes_session::HOBBES_SESSION_ID.read().clone())
+    use_memo(crate::system_sessions::current_reactive)
 }
 
 /// Whether a tab shows a system icon: the live Hobbes session (read through

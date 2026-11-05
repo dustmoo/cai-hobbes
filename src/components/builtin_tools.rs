@@ -1223,7 +1223,7 @@ mod tests {
                 crate::todo::PlannerState::default(),
                 crate::settings::Settings::default(),
             );
-            crate::system_sessions::register("gate-hobbes");
+            crate::system_sessions::set_current("gate-hobbes");
             let gate = |origin: TurnOrigin, tool: &str| {
                 let mut tc = call(tool);
                 assert_eq!(tc.origin, None, "the connector never sets an origin");
@@ -1339,7 +1339,7 @@ mod tests {
                 crate::todo::PlannerState::default(),
                 crate::settings::Settings::default(),
             );
-            crate::system_sessions::register("resume-hobbes");
+            crate::system_sessions::set_current("resume-hobbes");
             // A wake's call held for approval, as the stream path stored it.
             let mut held = call("gmail_send_email");
             stamp_turn_origin(&mut held, TurnOrigin::Heartbeat);
@@ -1426,7 +1426,7 @@ mod tests {
                 state.sessions.get_mut(&puget).unwrap().messages.push(m);
                 (hobbes, puget, other)
             };
-            crate::system_sessions::register(&hobbes);
+            crate::system_sessions::set_current(&hobbes);
             let args = serde_json::json!({ "session_id": puget });
             let stamped = |tool: &str, origin: TurnOrigin| {
                 let mut tc = ToolCall::new("hobbes-core".into(), tool.into(), args.clone(), None, None);

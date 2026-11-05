@@ -210,12 +210,45 @@ fn read<T>(f: impl FnOnce(&Ids) -> T) -> Option<T> {
     registry().read().ok().map(|ids| f(&ids))
 }
 
-/// Record the session the Hobbes tab uses (on creation or adoption).
-pub fn register(id: &str) {
+/// The reactive mirror of the current id for the UI. Private: only
+/// [`set_current`] and [`apply_rotation`] write it, through [`notify`];
+/// read it with [`current_reactive`].
+static MIRROR: dioxus::prelude::GlobalSignal<Option<String>> = dioxus::prelude::Signal::global(current);
+
+/// Push the registry's current id into the mirror. A no-op without a Dioxus
+/// runtime (plain unit tests, background threads): the registry is still
+/// correct, and the mirror initialises from it when first read.
+fn notify() {
+    use dioxus::prelude::Readable;
+    if dioxus::dioxus_core::Runtime::current().is_err() {
+        return;
+    }
+    let now = current();
+    if *MIRROR.peek() != now {
+        *MIRROR.write() = now;
+    }
+}
+
+/// The live Hobbes session's id, if there is one (not reactive).
+pub fn current() -> Option<String> {
+    read(|ids| ids.current.clone()).flatten()
+}
+
+/// [`current`] as a subscribing read, for the UI: a component re-renders
+/// when the id is assigned or rotated.
+pub fn current_reactive() -> Option<String> {
+    use dioxus::prelude::Readable;
+    MIRROR.read().clone()
+}
+
+/// The one writer of the current Hobbes session id: the registry and the
+/// UI's reactive mirror. Call on creation, adoption or in tests.
+pub fn set_current(id: &str) {
     seed();
     if let Ok(mut ids) = registry().write() {
         ids.current = Some(id.to_string());
     }
+    notify();
 }
 
 /// The archive list as it will be after rotating `olds` out for `new`, for
@@ -234,13 +267,7 @@ pub fn apply_rotation(olds: &[&str], new: &str) {
     if let Ok(mut ids) = registry().write() {
         ids.rotate(olds, new);
     }
-}
-
-/// Follow a persisted pointer forward through recorded rotations: loading
-/// the session id calls this, so a pointer left on an archive (a crash
-/// between the rotation's commit and a stale async save) recovers.
-pub fn resolve_successor(id: &str) -> String {
-    stored_archives().resolve(id)
+    notify();
 }
 
 /// A system session, current or archived: keeps its icon, stays out of
@@ -337,7 +364,7 @@ mod tests {
 
     #[test]
     fn registered_sessions_are_recognised() {
-        register("test-hobbes-session");
+        set_current("test-hobbes-session");
         assert!(is_system("test-hobbes-session"));
         assert!(is_current("test-hobbes-session"));
         assert!(!is_system("an-ordinary-chat"));
@@ -421,5 +448,28 @@ mod tests {
         cyclic.successors.insert("x".into(), "y".into());
         cyclic.successors.insert("y".into(), "x".into());
         let _ = cyclic.resolve("x");
+    }
+
+    #[test]
+    fn set_current_and_rotation_reach_the_registry_and_the_reader() {
+        use dioxus::prelude::*;
+        // Without a runtime the registry still updates.
+        set_current("h-1");
+        assert!(is_system("h-1") && is_current("h-1"));
+        assert_eq!(current().as_deref(), Some("h-1"));
+        let mut dom = VirtualDom::new(|| {
+            set_current("h-1");
+            assert_eq!(current_reactive().as_deref(), Some("h-1"));
+            apply_rotation(&["h-1"], "h-2");
+            assert_eq!(current().as_deref(), Some("h-2"));
+            assert_eq!(current_reactive().as_deref(), Some("h-2"));
+            assert!(is_current("h-2") && is_system("h-2"));
+            assert!(is_archive("h-1") && is_system("h-1"));
+            assert_eq!(current_for("h-1"), "h-2");
+            set_current("h-3");
+            assert_eq!(current_reactive().as_deref(), Some("h-3"));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 }

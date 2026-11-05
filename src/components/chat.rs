@@ -86,7 +86,7 @@ fn heartbeat_briefing_events(session_id: &str, unattended: bool) -> Vec<crate::h
     let since = chrono::Utc::now() - chrono::Duration::days(crate::heartbeat::state::EVENT_MAX_AGE_DAYS);
     let state = crate::heartbeat::HEARTBEAT.peek();
     // A wake's own message already lists these.
-    if crate::hobbes_session::is_hobbes(session_id) && unattended {
+    if crate::system_sessions::is_current(session_id) && unattended {
         return Vec::new();
     }
     // A rotated system session also owns what its archives dispatched.

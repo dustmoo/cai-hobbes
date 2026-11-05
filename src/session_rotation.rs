@@ -636,7 +636,7 @@ pub fn check_all(
         return;
     }
     let now = Utc::now();
-    let Some(id) = crate::hobbes_session::current_id() else { return };
+    let Some(id) = crate::system_sessions::current() else { return };
     let prepared = {
         let state = session_state.peek();
         let Some(session) = state.sessions.get(&id) else { return };
@@ -690,8 +690,7 @@ fn commit(p: &Prepared) -> Result<(), String> {
 fn switch_over(olds: &[(String, Option<serde_json::Value>)], new_id: &str) {
     let old_ids: Vec<&str> = olds.iter().map(|(id, _)| id.as_str()).collect();
     system_sessions::apply_rotation(&old_ids, new_id);
-    *crate::hobbes_session::HOBBES_SESSION_ID.write() = Some(new_id.to_string());
-    for (old_id, brief) in olds {
+        for (old_id, brief) in olds {
         crate::fleet::bridge::report_with_brief(old_id, "", crate::fleet::bridge::HobbesSignal::Closed, brief.clone());
         crate::llm::claude::keepalive::cancel_session(old_id);
         crate::request_tab_replace(old_id, new_id);
@@ -1177,7 +1176,7 @@ mod tests {
             assert_eq!(apply_merge(sig, p), None);
             assert!(sig.peek().sessions.contains_key(&hb));
             assert!(!sig.peek().sessions.contains_key("never-hobbes"));
-            assert_eq!(crate::hobbes_session::current_id(), None);
+            assert_eq!(crate::system_sessions::current(), None);
             assert!(!system_sessions::is_archive(&hb));
             rsx! { div {} }
         });
@@ -1221,7 +1220,7 @@ mod tests {
         // It ages out with the window (the system-session rule; an
         // ordinary tab's carried reads have no clock).
         let later = now + READ_WINDOW;
-        crate::system_sessions::register("reach-test-hb");
+        crate::system_sessions::set_current("reach-test-hb");
         let mut registered = p.successor.clone();
         registered.id = "reach-test-hb".into();
         let aged = session_read_profiles(&settings, &registered, later);
@@ -1249,8 +1248,7 @@ mod tests {
             let (state, old) = rotated_session();
             let mut sig = use_signal(|| state);
             sig.write().active_session_id = old.clone();
-            *crate::hobbes_session::HOBBES_SESSION_ID.write() = Some(old.clone());
-            system_sessions::register(&old);
+            system_sessions::set_current(&old);
             let p = prepare(&sig.peek().sessions[&old], &crate::settings::Settings::default(), "never-new", Utc::now());
             let before = sig.peek().sessions[&old].clone();
             assert_eq!(rotate(sig, p), None);
@@ -1259,7 +1257,7 @@ mod tests {
             assert_eq!(after.sessions[&old], before, "the old session is untouched");
             assert!(!after.sessions.contains_key("never-new"));
             assert_eq!(after.active_session_id, old);
-            assert_eq!(crate::hobbes_session::current_id().as_deref(), Some(old.as_str()));
+            assert_eq!(crate::system_sessions::current().as_deref(), Some(old.as_str()));
             assert!(!system_sessions::is_archive(&old));
             assert_eq!(system_sessions::current_for(&old), old);
             assert!(crate::PENDING_TAB_REPLACE.peek().is_empty(), "no tab swap requested");

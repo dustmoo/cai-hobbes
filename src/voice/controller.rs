@@ -241,7 +241,7 @@ pub fn pending_announcement(
     settings: Signal<crate::settings::Settings>,
     session_id: &str,
 ) -> Option<(String, AnnounceKind)> {
-    if !crate::hobbes_session::is_hobbes(session_id) {
+    if !crate::system_sessions::is_current(session_id) {
         return None;
     }
     let speak_heartbeat = {
