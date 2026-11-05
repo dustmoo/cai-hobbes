@@ -1258,10 +1258,10 @@ pub(crate) fn tab_rows_conn(
     rows.collect()
 }
 
-/// Read one session for viewing only (`HOBBES_TAB_READ`): parsed from its
-/// row, with none of [`load_sessions`]' hydration side effects — no
-/// fingerprint recorded, no cut-off call ended or journalled. The result
-/// must never be put into `SessionState`.
+/// Read one session for viewing only (`HOBBES_TAB_READ`, the Heartbeat's
+/// worker diagnoses): parsed from its row, with none of [`load_sessions`]'
+/// hydration side effects — no fingerprint recorded, no cut-off call ended
+/// or journalled. The result must never be put into `SessionState`.
 pub fn peek_session(id: &str) -> Option<Session> {
     // Only the fetch holds the connection lock; the parse runs after.
     let data = with_conn(|conn| peek_data_conn(conn, id)).ok().flatten()?;

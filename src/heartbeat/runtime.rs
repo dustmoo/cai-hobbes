@@ -391,7 +391,9 @@ pub fn restore_runaway(mut planner: Signal<crate::todo::PlannerState>, note_id: 
 }
 
 /// Tails for the workers a wake's events point at. A Hobbes chat worker
-/// shows its last messages (hydrated, or one indexed row from the store); a
+/// shows its last messages (hydrated, or one indexed row from the store,
+/// peeked: reading it must not hydrate it, so no restart-cut call is ended
+/// and journaled for a row this never saves); a
 /// Claude Code run shows the end of its transcript (a small tail read; the
 /// tick is synchronous, so no guard is held across it).
 fn diagnoses(
@@ -408,7 +410,7 @@ fn diagnoses(
             state.sessions.get(&t.session_id).map(|s| (s.name.clone(), diagnose::chat_tail(&s.messages)))
         };
         let chat = chat.or_else(|| {
-            crate::session_store::load_session(&t.session_id).map(|s| (s.name.clone(), diagnose::chat_tail(&s.messages)))
+            crate::session_store::peek_session(&t.session_id).map(|s| (s.name.clone(), diagnose::chat_tail(&s.messages)))
         });
         if let Some((name, tail)) = chat {
             if let Some(tail) = tail {
