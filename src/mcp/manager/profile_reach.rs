@@ -47,6 +47,16 @@ pub struct ReachProfile {
     pub name: String,
 }
 
+/// A configured profile by id, else by exact name (pins written before
+/// profiles had ids, as [`profile_for_server_name`] accepts).
+pub fn find_profile<'a>(settings: &'a Settings, key: &str) -> Option<&'a crate::settings::ComposioProfile> {
+    settings
+        .composio_profiles
+        .iter()
+        .find(|p| p.id == key)
+        .or_else(|| settings.composio_profiles.iter().find(|p| p.name == key))
+}
+
 /// Where a chat's home profile came from ([`ProfileScope::source`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeSource {
@@ -84,7 +94,7 @@ impl ProfileScope {
         let pin = pin.filter(|p| !p.is_empty());
         let as_reach = |p: &crate::settings::ComposioProfile| ReachProfile { id: p.id.clone(), name: p.name.clone() };
         let (home, source) = match pin {
-            Some(id) => match settings.composio_profiles.iter().find(|p| p.id == id) {
+            Some(id) => match find_profile(settings, id) {
                 Some(p) => (Some(as_reach(p)), ScopeSource::Pinned),
                 None => (None, ScopeSource::Missing { pinned_id: Some(id.to_string()) }),
             },
