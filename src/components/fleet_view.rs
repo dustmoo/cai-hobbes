@@ -129,25 +129,27 @@ impl Group {
     }
 }
 
+/// Grouped by what the session asks of the person
+/// ([`FleetSession::disposition`]), not its raw status: Claude Code's
+/// `idle_prompt` arrives about a minute after every finished turn, so a raw
+/// `NeedsAttention` is mostly "wrapped, prompt open" — Idle, not Needs you.
 /// Working covers background phases and timer waits: the session is still
 /// on the job and nothing is asked of the user.
-fn group_of(status: &FleetStatus) -> Group {
-    match status {
-        FleetStatus::NeedsAttention(_) => Group::NeedsYou,
-        FleetStatus::Working | FleetStatus::WorkingBackground | FleetStatus::Waiting => {
-            Group::Working
-        }
-        FleetStatus::Idle => Group::Idle,
+fn group_of(session: &FleetSession, now: DateTime<Utc>) -> Group {
+    match session.disposition(now) {
+        fleet::Disposition::Decision => Group::NeedsYou,
+        fleet::Disposition::Active => Group::Working,
+        fleet::Disposition::Parked | fleet::Disposition::Ended => Group::Idle,
     }
 }
 
 /// Live sessions bucketed by [`Group`] (indexed `Group as usize`), each
 /// bucket most recent activity first — except that idle rows whose brief
 /// says they are blocked lead the Idle group.
-fn grouped_sessions(state: &fleet::FleetState) -> [Vec<FleetSession>; 3] {
+fn grouped_sessions(state: &fleet::FleetState, now: DateTime<Utc>) -> [Vec<FleetSession>; 3] {
     let mut groups: [Vec<FleetSession>; 3] = Default::default();
     for s in state.sessions.values() {
-        groups[group_of(&s.status) as usize].push(s.clone());
+        groups[group_of(s, now) as usize].push(s.clone());
     }
     for (i, g) in groups.iter_mut().enumerate() {
         let blocked_first = i == Group::Idle as usize;
@@ -311,7 +313,7 @@ pub fn FleetView() -> Element {
     let now = Utc::now();
     let today = Local::now().date_naive();
     let state = fleet_state.read();
-    let groups = grouped_sessions(&state);
+    let groups = grouped_sessions(&state, now);
     let live_count: usize = groups.iter().map(Vec::len).sum();
     let agent_minutes = fleet::fleet_agent_minutes_on(&state, today, now);
     let engaged_minutes = fleet::engaged_seconds_on(&state, today, now) / 60;
@@ -1415,14 +1417,26 @@ mod tests {
             session("cc-gate", FleetStatus::NeedsAttention(AttentionKind::Gate), fleet::FleetOrigin::External, 5),
             session("bg", FleetStatus::WorkingBackground, fleet::FleetOrigin::Hobbes, 9),
             session("timer", FleetStatus::Waiting, fleet::FleetOrigin::Hobbes, 3),
+            // Claude Code's idle prompt after a finished turn asks nothing.
+            session(
+                "cc-parked",
+                FleetStatus::NeedsAttention(AttentionKind::Notification {
+                    kind: "idle_prompt".into(),
+                    message: "Claude is waiting for your input".into(),
+                }),
+                fleet::FleetOrigin::External,
+                2,
+            ),
         ] {
             state.sessions.insert(s.id.clone(), s);
         }
-        let g = grouped_sessions(&state);
+        let g = grouped_sessions(&state, utc("2026-08-25T10:00:00Z"));
         let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
         assert_eq!(ids(Group::NeedsYou), vec!["cc-gate", "tab-needs"]);
         assert_eq!(ids(Group::Working), vec!["work-fresh", "timer", "bg"]);
-        assert_eq!(ids(Group::Idle), vec!["idle-old"]);
+        assert_eq!(ids(Group::Idle), vec!["cc-parked", "idle-old"]);
+        // The header counts the same group: the parked prompt isn't counted.
+        assert_eq!(summary_parts(g[Group::NeedsYou as usize].len(), 0, 0).0.as_deref(), Some("2 need you"));
     }
 
     #[test]
@@ -1521,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn blocked_idle_rows_lead_the_idle_group() {
+    fn blocked_idle_rows_need_you() {
         let mut state = fleet::FleetState::default();
         let mut blocked = session("blocked-old", FleetStatus::Idle, fleet::FleetOrigin::External, 90);
         blocked.brief = Some(brief("x", Some("waiting on review")));
@@ -1532,9 +1546,11 @@ mod tests {
         ] {
             state.sessions.insert(s.id.clone(), s);
         }
-        let g = grouped_sessions(&state);
-        let ids: Vec<&str> = g[Group::Idle as usize].iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["blocked-old", "fresh", "older"]);
+        let g = grouped_sessions(&state, utc("2026-08-25T10:00:00Z"));
+        // A current brief question is a decision: it needs you.
+        let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
+        assert_eq!(ids(Group::NeedsYou), vec!["blocked-old"]);
+        assert_eq!(ids(Group::Idle), vec!["fresh", "older"]);
     }
 
     #[test]

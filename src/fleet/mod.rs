@@ -1016,9 +1016,11 @@ pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSessi
 
 /// Retirement sweep: Idle sessions silent past [`RETIRE_MINUTES`] leave the
 /// live map with `ended_at` set to their last event (no span is open — the
-/// stale→Idle sweep or a Stop closed it long before). Working and
-/// needs-attention sessions are exempt: work proves itself with events, and
-/// attention must never fall off the board unanswered.
+/// stale→Idle sweep or a Stop closed it long before). Working sessions and
+/// those that ask the person something ([`FleetSession::asks_person`]) are
+/// exempt: work proves itself with events, and a question must never fall
+/// off the board unanswered. A bare `idle_prompt` (Claude Code's nudge after
+/// every finished turn) asks nothing, so it retires like Idle.
 pub fn sweep_retired(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
     sweep_retired_after(state, now, retire_minutes())
 }
@@ -1033,7 +1035,14 @@ pub fn sweep_retired_after(
     let retire: Vec<String> = state
         .sessions
         .values()
-        .filter(|s| s.status == FleetStatus::Idle && s.last_event_at < cutoff)
+        .filter(|s| {
+            let parked = match &s.status {
+                FleetStatus::Idle => true,
+                FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) => !s.asks_person(),
+                _ => false,
+            };
+            parked && s.last_event_at < cutoff
+        })
         .map(|s| s.id.clone())
         .collect();
     let mut rows = Vec::new();
@@ -2316,6 +2325,31 @@ mod tests {
             state.sessions.contains_key("stuck-gate"),
             "attention never falls off the board silently"
         );
+    }
+
+    #[test]
+    fn a_bare_idle_prompt_retires_but_a_real_question_does_not() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        let notify = |id: &str, kind: &str| FleetEvent::Notification {
+            session_id: id.into(),
+            cwd: "/x".into(),
+            kind: kind.into(),
+            message: "Claude is waiting for your input".into(),
+        };
+        reduce(&mut state, &notify("parked", "idle_prompt"), t0);
+        reduce(&mut state, &notify("asks", "elicitation_dialog"), t0);
+        reduce(&mut state, &notify("parked-asking", "idle_prompt"), t0);
+        state.sessions.get_mut("parked-asking").unwrap().brief = Some(SessionBrief {
+            blocked_on: Some("pick a schema".into()),
+            ..brief_at(t0, "h")
+        });
+
+        let retired = sweep_retired_after(&mut state, t0 + chrono::Duration::minutes(95), 60);
+        let ids: Vec<&str> = retired.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["parked"]);
+        assert!(state.sessions.contains_key("asks"));
+        assert!(state.sessions.contains_key("parked-asking"), "its brief still asks something");
     }
 
     #[test]
