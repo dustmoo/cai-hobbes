@@ -597,18 +597,8 @@ pub fn start_now(
     // Continue today's agent-time chat when it can be found (one chat per
     // day, whatever its last run's end reason); otherwise a new one.
     let last_leased = LAST_LEASED.lock().ok().and_then(|g| g.clone());
-    let resumed = todays_chat(&planner.peek(), last_leased.as_ref(), today).filter(|id| {
-        if session_state.peek().sessions.contains_key(id) {
-            return true;
-        }
-        match crate::session_store::load_session(id) {
-            Some(s) => {
-                session_state.write().sessions.insert(id.clone(), s);
-                true
-            }
-            None => false,
-        }
-    });
+    let resumed = todays_chat(&planner.peek(), last_leased.as_ref(), today)
+        .filter(|id| SessionState::ensure_hydrated(session_state, id));
     let is_resume = resumed.is_some();
     let chat_id = match resumed {
         Some(id) => id,

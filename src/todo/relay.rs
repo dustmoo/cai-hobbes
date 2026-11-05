@@ -366,19 +366,6 @@ fn parent_matches(linked_parent: &str, parent: &str) -> bool {
     linked_parent == parent || crate::system_sessions::current_for(linked_parent) == parent
 }
 
-/// Make sure `id` is in memory (it may be a closed tab); false when gone.
-fn ensure_hydrated(mut state: Signal<SessionState>, id: &str) -> bool {
-    if state.peek().sessions.contains_key(id) {
-        return true;
-    }
-    match crate::session_store::load_session(id) {
-        Some(session) => {
-            state.write().sessions.insert(id.to_string(), session);
-            true
-        }
-        None => false,
-    }
-}
 
 /// A worker's name on the link: its to-do's title, else its tab title.
 fn worker_title(planner: &PlannerState, worker: &Session) -> String {
@@ -424,7 +411,8 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
             Err(e) => return Err(e),
         }
     };
-    if !ensure_hydrated(session_state, out.to) {
+    // The receiver may be a closed tab.
+    if !SessionState::ensure_hydrated(session_state, out.to) {
         return Err("the other chat no longer exists".to_string());
     }
     // The edge itself, re-checked at delivery whatever the caller resolved.
@@ -754,7 +742,7 @@ fn message_worker(sig: RelaySignals, args: &serde_json::Value, session_id: &str)
         let parent = state.sessions.get(session_id).ok_or("this chat isn't loaded")?;
         resolve_worker(&state, &sig.planner.peek(), parent, reference)?
     };
-    if !ensure_hydrated(sig.session_state, &worker) {
+    if !SessionState::ensure_hydrated(sig.session_state, &worker) {
         return Err("that worker's chat no longer exists".to_string());
     }
     let link = sig

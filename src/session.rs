@@ -2095,6 +2095,23 @@ impl SessionState {
         Self::save_async(&signal.read(), error_signal);
     }
 
+    /// Make sure session `id` is in memory, hydrating it from the store
+    /// (one indexed row) when it is only on disk — a closed tab a dispatch
+    /// result, relay or review needs. False when there is no such session.
+    pub fn ensure_hydrated(mut signal: dioxus::prelude::Signal<SessionState>, id: &str) -> bool {
+        use dioxus::prelude::{Readable, Writable};
+        if signal.peek().sessions.contains_key(id) {
+            return true;
+        }
+        match crate::session_store::load_session(id) {
+            Some(session) => {
+                signal.write().sessions.insert(id.to_string(), session);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A rename from the tab bar or History — a user act. Wins forever: sets
     /// `name_user_set` so the summarizer never overwrites `name`/`tab_title`
     /// for this session again.

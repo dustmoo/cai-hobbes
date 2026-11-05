@@ -98,21 +98,6 @@ pub(crate) fn chat_message(on_title: Option<&str>, text: &str) -> String {
     }
 }
 
-/// Make sure the chat is in memory; hydrate it from the store if not.
-/// Returns false when it can't be found.
-fn hydrate(mut session_state: Signal<SessionState>, chat_id: &str) -> bool {
-    let present = session_state.peek().sessions.contains_key(chat_id);
-    if present {
-        return true;
-    }
-    match crate::session_store::load_session(chat_id) {
-        Some(s) => {
-            session_state.write().sessions.insert(chat_id.to_string(), s);
-            true
-        }
-        None => false,
-    }
-}
 
 // ── The rail ────────────────────────────────────────────────────────────────
 
@@ -127,7 +112,7 @@ pub(crate) fn ChatRail(chat_ref: Signal<Option<ChatRef>>) -> Element {
     // Bring the chat into memory so its messages can show.
     use_effect(move || {
         if let Some(id) = chat_id() {
-            hydrate(session_state, &id);
+            SessionState::ensure_hydrated(session_state, &id);
         }
     });
     let bubbles = use_memo(move || {
@@ -163,7 +148,7 @@ pub(crate) fn ChatRail(chat_ref: Signal<Option<ChatRef>>) -> Element {
                 Err(e) => tracing::warn!("planner: couldn't note result {}: {}", r.id, e),
             }
         }
-        if !hydrate(session_state, &chat_id) {
+        if !SessionState::ensure_hydrated(session_state, &chat_id) {
             tracing::warn!("agent-time chat {} could not be loaded", chat_id);
             return;
         }

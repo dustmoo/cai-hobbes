@@ -117,15 +117,8 @@ pub fn ensure_session(mut session_state: Signal<SessionState>, settings: &Settin
     }
     let home = settings.home_profile_id();
     if let Some(id) = current_id() {
-        let mut hydrated = session_state.peek().sessions.contains_key(&id);
         // One indexed row: fine on the UI thread (P-017).
-        if !hydrated {
-            if let Some(session) = crate::session_store::load_session(&id) {
-                session_state.write().sessions.insert(id.clone(), session);
-                hydrated = true;
-            }
-        }
-        if hydrated {
+        if SessionState::ensure_hydrated(session_state, &id) {
             adopt(&mut session_state, &id, home);
             return Some(id);
         }

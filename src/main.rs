@@ -982,22 +982,12 @@ fn app() -> Element {
                     // was closed is hydrated back into memory first. Focus is
                     // never stolen — the turn runs in the background and the
                     // toast is the only interruption.
-                    if !session_state.peek().sessions.contains_key(&c.parent_session_id) {
-                        match crate::session_store::load_session(&c.parent_session_id) {
-                            Some(session) => {
-                                session_state
-                                    .write()
-                                    .sessions
-                                    .insert(c.parent_session_id.clone(), session);
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "dispatch continuation: parent session {} is gone; dropping",
-                                    c.parent_session_id
-                                );
-                                continue;
-                            }
-                        }
+                    if !SessionState::ensure_hydrated(session_state, &c.parent_session_id) {
+                        tracing::warn!(
+                            "dispatch continuation: parent session {} is gone; dropping",
+                            c.parent_session_id
+                        );
+                        continue;
                     }
                     crate::components::chat_queue::queue_push(
                         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
