@@ -266,8 +266,9 @@ pub fn all_profiles(settings: &Settings) -> Vec<ReachProfile> {
 /// argument or not — and only while that profile is still the tab's home or
 /// in its reach; otherwise it is refused, never moved to the current home
 /// (repinning between hold and approval would run a flow nobody was shown).
-/// Only a call that is neither routed nor flow-held, in an ordinary tab
-/// without reach, runs in the tab's current home. System sessions always
+/// A call that is neither routed nor flow-held, in an ordinary tab without
+/// reach, runs in the tab's current home — unless it was stamped with
+/// another profile (minted before a repin), which is refused too. System sessions always
 /// route by the stamp (not `reach.len()`: a system session whose other
 /// profiles dropped out must still refuse a call routed to one of them; an
 /// archive counts too, so a stale held call in it is refused rather than
@@ -306,7 +307,15 @@ pub fn resume_profile_in(
     let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
     let routed = asked_profile(&tool_call.tool_name, &args).is_some();
     if reach.len() < 2 && !routed && tool_call.hold_rule_key.is_none() {
-        return Ok(home);
+        // Minted in another profile (the tab was repinned since): refused,
+        // never run in the company the tab moved to.
+        return match tool_call.profile_id.as_deref() {
+            Some(t) if find_profile(settings, t).map(|p| p.id.as_str()) != home.as_deref() => Err(format!(
+                "Not run: this was asked for in another profile ({}) than this tab's current one, and it won't be run in another company's account.",
+                settings.profile_name_for_id(t).unwrap_or(t)
+            )),
+            _ => Ok(home),
+        };
     }
     match target {
         Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
@@ -1318,9 +1327,13 @@ mod tests {
         assert!(resume_profile_in(&settings, &session.id, Some("pg"), &[], &held).is_err());
         // Still in reach after the repin: runs where it was shown, Clearmirror.
         assert_eq!(resume_profile_in(&settings, &session.id, Some("pg"), &["cm".into()], &held), Ok(Some("cm".into())));
-        // An unheld call in a tab without reach keeps the tab's current pin.
+        // An unheld call in a tab without reach, minted in Puget before a
+        // repin to Clearmirror: refused (it used to run in the new home).
         let mut plain = call(json!({"to": "a@b.c"}));
         plain.profile_id = Some(pg.id.clone());
+        assert!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), &[], &plain).is_err());
+        // Minted at the current home: runs there.
+        plain.profile_id = Some(cm.id.clone());
         assert_eq!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), &[], &plain), Ok(Some("cm".into())));
     }
 
