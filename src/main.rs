@@ -874,29 +874,37 @@ fn app() -> Element {
         }
     });
 
-    // Pin tabs without a Composio profile (profile_reach::ProfileScope): an
+    // The pin rule's view of the settings (profiles, Hobbes' home), kept
+    // current for the loader and the background backfill.
+    use_effect(move || {
+        crate::session_store::set_pin_rules(&settings.read());
+    });
+
+    // Pin tabs without a Composio profile (profile_reach::pin_fix): an
     // unpinned tab followed the global profile, which follows focus, so its
-    // tools moved between companies as other tabs were opened. One target —
-    // the global active profile at upgrade time — for the hydrated sessions
-    // here, for the stored rows (background backfill, which starts only
-    // after this pass and skips these ids), and for rows hydrated later
-    // (session_store::pin_on_load).
+    // tools moved between companies as other tabs were opened. Per tab: its
+    // own Composio calls' profile, else Hobbes' home, else left unpinned —
+    // never the focus-driven global. Hydrated tabs here; stored rows by a
+    // background backfill that starts only after this pass and skips these
+    // ids; rows hydrated later as they load (session_store::pin_on_load).
     use_effect(move || {
         if session_state.peek().save_disabled {
             return;
         }
-        let active = settings.peek().get_active_profile().map(|p| p.id.clone());
-        let Some(target) = crate::session_store::pin_target(active) else {
+        let settings_snapshot = settings.peek().clone();
+        if settings_snapshot.composio_profiles.is_empty() {
+            // Nothing to pin to yet; the migration waits for a profile.
             return;
-        };
-        let pinned = session_state.write().pin_unpinned(&target);
+        }
+        crate::session_store::set_pin_rules(&settings_snapshot);
+        let pinned = session_state.write().pin_unpinned(&settings_snapshot);
         if !pinned.is_empty() {
             tracing::info!(count = pinned.len(), "pinned open tabs without a Composio profile");
             SessionState::save_signal(&session_state, None);
         }
         let mut skip: std::collections::HashSet<String> = session_state.peek().sessions.keys().cloned().collect();
         skip.extend(crate::system_sessions::lineage());
-        crate::session_store::spawn_pin_backfill(target, skip);
+        crate::session_store::spawn_pin_backfill(skip);
     });
 
     // Global focus context for keyboard event coordination

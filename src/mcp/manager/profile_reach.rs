@@ -223,6 +223,34 @@ pub fn data_profile(settings: &Settings, session_pin: Option<&str>) -> Option<St
     ProfileScope::resolve(settings, "", session_pin, &[]).turn_pin()
 }
 
+/// The pin an ordinary tab should have, when it differs from its own: the
+/// migration rule for tabs without a pin, and id normalisation for legacy
+/// name pins. `None` = leave the pin as it is. Every id returned names a
+/// profile that exists now.
+///
+/// A tab without a pin gets (a) the profile its own most recent Composio
+/// call ran in (the call's `profile_id` stamp, else the profile its
+/// `composio-native:<id|name>` server name names), else (b) Hobbes' home
+/// profile, else (c) nothing — it stays unpinned. Never the global
+/// profile: that follows focus, so it says nothing about this tab.
+/// System sessions keep their own rules (the caller skips them).
+pub fn pin_fix(settings: &Settings, session: &crate::session::Session) -> Option<String> {
+    if let Some(pin) = session.composio_profile.as_deref().filter(|p| !p.is_empty()) {
+        // A legacy name pin: its id. A removed pin stays as it is (Missing).
+        return find_profile(settings, pin).filter(|p| p.id != pin).map(|p| p.id.clone());
+    }
+    let from_calls = session.messages.iter().rev().find_map(|m| match &m.content {
+        MessageContent::ToolCall(tc) | MessageContent::PermissionRequest(tc) if is_composio_native(&tc.server_name) => tc
+            .profile_id
+            .as_deref()
+            .and_then(|id| find_profile(settings, id))
+            .map(|p| p.id.clone())
+            .or_else(|| profile_for_server_name(settings, &tc.server_name).map(str::to_string)),
+        _ => None,
+    });
+    from_calls.or_else(|| settings.home_profile_id().map(str::to_string))
+}
+
 /// The profiles `session_id` can act in, home first. Only the live Hobbes
 /// session reaches beyond home in phase 1 — not its rotated-out archives, which are read-only; with no home profile there is
 /// nothing to anchor to, so no reach either.
@@ -1765,5 +1793,45 @@ mod tests {
         assert!(i.contains("home profile is 'Clearmirror'"));
         assert!(i.contains("Puget, Acme"));
         assert!(i.contains("different company"));
+    }
+
+    #[test]
+    fn pin_fix_follows_the_tabs_own_calls_then_hobbes_home() {
+        let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
+        settings.active_composio_profile = Some("pg".into());
+        let now = chrono::Utc::now();
+        let mut s = crate::session_events::blank_session();
+        s.id = "fix-tab".into();
+        // No calls, no Hobbes home: stays unpinned — never the (focus-driven) global.
+        assert_eq!(pin_fix(&settings, &s), None);
+        settings.home_composio_profile = Some("cm".into());
+        assert_eq!(pin_fix(&settings, &s), Some("cm".into()));
+        // Its own calls win, the most recent one first; a server name counts
+        // when the call carries no stamp.
+        let mut by_name = read_via_reach(&p("pg", "Puget"), now);
+        if let MessageContent::ToolCall(tc) = &mut by_name.content {
+            tc.profile_id = None;
+        }
+        s.messages.push(read_at_home(&p("cm", "Clearmirror"), now));
+        s.messages.push(by_name);
+        assert_eq!(pin_fix(&settings, &s), Some("pg".into()));
+        // A stamp naming a removed profile is skipped.
+        let mut gone = read_via_reach(&p("gone", "Gone"), now);
+        if let MessageContent::ToolCall(tc) = &mut gone.content {
+            tc.server_name = "composio-native:Gone".into();
+        }
+        s.messages.push(gone);
+        assert_eq!(pin_fix(&settings, &s), Some("pg".into()));
+        // A legacy name pin becomes its id; an id pin, or a removed one, is left.
+        s.composio_profile = Some("Puget".into());
+        assert_eq!(pin_fix(&settings, &s), Some("pg".into()));
+        s.composio_profile = Some("pg".into());
+        assert_eq!(pin_fix(&settings, &s), None);
+        s.composio_profile = Some("gone".into());
+        assert_eq!(pin_fix(&settings, &s), None);
+        // A name pin resolves in the scope too, to the id.
+        let scope = ProfileScope::resolve(&settings, "fix-tab", Some("Puget"), &[]);
+        assert_eq!(scope.home_id(), Some("pg"));
+        assert_eq!(data_profile(&settings, Some("Puget")).as_deref(), Some("pg"));
     }
 }

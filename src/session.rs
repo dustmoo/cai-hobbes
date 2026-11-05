@@ -1922,7 +1922,11 @@ impl SessionState {
         // migration journals it at the end) keeps the source's current pin,
         // so it never starts unpinned.
         if session.composio_profile.is_none() {
-            if let Some(pin) = self.sessions.get(source_id).and_then(|s| s.composio_profile.clone()) {
+            let source_pin = match self.sessions.get(source_id) {
+                Some(s) => s.composio_profile.clone(),
+                None => crate::session_store::stored_pin(source_id),
+            };
+            if let Some(pin) = source_pin {
                 session.composio_profile = Some(pin.clone());
                 crate::session_events::log_event(
                     &new_id,
@@ -2181,24 +2185,26 @@ impl SessionState {
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 
-    /// Pin every hydrated tab that has no Composio profile to `target` (the
-    /// pin migration's target, `session_store::pin_target`), journaling each
-    /// pin. System sessions keep their own rules. Returns the pinned ids; the
-    /// caller saves. Runs before the stored-row backfill starts, so no
-    /// hydrated copy can write a missing pin back over a backfilled row.
-    pub fn pin_unpinned(&mut self, target: &str) -> Vec<String> {
+    /// Fix the pin of every hydrated ordinary tab by the per-tab rule
+    /// (`profile_reach::pin_fix`: a tab without a pin gets its own Composio
+    /// calls' profile, else Hobbes' home, else stays unpinned; a legacy name
+    /// pin becomes its id), journaling each. System sessions keep their own
+    /// rules. Returns the changed ids; the caller saves. Runs before the
+    /// stored-row backfill starts, which then skips these ids.
+    pub fn pin_unpinned(&mut self, settings: &crate::settings::Settings) -> Vec<String> {
         let mut pinned = Vec::new();
         for (id, session) in self.sessions.iter_mut() {
-            if session.composio_profile.is_none() && !crate::system_sessions::is_system(id) {
-                session.composio_profile = Some(target.to_string());
-                pinned.push(id.clone());
+            if crate::system_sessions::is_system(id) {
+                continue;
             }
-        }
-        for id in &pinned {
-            crate::session_events::log_event(
-                id,
-                crate::session_events::SessionEvent::ComposioProfileSet { profile: Some(target.to_string()) },
-            );
+            if let Some(pin) = crate::mcp::manager::profile_reach::pin_fix(settings, session) {
+                session.composio_profile = Some(pin.clone());
+                pinned.push(id.clone());
+                crate::session_events::log_event(
+                    id,
+                    crate::session_events::SessionEvent::ComposioProfileSet { profile: Some(pin) },
+                );
+            }
         }
         pinned
     }
@@ -3761,16 +3767,33 @@ mod tests {
 
     #[test]
     fn pin_unpinned_pins_open_tabs_but_not_system_sessions() {
+        let mut settings = crate::settings::Settings::default();
+        for (id, name) in [("cm", "Clearmirror"), ("pg", "Puget")] {
+            settings.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        // The global profile follows focus: never the target.
+        settings.active_composio_profile = Some("pg".into());
         let mut state = SessionState::default();
         let plain = state.create_session_raw(None);
         let pinned = state.create_session_raw(Some("pg".into()));
+        let named = state.create_session_raw(Some("Puget".into()));
         let hobbes = state.create_session_raw(None);
         crate::system_sessions::set_current(&hobbes);
-        let done = state.pin_unpinned("cm");
-        assert_eq!(done, vec![plain.clone()]);
+        // No calls and no Hobbes home: left unpinned.
+        let done = state.pin_unpinned(&settings);
+        assert_eq!(done, vec![named.clone()], "only the name pin, normalised");
+        assert_eq!(state.sessions[&named].composio_profile.as_deref(), Some("pg"));
+        assert_eq!(state.sessions[&plain].composio_profile, None);
+        // With Hobbes' home set, the tab takes it.
+        settings.home_composio_profile = Some("cm".into());
+        assert_eq!(state.pin_unpinned(&settings), vec![plain.clone()]);
         assert_eq!(state.sessions[&plain].composio_profile.as_deref(), Some("cm"));
         assert_eq!(state.sessions[&pinned].composio_profile.as_deref(), Some("pg"));
         assert_eq!(state.sessions[&hobbes].composio_profile, None);
-        assert!(state.pin_unpinned("cm").is_empty(), "idempotent");
+        assert!(state.pin_unpinned(&settings).is_empty(), "idempotent");
     }
 }
