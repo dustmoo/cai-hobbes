@@ -4,7 +4,8 @@
 use super::super::SettingsCtx;
 use crate::components::hotkey_recorder::HotkeyRecorder;
 use crate::settings::{
-    default_realtime_model, realtime_capable, VoiceProfile, VOICE_NEEDS_REALTIME,
+    default_realtime_model, realtime_capable, VoiceProfile, VOICE_END_OF_TURN_MAX_MS,
+    VOICE_END_OF_TURN_MIN_MS, VOICE_NEEDS_REALTIME,
 };
 use crate::voice::audio::{MicPermission, VoiceEcho};
 use dioxus::prelude::*;
@@ -325,6 +326,27 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                     }
                 }
                 div {
+                    class: "mb-4",
+                    label { class: "block text-sm font-medium text-fg-muted mb-1", "End of turn (ms)" }
+                    p { class: "text-xs text-fg-muted mb-1", "How long a pause ends what you're saying. Longer lets you stop to think without Hobbes answering half a sentence." }
+                    input {
+                        r#type: "number",
+                        min: "{VOICE_END_OF_TURN_MIN_MS}",
+                        max: "{VOICE_END_OF_TURN_MAX_MS}",
+                        step: "100",
+                        class: "w-32 rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
+                        value: "{s.voice.end_of_turn_ms}",
+                        oninput: move |e| {
+                            if let Ok(v) = e.value().parse::<u64>() {
+                                // Clamped up to the minimum where it's used
+                                // (`end_of_turn`), so typing "1500" isn't
+                                // bumped to 300 at its first digit.
+                                local_settings.write().voice.end_of_turn_ms = v.min(VOICE_END_OF_TURN_MAX_MS);
+                            }
+                        }
+                    }
+                }
+                div {
                     class: "flex items-center justify-between mb-4",
                     div {
                         label { class: "text-sm font-medium text-fg-muted", "Speak the Heartbeat's news" }
@@ -392,7 +414,7 @@ pub(in super::super) fn VoiceCard(ctx: SettingsCtx) -> Element {
                     class: "mb-4",
                     label { class: "block text-sm font-medium text-fg-muted mb-1", "Echo cancellation" }
                     p { class: "text-xs text-fg-muted mb-1",
-                        "Stops Hobbes hearing itself on speakers. Apple's echo cancellation only works with the system default mic and switches Bluetooth headsets to call quality. Auto uses it only when no mic is chosen and you're on speakers; otherwise the chosen mic is used directly, and on speakers the mic pauses while Hobbes talks."
+                        "Stops Hobbes hearing itself on speakers. Apple's echo cancellation only works with the system default mic and switches Bluetooth headsets to call quality. Auto uses it only when no mic is chosen and you're on speakers; otherwise the chosen mic is used directly, and on speakers Hobbes only hears you over its own voice when you speak up clearly."
                     }
                     select {
                         class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",

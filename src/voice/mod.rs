@@ -5,6 +5,7 @@
 //! - [`gemini_live`]: Gemini Live over WebSocket (the first provider).
 //! - [`audio`]: mic + speaker with platform echo cancellation.
 //! - [`controller`]: the live conversation (hotkey, barge-in, tools).
+//! - [`floor`]: floor control — who may speak, queued news, local barge-in.
 //! - [`brain`]: `VOICE_ASK_BRAIN` — a turn on the global connector.
 //! - [`session`]: transcript lines and the session tail, in the Hobbes
 //!   session (`hobbes_session`).
@@ -16,6 +17,7 @@
 pub mod audio;
 pub mod brain;
 pub mod controller;
+pub mod floor;
 pub mod gemini_live;
 pub mod hotkey;
 pub mod probe;
