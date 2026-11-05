@@ -56,6 +56,52 @@ impl PendingLine {
     }
 }
 
+/// One side's utterance in progress: transcript fragments accumulate until
+/// the turn ends (or is cut off), then go out as one [`PendingLine`] stamped
+/// with when the utterance began.
+#[derive(Debug, Default)]
+pub struct Utterance {
+    /// What the person said (`true`) or what the voice said.
+    heard: bool,
+    text: String,
+    at: Option<DateTime<Utc>>,
+}
+
+impl Utterance {
+    pub fn new(heard: bool) -> Self {
+        Self { heard, ..Self::default() }
+    }
+
+    /// The text so far (untrimmed).
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Nothing but whitespace said yet.
+    pub fn is_blank(&self) -> bool {
+        self.text.trim().is_empty()
+    }
+
+    /// Add a fragment; the first non-blank one stamps the start time.
+    pub fn push(&mut self, fragment: &str) {
+        if self.is_blank() {
+            self.at = Some(Utc::now());
+        }
+        self.text.push_str(fragment);
+    }
+
+    /// Move the utterance into `lines` as one line, if anything was said.
+    /// `cut`: it was talked over or interrupted, so the line ends in " —".
+    pub fn finish_into(&mut self, cut: bool, lines: &mut Vec<PendingLine>) {
+        if self.is_blank() {
+            return;
+        }
+        let text = std::mem::take(&mut self.text);
+        let text = if cut { format!("{} —", text.trim_end()) } else { text };
+        lines.push(PendingLine::new(self.heard, text, self.at.take()));
+    }
+}
+
 /// A Hobbes-authored message that stands alone rather than being part of a
 /// turn's machinery: a spoken transcript line.
 fn standalone(m: &Message) -> bool {
@@ -286,6 +332,31 @@ pub fn write_lines(mut session_state: Signal<SessionState>, session_id: &str, li
 mod tests {
     use super::*;
     use crate::components::shared::ToolCall;
+
+    #[test]
+    fn an_utterance_becomes_one_line_stamped_at_its_start() {
+        let mut lines = Vec::new();
+        let mut spoke = Utterance::new(false);
+        spoke.finish_into(false, &mut lines);
+        spoke.push("  ");
+        spoke.finish_into(true, &mut lines);
+        assert!(lines.is_empty(), "nothing said, nothing written");
+
+        spoke.push("Hello ");
+        let started = spoke.at;
+        assert!(started.is_some());
+        spoke.push("there ");
+        assert_eq!(spoke.at, started, "later fragments keep the start time");
+        spoke.finish_into(true, &mut lines);
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].heard, lines[0].text.as_str(), Some(lines[0].at)), (false, "  Hello there —", started));
+        assert!(spoke.is_blank() && spoke.at.is_none());
+
+        let mut heard = Utterance::new(true);
+        heard.push("yes ");
+        heard.finish_into(false, &mut lines);
+        assert_eq!((lines[1].heard, lines[1].text.as_str()), (true, "yes "));
+    }
 
     fn t0() -> DateTime<Utc> {
         DateTime::parse_from_rfc3339("2026-11-03T10:00:00Z").unwrap().with_timezone(&Utc)

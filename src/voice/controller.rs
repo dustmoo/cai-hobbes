@@ -49,7 +49,7 @@ use crate::voice::brain::{self, BrainHandle, BrainOutcome};
 use crate::voice::realtime::{
     RealtimeControl, RealtimeEvent, RealtimeSetup, RealtimeVoice, Scheduling,
 };
-use crate::voice::transcript::PendingLine;
+use crate::voice::transcript::{PendingLine, Utterance};
 use crate::voice::{session, tools};
 
 /// What the voice is doing (drives the indicator).
@@ -541,12 +541,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut mode: Option<Mode> = announcing_text.as_ref().map(|_| Mode::PushToTalk);
     let mut held = announcing_text.is_none();
     let mut last_activity = Instant::now();
-    let mut heard_buf = String::new();
-    let mut spoke_buf = String::new();
-    // When the utterance in each buffer began: a line is placed in the
-    // session by when it was said, not when it is written (see transcript.rs).
-    let mut heard_at: Option<chrono::DateTime<chrono::Utc>> = None;
-    let mut spoke_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    // Each side's utterance in progress. A line is placed in the session by
+    // when it was said, not when it is written (see transcript.rs).
+    let mut heard = Utterance::new(true);
+    let mut spoke = Utterance::new(false);
     let mut pending_lines: Vec<PendingLine> = Vec::new();
     let mut brain_cancel: HashMap<String, BrainHandle> = HashMap::new();
     let mut abandoned: HashSet<String> = HashSet::new();
@@ -592,10 +590,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         audio_io.flush();
                         muting_turn = true;
                         stats.barge_ins += 1;
-                        if !spoke_buf.trim().is_empty() {
-                            let text = format!("{} —", std::mem::take(&mut spoke_buf).trim_end());
-                            pending_lines.push(PendingLine::new(false, text, spoke_at.take()));
-                        }
+                        spoke.finish_into(true, &mut pending_lines);
                         let buffered = ring.drain();
                         tracing::info!("voice: local barge-in; sending {} buffered mic frames", buffered.len());
                         for f in buffered {
@@ -635,9 +630,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         } else {
                             last_spoke = Some(Instant::now());
                             stats.model_audio_ms += audio_ms;
-                            if !heard_buf.trim().is_empty() {
-                                pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
-                            }
+                            heard.finish_into(false, &mut pending_lines);
                             audio_io.play(&pcm, sample_rate);
                             last_activity = Instant::now();
                             ui.phase = Phase::Speaking;
@@ -647,12 +640,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     RealtimeEvent::InputTranscript(t) => {
                         floor_state.person_transcript(Instant::now());
                         stats.heard_fragments += 1;
-                        if heard_buf.trim().is_empty() {
-                            heard_at = Some(chrono::Utc::now());
-                        }
-                        heard_buf.push_str(&t);
+                        heard.push(&t);
                         last_activity = Instant::now();
-                        ui.heard = live_tail(&heard_buf);
+                        ui.heard = live_tail(heard.text());
                         ui.phase = Phase::Listening;
                     }
                     RealtimeEvent::OutputTranscript(t) => {
@@ -662,20 +652,14 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         if !muting_turn {
                             last_spoke = Some(Instant::now());
                             stats.spoke_fragments += 1;
-                            if spoke_buf.trim().is_empty() {
-                                spoke_at = Some(chrono::Utc::now());
-                            }
-                            spoke_buf.push_str(&t);
+                            spoke.push(&t);
                         }
                     }
                     RealtimeEvent::Interrupted => {
                         floor_state.model_turn_ended(Instant::now());
                         muting_turn = false;
                         audio_io.flush();
-                        if !spoke_buf.trim().is_empty() {
-                            let text = format!("{} —", std::mem::take(&mut spoke_buf).trim_end());
-                            pending_lines.push(PendingLine::new(false, text, spoke_at.take()));
-                        }
+                        spoke.finish_into(true, &mut pending_lines);
                         ui.phase = Phase::Listening;
                         last_activity = Instant::now();
                     }
@@ -683,12 +667,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         floor_state.model_turn_ended(Instant::now());
                         muting_turn = false;
                         stats.turns += 1;
-                        if !heard_buf.trim().is_empty() {
-                            pending_lines.push(PendingLine::new(true, std::mem::take(&mut heard_buf), heard_at.take()));
-                        }
-                        if !spoke_buf.trim().is_empty() {
-                            pending_lines.push(PendingLine::new(false, std::mem::take(&mut spoke_buf), spoke_at.take()));
-                        }
+                        heard.finish_into(false, &mut pending_lines);
+                        spoke.finish_into(false, &mut pending_lines);
                         ui.heard.clear();
                         last_activity = Instant::now();
                     }
@@ -710,7 +690,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                     // spoke this turn (its own holding phrase), nor
                                     // again within the cooldown. The result follows
                                     // on this call either way.
-                                    let spoke_recently = !spoke_buf.trim().is_empty()
+                                    let spoke_recently = !spoke.is_blank()
                                         || last_spoke.is_some_and(|t| t.elapsed() < RECENT_SPEECH);
                                     let speak = holding_should_speak(spoke_recently, last_holding, Instant::now());
                                     last_holding = Some(Instant::now());
@@ -922,12 +902,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let _ = rt.control.send(RealtimeControl::Close);
     audio_io.flush();
     audio_io.stop();
-    if !heard_buf.trim().is_empty() {
-        pending_lines.push(PendingLine::new(true, heard_buf, heard_at));
-    }
-    if !spoke_buf.trim().is_empty() {
-        pending_lines.push(PendingLine::new(false, spoke_buf, spoke_at));
-    }
+    heard.finish_into(false, &mut pending_lines);
+    spoke.finish_into(false, &mut pending_lines);
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
     if !queue.is_empty() {
         // Their text is in the Hobbes tab already.
