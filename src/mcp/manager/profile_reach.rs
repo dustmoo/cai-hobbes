@@ -149,12 +149,12 @@ pub fn profile_note_name(settings: &Settings, session: &crate::session::Session)
     ProfileScope::for_session(settings, session).home_name().unwrap_or("None").to_string()
 }
 
-/// The home profile a session acts in: its pin, else the global active
-/// profile (the same fallback the tool list and the prompt use).
-pub fn home_profile(settings: &Settings, session_pin: Option<&str>) -> Option<String> {
-    session_pin
-        .map(str::to_string)
-        .or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
+/// The profile a tab's data belongs to, for counting where data came from:
+/// its [`ProfileScope`] home, else a removed pin's id (that company's data
+/// is still in the conversation). Not a profile to act in — use
+/// [`ProfileScope`] for that.
+pub fn data_profile(settings: &Settings, session_pin: Option<&str>) -> Option<String> {
+    ProfileScope::resolve(settings, "", session_pin, &[]).turn_pin()
 }
 
 /// The profiles `session_id` can act in, home first. Only the live Hobbes
@@ -204,15 +204,13 @@ pub fn session_reach(
     out
 }
 
-/// [`session_reach`] for a hydrated session: its home (pin, else the global
-/// active profile) and its reach, home first.
+/// A hydrated session's reach, home first ([`ProfileScope::for_session`]).
 pub fn reach_of(settings: &Settings, session: &crate::session::Session) -> Vec<ReachProfile> {
-    let home = home_profile(settings, session.composio_profile.as_deref());
-    session_reach(settings, &session.id, home.as_deref(), &session.profile_reach)
+    ProfileScope::for_session(settings, session).reach
 }
 
 /// What a tab's profile chip shows, from the same resolution dispatch uses
-/// ([`reach_of`]): the home profile's id (`None` when nothing resolves),
+/// ([`ProfileScope`]): the home profile's id (`None` when nothing resolves),
 /// whether its reach can be edited here (an ordinary tab with a home), and
 /// the names of the other profiles it reaches.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -312,7 +310,7 @@ pub fn resume_profile_in(
 pub fn inherited_sources(settings: &Settings, old: &crate::session::Session) -> Vec<String> {
     let mut out: BTreeSet<String> = summary_sources(old).into_iter().collect();
     out.extend(old.carried_reads.iter().map(|r| r.profile_id.clone()));
-    out.extend(home_profile(settings, old.composio_profile.as_deref()));
+    out.extend(data_profile(settings, old.composio_profile.as_deref()));
     out.into_iter().collect()
 }
 
@@ -1153,8 +1151,7 @@ mod tests {
         crate::system_sessions::set_current("reach-test-hb");
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let home = home_profile(&settings, None);
-        let reach = reach_for_session(&settings, "reach-test-hb", home.as_deref());
+        let reach = ProfileScope::resolve(&settings, "reach-test-hb", None, &[]).reach;
         let mut c = call(json!({"hobbes_profile": "Puget"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("pg", "Puget")));
     }
@@ -1502,12 +1499,15 @@ mod tests {
         assert!(!eval("profile-flow:cm>pg", Some("proj-cm")));
     }
 
-    /// The tab states the resolver must cover, with the legacy
-    /// `home_profile` (pin passed through unvalidated, else the validated
-    /// global) beside the scope. Rows where the two differ are the
-    /// behaviour changes the later commits make at each call site.
+    /// The tab states the resolver must cover, with the rule every site
+    /// used before (`home_profile`: the pin passed through unvalidated, else
+    /// the validated global) beside the scope. Rows where the two differ are
+    /// the behaviour changes the call-site commits made.
     #[test]
     fn profile_scope_table() {
+        let home_profile = |settings: &Settings, pin: Option<&str>| {
+            pin.map(str::to_string).or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
+        };
         crate::system_sessions::set_current("scope-test-hobbes");
         let base = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         let with_global = |g: Option<&str>| {

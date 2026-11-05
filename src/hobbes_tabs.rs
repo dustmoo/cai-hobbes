@@ -317,7 +317,7 @@ pub async fn list_tabs(
     let sources = {
         let settings = deps.settings.peek();
         let reader_pin = deps.session_state.peek().sessions.get(reader).and_then(|s| s.composio_profile.clone());
-        let home = crate::mcp::manager::profile_reach::home_profile(&settings, reader_pin.as_deref());
+        let home = crate::mcp::manager::profile_reach::data_profile(&settings, reader_pin.as_deref());
         list_sources(&settings, home.as_deref(), &entries)
     };
     carry_reads(deps.session_state, reader, &sources, chrono::Utc::now());
@@ -327,12 +327,12 @@ pub async fn list_tabs(
 }
 
 /// The companies a listing's titles come from, other than the reader's
-/// `home`: each listed tab's home profile (pin, else the global active
-/// profile).
+/// `home`: each listed tab's profile (`profile_reach::data_profile`: its
+/// home, or a removed pin's id).
 pub fn list_sources(settings: &Settings, home: Option<&str>, entries: &[TabEntry]) -> BTreeSet<String> {
     entries
         .iter()
-        .filter_map(|e| crate::mcp::manager::profile_reach::home_profile(settings, e.composio_profile.as_deref()))
+        .filter_map(|e| crate::mcp::manager::profile_reach::data_profile(settings, e.composio_profile.as_deref()))
         .filter(|id| Some(id.as_str()) != home)
         .collect()
 }
@@ -347,8 +347,10 @@ fn resolve_project(projects: &[crate::todo::model::Project], p: &str) -> Option<
 }
 
 fn profile_label(settings: &Settings, pin: Option<&str>) -> String {
-    match crate::mcp::manager::profile_reach::home_profile(settings, pin) {
-        Some(id) => settings.profile_name_for_id(&id).unwrap_or(&id).to_string(),
+    let scope = crate::mcp::manager::profile_reach::ProfileScope::resolve(settings, "", pin, &[]);
+    match scope.home_name() {
+        Some(name) => name.to_string(),
+        None if scope.pin_removed() => "removed profile".to_string(),
         None => "none".to_string(),
     }
 }
