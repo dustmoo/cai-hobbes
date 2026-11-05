@@ -211,20 +211,20 @@ pub fn ChatWindow(
     // Shared helper: fetch fresh MCP context for a session and update its active_context.
     // Returns the fetched McpContext for downstream use (e.g. passing to send_prompt_to_llm).
     let fetch_fresh_mcp_context = move |target_id: String, settings_snapshot: Settings| async move {
-        // Pass the profile ID directly (composio_profile is the stable ID).
-        // A session with no pinned profile uses the global active one —
-        // `get_mcp_context(None)` would return every profile's Composio
-        // server, whose tools collide by name at the provider.
-        let (profile_id, selected_reach) = {
+        // The turn's scope (profile_reach::turn_scope_for), as dispatch uses:
+        // its home's id, or — with no profile to act in — a context stripped
+        // of every Composio tool below.
+        let scope = {
             let state = session_state.read();
             let session = state.sessions.get(&target_id);
-            (
-                session
-                    .and_then(|s| s.composio_profile.clone())
-                    .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone())),
-                session.map(|s| s.profile_reach.clone()).unwrap_or_default(),
+            crate::mcp::manager::profile_reach::turn_scope_for(
+                &settings_snapshot,
+                &target_id,
+                session.and_then(|s| s.composio_profile.as_deref()),
+                session.map_or(&[][..], |s| s.profile_reach.as_slice()),
             )
         };
+        let profile_id = scope.home_id().map(str::to_string);
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
@@ -235,16 +235,16 @@ pub fn ChatWindow(
         }
 
         let mut fresh = mcp_manager.read().get_mcp_context(profile_id.clone()).await;
+        // No profile to act in: no Composio tools at all (get_mcp_context
+        // would still offer a profile-less legacy client, or every profile's).
+        if scope.home.is_none() {
+            fresh = crate::mcp::manager::profile_reach::without_composio(fresh);
+        }
         // Multi-profile reach (Heartbeat / Voice, and ordinary tabs with
         // profiles ticked on their chip): the other reachable profiles'
         // Composio tools join the home set, each call naming its profile
         // (mcp::manager::profile_reach).
-        let reach = crate::mcp::manager::profile_reach::session_reach(
-            &settings_snapshot,
-            &target_id,
-            profile_id.as_deref(),
-            &selected_reach,
-        );
+        let reach = scope.reach;
         if reach.len() > 1 {
             let mut others = Vec::new();
             for p in &reach[1..] {
@@ -332,10 +332,8 @@ pub fn ChatWindow(
         let target_id = current_target_id.read().clone();
         if let Some(session) = state.sessions.get_mut(&target_id) {
             // Same resolution as `fetch_fresh_mcp_context`.
-            let profile_id = crate::mcp::manager::resolve_context_profile(
-                session.composio_profile.as_deref(),
-                &settings_read,
-            );
+            let scope = crate::mcp::manager::profile_reach::turn_scope(&settings_read, session);
+            let profile_id = scope.home_id().map(str::to_string);
             let profile_name = profile_id
                 .as_deref()
                 .and_then(|id| settings_read.profile_name_for_id(id));
@@ -347,20 +345,17 @@ pub fn ChatWindow(
             );
             // A refresh carries only the home profile: keep the session's
             // reach tools (no-op for single-profile sessions).
-            let reach_names: Vec<String> = crate::mcp::manager::profile_reach::session_reach(
-                &settings_read,
-                &target_id,
-                profile_id.as_deref(),
-                &session.profile_reach,
-            )
-            .into_iter()
-            .map(|p| p.name)
-            .collect();
+            let reach_names: Vec<String> = scope.reach.iter().map(|p| p.name.clone()).collect();
             let scoped = crate::mcp::manager::profile_reach::carry_reach(
                 scoped,
                 session.active_context.mcp_tools.as_ref(),
                 &reach_names,
             );
+            let scoped = if scope.home.is_none() {
+                crate::mcp::manager::profile_reach::without_composio(scoped)
+            } else {
+                scoped
+            };
 
             if !scoped.servers.is_empty() {
                 session.active_context.mcp_tools = Some(scoped);
@@ -519,13 +514,18 @@ pub fn ChatWindow(
                     );
                 }
 
-                // 1. Identify tools that need to be run and capture profile context
-                let composio_profile = {
+                // 1. Identify tools that need to be run and capture profile context:
+                // the tab's raw pin (resolved per call by resume_profile_in) and
+                // its resolved home (profile_reach::ProfileScope) for built-ins.
+                let (composio_profile, home_profile) = {
                     let state = session_state.read();
-                    state
-                        .sessions
-                        .get(&owning_id)
-                        .and_then(|s| s.composio_profile.clone())
+                    let pin = state.sessions.get(&owning_id).and_then(|s| s.composio_profile.clone());
+                    let home = state.sessions.get(&owning_id).and_then(|s| {
+                        crate::mcp::manager::profile_reach::ProfileScope::for_session(&settings.peek(), s)
+                            .home_id()
+                            .map(str::to_string)
+                    });
+                    (pin, home)
                 };
 
                 {
@@ -641,7 +641,7 @@ pub fn ChatWindow(
                                 &tool_call,
                                 &args_json,
                                 &owning_id,
-                                composio_profile.as_ref(),
+                                home_profile.as_ref(),
                                 // Only approved calls are `Running` here (see step 1):
                                 // the Approve click already satisfied the skill gate.
                                 true,
@@ -691,10 +691,7 @@ pub fn ChatWindow(
                                 )
                             };
                             // Connect only another company's client (not home's).
-                            let routed = {
-                                let home = crate::mcp::manager::profile_reach::home_profile(&settings.peek(), composio_profile.as_deref());
-                                matches!(&call_profile, Ok(Some(p)) if home.as_deref() != Some(p.as_str()))
-                            };
+                            let routed = matches!(&call_profile, Ok(Some(p)) if home_profile.as_deref() != Some(p.as_str()));
                             let result_receiver = match call_profile {
                                 // Its profile is gone: refuse, never re-route.
                                 Err(e) => Err(e),
@@ -772,7 +769,7 @@ pub fn ChatWindow(
                             profile_color: {
                                 let settings_read = settings.read();
                                 crate::components::shared::resolve_profile_color(
-                                    tool_call.profile_id.as_ref().or(composio_profile.as_ref()),
+                                    tool_call.profile_id.as_ref().or(home_profile.as_ref()),
                                     &settings_read,
                                 )
                             },
@@ -891,6 +888,11 @@ pub fn ChatWindow(
                     if let Some(session) = session_state.write().sessions.get_mut(&target_id) {
                         session.reset_turn_count();
                         session.turn_origin = turn_origin;
+                    }
+                    // Fix the turn's Composio profile: every round of it (and
+                    // its continuations) runs there (profile_reach::begin_turn).
+                    if let Some(session) = session_state.peek().sessions.get(&target_id) {
+                        crate::mcp::manager::profile_reach::begin_turn(&settings_read, session);
                     }
                     // The user has the floor: a relay no longer started this turn.
                     crate::todo::relay::clear_turn_origin(&target_id);

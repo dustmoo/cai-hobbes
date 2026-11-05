@@ -127,6 +127,39 @@ fn test_ordinary_tab_reach_changes_the_prompt_only_when_ticked() {
     assert!(reach.contains("Puget"));
 }
 
+/// The profile the prompt names for a tab whose profile doesn't resolve:
+/// a pin naming a removed profile, or no pin and a dangling global id.
+#[test]
+fn test_prompt_profile_when_the_tab_profile_does_not_resolve() {
+    use crate::settings::ComposioProfile;
+    let settings = |active: &str| Settings {
+        composio_profiles: vec![ComposioProfile {
+            id: "cm".to_string(),
+            name: "Clearmirror".to_string(),
+            user_id: Some("u".to_string()),
+            api_key: Some("k".to_string()),
+            ..Default::default()
+        }],
+        active_composio_profile: Some(active.to_string()),
+        ..Default::default()
+    };
+    let system = |pin: Option<&str>, active: &str| {
+        let mut session = create_test_session();
+        session.composio_profile = pin.map(str::to_string);
+        PromptBuilder::new(&session, &settings(active)).build_prompt("Hello".to_string()).prompt.system.unwrap()
+    };
+    // Pinned to a removed profile: no profile is active (it used to say
+    // 'Default'), and never the global one.
+    let removed = system(Some("gone"), "cm");
+    assert!(removed.contains("profile was removed, so no profile is active"), "{removed}");
+    assert!(!removed.contains("'Default'") && !removed.contains("'Clearmirror'"), "{removed}");
+    // Unpinned, the global id dangling: no profile (it used to say 'Default').
+    let dangling = system(None, "gone");
+    assert!(dangling.contains("has no Composio profile, so no profile is active"), "{dangling}");
+    // Unpinned, the global id valid.
+    assert!(system(None, "cm").contains("connections is: 'Clearmirror'"));
+}
+
 #[test]
 fn test_composio_context_not_injected_when_profile_missing_api_key() {
     use crate::settings::ComposioProfile;

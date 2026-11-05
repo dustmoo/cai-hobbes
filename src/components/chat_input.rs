@@ -1711,7 +1711,7 @@ pub fn ChatInput(
                                 // (no profile resolves) the first profile is shown
                                 // and there is no reach to edit. System sessions keep
                                 // their own reach, so they get no checkboxes.
-                                let (home, reach_enabled, ticked, reach_extra) = {
+                                let (home, reach_enabled, ticked, reach_extra, pin_removed) = {
                                     let state = session_state.read();
                                     match state.get_active_session() {
                                         Some(s) => {
@@ -1721,17 +1721,21 @@ pub fn ChatInput(
                                                 chip.editable,
                                                 if chip.editable { s.profile_reach.clone() } else { Vec::new() },
                                                 chip.extra,
+                                                chip.pin_removed,
                                             )
                                         }
-                                        None => (None, false, Vec::new(), Vec::new()),
+                                        None => (None, false, Vec::new(), Vec::new(), false),
                                     }
                                 };
-                                // No home (the pin points at a deleted profile, and no
-                                // global profile is set): say so, and list every
-                                // profile so one can be picked.
+                                // No home (the pin points at a removed profile, or
+                                // there is no pin and no global profile): say so —
+                                // a removed pin as a warning, since this tab's
+                                // Composio calls are refused until one is picked —
+                                // and list every profile so one can be picked.
                                 let active_id: Option<String> = home.as_ref().map(|h| h.id.clone());
                                 let (active_name, active_color) = match &home {
                                     Some(h) => (h.name.clone(), h.color.clone()),
+                                    None if pin_removed => ("Profile removed".to_string(), "bg-yellow-900/40".to_string()),
                                     None => ("No profile".to_string(), "bg-input".to_string()),
                                 };
                                 let reach_badge = (!reach_extra.is_empty()).then(|| format!("+{}", reach_extra.len()));
@@ -1750,8 +1754,13 @@ pub fn ChatInput(
                                 // tab's identity is legible without opening anything.
                                 let pill_class = format!(
                                     "h-7 rounded-full border {} text-xs flex items-center gap-1.5 pl-1 pr-2.5 select-none shrink-0",
-                                    profile_border_class(&active_color),
+                                    if pin_removed { "border-yellow-600".to_string() } else { profile_border_class(&active_color) },
                                 );
+                                let pill_title = if pin_removed {
+                                    "This tab's Composio profile was removed, so its Composio tools won't run. Pick a profile.".to_string()
+                                } else {
+                                    format!("Profile: {active_name}{reach_title}")
+                                };
                                 let avatar_class = format!(
                                     "w-5 h-5 rounded-full {} flex items-center justify-center text-[10px] font-bold text-fg shrink-0",
                                     active_color,
@@ -1766,10 +1775,18 @@ pub fn ChatInput(
                                         if interactive {
                                             button {
                                                 class: "{pill_class} cursor-pointer hover:brightness-110 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600",
-                                                title: "Profile: {active_name}{reach_title}",
+                                                title: "{pill_title}",
                                                 onclick: move |_| show_profile_selector.set(!show_profile_selector()),
-                                                span { class: "{avatar_class}", "{active_initial}" }
-                                                span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                                if pin_removed {
+                                                    span {
+                                                        class: "{avatar_class} text-yellow-300",
+                                                        Icon { width: 12, height: 12, icon: fi_icons::FiAlertTriangle }
+                                                    }
+                                                    span { class: "text-yellow-300 truncate max-w-28", "{active_name}" }
+                                                } else {
+                                                    span { class: "{avatar_class}", "{active_initial}" }
+                                                    span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                                }
                                                 if let Some(badge) = &reach_badge {
                                                     span { class: "text-fg-muted font-mono", "{badge}" }
                                                 }

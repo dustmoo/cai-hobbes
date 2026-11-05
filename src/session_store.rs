@@ -49,6 +49,10 @@ const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
 const META_PROJECT_ID_COLUMN: &str = "project_id_column_backfilled";
 /// Set once the background `tab_title` backfill (`spawn_tab_title_backfill`) has filled the column.
 const META_TAB_TITLE_COLUMN: &str = "tab_title_column_backfilled";
+/// The one-time pin backfill over stored rows has finished.
+const META_PIN_BACKFILLED: &str = "unpinned_tabs_pinned";
+/// The last rowid the pin backfill finished, so a restart resumes there.
+const META_PIN_CURSOR: &str = "unpinned_tabs_pin_cursor";
 
 /// Bumped whenever a write changes what the History listing shows (a row
 /// added, deleted or renamed, or its title, emoji, summary, message count or
@@ -280,6 +284,280 @@ pub(crate) fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -
 }
 
 // ── One-time migration ──────────────────────────────────────────────────────
+
+/// What the pin rule (`profile_reach::pin_fix`) needs from the settings —
+/// the profiles and Hobbes' home — kept current by the app
+/// ([`set_pin_rules`]) so the loader and the backfill validate against the
+/// profiles as they are now. Process-wide; per thread in tests.
+#[cfg(not(test))]
+fn pin_rules_cell() -> &'static std::sync::RwLock<Option<crate::settings::Settings>> {
+    static CELL: OnceLock<std::sync::RwLock<Option<crate::settings::Settings>>> = OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+#[cfg(test)]
+fn pin_rules_cell() -> &'static std::sync::RwLock<Option<crate::settings::Settings>> {
+    thread_local! {
+        static CELL: &'static std::sync::RwLock<Option<crate::settings::Settings>> =
+            Box::leak(Box::new(std::sync::RwLock::new(None)));
+    }
+    CELL.with(|c| *c)
+}
+
+/// Keep the pin rules current: call with the settings whenever they change.
+pub fn set_pin_rules(settings: &crate::settings::Settings) {
+    let slim = crate::settings::Settings {
+        composio_profiles: settings.composio_profiles.clone(),
+        home_composio_profile: settings.home_composio_profile.clone(),
+        ..Default::default()
+    };
+    if let Ok(mut r) = pin_rules_cell().write() {
+        *r = Some(slim);
+    }
+}
+
+#[cfg(test)]
+fn clear_pin_rules() {
+    if let Ok(mut r) = pin_rules_cell().write() {
+        *r = None;
+    }
+}
+
+fn pin_rules() -> Option<crate::settings::Settings> {
+    pin_rules_cell().read().ok().and_then(|r| r.clone())
+}
+
+/// Ids whose load-time pin was journaled this run: a tab reloaded before
+/// its first save isn't journaled twice.
+fn load_pins_logged() -> &'static Mutex<std::collections::HashSet<String>> {
+    static LOGGED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    LOGGED.get_or_init(Default::default)
+}
+
+/// A hydrating ordinary tab gets its pin fixed by the same rule as the
+/// backfill (`profile_reach::pin_fix`: its own calls' profile, else
+/// Hobbes' home; a legacy name pin becomes its id), so an in-memory copy
+/// can never write a missing pin back over a row the backfill pinned.
+/// System sessions keep their own rules. Returns whether it changed; the
+/// session's fingerprint still matches the old bytes, so its next save
+/// writes the pin.
+fn pin_on_load(id: &str, session: &mut Session) -> bool {
+    if crate::system_sessions::is_system(id) {
+        return false;
+    }
+    let Some(rules) = pin_rules() else { return false };
+    match crate::mcp::manager::profile_reach::pin_fix(&rules, session) {
+        Some(pin) => {
+            session.composio_profile = Some(pin);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A fork's source pin when the source isn't hydrated: its stored row's,
+/// as an id when the rules know it. One indexed row.
+pub fn stored_pin(id: &str) -> Option<String> {
+    let pin: Option<String> = with_conn(|c| {
+        use rusqlite::OptionalExtension;
+        c.query_row(
+            "SELECT json_extract(data, '$.composio_profile') FROM sessions WHERE id = ?1 AND json_valid(data)",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+    })
+    .ok()
+    .flatten();
+    let pin = pin.filter(|p| !p.is_empty())?;
+    Some(
+        pin_rules()
+            .and_then(|r| crate::mcp::manager::profile_reach::find_profile(&r, &pin).map(|p| p.id.clone()))
+            .unwrap_or(pin),
+    )
+}
+
+/// Bytes of row data read per pin-backfill batch (at least one row): the
+/// connection lock is held only to read a batch and to write its fixes;
+/// parsing happens between, without it.
+const PIN_BACKFILL_BATCH_BYTES: i64 = 8 * 1024 * 1024;
+
+/// One-time: fix the pin of every stored ordinary tab by the per-tab rule
+/// (`profile_reach::pin_fix`) — tabs without a pin get their own calls'
+/// profile, else Hobbes' home, else stay unpinned; legacy name pins become
+/// ids. A background thread over rowid batches by size; the cursor is kept
+/// in meta, so a restart resumes where it stopped.
+///
+/// Never touches a row that has (or had) an in-memory copy, which is
+/// pinned in `SessionState` (startup pass, [`pin_on_load`]) and saved by
+/// its own copy: it skips `skip` (the hydrated and system ids at spawn),
+/// any system session, any row with a fingerprint (loaded or saved by this
+/// process; loads record it under the connection lock), any row written
+/// since the spawn (`seq` at or above the high-water mark), and any row
+/// whose `seq` changed between the read and the write. A fixed row is
+/// rewritten whole (`build_row`) with a fresh `seq`, and its
+/// `ComposioProfileSet` is journaled in the same transaction.
+pub fn spawn_pin_backfill(skip: std::collections::HashSet<String>) {
+    let (done, cursor) = with_conn(|c| Ok((meta_get_conn(c, META_PIN_BACKFILLED)?, meta_get_conn(c, META_PIN_CURSOR)?)))
+        .unwrap_or((Some(String::new()), None));
+    if done.is_some() {
+        return;
+    }
+    let high_water = SEQ.load(Ordering::SeqCst);
+    let mut cursor: i64 = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
+    let spawned = std::thread::Builder::new().name("pin-backfill".into()).spawn(move || {
+        let started = std::time::Instant::now();
+        let mut pinned = 0usize;
+        loop {
+            let Some(rules) = pin_rules() else {
+                tracing::warn!("pin backfill: no profile rules; will retry next launch");
+                return;
+            };
+            let step = with_conn(|c| read_pin_batch(c, cursor, PIN_BACKFILL_BATCH_BYTES)).and_then(|batch| match batch {
+                None => with_conn(|c| meta_set_conn(c, META_PIN_BACKFILLED, "1", next_seq())).map(|_| None),
+                Some((last, rows)) => {
+                    let fixes = pin_fixes(&rules, rows, high_water, &skip);
+                    with_conn(|c| write_pin_fixes(c, &fixes, last)).map(|n| Some((last, n)))
+                }
+            });
+            match step {
+                Ok(Some((last, n))) => {
+                    cursor = last;
+                    pinned += n;
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        pinned,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "pin backfill: stored tabs done"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("pin backfill failed (will resume next launch): {e}");
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("pin backfill not started: {e}");
+    }
+}
+
+/// A stored row as the pin backfill reads it: id, seq, data.
+type PinRow = (String, i64, String);
+
+/// The next batch after rowid `after`: rows up to `max_bytes` of data (at
+/// least one), and the batch's last rowid. `None` when no rows are left.
+fn read_pin_batch(conn: &Connection, after: i64, max_bytes: i64) -> rusqlite::Result<Option<(i64, Vec<PinRow>)>> {
+    let mut last = None;
+    {
+        // `octet_length` reads the size from the record, not the value.
+        let mut stmt =
+            conn.prepare("SELECT rowid, octet_length(data) FROM sessions WHERE rowid > ?1 ORDER BY rowid LIMIT 256")?;
+        let mut rows = stmt.query(params![after])?;
+        let mut total = 0i64;
+        while let Some(r) = rows.next()? {
+            let (rowid, len): (i64, i64) = (r.get(0)?, r.get(1)?);
+            if last.is_some() && total + len > max_bytes {
+                break;
+            }
+            total += len;
+            last = Some(rowid);
+        }
+    }
+    let Some(last) = last else { return Ok(None) };
+    let mut stmt = conn.prepare("SELECT id, seq, data FROM sessions WHERE rowid > ?1 AND rowid <= ?2")?;
+    let rows = stmt
+        .query_map(params![after, last], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<PinRow>>>()?;
+    Ok(Some((last, rows)))
+}
+
+/// A fixed row, ready to write: the seq it was read at, the rewritten row
+/// and its journal event — all built without the connection lock.
+struct PinFix {
+    read_seq: i64,
+    row: SessionRow,
+    events: Vec<SessionEventRow>,
+}
+
+/// The rows of a batch whose pin the rule changes, built into the rows to
+/// write. Pure apart from the system-session registry; runs without the
+/// connection lock. Each row is parsed once for its pin and, only when it
+/// is unpinned or holds a profile name, once in full.
+fn pin_fixes(
+    rules: &crate::settings::Settings,
+    rows: Vec<PinRow>,
+    high_water: i64,
+    skip: &std::collections::HashSet<String>,
+) -> Vec<PinFix> {
+    #[derive(serde::Deserialize)]
+    struct PinProbe {
+        #[serde(default)]
+        composio_profile: Option<String>,
+    }
+    rows.into_iter()
+        .filter(|(id, seq, _)| *seq < high_water && !skip.contains(id) && !crate::system_sessions::is_system(id))
+        .filter_map(|(id, seq, data)| {
+            let pin = serde_json::from_str::<PinProbe>(&data).ok()?.composio_profile;
+            let candidate = match pin.as_deref() {
+                None | Some("") => true,
+                Some(p) => crate::mcp::manager::profile_reach::find_profile(rules, p).is_some_and(|f| f.id != p),
+            };
+            if !candidate {
+                return None;
+            }
+            let mut session = parse_session(&id, &data)?;
+            let fixed = crate::mcp::manager::profile_reach::pin_fix(rules, &session)?;
+            session.composio_profile = Some(fixed.clone());
+            let row = match build_row(&session, next_seq()) {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(session_id = %id, "pin backfill: row skipped: {e}");
+                    return None;
+                }
+            };
+            let events = prepare_event_rows(&id, &[SessionEvent::ComposioProfileSet { profile: Some(fixed) }]);
+            Some(PinFix { read_seq: seq, row, events })
+        })
+        .collect()
+}
+
+/// Write a batch's fixes and advance the cursor to `last`, in one
+/// transaction with their journal events. Under the lock only the checks
+/// and the writes: a row is written only if it still has the seq it was
+/// read at and no in-memory copy (no fingerprint). Returns how many rows
+/// were pinned.
+fn write_pin_fixes(conn: &Connection, fixes: &[PinFix], last: i64) -> rusqlite::Result<usize> {
+    use rusqlite::OptionalExtension;
+    let tx = conn.unchecked_transaction()?;
+    let mut writes: Vec<&PinFix> = Vec::new();
+    for fix in fixes {
+        let now: Option<i64> =
+            tx.query_row("SELECT seq FROM sessions WHERE id = ?1", params![fix.row.id], |r| r.get(0)).optional()?;
+        if now == Some(fix.read_seq) {
+            writes.push(fix);
+        }
+    }
+    // Checked under the connection lock (loads record fingerprints under
+    // it); the guard is dropped before the journal takes the tombstone
+    // lock (`mark_rows_saved` takes tombstones, then fingerprints).
+    {
+        let fps = fingerprints().lock().unwrap();
+        writes.retain(|f| !fps.contains_key(&f.row.id));
+    }
+    for fix in &writes {
+        upsert_row(&tx, &fix.row)?;
+        insert_event_rows_in(&tx, &fix.events)?;
+    }
+    meta_set_conn(&tx, META_PIN_CURSOR, &last.to_string(), next_seq())?;
+    tx.commit()?;
+    Ok(writes.len())
+}
 
 /// One-time: prepend each row's AI topic title to `search_text`, matching what
 /// `build_row` now writes, so History search finds chats by the title the
@@ -831,6 +1109,16 @@ pub fn load_sessions(ids: &[String]) -> HashMap<String, Session> {
     });
     if let Err(e) = result {
         tracing::error!("load_sessions failed: {e}");
+    }
+    // Outside `with_conn`: the system-session check may read meta. A tab
+    // the pin migration hasn't reached yet is pinned as it hydrates.
+    for (id, session) in out.iter_mut() {
+        if pin_on_load(id, session) && load_pins_logged().lock().unwrap().insert(id.clone()) {
+            crate::session_events::log_event(
+                id,
+                SessionEvent::ComposioProfileSet { profile: session.composio_profile.clone() },
+            );
+        }
     }
     // Journal outside `with_conn`: appending takes the same connection lock.
     for (id, messages) in cancelled {
@@ -1454,6 +1742,12 @@ pub fn prepare_event_rows(session_id: &str, events: &[SessionEvent]) -> Vec<Sess
 
 fn insert_event_rows_conn(conn: &Connection, rows: &[SessionEventRow]) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    insert_event_rows_in(&tx, rows)?;
+    tx.commit()
+}
+
+/// [`insert_event_rows_conn`] inside a transaction the caller holds.
+fn insert_event_rows_in(tx: &Connection, rows: &[SessionEventRow]) -> rusqlite::Result<()> {
     {
         // A tombstoned session's journal must not grow again: a stream that
         // is still running when its tab is deleted keeps producing events
@@ -1483,7 +1777,7 @@ fn insert_event_rows_conn(conn: &Connection, rows: &[SessionEventRow]) -> rusqli
             stmt.execute(params![row.session_id, row.seq, row.ts, row.kind, row.payload])?;
         }
     }
-    tx.commit()
+    Ok(())
 }
 
 /// Write prepared event rows. Called on a blocking thread by `append_events`,
@@ -2251,6 +2545,224 @@ mod list_metadata_tests {
         assert_eq!(m.display_emoji(), None);
         m.tab_emoji = Some("🐯".into());
         assert_eq!(m.display_emoji(), Some("🐯"));
+    }
+
+    // ── Pin migration ───────────────────────────────────────────────────
+
+    fn pin_of(conn: &Connection, id: &str) -> Option<String> {
+        let data = get_row_data(conn, id).unwrap();
+        serde_json::from_str::<Session>(&data).unwrap().composio_profile
+    }
+
+    fn row_seq(conn: &Connection, id: &str) -> i64 {
+        conn.query_row("SELECT seq FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn pin_settings(home: Option<&str>) -> crate::settings::Settings {
+        let mut s = crate::settings::Settings::default();
+        for (id, name) in [("cm", "Clearmirror"), ("pg", "Puget")] {
+            s.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        s.home_composio_profile = home.map(str::to_string);
+        // Focus-driven: must never be the target.
+        s.active_composio_profile = Some("pg".into());
+        s
+    }
+
+    /// A Composio call stamped with `profile`.
+    fn composio_call(profile: &str) -> crate::components::chat::Message {
+        let mut tc = crate::components::shared::ToolCall::new(
+            format!("composio-native:{profile}"),
+            "GMAIL_SEND_EMAIL".into(),
+            serde_json::json!({}),
+            None,
+            None,
+        );
+        tc.profile_id = Some(profile.into());
+        crate::components::chat::Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".into(),
+            content: crate::components::shared::MessageContent::ToolCall(tc),
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    /// The whole backfill on one connection, the way the thread runs it
+    /// (tiny batches, so the test crosses batch boundaries).
+    fn run_pin_backfill(
+        conn: &Connection,
+        rules: &crate::settings::Settings,
+        high_water: i64,
+        skip: &std::collections::HashSet<String>,
+    ) -> usize {
+        let mut cursor = meta(conn, META_PIN_CURSOR).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let mut pinned = 0;
+        while let Some((last, rows)) = read_pin_batch(conn, cursor, 1).unwrap() {
+            let fixes = pin_fixes(rules, rows, high_water, skip);
+            pinned += write_pin_fixes(conn, &fixes, last).unwrap();
+            cursor = last;
+        }
+        meta_set_conn(conn, META_PIN_BACKFILLED, "1", next_seq()).unwrap();
+        pinned
+    }
+
+    #[test]
+    fn pin_backfill_follows_each_tabs_own_profile() {
+        with_test_db(|conn| {
+            let rules = pin_settings(Some("cm"));
+            // Its own most recent Composio call ran in Puget.
+            let mut worked = session("Worked in Puget", false, Some("Topic"), None);
+            worked.messages.push(composio_call("cm"));
+            worked.messages.push(composio_call("pg"));
+            worked.scratchpad = "notes".into();
+            // No Composio calls: Hobbes' home.
+            let quiet = session("Quiet", false, None, None);
+            // A legacy name pin: normalised to the id.
+            let mut named = session("Named", false, None, None);
+            named.composio_profile = Some("Puget".into());
+            let mut pinned = session("Pinned", false, None, None);
+            pinned.composio_profile = Some("pg".into());
+            let mut removed = session("Removed", false, None, None);
+            removed.composio_profile = Some("gone".into());
+            for s in [&worked, &quiet, &named, &pinned, &removed] {
+                upsert(conn, s);
+            }
+            let before = row_seq(conn, &worked.id);
+            let high_water = next_seq();
+
+            assert_eq!(run_pin_backfill(conn, &rules, high_water, &Default::default()), 3);
+
+            assert_eq!(pin_of(conn, &worked.id).as_deref(), Some("pg"), "its own calls, not Hobbes' home");
+            assert_eq!(pin_of(conn, &quiet.id).as_deref(), Some("cm"), "Hobbes' home");
+            assert_eq!(pin_of(conn, &named.id).as_deref(), Some("pg"));
+            assert_eq!(pin_of(conn, &pinned.id).as_deref(), Some("pg"));
+            assert_eq!(pin_of(conn, &removed.id).as_deref(), Some("gone"), "never repointed at another profile");
+            assert!(row_seq(conn, &worked.id) > before, "a fresh seq, so an older in-flight save can't undo it");
+            let back: Session = serde_json::from_str(&get_row_data(conn, &worked.id).unwrap()).unwrap();
+            assert_eq!(back.scratchpad, "notes", "the rest of the session is untouched");
+            assert_eq!(back.tab_title.as_deref(), Some("Topic"));
+            // Journaled with the write.
+            assert!(matches!(
+                &load_events_for_test(conn, &worked.id, 0).last().unwrap().event,
+                SessionEvent::ComposioProfileSet { profile: Some(p) } if p == "pg"
+            ));
+            assert_eq!(meta(conn, META_PIN_BACKFILLED).as_deref(), Some("1"));
+        });
+    }
+
+    #[test]
+    fn pin_backfill_without_a_rule_leaves_the_tab_unpinned() {
+        with_test_db(|conn| {
+            let quiet = session("Quiet", false, None, None);
+            upsert(conn, &quiet);
+            // No calls, no Hobbes home: today's behaviour (never the global).
+            assert_eq!(run_pin_backfill(conn, &pin_settings(None), next_seq(), &Default::default()), 0);
+            assert_eq!(pin_of(conn, &quiet.id), None);
+        });
+    }
+
+    #[test]
+    fn pin_backfill_never_touches_rows_with_an_in_memory_copy() {
+        with_test_db(|conn| {
+            let rules = pin_settings(Some("cm"));
+            let hydrated = session("Hydrated", false, None, None);
+            let system = session("Hobbes archive", false, None, None);
+            let loaded = session("Loaded earlier", false, None, None);
+            let later = session("Saved after the spawn", false, None, None);
+            for s in [&hydrated, &system, &loaded] {
+                upsert(conn, s);
+            }
+            let high_water = next_seq();
+            upsert(conn, &later);
+            // A system session the backfill wasn't told about: the registry
+            // knows it (it may learn an archive after the spawn).
+            crate::system_sessions::set_current(&system.id);
+            mark_row_loaded(&loaded.id, &get_row_data(conn, &loaded.id).unwrap());
+            let skip: std::collections::HashSet<String> = [hydrated.id.clone()].into();
+
+            assert_eq!(run_pin_backfill(conn, &rules, high_water, &skip), 0);
+
+            assert_eq!(pin_of(conn, &hydrated.id), None, "hydrated at spawn: pinned in memory instead");
+            assert_eq!(pin_of(conn, &system.id), None, "system sessions keep their own rules");
+            assert_eq!(pin_of(conn, &loaded.id), None, "a row with a fingerprint is left to its copy");
+            assert_eq!(pin_of(conn, &later.id), None, "written since the spawn: an in-memory copy's");
+            forget_fingerprint(&loaded.id);
+        });
+    }
+
+    /// A save landing between the batch read and its write wins: the fix
+    /// is dropped (its seq changed), not written over the newer row.
+    #[test]
+    fn pin_backfill_drops_a_fix_when_the_row_changed_since_its_read() {
+        with_test_db(|conn| {
+            let rules = pin_settings(Some("cm"));
+            let mut s = session("Open tab", false, None, None);
+            upsert(conn, &s);
+            let (last, rows) = read_pin_batch(conn, 0, PIN_BACKFILL_BATCH_BYTES).unwrap().unwrap();
+            let fixes = pin_fixes(&rules, rows, next_seq(), &Default::default());
+            assert_eq!(fixes.len(), 1);
+            // Meanwhile its copy saves, pinned elsewhere, with more content.
+            s.composio_profile = Some("pg".into());
+            s.scratchpad = "newer".into();
+            upsert(conn, &s);
+            assert_eq!(write_pin_fixes(conn, &fixes, last).unwrap(), 0);
+            let back: Session = serde_json::from_str(&get_row_data(conn, &s.id).unwrap()).unwrap();
+            assert_eq!(back.composio_profile.as_deref(), Some("pg"));
+            assert_eq!(back.scratchpad, "newer");
+            assert_eq!(meta(conn, META_PIN_CURSOR).as_deref(), Some(last.to_string().as_str()), "the cursor still moves");
+        });
+    }
+
+    /// Batches are cut by bytes (at least one row), and a restart resumes
+    /// from the stored cursor.
+    #[test]
+    fn pin_backfill_batches_by_bytes_and_resumes() {
+        with_test_db(|conn| {
+            let a = session("A", false, None, None);
+            let b = session("B", false, None, None);
+            upsert(conn, &a);
+            upsert(conn, &b);
+            let (first, rows) = read_pin_batch(conn, 0, 1).unwrap().unwrap();
+            assert_eq!(rows.len(), 1, "one row even when it alone exceeds the budget");
+            let (_, both) = read_pin_batch(conn, 0, i64::MAX).unwrap().unwrap();
+            assert_eq!(both.len(), 2);
+            // Interrupted after the first batch: the next run starts after it.
+            write_pin_fixes(conn, &[], first).unwrap();
+            let rules = pin_settings(Some("cm"));
+            assert_eq!(run_pin_backfill(conn, &rules, next_seq(), &Default::default()), 1);
+            assert_eq!(pin_of(conn, &rows[0].0), None, "behind the cursor: not revisited");
+        });
+    }
+
+    #[test]
+    fn a_tab_hydrating_unpinned_follows_the_pin_rule() {
+        clear_pin_rules();
+        let mut s = session("Old tab", false, None, None);
+        assert!(!pin_on_load(&s.id.clone(), &mut s), "no rules yet: nothing to pin to");
+        set_pin_rules(&pin_settings(None));
+        assert!(!pin_on_load(&s.id.clone(), &mut s), "no calls, no Hobbes home: left unpinned");
+        s.messages.push(composio_call("pg"));
+        assert!(pin_on_load(&s.id.clone(), &mut s));
+        assert_eq!(s.composio_profile.as_deref(), Some("pg"));
+        // A name pin becomes its id; an id pin is untouched.
+        s.composio_profile = Some("Clearmirror".into());
+        assert!(pin_on_load(&s.id.clone(), &mut s));
+        assert_eq!(s.composio_profile.as_deref(), Some("cm"));
+        assert!(!pin_on_load(&s.id.clone(), &mut s));
+        // The Hobbes session keeps its own rules.
+        let mut hobbes = session("Hobbes", false, None, None);
+        hobbes.messages.push(composio_call("pg"));
+        crate::system_sessions::set_current(&hobbes.id);
+        assert!(!pin_on_load(&hobbes.id.clone(), &mut hobbes));
+        assert_eq!(hobbes.composio_profile, None);
+        clear_pin_rules();
     }
 }
 

@@ -876,6 +876,39 @@ fn app() -> Element {
         }
     });
 
+    // The pin rule's view of the settings (profiles, Hobbes' home), kept
+    // current for the loader and the background backfill.
+    use_effect(move || {
+        crate::session_store::set_pin_rules(&settings.read());
+    });
+
+    // Pin tabs without a Composio profile (profile_reach::pin_fix): an
+    // unpinned tab followed the global profile, which follows focus, so its
+    // tools moved between companies as other tabs were opened. Per tab: its
+    // own Composio calls' profile, else Hobbes' home, else left unpinned —
+    // never the focus-driven global. Hydrated tabs here; stored rows by a
+    // background backfill that starts only after this pass and skips these
+    // ids; rows hydrated later as they load (session_store::pin_on_load).
+    use_effect(move || {
+        if session_state.peek().save_disabled {
+            return;
+        }
+        let settings_snapshot = settings.peek().clone();
+        if settings_snapshot.composio_profiles.is_empty() {
+            // Nothing to pin to yet; the migration waits for a profile.
+            return;
+        }
+        crate::session_store::set_pin_rules(&settings_snapshot);
+        let pinned = session_state.write().pin_unpinned(&settings_snapshot);
+        if !pinned.is_empty() {
+            tracing::info!(count = pinned.len(), "pinned open tabs without a Composio profile");
+            SessionState::save_signal(&session_state, None);
+        }
+        let mut skip: std::collections::HashSet<String> = session_state.peek().sessions.keys().cloned().collect();
+        skip.extend(crate::system_sessions::lineage());
+        crate::session_store::spawn_pin_backfill(skip);
+    });
+
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
@@ -2376,11 +2409,18 @@ fn app() -> Element {
     let active_profile_id = move || settings.peek().get_active_profile().map(|p| p.id.clone());
 
     let mut sync_profile_from_session = move |session_id: &str| {
-        let profile_id = session_state
-            .read()
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.composio_profile.clone());
+        // Only a pin that names a profile that exists (by id, or a legacy
+        // name, as its id): a removed pin never becomes the global profile.
+        let profile_id = {
+            let state = session_state.read();
+            let settings_read = settings.peek();
+            state.sessions.get(session_id).and_then(|s| {
+                let scope = crate::mcp::manager::profile_reach::ProfileScope::for_session(&settings_read, s);
+                (scope.source == crate::mcp::manager::profile_reach::ScopeSource::Pinned)
+                    .then(|| scope.home_id().map(str::to_string))
+                    .flatten()
+            })
+        };
         if let Some(pid) = profile_id {
             if settings.peek().active_composio_profile.as_deref() != Some(&pid) {
                 settings.write().active_composio_profile = Some(pid);

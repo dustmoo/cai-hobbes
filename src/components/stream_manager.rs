@@ -321,6 +321,9 @@ impl StreamManagerContext {
         // connector produced, so the scope gates — here and on the
         // approval-resume path — see the turn's origin, not the model's say.
         let stream_origin = origin;
+        // The turn's Composio profile is fixed when the turn starts
+        // (profile_reach::begin_turn, on the send path) and read per call
+        // below; `profile_id` (the tab's raw pin) is only its fallback.
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -661,8 +664,25 @@ impl StreamManagerContext {
                         // or propagated above), so a later mid-chat provider switch
                         // never replays it to an incompatible provider.
                         tool_call = tool_call.with_signature_provider(stream_provider);
+                        // One resolution for the stamp, the guard and dispatch
+                        // (profile_reach::ProfileScope), so they can't disagree.
+                        let scope = {
+                            let settings_read = self.settings.peek();
+                            let state = self.session_state.peek();
+                            // The tab's live pin, so a repin since the round
+                            // started re-resolves the turn (turn_scope_for).
+                            match state.sessions.get(&session_id) {
+                                Some(s) => crate::mcp::manager::profile_reach::turn_scope(&settings_read, s),
+                                None => crate::mcp::manager::profile_reach::turn_scope_for(
+                                    &settings_read,
+                                    &session_id,
+                                    profile_id.as_deref(),
+                                    &[],
+                                ),
+                            }
+                        };
                         tool_call = tool_call.with_turn_provenance(
-                            profile_id.clone(),
+                            scope.home_id().map(str::to_string),
                             stream_connector_name.clone(),
                             Some(stream_model.clone()),
                         );
@@ -681,24 +701,25 @@ impl StreamManagerContext {
                             let settings_read = self.settings.peek();
                             let state = self.session_state.peek();
                             let session = state.sessions.get(&session_id);
-                            let home = reach_mod::home_profile(&settings_read, profile_id.as_deref());
+                            let home = scope.home_id().map(str::to_string);
                             // Phase 2: an ordinary tab's ticked profiles join its reach.
-                            let selected: &[String] = session.map_or(&[], |s| s.profile_reach.as_slice());
-                            let reach = reach_mod::session_reach(&settings_read, &session_id, home.as_deref(), selected);
-                            let route = reach_mod::route_tool_call(&reach, &mut tool_call);
+                            let reach = &scope.reach;
+                            // No profile to act in: a Composio call is refused,
+                            // never left to the manager to guess.
+                            let route = reach_mod::route_in_scope(&scope, &mut tool_call);
                             let read_from = session
                                 .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
                                 .unwrap_or_default();
                             // Checked with reach, or with another company's data
                             // in play (reach since narrowed, or an earlier home).
-                            if reach_mod::flow_checked(&reach, &read_from) && !matches!(route, reach_mod::Route::Refused(_)) {
+                            if reach_mod::flow_checked(reach, &read_from) && !matches!(route, reach_mod::Route::Refused(_)) {
                                 let target = match &route {
                                     reach_mod::Route::To(t) => Some(t),
                                     // Narrowed to home: a Composio call still lands at home.
                                     reach_mod::Route::Unchanged
                                         if crate::mcp::manager::is_composio_native(&tool_call.server_name) =>
                                     {
-                                        Some(&reach[0])
+                                        reach.first()
                                     }
                                     _ => None,
                                 };
@@ -710,7 +731,7 @@ impl StreamManagerContext {
                                     None => reach_mod::local_write(&tool_call.server_name, &tool_call.tool_name, &args),
                                 };
                                 let named = reach_mod::all_profiles(&settings_read);
-                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &named, write);
+                                let hold = reach_mod::cross_company_hold_in(target, reach.first(), &read_from, &named, write);
                                 if let Some(hold) = hold {
                                     let project_id = session.and_then(|s| s.project_id.clone());
                                     let rule = crate::context::trust::evaluate(
@@ -817,7 +838,9 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
-                        let profile_id_inner = profile_id.clone();
+                        // Always the resolved home (never the raw pin), so
+                        // the executor runs where the guard checked.
+                        let profile_id_inner = scope.home_id().map(str::to_string);
                         let session_id_inner = session_id.clone();
                         let _handle = spawn(async move {
                             let mut args_json: serde_json::Value =
@@ -1691,12 +1714,11 @@ impl StreamManagerContext {
                                     })
                                     .collect();
 
-                                let active_profile_name = settings_snapshot
-                                    .active_composio_profile
-                                    .as_deref()
-                                    .and_then(|id| settings_snapshot.profile_name_for_id(id))
-                                    .unwrap_or("None")
-                                    .to_string();
+                                // This tab's profile, not the focused tab's (global) one.
+                                let active_profile_name = crate::mcp::manager::profile_reach::profile_note_name(
+                                    &settings_snapshot,
+                                    &active_session,
+                                );
                                 let system_note =
                                     format!("[System: Active Profile '{}']", active_profile_name);
                                 let recent = std::iter::once(system_note)
