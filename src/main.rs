@@ -874,6 +874,31 @@ fn app() -> Element {
         }
     });
 
+    // Pin tabs without a Composio profile (profile_reach::ProfileScope): an
+    // unpinned tab followed the global profile, which follows focus, so its
+    // tools moved between companies as other tabs were opened. One target —
+    // the global active profile at upgrade time — for the hydrated sessions
+    // here, for the stored rows (background backfill, which starts only
+    // after this pass and skips these ids), and for rows hydrated later
+    // (session_store::pin_on_load).
+    use_effect(move || {
+        if session_state.peek().save_disabled {
+            return;
+        }
+        let active = settings.peek().get_active_profile().map(|p| p.id.clone());
+        let Some(target) = crate::session_store::pin_target(active) else {
+            return;
+        };
+        let pinned = session_state.write().pin_unpinned(&target);
+        if !pinned.is_empty() {
+            tracing::info!(count = pinned.len(), "pinned open tabs without a Composio profile");
+            SessionState::save_signal(&session_state, None);
+        }
+        let mut skip: std::collections::HashSet<String> = session_state.peek().sessions.keys().cloned().collect();
+        skip.extend(crate::system_sessions::lineage());
+        crate::session_store::spawn_pin_backfill(target, skip);
+    });
+
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
