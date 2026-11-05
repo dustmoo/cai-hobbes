@@ -123,6 +123,10 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
+         -- A WAL file keeps its high-water size after a checkpoint unless
+         -- this is set; one large write (a backfill, an import) otherwise
+         -- leaves hundreds of MB on disk for good.
+         PRAGMA journal_size_limit=33554432;
          CREATE TABLE IF NOT EXISTS sessions (
              id            TEXT PRIMARY KEY,
              name          TEXT NOT NULL,
@@ -138,6 +142,11 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
              project_id    TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_last_updated ON sessions(last_updated DESC);
+         -- `seed_seq_from_db` reads MAX(seq) at every launch. Without this
+         -- it walks every row, through each row's search_text overflow
+         -- pages to reach the column: ~0.5 s cold on a 1.5 GB store, before
+         -- the window shows. Built once (one such walk) on first open.
+         CREATE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq);
          CREATE TABLE IF NOT EXISTS meta (
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL,
@@ -169,6 +178,7 @@ pub fn init() -> Result<(), String> {
     if CONN.get().is_some() {
         return Ok(());
     }
+    let opened = std::time::Instant::now();
     let path = get_db_path().ok_or("could not resolve sessions.db path")?;
     let conn = Connection::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
 
@@ -191,7 +201,9 @@ pub fn init() -> Result<(), String> {
     }
 
     create_schema(&conn).map_err(|e| format!("schema: {e}"))?;
+    crate::startup_timing::record("store open", opened);
 
+    let migrations = std::time::Instant::now();
     if let Err(e) = migrate_from_json_files(&conn) {
         // Import failure must not brick the app, but log loudly — the JSON
         // files are left untouched so the import retries next launch.
@@ -206,7 +218,9 @@ pub fn init() -> Result<(), String> {
         tracing::warn!("project_id column backfill failed (will retry next launch): {e}");
     }
 
-    seed_seq_from_db(&conn);
+    crate::startup_timing::record("store migrations", migrations);
+
+    crate::startup_timing::time("store seq", || seed_seq_from_db(&conn));
 
     let _ = CONN.set(Mutex::new(conn));
     spawn_tab_title_backfill();
@@ -2004,6 +2018,23 @@ mod list_metadata_tests {
             )
             .unwrap();
         assert!(plan.contains("idx_sessions_project_id"), "{plan}");
+    }
+
+    /// `seed_seq_from_db` runs before the window shows: its `MAX(seq)`
+    /// reads must be index lookups, never a walk of every session's row.
+    #[test]
+    fn seq_high_water_reads_use_an_index() {
+        with_test_db(|conn| {
+            // session_events' MAX(seq) scans its (session_id, seq) key
+            // index, a few MB: cheaper than a one-time index build over
+            // the journal's hundreds of MB.
+            for (table, index) in [("sessions", "idx_sessions_seq"), ("fleet_events", "idx_fleet_events_seq")] {
+                let plan: String = conn
+                    .query_row(&format!("EXPLAIN QUERY PLAN SELECT MAX(seq) FROM {table}"), [], |r| r.get(3))
+                    .unwrap();
+                assert!(plan.contains(index), "{table}: {plan}");
+            }
+        });
     }
 
     #[test]

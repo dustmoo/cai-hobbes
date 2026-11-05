@@ -49,8 +49,14 @@ const MIGRATION_V2: &str = "
     );
 ";
 
+/// `max_seq` at startup reads `MAX(seq)` of `fleet_events`: without an
+/// index that walks the whole table (tens of MB on a long-lived store).
+const MIGRATION_V3: &str = "
+    CREATE INDEX IF NOT EXISTS idx_fleet_events_seq ON fleet_events(seq);
+";
+
 /// Ordered migrations. Append only — never edit a shipped entry.
-const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2)];
+const MIGRATIONS: &[(i32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)];
 
 /// Create the fleet schema / apply pending migrations. Called from
 /// `session_store::create_schema`, so real startup and every in-memory test

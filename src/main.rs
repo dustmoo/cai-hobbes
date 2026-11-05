@@ -52,6 +52,7 @@ mod services;
 mod session;
 mod session_events;
 mod session_store;
+mod startup_timing;
 mod str_utils;
 mod session_rotation;
 mod system_sessions;
@@ -615,6 +616,7 @@ fn init_logger() {
 }
 
 fn main() {
+    startup_timing::begin();
     // Try to load .env file for developer convenience.
     dotenv().ok();
     tracing::debug!("Attempted to load .env file from the environment.");
@@ -634,14 +636,14 @@ fn main() {
     // One-time: system sessions' summaries stop carrying the Composio
     // reads they recorded before tab reads (profile_reach counts a system
     // session's summary sources now). Before any hydration.
-    system_sessions::clear_legacy_summary_sources();
+    startup_timing::time("system sessions", system_sessions::clear_legacy_summary_sources);
 
     // Read persisted window size (meta only — no session hydration)
     let (initial_width, initial_height) = session::SessionState::load_window_dims();
 
     // Load settings for menu
     let settings_manager = settings::SettingsManager::new(get_settings_path());
-    let initial_settings = settings_manager.load();
+    let initial_settings = startup_timing::time("settings", || settings_manager.load());
 
     let menu = menu::build_menu(&initial_settings);
     LaunchBuilder::new()
@@ -830,7 +832,7 @@ fn app() -> Element {
     let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
     let mut session_state = use_context_provider(|| {
         let open_tabs = ui_state.peek().open_tabs.clone();
-        let mut state = SessionState::load(&open_tabs).unwrap_or_else(|e| {
+        let mut state = startup_timing::time("hydrate", || SessionState::load(&open_tabs)).unwrap_or_else(|e| {
             tracing::error!("Failed to load session state during startup: {}", e);
             // Create default state with save DISABLED to protect stored data
             SessionState {
@@ -876,7 +878,8 @@ fn app() -> Element {
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
     // Usage log for cost tracking that survives session deletion
-    let mut usage_log_sig = use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
+    let mut usage_log_sig =
+        use_context_provider(|| Signal::new(startup_timing::time("usage log", usage_log::UsageLog::load)));
     // Cache keep-alive pings run on background tasks; their usage entries
     // come back over a channel because a Signal can't be written from there.
     use_hook(move || {
@@ -901,7 +904,8 @@ fn app() -> Element {
     // The planner is hydrated in full at startup — its rows are small and
     // bounded by human effort, so there is no lazy-loading path to justify.
     // Safe here: session_store::init() ran in main() before the app launched.
-    let mut planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
+    let mut planner_state =
+        use_context_provider(|| Signal::new(startup_timing::time("planner", todo::PlannerState::load)));
     // Which list the Planner is showing, for surfaces mounted outside it
     // (the ⌘K palette pre-seeds its project from this).
     use_context_provider(|| {
@@ -1246,6 +1250,7 @@ fn app() -> Element {
     let mut is_app_initialized = use_signal(|| false);
     use_effect(move || {
         is_app_initialized.set(true);
+        startup_timing::report();
     });
 
     // Sync theme to DOM (class on <html> element)
