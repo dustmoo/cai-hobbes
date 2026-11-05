@@ -2399,11 +2399,18 @@ fn app() -> Element {
     let active_profile_id = move || settings.peek().get_active_profile().map(|p| p.id.clone());
 
     let mut sync_profile_from_session = move |session_id: &str| {
-        let profile_id = session_state
-            .read()
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.composio_profile.clone());
+        // Only a pin that names a profile that exists (by id, or a legacy
+        // name, as its id): a removed pin never becomes the global profile.
+        let profile_id = {
+            let state = session_state.read();
+            let settings_read = settings.peek();
+            state.sessions.get(session_id).and_then(|s| {
+                let scope = crate::mcp::manager::profile_reach::ProfileScope::for_session(&settings_read, s);
+                (scope.source == crate::mcp::manager::profile_reach::ScopeSource::Pinned)
+                    .then(|| scope.home_id().map(str::to_string))
+                    .flatten()
+            })
+        };
         if let Some(pid) = profile_id {
             if settings.peek().active_composio_profile.as_deref() != Some(&pid) {
                 settings.write().active_composio_profile = Some(pid);
