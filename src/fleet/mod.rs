@@ -787,6 +787,13 @@ pub fn reduce_with_prompt(
             session.pending_gate = None;
             session.attention_at = None;
             session.active_prompt = prompt_id.map(str::to_string);
+            // The user just answered whatever the last brief asked: its
+            // blocker belongs to a turn that is over. Cleared in the row
+            // itself (not only hidden by the dirty mark), so no reader —
+            // and no later clear of the dirty mark — can resurrect it.
+            if let Some(b) = session.brief.as_mut() {
+                b.blocked_on = None;
+            }
         }
         FleetEvent::SubagentStop { background_tasks, .. }
             if *background_tasks == 0 && session.status == FleetStatus::WorkingBackground =>
@@ -1198,7 +1205,7 @@ pub fn sweep_dispatch_continuations(
             run_session_id: s.id.clone(),
             todo_id: s.dispatched_todo.clone(),
             session_name: s.display_name().to_string(),
-            progress: brief.map(briefs::progress_line),
+            progress: brief.map(|b| briefs::progress_line(b, s.blocked_on())),
         })
     };
 
@@ -1528,6 +1535,16 @@ impl FleetShared {
             }
             None => false,
         }
+    }
+
+    /// A LIVE session's current blocker, through [`FleetSession::blocked_on`]
+    /// (`None` when the brief was overtaken or the session left the map).
+    pub fn blocked_on_of(&self, session_id: &str) -> Option<String> {
+        let state = self.state.lock().expect("fleet state lock poisoned");
+        state
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.blocked_on().map(str::to_string))
     }
 
     /// Refresh a LIVE session's Claude Code title (event-ingest path — no
@@ -2902,6 +2919,32 @@ mod tests {
         assert_eq!(s.status, FleetStatus::Working);
         assert_eq!(s.working_since, Some(t1));
         assert!(s.pending_gate.is_none());
+    }
+
+    #[test]
+    fn prompt_submit_clears_the_briefs_blocker_in_the_row_it_persists() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-10-23T08:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        reduce(&mut state, &stop("s1"), t0);
+        state.sessions.get_mut("s1").unwrap().brief = Some(SessionBrief {
+            blocked_on: Some("pick a schema".into()),
+            ..brief_at(t0, "h")
+        });
+        assert_eq!(state.sessions["s1"].blocked_on(), Some("pick a schema"));
+        let mut changed = reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() },
+            utc("2026-10-23T08:05:00Z"),
+        );
+        note_transcript_and_dirty(&mut state, &mut changed, &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() }, None, utc("2026-10-23T08:05:00Z"));
+        assert!(state.sessions["s1"].brief.as_ref().unwrap().blocked_on.is_none());
+        assert!(changed[0].brief.as_ref().unwrap().blocked_on.is_none(), "the persisted clone too");
+        // Even with the dirty mark cleared without a new brief, nothing comes back.
+        let s = state.sessions.get_mut("s1").unwrap();
+        s.brief_dirty_at = None;
+        assert!(s.blocked_on().is_none());
+        assert!(!s.asks_person());
     }
 
     #[test]

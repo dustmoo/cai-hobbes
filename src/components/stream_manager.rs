@@ -114,7 +114,7 @@ impl StreamManagerContext {
             if let Some(brief) = brief_source.and_then(|v| {
                 crate::fleet::briefs::brief_from_summary_value(&v, chrono::Utc::now(), false)
             }) {
-                let line = crate::fleet::briefs::progress_line(&brief);
+                let line = crate::fleet::briefs::progress_line(&brief, brief.blocked_on.as_deref());
                 let mut planner = self.planner_state;
                 let changed = crate::todo::handlers::apply_brief_progress(
                     &mut planner.write(),

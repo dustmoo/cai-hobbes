@@ -1215,14 +1215,20 @@ fn app() -> Element {
                             continue;
                         };
                         let shared = fleet::shared();
-                        if !shared.set_brief(
+                        // The blocker as the row now shows it: hidden when a
+                        // turn raced in while the brief was generating.
+                        let blocked = if shared.set_brief(
                             &task.session_id,
                             brief.clone(),
                             started_at,
                             session_title.clone(),
                         ) {
+                            shared.blocked_on_of(&task.session_id)
+                        } else {
                             // Ended (or just-ended) row: merge into the store.
                             let brief_for_merge = brief.clone();
+                            let blocked = std::cell::RefCell::new(None);
+                            let blocked_ref = &blocked;
                             let merged =
                                 fleet::store::merge_session(&task.session_id, move |row| {
                                     row.brief = Some(brief_for_merge);
@@ -1232,14 +1238,16 @@ fn app() -> Element {
                                     if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
                                         row.brief_dirty_at = None;
                                     }
+                                    *blocked_ref.borrow_mut() = row.blocked_on().map(str::to_string);
                                 });
                             if merged {
                                 shared.poke();
                             }
-                        }
+                            blocked.into_inner()
+                        };
                         // Progress flows onto linked todos (display-only —
                         // never status; progress is reported, not judged).
-                        let line = fleet::briefs::progress_line(&brief);
+                        let line = fleet::briefs::progress_line(&brief, blocked.as_deref());
                         let changed = crate::todo::handlers::apply_brief_progress(
                             &mut planner_state.write(),
                             &task.session_id,

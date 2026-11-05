@@ -166,18 +166,14 @@ fn grouped_sessions(state: &fleet::FleetState) -> [Vec<FleetSession>; 3] {
 
 /// The brief's blocker, shown whenever the session is not on the job (no
 /// turn, background phase or timer running): a session doing work is not
-/// blocked-waiting on the user, whatever an older brief believed.
+/// blocked-waiting on the user, whatever an older brief believed. Read
+/// through [`FleetSession::blocked_on`], so a brief overtaken by a later
+/// turn (the user answered, or a newer turn stopped) shows nothing.
 fn blocked_text(session: &FleetSession) -> Option<String> {
     if session.status.is_active() {
         return None;
     }
-    session
-        .brief
-        .as_ref()
-        .and_then(|b| b.blocked_on.as_deref())
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .map(str::to_string)
+    session.blocked_on().map(str::to_string)
 }
 
 /// The brief's headline, display-safe: briefs stored before headlines were
@@ -1508,6 +1504,19 @@ mod tests {
         // Blank blockers are ignored.
         s.status = FleetStatus::Idle;
         s.brief = Some(brief("Wired the exporter", Some("  ")));
+        assert_eq!(status_phrase(&s, now), "Wired the exporter");
+    }
+
+    #[test]
+    fn an_overtaken_brief_shows_no_blocker() {
+        // The brief asked something, then a later turn stopped (or the user
+        // answered): the row's dirty mark is past the brief, so the view
+        // must not show the old question, whatever the raw field says.
+        let now = utc("2026-08-25T10:00:00Z");
+        let mut s = session("a", FleetStatus::Idle, fleet::FleetOrigin::External, 0);
+        s.brief = Some(brief("Wired the exporter", Some("needs the staging API key")));
+        s.brief_dirty_at = Some(utc("2026-08-25T10:05:00Z"));
+        assert_eq!(blocked_text(&s), None);
         assert_eq!(status_phrase(&s, now), "Wired the exporter");
     }
 

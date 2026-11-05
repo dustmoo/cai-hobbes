@@ -125,7 +125,7 @@ fn render_session(s: &FleetSession, now: DateTime<Utc>, today: NaiveDate) -> Str
         for bullet in b.bullets.iter().take(3) {
             lines.push(format!("  - {}", truncate_summary(bullet, 120)));
         }
-        if let Some(blocked) = &b.blocked_on {
+        if let Some(blocked) = s.blocked_on() {
             lines.push(format!("  blocked: {}", truncate_summary(blocked, 160)));
         }
     }

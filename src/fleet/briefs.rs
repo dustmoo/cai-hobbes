@@ -222,12 +222,15 @@ pub fn clean_headline(text: &str) -> Option<String> {
 }
 
 /// One display line from a brief: headline plus blocker, clipped — the shape
-/// written onto linked todos' `latest_progress`.
-pub fn progress_line(brief: &SessionBrief) -> String {
+/// written onto linked todos' `latest_progress`. The blocker is passed in
+/// rather than read off the brief: callers hand over
+/// [`FleetSession::blocked_on`] (or a brief they know is current), so a
+/// blocker from a turn the user already answered never reaches a to-do.
+pub fn progress_line(brief: &SessionBrief, blocked: Option<&str>) -> String {
     // Briefs persisted before the headline was cleaned may still hold JSON.
     let headline = clean_headline(&brief.headline).unwrap_or_default();
     let mut line = truncate_summary(&headline, 160);
-    if let Some(blocked) = &brief.blocked_on {
+    if let Some(blocked) = blocked.map(str::trim).filter(|b| !b.is_empty()) {
         let sep = if line.is_empty() { "" } else { "; " };
         line.push_str(&format!("{sep}blocked: {}", truncate_summary(blocked, 80)));
     }
@@ -308,7 +311,7 @@ fn session_lines(
             let mut line = format!("{} — {}", truncate_summary(s.display_name(), 60), time);
             if let Some(b) = &s.brief {
                 line.push_str(&format!(" — {}", truncate_summary(&b.headline, 140)));
-                if let Some(blocked) = &b.blocked_on {
+                if let Some(blocked) = s.blocked_on() {
                     line.push_str(&format!("; blocked: {}", truncate_summary(blocked, 80)));
                 }
             }
@@ -398,7 +401,7 @@ pub fn status_report(
                 if !b.bullets.is_empty() {
                     brief["details"] = serde_json::json!(b.bullets);
                 }
-                if let Some(blocked) = &b.blocked_on {
+                if let Some(blocked) = s.blocked_on() {
                     brief["blocked_on"] = serde_json::json!(truncate_summary(blocked, 160));
                 }
                 v["brief"] = brief;
@@ -660,7 +663,7 @@ mod tests {
         let v = serde_json::json!({ "summary": cut });
         let b = brief_from_summary_value(&v, now, false).unwrap();
         assert_eq!(b.headline, "Active Composio profile is 'Clearmirror.ai'. Hobbes was asked to verify the cal");
-        assert!(!progress_line(&b).contains('{'));
+        assert!(!progress_line(&b, None).contains('{'));
 
         // A complete object (prose-wrapped, fenced) as the summary string.
         let fenced = "Sure!\n```json\n{\"summary\":\"Shipped the digest\",\"current_task\":\"qa\"}\n```";
@@ -683,7 +686,33 @@ mod tests {
             generated_at: now,
             final_brief: false,
         };
-        assert!(progress_line(&legacy).starts_with("Active Composio"));
+        assert!(progress_line(&legacy, None).starts_with("Active Composio"));
+    }
+
+    #[test]
+    fn progress_and_context_lines_drop_an_overtaken_blocker() {
+        let b = SessionBrief {
+            headline: "Built the exporter".into(),
+            bullets: vec![],
+            blocked_on: Some("needs the API key".into()),
+            generated_at: utc("2026-09-01T10:00:00Z"),
+            final_brief: false,
+        };
+        assert_eq!(progress_line(&b, Some("needs the API key")), "Built the exporter; blocked: needs the API key");
+        assert_eq!(progress_line(&b, None), "Built the exporter");
+        assert_eq!(progress_line(&b, Some("  ")), "Built the exporter");
+
+        let mut s = session("s1");
+        s.brief = Some(b);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let now = utc("2026-09-01T12:00:00Z");
+        assert!(fleet_context_lines(std::slice::from_ref(&s), date, now, 5)[0].contains("blocked:"));
+        // A turn stopped after the brief: its question was overtaken.
+        s.brief_dirty_at = Some(utc("2026-09-01T11:00:00Z"));
+        assert!(!fleet_context_lines(std::slice::from_ref(&s), date, now, 5)[0].contains("blocked:"));
+        let live = FleetState { sessions: [(s.id.clone(), s.clone())].into(), ..Default::default() };
+        let report = status_report(&live, &[], None, &[], now, date);
+        assert!(report["sessions"][0]["brief"].get("blocked_on").is_none());
     }
 
     #[test]
