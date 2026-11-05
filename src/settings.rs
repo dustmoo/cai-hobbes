@@ -2699,6 +2699,7 @@ impl SettingsManager {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum SettingsTab {
     General,
+    Hobbes,
     Mcp,
     Behavior,
     Planner,

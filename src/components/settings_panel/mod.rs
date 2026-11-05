@@ -8,7 +8,7 @@ mod trust_rules;
 
 use shared::{comparable, flush_draft_into_instance, load_instance_into_draft};
 use tabs::{
-    AboutTab, BehaviorTab, DataTab, GeneralTab, HotkeysTab, McpTab, PermissionsTab, PlannerTab,
+    AboutTab, BehaviorTab, DataTab, GeneralTab, HobbesTab, HotkeysTab, McpTab, PermissionsTab, PlannerTab,
     SkillsTab,
 };
 
@@ -44,6 +44,7 @@ fn settings_tab_label(tab: crate::settings::SettingsTab) -> &'static str {
     use crate::settings::SettingsTab as T;
     match tab {
         T::General => "General",
+        T::Hobbes => "Hobbes",
         T::Mcp => "MCP Tools",
         T::Behavior => "Behavior",
         T::Planner => "Planner",
@@ -710,6 +711,7 @@ pub fn SettingsPanel(
                 div {
                     class: if nav_railed { "flex flex-col gap-0.5 py-2" } else { "flex flex-col gap-0.5 p-2" },
                     SettingsNavItem { tab: crate::settings::SettingsTab::General, icon: fi_icons::FiSettings, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Hobbes, icon: fi_icons::FiMessageCircle, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Mcp, icon: fi_icons::FiCpu, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Behavior, icon: fi_icons::FiSliders, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Planner, icon: fi_icons::FiCheckSquare, railed: nav_railed }
@@ -743,6 +745,7 @@ pub fn SettingsPanel(
                    class: "flex-1 overflow-y-auto pr-2",
                    match ui_state.read().active_settings_tab {
                        crate::settings::SettingsTab::Planner => rsx! { PlannerTab { ctx } },
+                       crate::settings::SettingsTab::Hobbes => rsx! { HobbesTab { ctx } },
                        crate::settings::SettingsTab::General => rsx! {
                            GeneralTab {
                                ctx,

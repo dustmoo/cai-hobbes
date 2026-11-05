@@ -1899,6 +1899,5 @@ pub(in super::super) fn GeneralTab(
                         }
                     }
                 }
-                super::VoiceCard { ctx }
     }
 }
