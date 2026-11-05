@@ -1189,11 +1189,16 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                                 usage["completion_tokens"].as_u64(),
                                 usage["total_tokens"].as_u64(),
                             ) {
+                                // A subset of `prompt_tokens`, billed at the cached rate.
+                                let cached = usage
+                                    .pointer("/prompt_tokens_details/cached_tokens")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
                                 events.push(StreamEvent::Usage(UsageData {
                                     prompt_tokens: p as i32,
                                     completion_tokens: c as i32,
                                     total_tokens: t as i32,
-                                    cached_content_tokens: None,
+                                    cached_content_tokens: (cached > 0).then_some(cached as i32),
                                     cache_creation_tokens: None,
                                     thoughts_tokens: None,
                                     // Billed only for the real OpenAI API with a key;
@@ -1203,6 +1208,7 @@ impl LlmFormatConverter for OpenAiCompatConnector {
                                         self.config.api_key.is_some(),
                                         &self.config.model,
                                         p as i64,
+                                        cached as i64,
                                         c as i64,
                                     ),
                                 }));

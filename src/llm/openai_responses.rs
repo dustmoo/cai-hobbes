@@ -341,11 +341,17 @@ fn parse_usage(response: &Value) -> Option<UsageData> {
         .get("total_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or((input + output) as u64) as i32;
+    // A subset of `input_tokens`, billed at the cached rate.
+    let cached = usage
+        .pointer("/input_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as i32)
+        .filter(|&v| v > 0);
     Some(UsageData {
         prompt_tokens: input,
         completion_tokens: output,
         total_tokens: total,
-        cached_content_tokens: None,
+        cached_content_tokens: cached,
         cache_creation_tokens: None,
         thoughts_tokens: None,
         cost: Some(0.0),
@@ -667,6 +673,7 @@ impl LlmConnector for OpenAiResponsesConnector {
                                 self.config.api_key.is_some(),
                                 &self.config.model,
                                 usage.prompt_tokens as i64,
+                                usage.cached_content_tokens.unwrap_or(0) as i64,
                                 usage.completion_tokens as i64,
                             );
                             let _ = tx.send(StreamMessage::Usage(usage));
@@ -928,6 +935,8 @@ mod tests {
             "gpt-5.6-terra",
             "gpt-5.6-luna",
             "gpt-6-astra",
+            "gpt-6.1-terra",
+            "gpt-6-luna",
             "o1",
             "o1-pro",
             "o3",
@@ -1213,5 +1222,19 @@ mod tests {
         let input = req["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
         assert_eq!(input[0], json!({ "role": "user", "content": "hi\n\n[Context]\nT1" }));
+    }
+
+    #[test]
+    fn parse_usage_reads_the_cached_input_split() {
+        let r = json!({ "usage": {
+            "input_tokens": 100_000, "output_tokens": 500, "total_tokens": 100_500,
+            "input_tokens_details": { "cached_tokens": 90_000 }
+        }});
+        let u = parse_usage(&r).unwrap();
+        assert_eq!(u.prompt_tokens, 100_000);
+        assert_eq!(u.cached_content_tokens, Some(90_000));
+        // No details (or zero cached) → None, not Some(0).
+        let r = json!({ "usage": { "input_tokens": 10, "output_tokens": 5, "total_tokens": 15 } });
+        assert_eq!(parse_usage(&r).unwrap().cached_content_tokens, None);
     }
 }

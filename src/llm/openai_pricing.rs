@@ -8,63 +8,95 @@
 //! Prices are USD per 1M tokens. This is a **manually maintained** table that
 //! drifts as OpenAI revises pricing — re-verify against the official page and
 //! bump the date when you touch it (see SYSTEM_PATTERNS P-013).
-//! Last verified: 2026-09-17. Added the new gpt-6 flagship tier (`gpt-6-astra`)
-//! and the gpt-5.6 family (`sol`/`terra`/`luna`); confirmed gpt-5.5 unchanged.
+//! Last verified: 2026-11-05 against developers.openai.com/api/docs/pricing.
+//! Added gpt-6.1 (`sol`/`terra`), gpt-6-sol, gpt-6-luna and gpt-6-rosalind;
+//! confirmed gpt-6-astra ($10/$1/$50) and the gpt-5.6 / gpt-5.5 rows unchanged.
 //! Reasoning tokens are billed as output tokens and are already included in the
-//! reported output count, so no special handling is needed. Cached-input
-//! discounts are recorded for reference but not yet applied (our stream parsers
-//! don't surface the cached-token split).
+//! reported output count, so no special handling is needed.
+//!
+//! Cached input: OpenAI reports cached tokens as a subset of `input_tokens`
+//! (`input_tokens_details.cached_tokens` / `prompt_tokens_details.cached_tokens`);
+//! those are billed at the cached rate, the rest at the full input rate.
+//!
+//! Long context: on the gpt-5.5 and later families, a request with more than
+//! [`LONG_CONTEXT_THRESHOLD`] input tokens is billed at 2x input / cached input
+//! and 1.5x output for the whole request.
+//!
+//! Not modelled: cache-write surcharges (the API doesn't report write counts),
+//! Batch / Flex / Fast tiers, and regional-processing uplift.
 
 /// Per-1M-token pricing for an OpenAI model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OpenAiPrice {
     pub input_per_1m: f64,
-    #[allow(dead_code)]
     pub cached_input_per_1m: f64,
     pub output_per_1m: f64,
+    /// Whether requests over [`LONG_CONTEXT_THRESHOLD`] input tokens are billed
+    /// at the long-context rate (2x input and cached input, 1.5x output).
+    pub long_context: bool,
+}
+
+/// Input-token count above which long-context pricing applies (">272K").
+pub const LONG_CONTEXT_THRESHOLD: i64 = 272_000;
+
+const fn p(input: f64, cached: f64, output: f64) -> OpenAiPrice {
+    OpenAiPrice { input_per_1m: input, cached_input_per_1m: cached, output_per_1m: output, long_context: false }
+}
+
+/// A price with the long-context surcharge (gpt-5.5 and later).
+const fn lc(input: f64, cached: f64, output: f64) -> OpenAiPrice {
+    OpenAiPrice { input_per_1m: input, cached_input_per_1m: cached, output_per_1m: output, long_context: true }
 }
 
 /// Pricing table, ordered **most-specific prefix first** so that e.g. `gpt-5.5`
 /// and `gpt-5-mini` are matched before the bare `gpt-5` entry. Matching is by
 /// `starts_with`, which also covers dated snapshots (`gpt-5-2026-…`).
 const PRICES: &[(&str, OpenAiPrice)] = &[
+    // ── gpt-6.1 family ────────────────────────────────────────────────
+    ("gpt-6.1-sol", lc(2.0, 0.10, 10.0)),
+    ("gpt-6.1-terra", lc(1.0, 0.05, 5.0)),
     // ── gpt-6 family ──────────────────────────────────────────────────
-    ("gpt-6-astra", OpenAiPrice { input_per_1m: 10.0, cached_input_per_1m: 1.0, output_per_1m: 50.0 }),
+    // `gpt-6-astra-law` matches `gpt-6-astra` (same $10/$1/$50).
+    ("gpt-6-astra", lc(10.0, 1.0, 50.0)),
+    ("gpt-6-rosalind", lc(15.0, 1.50, 75.0)),
+    ("gpt-6-sol", lc(2.0, 0.20, 10.0)),
+    ("gpt-6-luna", lc(0.10, 0.01, 0.50)),
+    ("gpt-6-cyber", p(20.0, 2.0, 100.0)),
     // ── gpt-5.6 family ────────────────────────────────────────────────
-    // Sol's standard rate is $5/$0.50/$30 (same as gpt-5.5); OpenAI is running a
-    // promotional rate of $4/$0.40/$20 through at least 2026-11-21. We record the
-    // current (promotional) rate here — re-check after that date and revert to
-    // standard if the promo has ended.
-    ("gpt-5.6-sol", OpenAiPrice { input_per_1m: 4.0, cached_input_per_1m: 0.40, output_per_1m: 20.0 }),
-    ("gpt-5.6-terra", OpenAiPrice { input_per_1m: 2.0, cached_input_per_1m: 0.20, output_per_1m: 12.0 }),
-    ("gpt-5.6-luna", OpenAiPrice { input_per_1m: 0.20, cached_input_per_1m: 0.02, output_per_1m: 1.20 }),
+    // OpenAI notes a gpt-5.6-sol promotional rate until 2026-11-30 without
+    // listing it; $4/$0.40/$20 is the rate on the Standard table.
+    ("gpt-5.6-sol", lc(4.0, 0.40, 20.0)),
+    ("gpt-5.6-terra", lc(2.0, 0.20, 12.0)),
+    ("gpt-5.6-luna", lc(0.20, 0.02, 1.20)),
+    ("gpt-5.6-cyber", p(12.50, 1.25, 75.0)),
     // ── gpt-5.5 family ────────────────────────────────────────────────
-    ("gpt-5.5-pro", OpenAiPrice { input_per_1m: 30.0, cached_input_per_1m: 30.0, output_per_1m: 180.0 }),
-    ("gpt-5.5", OpenAiPrice { input_per_1m: 5.0, cached_input_per_1m: 0.50, output_per_1m: 30.0 }),
+    ("gpt-5.5-pro", lc(30.0, 30.0, 180.0)),
+    ("gpt-5.5-cyber", p(12.50, 1.25, 75.0)),
+    ("gpt-5.5", lc(5.0, 0.50, 30.0)),
     // ── gpt-5.4 family ────────────────────────────────────────────────
-    ("gpt-5.4-pro", OpenAiPrice { input_per_1m: 30.0, cached_input_per_1m: 30.0, output_per_1m: 180.0 }),
-    ("gpt-5.4-mini", OpenAiPrice { input_per_1m: 0.75, cached_input_per_1m: 0.075, output_per_1m: 4.50 }),
-    ("gpt-5.4-nano", OpenAiPrice { input_per_1m: 0.20, cached_input_per_1m: 0.02, output_per_1m: 1.25 }),
-    ("gpt-5.4", OpenAiPrice { input_per_1m: 2.50, cached_input_per_1m: 0.25, output_per_1m: 15.0 }),
+    ("gpt-5.4-pro", p(30.0, 30.0, 180.0)),
+    ("gpt-5.4-mini", p(0.75, 0.075, 4.50)),
+    ("gpt-5.4-nano", p(0.20, 0.02, 1.25)),
+    ("gpt-5.4", p(2.50, 0.25, 15.0)),
     // ── gpt-5 family ──────────────────────────────────────────────────
-    ("gpt-5-pro", OpenAiPrice { input_per_1m: 15.0, cached_input_per_1m: 15.0, output_per_1m: 120.0 }),
-    ("gpt-5-mini", OpenAiPrice { input_per_1m: 0.25, cached_input_per_1m: 0.025, output_per_1m: 2.0 }),
-    ("gpt-5-nano", OpenAiPrice { input_per_1m: 0.05, cached_input_per_1m: 0.005, output_per_1m: 0.40 }),
-    ("gpt-5", OpenAiPrice { input_per_1m: 1.25, cached_input_per_1m: 0.125, output_per_1m: 10.0 }),
+    ("gpt-5-pro", p(15.0, 15.0, 120.0)),
+    ("gpt-5-mini", p(0.25, 0.025, 2.0)),
+    ("gpt-5-nano", p(0.05, 0.005, 0.40)),
+    ("gpt-5", p(1.25, 0.125, 10.0)),
     // ── gpt-4.1 family ────────────────────────────────────────────────
-    ("gpt-4.1-nano", OpenAiPrice { input_per_1m: 0.10, cached_input_per_1m: 0.025, output_per_1m: 0.40 }),
-    ("gpt-4.1-mini", OpenAiPrice { input_per_1m: 0.40, cached_input_per_1m: 0.10, output_per_1m: 1.60 }),
-    ("gpt-4.1", OpenAiPrice { input_per_1m: 2.0, cached_input_per_1m: 0.50, output_per_1m: 8.0 }),
+    ("gpt-4.1-nano", p(0.10, 0.025, 0.40)),
+    ("gpt-4.1-mini", p(0.40, 0.10, 1.60)),
+    ("gpt-4.1", p(2.0, 0.50, 8.0)),
     // ── gpt-4o family ─────────────────────────────────────────────────
-    ("gpt-4o-mini", OpenAiPrice { input_per_1m: 0.15, cached_input_per_1m: 0.075, output_per_1m: 0.60 }),
-    ("gpt-4o", OpenAiPrice { input_per_1m: 2.50, cached_input_per_1m: 1.25, output_per_1m: 10.0 }),
+    ("gpt-4o-mini", p(0.15, 0.075, 0.60)),
+    ("gpt-4o", p(2.50, 1.25, 10.0)),
     // ── o-series reasoning models ─────────────────────────────────────
-    ("o4-mini", OpenAiPrice { input_per_1m: 1.10, cached_input_per_1m: 0.275, output_per_1m: 4.40 }),
-    ("o3-mini", OpenAiPrice { input_per_1m: 1.10, cached_input_per_1m: 0.55, output_per_1m: 4.40 }),
-    ("o3", OpenAiPrice { input_per_1m: 2.0, cached_input_per_1m: 0.50, output_per_1m: 8.0 }),
-    ("o1-mini", OpenAiPrice { input_per_1m: 1.10, cached_input_per_1m: 0.55, output_per_1m: 4.40 }),
-    ("o1-pro", OpenAiPrice { input_per_1m: 150.0, cached_input_per_1m: 150.0, output_per_1m: 600.0 }),
-    ("o1", OpenAiPrice { input_per_1m: 15.0, cached_input_per_1m: 7.50, output_per_1m: 60.0 }),
+    ("o4-mini", p(1.10, 0.275, 4.40)),
+    ("o3-mini", p(1.10, 0.55, 4.40)),
+    ("o3", p(2.0, 0.50, 8.0)),
+    ("o1-mini", p(1.10, 0.55, 4.40)),
+    ("o1-pro", p(150.0, 150.0, 600.0)),
+    ("o1", p(15.0, 7.50, 60.0)),
 ];
 
 /// Whether `model` belongs to the family named by `prefix`. Matches the exact
@@ -96,13 +128,27 @@ pub fn billable(endpoint: &str, has_api_key: bool) -> bool {
     has_api_key && endpoint.contains("api.openai.com")
 }
 
-/// Estimate the USD cost of a turn from input/output token counts.
-/// Returns `None` for unknown models (cost intentionally left unset).
-pub fn estimate_cost(model: &str, input_tokens: i64, output_tokens: i64) -> Option<f64> {
+/// Estimate the USD cost of a turn. `cached_tokens` is the part of
+/// `input_tokens` served from OpenAI's prompt cache (a subset, not extra), billed
+/// at the cached rate. Returns `None` for unknown models (cost left unset).
+pub fn estimate_cost(
+    model: &str,
+    input_tokens: i64,
+    cached_tokens: i64,
+    output_tokens: i64,
+) -> Option<f64> {
     let price = price_for_model(model)?;
-    let input = (input_tokens.max(0) as f64 / 1_000_000.0) * price.input_per_1m;
-    let output = (output_tokens.max(0) as f64 / 1_000_000.0) * price.output_per_1m;
-    Some(input + output)
+    let input = input_tokens.max(0);
+    let cached = cached_tokens.clamp(0, input);
+    let (in_mul, out_mul) = if price.long_context && input > LONG_CONTEXT_THRESHOLD {
+        (2.0, 1.5)
+    } else {
+        (1.0, 1.0)
+    };
+    let per_m = |tokens: i64, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
+    let input_cost = per_m(input - cached, price.input_per_1m) + per_m(cached, price.cached_input_per_1m);
+    let output_cost = per_m(output_tokens.max(0), price.output_per_1m);
+    Some(input_cost * in_mul + output_cost * out_mul)
 }
 
 /// Resolve the cost to record for a turn:
@@ -113,10 +159,11 @@ pub fn turn_cost(
     has_api_key: bool,
     model: &str,
     input_tokens: i64,
+    cached_tokens: i64,
     output_tokens: i64,
 ) -> Option<f64> {
     if billable(endpoint, has_api_key) {
-        estimate_cost(model, input_tokens, output_tokens)
+        estimate_cost(model, input_tokens, cached_tokens, output_tokens)
     } else {
         Some(0.0)
     }
@@ -204,7 +251,7 @@ mod tests {
     fn unknown_models_have_no_price() {
         assert!(price_for_model("llama-3.3-70b").is_none());
         assert!(price_for_model("qwen2.5-coder").is_none());
-        assert!(estimate_cost("some-local-model", 1000, 1000).is_none());
+        assert!(estimate_cost("some-local-model", 1000, 0, 1000).is_none());
     }
 
     #[test]
@@ -226,10 +273,10 @@ mod tests {
     #[test]
     fn estimate_cost_math() {
         // gpt-5: $1.25 input + $10 output per 1M. 1M in + 1M out = 11.25.
-        let c = estimate_cost("gpt-5", 1_000_000, 1_000_000).unwrap();
+        let c = estimate_cost("gpt-5", 1_000_000, 0, 1_000_000).unwrap();
         assert!((c - 11.25).abs() < 1e-9, "got {c}");
         // Half-million output only on gpt-5-mini ($2/1M) = $1.00.
-        let c = estimate_cost("gpt-5-mini", 0, 500_000).unwrap();
+        let c = estimate_cost("gpt-5-mini", 0, 0, 500_000).unwrap();
         assert!((c - 1.0).abs() < 1e-9, "got {c}");
     }
 
@@ -244,11 +291,53 @@ mod tests {
     #[test]
     fn turn_cost_gates_by_endpoint() {
         // Real OpenAI, known model → estimated.
-        let c = turn_cost("https://api.openai.com/v1", true, "gpt-5", 1_000_000, 0).unwrap();
+        let c = turn_cost("https://api.openai.com/v1", true, "gpt-5", 1_000_000, 0, 0).unwrap();
         assert!((c - 1.25).abs() < 1e-9, "got {c}");
         // Local → free.
-        assert_eq!(turn_cost("http://localhost:11434/v1", false, "llama3", 1_000_000, 999), Some(0.0));
+        assert_eq!(turn_cost("http://localhost:11434/v1", false, "llama3", 1_000_000, 0, 999), Some(0.0));
         // Real OpenAI but unknown model → no fabricated cost.
-        assert_eq!(turn_cost("https://api.openai.com/v1", true, "mystery-model", 10, 10), None);
+        assert_eq!(turn_cost("https://api.openai.com/v1", true, "mystery-model", 10, 0, 10), None);
+    }
+
+    #[test]
+    fn gpt6_1_and_new_gpt6_tiers_resolve() {
+        assert_eq!(rate("gpt-6.1-terra"), lc(1.0, 0.05, 5.0));
+        assert_eq!(rate("gpt-6.1-sol"), lc(2.0, 0.10, 10.0));
+        assert_eq!(rate("gpt-6-sol"), lc(2.0, 0.20, 10.0));
+        assert_eq!(rate("gpt-6-luna"), lc(0.10, 0.01, 0.50));
+        assert_eq!(rate("gpt-6-rosalind").output_per_1m, 75.0);
+        // gpt-6.1-* must not fall through to a gpt-6 row, nor gpt-6-sol to 6.1.
+        assert_ne!(rate("gpt-6.1-sol"), rate("gpt-6-sol"));
+        assert_eq!(price_for_model("gpt-6.1-terra-2026-10-26"), price_for_model("gpt-6.1-terra"));
+        assert_eq!(price_for_model("gpt-6-astra-law"), price_for_model("gpt-6-astra"));
+        assert!(price_for_model("gpt-6.2-sol").is_none());
+    }
+
+    #[test]
+    fn cached_input_is_billed_at_the_cached_rate() {
+        // gpt-6-astra: 100K input of which 90K cached, 1K output.
+        // 10K * $10 + 90K * $1 + 1K * $50 = $0.10 + $0.09 + $0.05 = $0.24.
+        let c = estimate_cost("gpt-6-astra", 100_000, 90_000, 1_000).unwrap();
+        assert!((c - 0.24).abs() < 1e-9, "got {c}");
+        // Without the split the same turn would have cost $1.05.
+        let full = estimate_cost("gpt-6-astra", 100_000, 0, 1_000).unwrap();
+        assert!((full - 1.05).abs() < 1e-9, "got {full}");
+        // A cached count larger than the input is clamped, never negative.
+        let c = estimate_cost("gpt-6-astra", 1_000, 5_000, 0).unwrap();
+        assert!((c - 0.001).abs() < 1e-12, "got {c}");
+    }
+
+    #[test]
+    fn long_context_surcharge_applies_over_272k_only_where_listed() {
+        // gpt-6-astra at 300K uncached input + 10K output:
+        // 300K * $20 + 10K * $75 = $6.00 + $0.75 = $6.75.
+        let c = estimate_cost("gpt-6-astra", 300_000, 0, 10_000).unwrap();
+        assert!((c - 6.75).abs() < 1e-9, "got {c}");
+        // At exactly the threshold it's still short-context: 272K * $10 = $2.72.
+        let c = estimate_cost("gpt-6-astra", 272_000, 0, 0).unwrap();
+        assert!((c - 2.72).abs() < 1e-9, "got {c}");
+        // gpt-4.1 has no long-context tier.
+        let c = estimate_cost("gpt-4.1", 300_000, 0, 0).unwrap();
+        assert!((c - 0.60).abs() < 1e-9, "got {c}");
     }
 }
