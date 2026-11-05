@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::session::Session;
@@ -49,6 +49,40 @@ const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
 const META_PROJECT_ID_COLUMN: &str = "project_id_column_backfilled";
 /// Set once the background `tab_title` backfill (`spawn_tab_title_backfill`) has filled the column.
 const META_TAB_TITLE_COLUMN: &str = "tab_title_column_backfilled";
+
+/// Bumped whenever a write changes what the History listing shows (a row
+/// added, deleted or renamed, or its title, emoji, summary, message count or
+/// timestamp changed), so the History drawer re-queries on that and not on
+/// every save of a streaming reply. See [`list_version`].
+static LIST_VERSION: AtomicU64 = AtomicU64::new(0);
+/// Per row: the hash of its listed fields as last written ([`SessionRow::list_hash`]).
+static LIST_KEYS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// A counter that changes whenever the History listing may have changed.
+/// Compare against a previously read value; the number itself means nothing.
+pub fn list_version() -> u64 {
+    LIST_VERSION.load(Ordering::Acquire)
+}
+
+fn bump_list_version() {
+    LIST_VERSION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Bump [`list_version`] if `id`'s listed fields differ from its last write.
+fn note_listing(id: &str, list_hash: u64) {
+    let mut keys = LIST_KEYS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if keys.insert(id.to_string(), list_hash) != Some(list_hash) {
+        bump_list_version();
+    }
+}
+
+/// `id`'s row was deleted or changed outside `upsert_row`: always re-list.
+fn forget_listing(id: &str) {
+    if let Some(keys) = LIST_KEYS.get() {
+        keys.lock().unwrap().remove(id);
+    }
+    bump_list_version();
+}
 
 fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
     FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -533,6 +567,8 @@ pub struct SessionRow {
     pub seq: i64,
     pub data: String,
     pub data_hash: u64,
+    /// Hash of the fields the History drawer lists ([`list_version`]).
+    pub list_hash: u64,
 }
 
 /// Fixed-width UTC timestamp so lexicographic string order == time order.
@@ -564,7 +600,22 @@ pub fn build_row(session: &Session, seq: i64) -> Result<SessionRow, serde_json::
             search_text.push_str(&t.to_lowercase());
         }
     }
+    let list_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            &session.name,
+            &session.last_updated,
+            session.messages.len(),
+            &summary,
+            &session.tab_title,
+            &session.tab_emoji,
+            session.name_user_set,
+        )
+            .hash(&mut h);
+        h.finish()
+    };
     Ok(SessionRow {
+        list_hash,
         id: session.id.clone(),
         name: session.name.clone(),
         last_updated: fmt_ts(&session.last_updated),
@@ -620,6 +671,7 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
             row.tab_title,
         ],
     )?;
+    note_listing(&row.id, row.list_hash);
     Ok(())
 }
 
@@ -868,13 +920,20 @@ fn delete_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<(
         .optional()?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
     conn.execute("DELETE FROM session_events WHERE session_id = ?1", params![id])?;
+    forget_listing(id);
     Ok(harvest)
 }
 
 /// Rename a session directly in the DB (for sessions not hydrated in memory).
 /// Rewrites the `name` field inside the data blob to keep them consistent.
 pub fn rename_session(id: &str, new_name: &str) {
-    let result = with_conn(|conn| {
+    if let Err(e) = with_conn(|conn| rename_session_conn(conn, id, new_name)) {
+        tracing::error!("rename_session({id}) failed: {e}");
+    }
+}
+
+fn rename_session_conn(conn: &Connection, id: &str, new_name: &str) -> rusqlite::Result<()> {
+    {
         use rusqlite::OptionalExtension;
         let data: Option<String> = conn
             .query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
@@ -889,10 +948,8 @@ pub fn rename_session(id: &str, new_name: &str) {
             "UPDATE sessions SET name = ?2, data = ?3, seq = ?4 WHERE id = ?1",
             params![id, new_name, new_data, next_seq()],
         )?;
+        forget_listing(id);
         Ok(())
-    });
-    if let Err(e) = result {
-        tracing::error!("rename_session({id}) failed: {e}");
     }
 }
 
@@ -1006,16 +1063,16 @@ pub fn sum_cost_tokens() -> (f64, i64) {
     .unwrap_or((0.0, 0))
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionMeta {
     pub id: String,
     pub name: String,
     pub last_updated: String,
     pub message_count: i64,
     pub summary: String,
-    /// Tab identity, read out of the row's `data` JSON blob (least invasive:
-    /// no new columns/migration — `name`/`tab_title`/`tab_emoji`/
-    /// `name_user_set` already live in every session's serialized JSON).
+    /// Tab identity: `tab_title` from its column (or the row's JSON while
+    /// the column backfill hasn't reached it), `tab_emoji`/`name_user_set`
+    /// via `json_extract` ([`META_SELECT`]).
     pub tab_title: Option<String>,
     pub tab_emoji: Option<String>,
     pub name_user_set: bool,
@@ -1038,21 +1095,30 @@ impl SessionMeta {
         self.tab_emoji.as_deref().map(str::trim).filter(|e| !e.is_empty())
     }
 
-    fn from_row(id: String, name: String, last_updated: String, message_count: i64, summary: String, data: Option<String>) -> Self {
-        let (tab_title, tab_emoji, name_user_set) = data
-            .as_deref()
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-            .map(|v| {
-                (
-                    v.get("tab_title").and_then(|x| x.as_str()).map(str::to_string),
-                    v.get("tab_emoji").and_then(|x| x.as_str()).map(str::to_string),
-                    v.get("name_user_set").and_then(|x| x.as_bool()).unwrap_or(false),
-                )
-            })
-            .unwrap_or((None, None, false));
-        Self { id, name, last_updated, message_count, summary, tab_title, tab_emoji, name_user_set }
+    fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            last_updated: r.get(2)?,
+            message_count: r.get(3)?,
+            summary: r.get(4)?,
+            tab_title: r.get(5)?,
+            tab_emoji: r.get(6)?,
+            name_user_set: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+        })
     }
 }
+
+/// The [`SessionMeta`] columns. Only the listed fields are read: no row's
+/// `data` is deserialized. `tab_title` comes from its column, falling back
+/// to the JSON while `spawn_tab_title_backfill` hasn't filled it; the two
+/// JSON-only fields use `json_extract` (SQLite parses each row's JSON once
+/// and shares it between the calls). `json_valid` keeps one malformed row
+/// from failing the whole listing.
+const META_SELECT: &str = "id, name, last_updated, message_count, summary, \
+     coalesce(tab_title, CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END), \
+     CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_emoji') END, \
+     CASE WHEN json_valid(data) THEN json_extract(data, '$.name_user_set') END";
 
 /// Paginated, newest-first metadata listing. `query` (lowercased substring)
 /// matches name, summary, or message text. Returns (page, total_matches).
@@ -1068,11 +1134,9 @@ pub fn list_metadata(query: Option<&str>, offset: i64, limit: i64) -> (Vec<Sessi
 }
 
 /// `list_metadata` against an explicit connection (so tests can use an
-/// in-memory DB). Besides name/summary/message text, the query also matches
-/// the AI topic (`tab_title`), read straight from the row's `data` JSON so it
-/// works for rows saved before `tab_title` was part of anything else and
-/// needs no migration or backfill. `OR` short-circuits, so the JSON is only
-/// parsed for rows the cheaper columns did not already match.
+/// in-memory DB). The query matches name, summary and `search_text` (which
+/// carries the AI topic title and message text, `build_row`); all columns,
+/// so filtering parses no JSON.
 fn list_metadata_conn(
     conn: &Connection,
     query: Option<&str>,
@@ -1095,20 +1159,11 @@ fn list_metadata_conn(
 
         let count_sql = format!("SELECT COUNT(*) FROM sessions {where_clause}");
         let list_sql = format!(
-            "SELECT id, name, last_updated, message_count, summary, data FROM sessions {where_clause} \
+            "SELECT {META_SELECT} FROM sessions {where_clause} \
              ORDER BY last_updated DESC LIMIT {limit} OFFSET {offset}"
         );
 
-        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<SessionMeta> {
-            Ok(SessionMeta::from_row(
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        };
+        let map_row = SessionMeta::from_row;
 
         if pattern.is_empty() {
             let total: i64 = conn.query_row(&count_sql, [], |r| r.get(0))?;
@@ -1136,33 +1191,24 @@ pub fn all_name_summaries() -> Vec<(String, String, String)> {
     .unwrap_or_default()
 }
 
+/// [`SessionMeta`] for `ids`, in that order (missing ids skipped).
 pub fn metadata_by_ids(ids: &[String]) -> Vec<SessionMeta> {
-    with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, last_updated, message_count, summary, data FROM sessions WHERE id = ?1",
-        )?;
-        let mut out = Vec::new();
-        for id in ids {
-            use rusqlite::OptionalExtension;
-            if let Some(m) = stmt
-                .query_row(params![id], |r| {
-                    Ok(SessionMeta::from_row(
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                })
-                .optional()?
-            {
-                out.push(m);
-            }
-        }
-        Ok(out)
+    with_conn(|conn| metadata_by_ids_conn(conn, ids)).unwrap_or_else(|e| {
+        tracing::error!("metadata_by_ids failed: {e}");
+        Vec::new()
     })
-    .unwrap_or_default()
+}
+
+fn metadata_by_ids_conn(conn: &Connection, ids: &[String]) -> rusqlite::Result<Vec<SessionMeta>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = conn.prepare(&format!("SELECT {META_SELECT} FROM sessions WHERE id = ?1"))?;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(m) = stmt.query_row(params![id], SessionMeta::from_row).optional()? {
+            out.push(m);
+        }
+    }
+    Ok(out)
 }
 
 /// A conversation row for the Hobbes tab's `HOBBES_TAB_LIST` (`hobbes_tabs`):
@@ -2037,6 +2083,118 @@ mod list_metadata_tests {
         });
     }
 
+    /// The listing reads only the listed fields: a row whose `data` is huge
+    /// and isn't even a `Session` still lists with the right values.
+    #[test]
+    fn listing_reads_fields_without_deserializing_data() {
+        with_test_db(|conn| {
+            let s = session("Sep 18 - 10:00 AM", true, Some("Trip Planning"), Some("🧳"));
+            upsert(conn, &s);
+            let blob = "x".repeat(4 * 1024 * 1024);
+            let data = serde_json::json!({
+                "tab_title": "Trip Planning",
+                "tab_emoji": "🧳",
+                "name_user_set": true,
+                "messages": [{ "huge": blob }],
+            })
+            .to_string();
+            conn.execute("UPDATE sessions SET data = ?2 WHERE id = ?1", params![s.id, data]).unwrap();
+            assert!(parse_session(&s.id, &data).is_none(), "data must not be a Session for this test");
+
+            let (metas, total) = list_metadata_conn(conn, None, 0, 10).unwrap();
+            assert_eq!(total, 1);
+            let m = &metas[0];
+            assert_eq!(m.id, s.id);
+            assert_eq!(m.name, "Sep 18 - 10:00 AM");
+            assert_eq!(m.tab_title.as_deref(), Some("Trip Planning"));
+            assert_eq!(m.display_emoji(), Some("🧳"));
+            assert!(m.name_user_set);
+            assert_eq!(m.display_title(), "Sep 18 - 10:00 AM");
+            assert_eq!(metadata_by_ids_conn(conn, std::slice::from_ref(&s.id)).unwrap()[0], *m);
+        });
+    }
+
+    #[test]
+    fn listing_survives_malformed_data() {
+        with_test_db(|conn| {
+            let s = session("Sep 19 - 08:00 AM", false, Some("Garden"), Some("🌱"));
+            upsert(conn, &s);
+            conn.execute("UPDATE sessions SET data = '{not json' WHERE id = ?1", params![s.id]).unwrap();
+            let (metas, _) = list_metadata_conn(conn, None, 0, 10).unwrap();
+            // The column still carries the title; the JSON-only fields are blank.
+            assert_eq!(metas[0].display_title(), "Garden");
+            assert_eq!(metas[0].tab_emoji, None);
+            assert!(!metas[0].name_user_set);
+        });
+    }
+
+    /// Until `spawn_tab_title_backfill` reaches a row, its `tab_title`
+    /// column is NULL: the title comes from the JSON instead.
+    #[test]
+    fn null_tab_title_column_falls_back_to_json() {
+        with_test_db(|conn| {
+            let titled = session("Sep 20 - 09:00 AM", false, Some("Quarterly Budget Review"), Some("💰"));
+            let untitled = session("Sep 21 - 09:00 AM", false, None, None);
+            upsert(conn, &titled);
+            upsert(conn, &untitled);
+            conn.execute("UPDATE sessions SET tab_title = NULL", []).unwrap();
+            let metas = metadata_by_ids_conn(conn, &[titled.id.clone(), untitled.id.clone()]).unwrap();
+            assert_eq!(metas[0].display_title(), "Quarterly Budget Review");
+            assert_eq!(metas[1].tab_title, None);
+            assert_eq!(metas[1].display_title(), "Sep 21 - 09:00 AM");
+        });
+    }
+
+    #[test]
+    fn search_matches_name_and_title_and_misses_the_rest() {
+        with_test_db(|conn| {
+            upsert(conn, &session("Garden notes", false, None, None));
+            upsert(conn, &session("Sep 22 - 09:00 AM", false, Some("Garden Planning"), None));
+            upsert(conn, &session("Sep 23 - 09:00 AM", false, Some("Taxes"), None));
+            let (metas, total) = list_metadata_conn(conn, Some("GARDEN"), 0, 10).unwrap();
+            assert_eq!(total, 2);
+            let mut titles: Vec<String> = metas.iter().map(SessionMeta::display_title).collect();
+            titles.sort();
+            assert_eq!(titles, ["Garden Planning", "Garden notes"]);
+            // Pagination keeps the total.
+            let (page, total) = list_metadata_conn(conn, Some("garden"), 1, 1).unwrap();
+            assert_eq!((page.len(), total), (1, 2));
+        });
+    }
+
+    /// `list_version` moves when the listing changes (the History drawer
+    /// re-queries on it), and a save that changes nothing listed (a
+    /// streaming reply's other fields) leaves the row's listing hash alone.
+    #[test]
+    fn list_version_tracks_listing_changes_only() {
+        with_test_db(|conn| {
+            let mut s = session("Sep 24 - 09:00 AM", false, None, None);
+            let v0 = list_version();
+            upsert(conn, &s);
+            let v1 = list_version();
+            assert!(v1 > v0, "a new row bumps the version");
+
+            let before = build_row(&s, next_seq()).unwrap().list_hash;
+            s.scratchpad = "streaming scratch".into();
+            s.project_id = Some("p".into());
+            assert_eq!(build_row(&s, next_seq()).unwrap().list_hash, before);
+            s.tab_title = Some("Retitled".into());
+            assert_ne!(build_row(&s, next_seq()).unwrap().list_hash, before);
+            upsert(conn, &s);
+            let v2 = list_version();
+            assert!(v2 > v1, "a retitle bumps the version");
+
+            rename_session_conn(conn, &s.id, "Renamed").unwrap();
+            let v3 = list_version();
+            assert!(v3 > v2, "a rename from History bumps the version");
+            assert_eq!(list_metadata_conn(conn, None, 0, 10).unwrap().0[0].name, "Renamed");
+
+            delete_session_for_test(conn, &s.id);
+            assert!(list_version() > v3, "a delete bumps the version");
+            assert_eq!(list_metadata_conn(conn, None, 0, 10).unwrap().1, 0);
+        });
+    }
+
     #[test]
     fn search_matches_ai_topic_title() {
         with_test_db(|conn| {
@@ -2078,7 +2236,16 @@ mod list_metadata_tests {
 
     #[test]
     fn display_emoji_ignores_blank() {
-        let mut m = SessionMeta::from_row("a".into(), "n".into(), String::new(), 0, String::new(), None);
+        let mut m = SessionMeta {
+            id: "a".into(),
+            name: "n".into(),
+            last_updated: String::new(),
+            message_count: 0,
+            summary: String::new(),
+            tab_title: None,
+            tab_emoji: None,
+            name_user_set: false,
+        };
         assert_eq!(m.display_emoji(), None);
         m.tab_emoji = Some("  ".into());
         assert_eq!(m.display_emoji(), None);
