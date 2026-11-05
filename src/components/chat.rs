@@ -215,16 +215,20 @@ pub fn ChatWindow(
         // A session with no pinned profile uses the global active one —
         // `get_mcp_context(None)` would return every profile's Composio
         // server, whose tools collide by name at the provider.
-        let (profile_id, selected_reach) = {
+        // Resolved by profile_reach::ProfileScope, as dispatch is. A removed
+        // pin keeps its dead id here, so the context carries no Composio
+        // tools rather than another profile's.
+        let scope = {
             let state = session_state.read();
             let session = state.sessions.get(&target_id);
-            (
-                session
-                    .and_then(|s| s.composio_profile.clone())
-                    .or_else(|| settings_snapshot.get_active_profile().map(|p| p.id.clone())),
-                session.map(|s| s.profile_reach.clone()).unwrap_or_default(),
+            crate::mcp::manager::profile_reach::ProfileScope::resolve(
+                &settings_snapshot,
+                &target_id,
+                session.and_then(|s| s.composio_profile.as_deref()),
+                session.map_or(&[][..], |s| s.profile_reach.as_slice()),
             )
         };
+        let profile_id = scope.turn_pin();
 
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
@@ -239,12 +243,7 @@ pub fn ChatWindow(
         // profiles ticked on their chip): the other reachable profiles'
         // Composio tools join the home set, each call naming its profile
         // (mcp::manager::profile_reach).
-        let reach = crate::mcp::manager::profile_reach::session_reach(
-            &settings_snapshot,
-            &target_id,
-            profile_id.as_deref(),
-            &selected_reach,
-        );
+        let reach = scope.reach;
         if reach.len() > 1 {
             let mut others = Vec::new();
             for p in &reach[1..] {
@@ -519,13 +518,18 @@ pub fn ChatWindow(
                     );
                 }
 
-                // 1. Identify tools that need to be run and capture profile context
-                let composio_profile = {
+                // 1. Identify tools that need to be run and capture profile context:
+                // the tab's raw pin (resolved per call by resume_profile_in) and
+                // its resolved home (profile_reach::ProfileScope) for built-ins.
+                let (composio_profile, home_profile) = {
                     let state = session_state.read();
-                    state
-                        .sessions
-                        .get(&owning_id)
-                        .and_then(|s| s.composio_profile.clone())
+                    let pin = state.sessions.get(&owning_id).and_then(|s| s.composio_profile.clone());
+                    let home = state.sessions.get(&owning_id).and_then(|s| {
+                        crate::mcp::manager::profile_reach::ProfileScope::for_session(&settings.peek(), s)
+                            .home_id()
+                            .map(str::to_string)
+                    });
+                    (pin, home)
                 };
 
                 {
@@ -641,7 +645,7 @@ pub fn ChatWindow(
                                 &tool_call,
                                 &args_json,
                                 &owning_id,
-                                composio_profile.as_ref(),
+                                home_profile.as_ref(),
                                 // Only approved calls are `Running` here (see step 1):
                                 // the Approve click already satisfied the skill gate.
                                 true,
@@ -691,10 +695,7 @@ pub fn ChatWindow(
                                 )
                             };
                             // Connect only another company's client (not home's).
-                            let routed = {
-                                let home = crate::mcp::manager::profile_reach::home_profile(&settings.peek(), composio_profile.as_deref());
-                                matches!(&call_profile, Ok(Some(p)) if home.as_deref() != Some(p.as_str()))
-                            };
+                            let routed = matches!(&call_profile, Ok(Some(p)) if home_profile.as_deref() != Some(p.as_str()));
                             let result_receiver = match call_profile {
                                 // Its profile is gone: refuse, never re-route.
                                 Err(e) => Err(e),
@@ -772,7 +773,7 @@ pub fn ChatWindow(
                             profile_color: {
                                 let settings_read = settings.read();
                                 crate::components::shared::resolve_profile_color(
-                                    tool_call.profile_id.as_ref().or(composio_profile.as_ref()),
+                                    tool_call.profile_id.as_ref().or(home_profile.as_ref()),
                                     &settings_read,
                                 )
                             },

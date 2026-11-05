@@ -110,10 +110,6 @@ impl ProfileScope {
         self.home.as_ref().map(|h| h.name.as_str())
     }
 
-    pub fn is_missing(&self) -> bool {
-        matches!(self.source, ScopeSource::Missing { .. })
-    }
-
     /// The tab's pin names a profile that no longer exists (the chip warns).
     pub fn pin_removed(&self) -> bool {
         matches!(self.source, ScopeSource::Missing { pinned_id: Some(_) })
@@ -247,15 +243,22 @@ pub fn all_profiles(settings: &Settings) -> Vec<ReachProfile> {
         .collect()
 }
 
-/// [`resume_profile`] with an ordinary tab's own reach (`selected`). The
-/// profile a Composio call was stamped with at mint (`profile_id`: its
+/// The profile an approved call runs in on the resume path, from the tab's
+/// [`ProfileScope`] (the same resolution the streaming path used to guard
+/// it), always explicit: with no profile to act in a Composio call is
+/// refused, never dispatched without one.
+///
+/// The profile a Composio call was stamped with at mint (`profile_id`: its
 /// routed target, else the turn's home) is where it runs — `hobbes_profile`
 /// argument or not — and only while that profile is still the tab's home or
 /// in its reach; otherwise it is refused, never moved to the current home
 /// (repinning between hold and approval would run a flow nobody was shown).
-/// Only a call that is neither routed nor flow-held, in a tab without
-/// reach, keeps the old behaviour: the tab's current pin. System sessions
-/// use [`resume_profile`] unchanged.
+/// Only a call that is neither routed nor flow-held, in an ordinary tab
+/// without reach, runs in the tab's current home. System sessions always
+/// route by the stamp (not `reach.len()`: a system session whose other
+/// profiles dropped out must still refuse a call routed to one of them; an
+/// archive counts too, so a stale held call in it is refused rather than
+/// run at home).
 pub fn resume_profile_in(
     settings: &Settings,
     session_id: &str,
@@ -263,26 +266,41 @@ pub fn resume_profile_in(
     selected: &[String],
     tool_call: &crate::components::shared::ToolCall,
 ) -> Result<Option<String>, String> {
-    if crate::system_sessions::is_system(session_id) || !is_composio_native(&tool_call.server_name) {
-        return resume_profile(settings, session_id, session_profile, tool_call);
+    let scope = ProfileScope::resolve(settings, session_id, session_profile, selected);
+    let home = scope.home_id().map(str::to_string);
+    if !is_composio_native(&tool_call.server_name) {
+        return Ok(home);
     }
-    let home = home_profile(settings, session_profile);
-    let reach = session_reach(settings, session_id, home.as_deref(), selected);
-    let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
-    let routed = asked_profile(&tool_call.tool_name, &args).is_some();
-    if reach.len() < 2 && !routed && tool_call.hold_rule_key.is_none() {
-        return Ok(session_profile.map(str::to_string));
+    if let Some(refusal) = scope.missing_refusal() {
+        return Err(refusal);
     }
+    let reach = &scope.reach;
     let target = tool_call
         .profile_id
         .clone()
         .or_else(|| profile_for_server_name(settings, &tool_call.server_name).map(str::to_string));
+    let name = || tool_call.server_name.trim_start_matches(COMPOSIO_NATIVE_PREFIX).trim_start_matches(':').to_string();
+    if crate::system_sessions::is_system(session_id) {
+        return match target {
+            None => Ok(home),
+            Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
+            Some(_) => Err(format!(
+                "Not run: the profile this was meant for ({}) is no longer available, and it won't be run in another company's account.",
+                name()
+            )),
+        };
+    }
+    let args: Value = serde_json::from_str(&tool_call.arguments).unwrap_or(Value::Null);
+    let routed = asked_profile(&tool_call.tool_name, &args).is_some();
+    if reach.len() < 2 && !routed && tool_call.hold_rule_key.is_none() {
+        return Ok(home);
+    }
     match target {
         Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
-        None if !routed => Ok(session_profile.map(str::to_string)),
+        None if !routed => Ok(home),
         _ => Err(format!(
             "Not run: the profile this was meant for ({}) is no longer this tab's home or in its reach, and it won't be run in another company's account.",
-            tool_call.server_name.trim_start_matches(COMPOSIO_NATIVE_PREFIX).trim_start_matches(':')
+            name()
         )),
     }
 }
@@ -624,43 +642,6 @@ pub fn route_in_scope(scope: &ProfileScope, tool_call: &mut crate::components::s
     match scope.missing_refusal() {
         Some(refusal) if is_composio_native(&tool_call.server_name) => Route::Refused(refusal),
         _ => route_tool_call(&scope.reach, tool_call),
-    }
-}
-
-/// The profile a held (then approved) call runs in on the resume path.
-/// Sessions without reach keep the old behaviour exactly (the session's own
-/// pin, `None` included). With reach, the call's routed target — refused if
-/// that profile is no longer reachable, never silently moved to home.
-pub fn resume_profile(
-    settings: &Settings,
-    session_id: &str,
-    session_profile: Option<&str>,
-    tool_call: &crate::components::shared::ToolCall,
-) -> Result<Option<String>, String> {
-    if !is_composio_native(&tool_call.server_name) {
-        return Ok(session_profile.map(str::to_string));
-    }
-    // Only system sessions route; everything else keeps its own pin. (Not
-    // `reach.len()`: a system session whose other profiles dropped out must
-    // still refuse a call routed to one of them. An archive counts here, so
-    // a stale held call in it is refused rather than run at home: its reach
-    // is home only.)
-    if !crate::system_sessions::is_system(session_id) {
-        return Ok(session_profile.map(str::to_string));
-    }
-    let home = home_profile(settings, session_profile);
-    let reach = reach_for_session(settings, session_id, home.as_deref());
-    let target = tool_call
-        .profile_id
-        .clone()
-        .or_else(|| profile_for_server_name(settings, &tool_call.server_name).map(str::to_string));
-    match target {
-        None => Ok(home),
-        Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
-        Some(_) => Err(format!(
-            "Not run: the profile this was meant for ({}) is no longer available, and it won't be run in another company's account.",
-            tool_call.server_name.trim_start_matches(COMPOSIO_NATIVE_PREFIX).trim_start_matches(':')
-        )),
     }
 }
 
@@ -1155,13 +1136,16 @@ mod tests {
         held.server_name = "composio-native:Puget".into();
         held.profile_id = Some("pg".into());
         // Still reachable: runs in Puget.
-        assert_eq!(resume_profile(&settings, "reach-test-voice", Some("cm"), &held), Ok(Some("pg".into())));
+        assert_eq!(resume_profile_in(&settings, "reach-test-voice", Some("cm"), &[], &held), Ok(Some("pg".into())));
         // Puget lost its key before the approval: refused, not run at home.
         let broken = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", false)]);
-        assert!(resume_profile(&broken, "reach-test-voice", Some("cm"), &held).is_err());
-        // An ordinary tab: exactly as before (its own pin, even None).
-        assert_eq!(resume_profile(&settings, "a-normal-tab", None, &held), Ok(None));
-        assert_eq!(resume_profile(&settings, "a-normal-tab", Some("cm"), &held), Ok(Some("cm".into())));
+        assert!(resume_profile_in(&broken, "reach-test-voice", Some("cm"), &[], &held).is_err());
+        // An ordinary tab without reach: a call routed to Puget is refused,
+        // and with no pin and no global profile there is nowhere to run it
+        // (it used to dispatch with no profile, for the manager to pick).
+        assert!(resume_profile_in(&settings, "a-normal-tab", Some("cm"), &[], &held).is_err());
+        let refused = resume_profile_in(&settings, "a-normal-tab", None, &[], &held).unwrap_err();
+        assert!(refused.contains("no Composio profile"), "{refused}");
     }
 
     #[test]
@@ -1220,10 +1204,14 @@ mod tests {
         assert_eq!(route_tool_call(&reach, &mut c), Route::Unchanged);
         let mut c = call(json!({"hobbes_profile": "Puget"}));
         assert!(matches!(route_tool_call(&reach, &mut c), Route::Refused(_)));
-        // A held call resumes in the tab's pin, None included.
+        // A held call resumes in the tab's home — explicitly, also for an
+        // unpinned tab (the global profile; it used to dispatch with None).
         let held = call(json!({"to": "a@b.c"}));
         assert_eq!(resume_profile_in(&settings, "p2-plain", Some("cm"), &[], &held), Ok(Some("cm".into())));
-        assert_eq!(resume_profile_in(&settings, "p2-plain", None, &[], &held), Ok(None));
+        assert_eq!(resume_profile_in(&settings, "p2-plain", None, &[], &held), Ok(Some("cm".into())));
+        // A removed pin: refused, never the global profile.
+        let removed = resume_profile_in(&settings, "p2-plain", Some("gone"), &[], &held).unwrap_err();
+        assert!(removed.contains("profile was removed"), "{removed}");
     }
 
     fn read_via_reach(profile: &ReachProfile, at: chrono::DateTime<chrono::Utc>) -> Message {
@@ -1562,8 +1550,9 @@ mod tests {
             assert_eq!(scope.source, r.source, "source: {}", r.what);
             // Reach is anchored on home: none without one.
             assert_eq!(scope.reach.first(), scope.home.as_ref(), "reach: {}", r.what);
-            assert_eq!(scope.is_missing(), scope.home.is_none(), "missing: {}", r.what);
-            assert_eq!(scope.missing_refusal().is_some(), scope.is_missing(), "refusal: {}", r.what);
+            let missing = matches!(scope.source, ScopeSource::Missing { .. });
+            assert_eq!(missing, scope.home.is_none(), "missing: {}", r.what);
+            assert_eq!(scope.missing_refusal().is_some(), missing, "refusal: {}", r.what);
         }
     }
 
