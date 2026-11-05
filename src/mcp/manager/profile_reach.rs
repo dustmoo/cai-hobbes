@@ -212,22 +212,27 @@ pub fn reach_of(settings: &Settings, session: &crate::session::Session) -> Vec<R
 /// What a tab's profile chip shows, from the same resolution dispatch uses
 /// ([`ProfileScope`]): the home profile's id (`None` when nothing resolves),
 /// whether its reach can be edited here (an ordinary tab with a home), and
-/// the names of the other profiles it reaches.
+/// the names of the other profiles it reaches, and whether the tab's pin
+/// names a removed profile (the chip warns; its Composio calls are refused).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChipReach {
     pub home: Option<String>,
     pub editable: bool,
     pub extra: Vec<String>,
+    pub pin_removed: bool,
 }
 
 pub fn chip_reach(settings: &Settings, session: &crate::session::Session) -> ChipReach {
-    let reach = reach_of(settings, session);
+    let scope = ProfileScope::for_session(settings, session);
+    let pin_removed = scope.pin_removed();
+    let reach = scope.reach;
     let home = reach.first().map(|h| h.id.clone());
     let editable = home.is_some() && !crate::system_sessions::is_system(&session.id);
     ChipReach {
         home,
         editable,
         extra: if editable { reach.into_iter().skip(1).map(|p| p.name).collect() } else { Vec::new() },
+        pin_removed,
     }
 }
 
@@ -1386,11 +1391,12 @@ mod tests {
     fn the_chip_shows_the_home_calls_run_in() {
         let settings = reach_settings();
         let chip = chip_reach(&settings, &tab("p2-chip", "cm", &["pg", "gone"]));
-        assert_eq!(chip, ChipReach { home: Some("cm".into()), editable: true, extra: vec!["Puget".into()] });
+        assert_eq!(chip, ChipReach { home: Some("cm".into()), editable: true, extra: vec!["Puget".into()], pin_removed: false });
         // Pinned to a deleted profile: dispatch has no home, so neither does
         // the chip (not the global active profile), and reach can't be edited.
         let chip = chip_reach(&settings, &tab("p2-chip-gone", "gone", &["pg"]));
-        assert_eq!(chip, ChipReach { home: None, editable: false, extra: vec![] });
+        // A removed pin: no home and the chip warns.
+        assert_eq!(chip, ChipReach { home: None, editable: false, extra: vec![], pin_removed: true });
         // Unpinned: the global active profile, as dispatch.
         let mut unpinned = tab("p2-chip-unpinned", "x", &["pg"]);
         unpinned.composio_profile = None;
