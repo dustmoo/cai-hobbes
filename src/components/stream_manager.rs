@@ -724,7 +724,7 @@ impl StreamManagerContext {
                                     reach_mod::Route::Unchanged
                                         if crate::mcp::manager::is_composio_native(&tool_call.server_name) =>
                                     {
-                                        Some(&reach[0])
+                                        reach.first()
                                     }
                                     _ => None,
                                 };
@@ -736,7 +736,7 @@ impl StreamManagerContext {
                                     None => reach_mod::local_write(&tool_call.server_name, &tool_call.tool_name, &args),
                                 };
                                 let named = reach_mod::all_profiles(&settings_read);
-                                let hold = reach_mod::cross_company_hold(target, &reach[0], &read_from, &named, write);
+                                let hold = reach_mod::cross_company_hold_in(target, reach.first(), &read_from, &named, write);
                                 if let Some(hold) = hold {
                                     let project_id = session.and_then(|s| s.project_id.clone());
                                     let rule = crate::context::trust::evaluate(

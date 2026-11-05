@@ -344,7 +344,10 @@ pub fn inherited_sources(settings: &Settings, old: &crate::session::Session) -> 
 /// tab that has only ever used one profile is never checked.
 pub fn flow_checked(reach: &[ReachProfile], read_from: &BTreeSet<String>) -> bool {
     match reach.first() {
-        None => false,
+        // No profile to act in: Composio calls are refused, but other
+        // writes (dispatch, relay, terminal) can still carry data the
+        // conversation read.
+        None => !read_from.is_empty(),
         Some(home) => reach.len() >= 2 || read_from.iter().any(|id| id != &home.id),
     }
 }
@@ -835,6 +838,7 @@ pub struct Hold {
 /// Hold a write that lands outside home, or after reading another company's
 /// data. `target` = the Composio profile written to; `None` = a non-Composio
 /// write (terminal, dispatch, …), which counts as home-side.
+#[cfg(test)]
 pub fn cross_company_hold(
     target: Option<&ReachProfile>,
     home: &ReachProfile,
@@ -842,10 +846,23 @@ pub fn cross_company_hold(
     reach: &[ReachProfile],
     write: bool,
 ) -> Option<Hold> {
+    cross_company_hold_in(target, Some(home), read_from, reach, write)
+}
+
+/// [`cross_company_hold`] for a chat that may have no home (its profile was
+/// removed): every company it read from counts as a source, so a write
+/// outside the connected accounts is still held.
+pub fn cross_company_hold_in(
+    target: Option<&ReachProfile>,
+    home: Option<&ReachProfile>,
+    read_from: &BTreeSet<String>,
+    reach: &[ReachProfile],
+    write: bool,
+) -> Option<Hold> {
     if !write {
         return None;
     }
-    let dest_id = target.map_or(home.id.as_str(), |t| t.id.as_str());
+    let dest_id = target.or(home).map_or("", |t| t.id.as_str());
     let name_of = |id: &str| reach.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_string());
     let sources: Vec<&String> = read_from.iter().filter(|id| id.as_str() != dest_id).collect();
     let to_key = target.map_or("local".to_string(), |t| t.id.clone());
@@ -864,8 +881,8 @@ pub fn cross_company_hold(
             rule_key: format!("{FLOW_KEY_PREFIX}{}>{to_key}", ids.join("+")),
         });
     }
-    match target {
-        Some(t) if t.id != home.id => Some(Hold {
+    match (target, home) {
+        (Some(t), Some(home)) if t.id != home.id => Some(Hold {
             reason: format!("This acts in {}, outside {} (this chat's home profile).", t.name, home.name),
             rule_key: format!("{FLOW_KEY_PREFIX}act>{}", t.id),
         }),
@@ -1406,7 +1423,9 @@ mod tests {
         single.messages.push(read_at_home(&cm, now));
         let reach = reach_of(&settings, &single);
         assert!(!flow_checked(&reach, &session_read_profiles(&settings, &single, now)));
-        assert!(!flow_checked(&[], &BTreeSet::from(["pg".to_string()])));
+        // No home at all (profile removed): checked once data was read
+        // (it used to switch the guard off).
+        assert!(flow_checked(&[], &BTreeSet::from(["pg".to_string()])));
     }
 
     /// 4. The chip's home is dispatch's home, not a display fallback.
@@ -1643,6 +1662,20 @@ mod tests {
         assert_eq!(route_in_scope(&global, &mut call(json!({}))), Route::Unchanged);
         // A removed pin stays removed when the turn resolves it again.
         assert_eq!(gone.turn_pin().as_deref(), Some("gone"));
+    }
+
+    /// A tab whose profile was removed still holds data it read: the guard
+    /// stays on for writes outside the connected accounts.
+    #[test]
+    fn a_tab_without_a_profile_keeps_the_flow_guard() {
+        let read_pg: BTreeSet<String> = ["pg".to_string()].into();
+        assert!(flow_checked(&[], &read_pg));
+        assert!(!flow_checked(&[], &BTreeSet::new()));
+        let named = vec![p("pg", "Puget")];
+        let hold = cross_company_hold_in(None, None, &read_pg, &named, true).expect("held");
+        assert_eq!(hold.rule_key, "profile-flow:pg>local");
+        assert!(hold.reason.contains("read Puget data"));
+        assert!(cross_company_hold_in(None, None, &read_pg, &named, false).is_none());
     }
 
     #[test]
