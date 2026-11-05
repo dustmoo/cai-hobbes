@@ -477,17 +477,24 @@ fn read_pin_batch(conn: &Connection, after: i64, max_bytes: i64) -> rusqlite::Re
     Ok(Some((last, rows)))
 }
 
-/// The rows of a batch whose pin the rule changes, as (id, the seq it was
-/// read at, the fixed session). Pure apart from the system-session
-/// registry; runs without the connection lock. Each row is parsed once for
-/// its pin and, only when it is unpinned or holds a profile name, once in
-/// full.
+/// A fixed row, ready to write: the seq it was read at, the rewritten row
+/// and its journal event — all built without the connection lock.
+struct PinFix {
+    read_seq: i64,
+    row: SessionRow,
+    events: Vec<SessionEventRow>,
+}
+
+/// The rows of a batch whose pin the rule changes, built into the rows to
+/// write. Pure apart from the system-session registry; runs without the
+/// connection lock. Each row is parsed once for its pin and, only when it
+/// is unpinned or holds a profile name, once in full.
 fn pin_fixes(
     rules: &crate::settings::Settings,
     rows: Vec<PinRow>,
     high_water: i64,
     skip: &std::collections::HashSet<String>,
-) -> Vec<(String, i64, Session)> {
+) -> Vec<PinFix> {
     #[derive(serde::Deserialize)]
     struct PinProbe {
         #[serde(default)]
@@ -506,54 +513,50 @@ fn pin_fixes(
             }
             let mut session = parse_session(&id, &data)?;
             let fixed = crate::mcp::manager::profile_reach::pin_fix(rules, &session)?;
-            session.composio_profile = Some(fixed);
-            Some((id, seq, session))
+            session.composio_profile = Some(fixed.clone());
+            let row = match build_row(&session, next_seq()) {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(session_id = %id, "pin backfill: row skipped: {e}");
+                    return None;
+                }
+            };
+            let events = prepare_event_rows(&id, &[SessionEvent::ComposioProfileSet { profile: Some(fixed) }]);
+            Some(PinFix { read_seq: seq, row, events })
         })
         .collect()
 }
 
 /// Write a batch's fixes and advance the cursor to `last`, in one
-/// transaction with their journal events. A row is written only if it still
-/// has the seq it was read at and no in-memory copy (no fingerprint).
-/// Returns how many rows were pinned.
-fn write_pin_fixes(conn: &Connection, fixes: &[(String, i64, Session)], last: i64) -> rusqlite::Result<usize> {
+/// transaction with their journal events. Under the lock only the checks
+/// and the writes: a row is written only if it still has the seq it was
+/// read at and no in-memory copy (no fingerprint). Returns how many rows
+/// were pinned.
+fn write_pin_fixes(conn: &Connection, fixes: &[PinFix], last: i64) -> rusqlite::Result<usize> {
     use rusqlite::OptionalExtension;
     let tx = conn.unchecked_transaction()?;
-    let mut writes = Vec::new();
-    for (id, seq, session) in fixes {
+    let mut writes: Vec<&PinFix> = Vec::new();
+    for fix in fixes {
         let now: Option<i64> =
-            tx.query_row("SELECT seq FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
-        if now != Some(*seq) {
-            continue;
+            tx.query_row("SELECT seq FROM sessions WHERE id = ?1", params![fix.row.id], |r| r.get(0)).optional()?;
+        if now == Some(fix.read_seq) {
+            writes.push(fix);
         }
-        writes.push((id, session));
     }
     // Checked under the connection lock (loads record fingerprints under
     // it); the guard is dropped before the journal takes the tombstone
     // lock (`mark_rows_saved` takes tombstones, then fingerprints).
     {
         let fps = fingerprints().lock().unwrap();
-        writes.retain(|(id, _)| !fps.contains_key(id.as_str()));
+        writes.retain(|f| !fps.contains_key(&f.row.id));
     }
-    let mut events = Vec::new();
-    for (id, session) in &writes {
-        let row = match build_row(session, next_seq()) {
-            Ok(row) => row,
-            Err(e) => {
-                tracing::warn!(session_id = %id, "pin backfill: row skipped: {e}");
-                continue;
-            }
-        };
-        upsert_row(&tx, &row)?;
-        events.extend(prepare_event_rows(
-            id,
-            &[SessionEvent::ComposioProfileSet { profile: session.composio_profile.clone() }],
-        ));
+    for fix in &writes {
+        upsert_row(&tx, &fix.row)?;
+        insert_event_rows_in(&tx, &fix.events)?;
     }
-    insert_event_rows_in(&tx, &events)?;
     meta_set_conn(&tx, META_PIN_CURSOR, &last.to_string(), next_seq())?;
     tx.commit()?;
-    Ok(events.len())
+    Ok(writes.len())
 }
 
 /// One-time: prepend each row's AI topic title to `search_text`, matching what
