@@ -14,8 +14,13 @@
 //! rows are live). Callers never need settings access.
 //!
 //! Hobbes rows carry no `transcript_path`, so the brief supervisor skips
-//! them — their state already lives in the app. (A later refinement could
-//! surface `Session.conversation_summary` as their brief.)
+//! them — their state already lives in the app. Their brief is built at
+//! each turn end ([`briefs::hobbes_turn_brief`](super::briefs::hobbes_turn_brief)):
+//! headline and bullets from `Session.conversation_summary`, the blocker
+//! only from the turn that just ended ([`latest_turn_ask`]). The summary's
+//! rolling `entities.blockers` is never read as an ask. A turn start clears
+//! the blocker (`reduce` on PromptSubmit), and a summary that lands between
+//! turns refreshes the headline without touching it ([`refresh_brief`]).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -97,12 +102,26 @@ pub fn report(session_id: &str, name: &str, signal: HobbesSignal) {
 /// `TurnCompleted`/`Closed` it becomes the row's re-entry brief via the same
 /// tolerant mapper the LLM path uses (`briefs::brief_from_summary_value`) —
 /// zero extra LLM calls, and the day rollup / planner context / fleet-status
-/// tool pick it up for free.
+/// tool pick it up for free. The summary's blockers are not an ask: the
+/// brief carries none (see [`report_turn`] for a turn that asks).
 pub fn report_with_brief(
     session_id: &str,
     name: &str,
     signal: HobbesSignal,
     summary_json: Option<serde_json::Value>,
+) {
+    let is_final = matches!(signal, HobbesSignal::Closed);
+    let brief = super::briefs::hobbes_turn_brief(summary_json.as_ref(), None, Utc::now(), is_final);
+    report_turn(session_id, name, signal, brief);
+}
+
+/// [`report`] with a ready-made brief for the row (applied only at a turn
+/// end, a timer wait or a close — see [`super::briefs::hobbes_turn_brief`]).
+pub fn report_turn(
+    session_id: &str,
+    name: &str,
+    signal: HobbesSignal,
+    brief: Option<super::SessionBrief>,
 ) {
     if !enabled() || session_id.is_empty() {
         return;
@@ -120,15 +139,12 @@ pub fn report_with_brief(
         });
         store::append_event(ev.session_id(), ev.event_name(), &body.to_string());
     }
-    let is_final = matches!(signal, HobbesSignal::Closed);
-    let brief = summary_json
-        .filter(|_| {
-            matches!(
-                signal,
-                HobbesSignal::TurnCompleted | HobbesSignal::TimerWaiting { .. } | HobbesSignal::Closed
-            )
-        })
-        .and_then(|v| super::briefs::brief_from_summary_value(&v, now, is_final));
+    let brief = brief.filter(|_| {
+        matches!(
+            signal,
+            HobbesSignal::TurnCompleted | HobbesSignal::TimerWaiting { .. } | HobbesSignal::Closed
+        )
+    });
     let shared = super::shared();
     let changed = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
@@ -182,6 +198,72 @@ fn patch_row(
         }
         _ if s.status != super::FleetStatus::Waiting => s.wake_at = None,
         _ => {}
+    }
+}
+
+/// A conversation summary landed for a Hobbes tab (proactive at turn start,
+/// or the idle / forced scheduler): refresh the live row's headline and
+/// bullets. The blocker is kept as the row has it — set by the latest turn
+/// end, or cleared by the turn now running — never read from the summary.
+/// No-op while disarmed, for a tab with no live row, or for an external
+/// session.
+pub fn refresh_brief(session_id: &str, summary_json: &serde_json::Value) {
+    if !enabled() || session_id.is_empty() {
+        return;
+    }
+    let shared = super::shared();
+    let row = {
+        let mut state = shared.state.lock().expect("fleet state lock poisoned");
+        state
+            .sessions
+            .get_mut(session_id)
+            .filter(|s| s.origin == FleetOrigin::Hobbes)
+            .and_then(|s| apply_refreshed_brief(s, summary_json, Utc::now()).then(|| s.clone()))
+    };
+    if let Some(row) = row {
+        store::persist_sessions(std::slice::from_ref(&row));
+        shared.poke();
+    }
+}
+
+/// Pure core of [`refresh_brief`]: returns whether the row changed.
+fn apply_refreshed_brief(
+    s: &mut super::FleetSession,
+    summary_json: &serde_json::Value,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let Some(mut b) = super::briefs::brief_from_summary_value(summary_json, now, false) else {
+        return false;
+    };
+    b.blocked_on = s.brief.as_ref().and_then(|old| old.blocked_on.clone());
+    let unchanged = s
+        .brief
+        .as_ref()
+        .is_some_and(|old| old.headline == b.headline && old.bullets == b.bullets);
+    if unchanged {
+        return false;
+    }
+    s.brief = Some(b);
+    true
+}
+
+/// What the latest turn of a Hobbes chat asks the person, if anything: the
+/// question its closing reply ends on ([`super::briefs::question_in_reply`]).
+/// Only the turn's last message counts — a reply followed by a tool call, a
+/// relay or the person's next message asks nothing now. A pending tool
+/// approval is reported separately (`GateWaiting`), not here.
+pub fn latest_turn_ask(messages: &[crate::components::chat::Message]) -> Option<String> {
+    use crate::components::shared::MessageContent;
+    let last = messages.iter().rev().find(|m| match &m.content {
+        MessageContent::Text { content, .. } => !content.trim().is_empty(),
+        _ => true,
+    })?;
+    if last.author != "Hobbes" {
+        return None;
+    }
+    match &last.content {
+        MessageContent::Text { content, .. } => super::briefs::question_in_reply(content),
+        _ => None,
     }
 }
 
@@ -249,10 +331,20 @@ mod tests {
     // report() itself is exercised only for the disarmed no-op.
 
     fn fold(state: &mut crate::fleet::FleetState, id: &str, name: &str, sig: HobbesSignal) {
+        fold_with(state, id, name, sig, None);
+    }
+
+    fn fold_with(
+        state: &mut crate::fleet::FleetState,
+        id: &str,
+        name: &str,
+        sig: HobbesSignal,
+        brief: Option<crate::fleet::SessionBrief>,
+    ) {
         let ev = to_event(id, &sig);
         let now = Utc::now();
         let mut changed = crate::fleet::reduce(state, &ev, now);
-        let patch = |s: &mut crate::fleet::FleetSession| patch_row(s, name, None, &sig);
+        let patch = |s: &mut crate::fleet::FleetSession| patch_row(s, name, brief.as_ref(), &sig);
         if let Some(s) = state.sessions.get_mut(ev.session_id()) {
             patch(s);
         }
@@ -349,6 +441,118 @@ mod tests {
         assert_eq!(brief.headline, "Drafted the Puget proposal.");
         assert_eq!(brief.blocked_on.as_deref(), Some("waiting on legal"));
         assert!(brief.final_brief);
+
+        // A Hobbes row never takes its ask from the rolling summary: its
+        // blockers are preserved turn after turn and never clear.
+        let row_brief = crate::fleet::briefs::hobbes_turn_brief(Some(&v), None, Utc::now(), true).unwrap();
+        assert_eq!(row_brief.headline, "Drafted the Puget proposal.");
+        assert_eq!(row_brief.blocked_on, None);
+        let asked = crate::fleet::briefs::hobbes_turn_brief(
+            Some(&v),
+            Some("Send it to legal now?".into()),
+            Utc::now(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(asked.blocked_on.as_deref(), Some("Send it to legal now?"));
+    }
+
+    fn summary_with_stale_blocker() -> serde_json::Value {
+        let mut cs = crate::session::ConversationSummary::default();
+        cs.summary = "Planning the week.".to_string();
+        cs.entities
+            .other_entities
+            .insert("blockers".into(), serde_json::json!(["Schedule over capacity"]));
+        serde_json::to_value(&cs).unwrap()
+    }
+
+    #[test]
+    fn a_hobbes_row_asks_only_what_its_latest_turn_asked() {
+        let mut state = crate::fleet::FleetState::default();
+        let v = summary_with_stale_blocker();
+        let brief = |ask: Option<&str>| {
+            crate::fleet::briefs::hobbes_turn_brief(Some(&v), ask.map(str::to_string), Utc::now(), false)
+        };
+        // The turn ends on a question: the row needs the person.
+        fold(&mut state, "tab1", "Week", HobbesSignal::TurnStarted);
+        fold_with(&mut state, "tab1", "Week", HobbesSignal::TurnCompleted, brief(Some("Move the 1:1 to Friday?")));
+        assert_eq!(state.sessions["tab1"].blocked_on(), Some("Move the 1:1 to Friday?"));
+        assert!(state.sessions["tab1"].asks_person());
+
+        // The person answers: the question is gone the moment the turn starts.
+        fold(&mut state, "tab1", "Week", HobbesSignal::TurnStarted);
+        assert_eq!(state.sessions["tab1"].blocked_on(), None);
+        assert!(!state.sessions["tab1"].asks_person());
+
+        // The next turn asks nothing, though the summary still lists its
+        // stale blocker: the row asks nothing.
+        fold_with(&mut state, "tab1", "Week", HobbesSignal::TurnCompleted, brief(None));
+        let s = &state.sessions["tab1"];
+        assert_eq!(s.brief.as_ref().unwrap().headline, "Planning the week.");
+        assert_eq!(s.blocked_on(), None);
+        assert!(!s.asks_person());
+    }
+
+    #[test]
+    fn a_summary_landing_between_turns_keeps_the_rows_ask() {
+        let now = Utc::now();
+        let mut s = crate::fleet::FleetSession::new("tab1", "", now);
+        s.origin = FleetOrigin::Hobbes;
+        s.brief = crate::fleet::briefs::hobbes_turn_brief(None, Some("Ship it?".into()), now, false);
+        let v = summary_with_stale_blocker();
+        assert!(apply_refreshed_brief(&mut s, &v, now));
+        let b = s.brief.as_ref().unwrap();
+        assert_eq!(b.headline, "Planning the week.");
+        assert_eq!(b.blocked_on.as_deref(), Some("Ship it?"), "the turn's ask stays");
+        // Same summary again: nothing to persist.
+        assert!(!apply_refreshed_brief(&mut s, &v, now));
+        // No ask on the row: the summary's blocker doesn't become one.
+        s.brief.as_mut().unwrap().blocked_on = None;
+        s.brief.as_mut().unwrap().headline = "older".into();
+        assert!(apply_refreshed_brief(&mut s, &v, now));
+        assert_eq!(s.blocked_on(), None);
+    }
+
+    fn msg(author: &str, content: crate::components::shared::MessageContent) -> crate::components::chat::Message {
+        crate::components::chat::Message {
+            id: uuid::Uuid::new_v4(),
+            author: author.into(),
+            content,
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+            usage: None,
+        }
+    }
+
+    fn text(t: &str) -> crate::components::shared::MessageContent {
+        crate::components::shared::MessageContent::Text {
+            content: t.into(),
+            thought_signature: None,
+            thought_summary: None,
+            signature_provider: None,
+        }
+    }
+
+    #[test]
+    fn the_latest_turn_asks_when_its_closing_reply_ends_on_a_question() {
+        let asks = vec![
+            msg("User", text("plan my week")),
+            msg("Hobbes", text("Here's the plan.\n\nShould I move the 1:1 to Friday?")),
+            msg("Hobbes", text("  ")),
+        ];
+        assert_eq!(latest_turn_ask(&asks).as_deref(), Some("Should I move the 1:1 to Friday?"));
+        let done = vec![msg("User", text("plan my week")), msg("Hobbes", text("Done — the week is planned."))];
+        assert_eq!(latest_turn_ask(&done), None);
+        // The person has already replied: the question is not this turn's.
+        let mut answered = asks.clone();
+        answered.push(msg("User", text("yes")));
+        assert_eq!(latest_turn_ask(&answered), None);
+        // An error closing the turn asks nothing.
+        let mut errored = asks.clone();
+        errored.push(msg("Hobbes", crate::components::shared::MessageContent::Error { message: "x?".into() }));
+        assert_eq!(latest_turn_ask(&errored), None);
+        assert_eq!(latest_turn_ask(&[]), None);
     }
 
     #[test]

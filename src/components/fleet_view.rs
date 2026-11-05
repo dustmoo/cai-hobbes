@@ -129,25 +129,27 @@ impl Group {
     }
 }
 
+/// Grouped by what the session asks of the person
+/// ([`FleetSession::disposition`]), not its raw status: Claude Code's
+/// `idle_prompt` arrives about a minute after every finished turn, so a raw
+/// `NeedsAttention` is mostly "wrapped, prompt open" — Idle, not Needs you.
 /// Working covers background phases and timer waits: the session is still
 /// on the job and nothing is asked of the user.
-fn group_of(status: &FleetStatus) -> Group {
-    match status {
-        FleetStatus::NeedsAttention(_) => Group::NeedsYou,
-        FleetStatus::Working | FleetStatus::WorkingBackground | FleetStatus::Waiting => {
-            Group::Working
-        }
-        FleetStatus::Idle => Group::Idle,
+fn group_of(session: &FleetSession, now: DateTime<Utc>) -> Group {
+    match session.disposition(now) {
+        fleet::Disposition::Decision => Group::NeedsYou,
+        fleet::Disposition::Active => Group::Working,
+        fleet::Disposition::Parked | fleet::Disposition::Ended => Group::Idle,
     }
 }
 
 /// Live sessions bucketed by [`Group`] (indexed `Group as usize`), each
 /// bucket most recent activity first — except that idle rows whose brief
 /// says they are blocked lead the Idle group.
-fn grouped_sessions(state: &fleet::FleetState) -> [Vec<FleetSession>; 3] {
+fn grouped_sessions(state: &fleet::FleetState, now: DateTime<Utc>) -> [Vec<FleetSession>; 3] {
     let mut groups: [Vec<FleetSession>; 3] = Default::default();
     for s in state.sessions.values() {
-        groups[group_of(&s.status) as usize].push(s.clone());
+        groups[group_of(s, now) as usize].push(s.clone());
     }
     for (i, g) in groups.iter_mut().enumerate() {
         let blocked_first = i == Group::Idle as usize;
@@ -166,18 +168,14 @@ fn grouped_sessions(state: &fleet::FleetState) -> [Vec<FleetSession>; 3] {
 
 /// The brief's blocker, shown whenever the session is not on the job (no
 /// turn, background phase or timer running): a session doing work is not
-/// blocked-waiting on the user, whatever an older brief believed.
+/// blocked-waiting on the user, whatever an older brief believed. Read
+/// through [`FleetSession::blocked_on`], so a brief overtaken by a later
+/// turn (the user answered, or a newer turn stopped) shows nothing.
 fn blocked_text(session: &FleetSession) -> Option<String> {
     if session.status.is_active() {
         return None;
     }
-    session
-        .brief
-        .as_ref()
-        .and_then(|b| b.blocked_on.as_deref())
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-        .map(str::to_string)
+    session.blocked_on().map(str::to_string)
 }
 
 /// The brief's headline, display-safe: briefs stored before headlines were
@@ -315,7 +313,7 @@ pub fn FleetView() -> Element {
     let now = Utc::now();
     let today = Local::now().date_naive();
     let state = fleet_state.read();
-    let groups = grouped_sessions(&state);
+    let groups = grouped_sessions(&state, now);
     let live_count: usize = groups.iter().map(Vec::len).sum();
     let agent_minutes = fleet::fleet_agent_minutes_on(&state, today, now);
     let engaged_minutes = fleet::engaged_seconds_on(&state, today, now) / 60;
@@ -1053,8 +1051,9 @@ fn FleetRow(session: FleetSession, now: DateTime<Utc>, today: chrono::NaiveDate)
         })
     };
     // A finished turn at Claude Code's idle prompt asks nothing: it reads
-    // as idle, not "needs you" (`FleetSession::asks_person`).
-    let attention = session.asks_person();
+    // as idle, not "needs you". Same rule as the group the row sits in
+    // (`FleetSession::disposition`), so a decayed brief question isn't loud.
+    let attention = session.disposition(now) == fleet::Disposition::Decision;
     let (chip_label, chip_color) = if session.status.needs_attention() && !attention {
         status_chip(&FleetStatus::Idle)
     } else {
@@ -1419,14 +1418,26 @@ mod tests {
             session("cc-gate", FleetStatus::NeedsAttention(AttentionKind::Gate), fleet::FleetOrigin::External, 5),
             session("bg", FleetStatus::WorkingBackground, fleet::FleetOrigin::Hobbes, 9),
             session("timer", FleetStatus::Waiting, fleet::FleetOrigin::Hobbes, 3),
+            // Claude Code's idle prompt after a finished turn asks nothing.
+            session(
+                "cc-parked",
+                FleetStatus::NeedsAttention(AttentionKind::Notification {
+                    kind: "idle_prompt".into(),
+                    message: "Claude is waiting for your input".into(),
+                }),
+                fleet::FleetOrigin::External,
+                2,
+            ),
         ] {
             state.sessions.insert(s.id.clone(), s);
         }
-        let g = grouped_sessions(&state);
+        let g = grouped_sessions(&state, utc("2026-08-25T10:00:00Z"));
         let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
         assert_eq!(ids(Group::NeedsYou), vec!["cc-gate", "tab-needs"]);
         assert_eq!(ids(Group::Working), vec!["work-fresh", "timer", "bg"]);
-        assert_eq!(ids(Group::Idle), vec!["idle-old"]);
+        assert_eq!(ids(Group::Idle), vec!["cc-parked", "idle-old"]);
+        // The header counts the same group: the parked prompt isn't counted.
+        assert_eq!(summary_parts(g[Group::NeedsYou as usize].len(), 0, 0).0.as_deref(), Some("2 need you"));
     }
 
     #[test]
@@ -1512,7 +1523,20 @@ mod tests {
     }
 
     #[test]
-    fn blocked_idle_rows_lead_the_idle_group() {
+    fn an_overtaken_brief_shows_no_blocker() {
+        // The brief asked something, then a later turn stopped (or the user
+        // answered): the row's dirty mark is past the brief, so the view
+        // must not show the old question, whatever the raw field says.
+        let now = utc("2026-08-25T10:00:00Z");
+        let mut s = session("a", FleetStatus::Idle, fleet::FleetOrigin::External, 0);
+        s.brief = Some(brief("Wired the exporter", Some("needs the staging API key")));
+        s.brief_dirty_at = Some(utc("2026-08-25T10:05:00Z"));
+        assert_eq!(blocked_text(&s), None);
+        assert_eq!(status_phrase(&s, now), "Wired the exporter");
+    }
+
+    #[test]
+    fn blocked_idle_rows_need_you() {
         let mut state = fleet::FleetState::default();
         let mut blocked = session("blocked-old", FleetStatus::Idle, fleet::FleetOrigin::External, 90);
         blocked.brief = Some(brief("x", Some("waiting on review")));
@@ -1523,9 +1547,19 @@ mod tests {
         ] {
             state.sessions.insert(s.id.clone(), s);
         }
-        let g = grouped_sessions(&state);
-        let ids: Vec<&str> = g[Group::Idle as usize].iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["blocked-old", "fresh", "older"]);
+        let g = grouped_sessions(&state, utc("2026-08-25T10:00:00Z"));
+        // A current brief question is a decision: it needs you.
+        let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
+        assert_eq!(ids(Group::NeedsYou), vec!["blocked-old"]);
+        assert_eq!(ids(Group::Idle), vec!["fresh", "older"]);
+
+        // Half a day later the brief's question has decayed: the row drops to
+        // Idle (where blocked rows still lead), and the header stops counting it.
+        let later = utc("2026-08-25T23:00:00Z");
+        let g = grouped_sessions(&state, later);
+        let ids = |grp: Group| -> Vec<&str> { g[grp as usize].iter().map(|s| s.id.as_str()).collect() };
+        assert!(ids(Group::NeedsYou).is_empty());
+        assert_eq!(ids(Group::Idle), vec!["blocked-old", "fresh", "older"]);
     }
 
     #[test]

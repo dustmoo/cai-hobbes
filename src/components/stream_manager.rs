@@ -71,13 +71,15 @@ impl StreamManagerContext {
 
     /// Report this session's lifecycle into the fleet (no-op while the
     /// bridge is disarmed). Name lookup peeks — never subscribes. Turn
-    /// completions carry the conversation summary so the fleet row gets a
-    /// re-entry brief without any transcript or extra LLM call.
+    /// completions carry a brief: headline from the conversation summary,
+    /// and an ask only when the turn's closing reply ends on a question
+    /// (`bridge::latest_turn_ask`) — never the summary's rolling blockers.
+    /// No transcript and no extra LLM call.
     fn fleet_report(&self, session_id: &str, signal: crate::fleet::bridge::HobbesSignal) {
         if !crate::fleet::bridge::enabled() {
             return;
         }
-        let (name, summary_json, next_timer) = {
+        let (name, summary_json, next_timer, ask) = {
             let state = self.session_state.peek();
             match state.sessions.get(session_id) {
                 Some(s) => {
@@ -86,9 +88,14 @@ impl StreamManagerContext {
                         || !cs.current_task.trim().is_empty())
                     .then(|| serde_json::to_value(cs).ok())
                     .flatten();
-                    (s.display_title(), json, s.next_pending_timer())
+                    (
+                        s.display_title(),
+                        json,
+                        s.next_pending_timer(),
+                        crate::fleet::bridge::latest_turn_ask(&s.messages),
+                    )
                 }
-                None => (String::new(), None, None),
+                None => (String::new(), None, None, None),
             }
         };
         // A turn that ends with a timer pending leaves the tab waiting on
@@ -99,22 +106,33 @@ impl StreamManagerContext {
             }
             other => other,
         };
-        let brief_source = summary_json.clone();
         let is_turn_end = matches!(
             signal,
             crate::fleet::bridge::HobbesSignal::TurnCompleted
                 | crate::fleet::bridge::HobbesSignal::TimerWaiting { .. }
                 | crate::fleet::bridge::HobbesSignal::Closed
         );
-        crate::fleet::bridge::report_with_brief(session_id, &name, signal, summary_json);
+        let is_final = matches!(signal, crate::fleet::bridge::HobbesSignal::Closed);
+        // A closed tab asks nothing; a timer wait or a finished turn asks
+        // what its closing reply asked.
+        let brief = is_turn_end
+            .then(|| {
+                crate::fleet::briefs::hobbes_turn_brief(
+                    summary_json.as_ref(),
+                    ask.filter(|_| !is_final),
+                    chrono::Utc::now(),
+                    is_final,
+                )
+            })
+            .flatten();
+        crate::fleet::bridge::report_turn(session_id, &name, signal, brief.clone());
 
         // Progress flows onto todos linked to THIS chat session too
-        // (display-only, mirroring the transcript-brief path).
+        // (display-only, mirroring the transcript-brief path). The brief was
+        // just built from this turn, so its blocker is current.
         if is_turn_end {
-            if let Some(brief) = brief_source.and_then(|v| {
-                crate::fleet::briefs::brief_from_summary_value(&v, chrono::Utc::now(), false)
-            }) {
-                let line = crate::fleet::briefs::progress_line(&brief);
+            if let Some(brief) = brief {
+                let line = crate::fleet::briefs::progress_line(&brief, brief.blocked_on.as_deref());
                 let mut planner = self.planner_state;
                 let changed = crate::todo::handlers::apply_brief_progress(
                     &mut planner.write(),
@@ -1777,6 +1795,9 @@ impl StreamManagerContext {
                                                             ),
                                                         }
                                                     };
+                                                    // The tab's Fleet row picks up the new
+                                                    // headline; its ask stays the turn's own.
+                                                    crate::fleet::bridge::refresh_brief(&session_id_clone, &summary_value);
                                                     log_event(
                                                         &session_id_clone,
                                                         SessionEvent::SummaryComputed {

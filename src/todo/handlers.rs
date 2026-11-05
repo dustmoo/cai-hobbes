@@ -2591,7 +2591,7 @@ pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession, now: DateTime<
         attention_at: row.attention_at,
         brief: row.brief.as_ref().map(|b| model::Brief {
             did: b.headline.clone(),
-            blocked: b.blocked_on.clone().filter(|x| !x.trim().is_empty()),
+            blocked: row.blocked_on().map(str::to_string),
             next: None,
         }),
         worker_name: row.display_name().to_string(),
@@ -6087,6 +6087,10 @@ mod tests {
         }));
         let signal = worker_signal_from_fleet(&ended, now);
         assert_eq!(signal.brief.as_ref().unwrap().did, "Built 4 of 5 images");
+        // A brief overtaken by a later turn carries no blocker into the lane.
+        let mut overtaken = ended.clone();
+        overtaken.brief_dirty_at = Some("2026-08-12T17:30:00Z".parse().unwrap());
+        assert!(worker_signal_from_fleet(&overtaken, now).brief.unwrap().blocked.is_none());
         sync_agent_states(&mut state, &live, &[ended], now);
         let t = state.todo(&id).unwrap();
         assert_eq!(t.agent_state, Some(model::AgentState::Review));

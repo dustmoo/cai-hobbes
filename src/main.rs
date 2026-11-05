@@ -1131,6 +1131,7 @@ fn app() -> Element {
         // Settings). One task per 15s tick — with the 45s quiet period this
         // is the debounce — keeps cost and concurrency trivially bounded.
         spawn(async move {
+            let mut backoff = fleet::briefs::BriefBackoff::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 let s = settings.peek().clone();
@@ -1157,17 +1158,18 @@ fn app() -> Element {
                 let ended = fleet::store::sessions_active_on(today);
                 let links = crate::todo::handlers::linked_session_pairs(&planner_state.peek());
                 let due = fleet::briefs::collect_due(&live, &ended, &links, chrono::Utc::now());
-                let Some(task) = due.into_iter().next() else {
+                // Oldest dirty first, past any session backing off after a
+                // failure — one failing task must not starve the rest.
+                let Some(task) = backoff.pick(due, chrono::Utc::now()) else {
                     continue;
                 };
 
                 let started_at = chrono::Utc::now();
+                // No new brief: clear the mark and the old blocker with it.
                 let clear_dirty = |task: &fleet::briefs::BriefTask| {
                     if !fleet::shared().clear_brief_dirty(&task.session_id, started_at) {
                         fleet::store::merge_session(&task.session_id, |row| {
-                            if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
-                                row.brief_dirty_at = None;
-                            }
+                            fleet::clear_dirty_without_brief(row, started_at);
                         });
                     }
                 };
@@ -1206,6 +1208,7 @@ fn app() -> Element {
                 .await
                 {
                     Ok(Ok(value)) => {
+                        backoff.succeeded(&task.session_id);
                         let Some(brief) = fleet::briefs::brief_from_summary_value(
                             &value,
                             chrono::Utc::now(),
@@ -1215,14 +1218,20 @@ fn app() -> Element {
                             continue;
                         };
                         let shared = fleet::shared();
-                        if !shared.set_brief(
+                        // The blocker as the row now shows it: hidden when a
+                        // turn raced in while the brief was generating.
+                        let blocked = if shared.set_brief(
                             &task.session_id,
                             brief.clone(),
                             started_at,
                             session_title.clone(),
                         ) {
+                            shared.blocked_on_of(&task.session_id)
+                        } else {
                             // Ended (or just-ended) row: merge into the store.
                             let brief_for_merge = brief.clone();
+                            let blocked = std::cell::RefCell::new(None);
+                            let blocked_ref = &blocked;
                             let merged =
                                 fleet::store::merge_session(&task.session_id, move |row| {
                                     row.brief = Some(brief_for_merge);
@@ -1232,14 +1241,16 @@ fn app() -> Element {
                                     if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
                                         row.brief_dirty_at = None;
                                     }
+                                    *blocked_ref.borrow_mut() = row.blocked_on().map(str::to_string);
                                 });
                             if merged {
                                 shared.poke();
                             }
-                        }
+                            blocked.into_inner()
+                        };
                         // Progress flows onto linked todos (display-only —
                         // never status; progress is reported, not judged).
-                        let line = fleet::briefs::progress_line(&brief);
+                        let line = fleet::briefs::progress_line(&brief, blocked.as_deref());
                         let changed = crate::todo::handlers::apply_brief_progress(
                             &mut planner_state.write(),
                             &task.session_id,
@@ -1257,14 +1268,20 @@ fn app() -> Element {
                             }
                         }
                     }
-                    Ok(Err(e)) => tracing::warn!(
-                        "fleet briefs: generation failed for {}: {e}",
-                        task.session_id
-                    ),
-                    Err(_) => tracing::warn!(
-                        "fleet briefs: generation timed out for {}",
-                        task.session_id
-                    ),
+                    Ok(Err(e)) => {
+                        backoff.failed(&task.session_id, chrono::Utc::now());
+                        tracing::warn!(
+                            "fleet briefs: generation failed for {}: {e}",
+                            task.session_id
+                        )
+                    }
+                    Err(_) => {
+                        backoff.failed(&task.session_id, chrono::Utc::now());
+                        tracing::warn!(
+                            "fleet briefs: generation timed out for {}",
+                            task.session_id
+                        )
+                    }
                 }
             }
         });

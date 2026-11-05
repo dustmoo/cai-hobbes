@@ -92,6 +92,54 @@ pub fn collect_due(
     tasks
 }
 
+/// First retry delay after a failed brief generation; doubles per failure.
+pub const BRIEF_RETRY_BASE_SECS: i64 = 30;
+/// Longest a failing session waits between attempts.
+pub const BRIEF_RETRY_MAX_SECS: i64 = 30 * 60;
+
+/// Per-session exponential backoff for the brief supervisor. It takes one
+/// task per tick, oldest dirty first, so a task that keeps failing (a
+/// provider outage, a transcript the model chokes on) would sit at the head
+/// and starve every other session. A failed session waits out its backoff
+/// while the supervisor moves on to the next due task.
+#[derive(Debug, Default)]
+pub struct BriefBackoff {
+    /// session id → (consecutive failures, not before).
+    entries: std::collections::HashMap<String, (u32, DateTime<Utc>)>,
+}
+
+impl BriefBackoff {
+    /// The first due task not backing off. Forgets sessions that are no
+    /// longer due (briefed, or their dirty mark was cleared).
+    pub fn pick(&mut self, due: Vec<BriefTask>, now: DateTime<Utc>) -> Option<BriefTask> {
+        self.entries
+            .retain(|id, _| due.iter().any(|t| &t.session_id == id));
+        due.into_iter().find(|t| {
+            self.entries
+                .get(&t.session_id)
+                .is_none_or(|(_, not_before)| *not_before <= now)
+        })
+    }
+
+    /// Record a failed attempt: the next one waits
+    /// `BRIEF_RETRY_BASE_SECS · 2^(failures-1)`, capped at
+    /// [`BRIEF_RETRY_MAX_SECS`].
+    pub fn failed(&mut self, session_id: &str, now: DateTime<Utc>) {
+        let entry = self.entries.entry(session_id.to_string()).or_insert((0, now));
+        entry.0 = entry.0.saturating_add(1);
+        let shift = entry.0.saturating_sub(1).min(16);
+        let delay = BRIEF_RETRY_BASE_SECS
+            .saturating_mul(1i64 << shift)
+            .min(BRIEF_RETRY_MAX_SECS);
+        entry.1 = now + chrono::Duration::seconds(delay);
+    }
+
+    /// The session got a brief (or its dirty mark was cleared): reset.
+    pub fn succeeded(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+}
+
 /// `(previous_summary, recent_messages)` framing for
 /// `LlmConnector::generate_fleet_brief` — the connector's summarize prompt
 /// is fixed, so the brief instructions ride the recent-messages slot (the
@@ -195,6 +243,108 @@ pub fn brief_from_summary_value(
     })
 }
 
+/// Longest question carried onto a Hobbes row's brief.
+pub const ASK_MAX_CHARS: usize = 160;
+
+/// The question a reply ends on, if it ends on one — the cheap "does this
+/// turn ask the person something" test for Hobbes chat rows (no LLM call).
+/// Looks at the last line only: its final sentence ending in `?`, or the
+/// one before it when a short sign-off follows ("Want me to ship it? Let me
+/// know."). A reply that ends in a code block asks nothing.
+pub fn question_in_reply(text: &str) -> Option<String> {
+    let t = text.trim_end();
+    if t.is_empty() || t.ends_with("```") {
+        return None;
+    }
+    let line = t.lines().rev().map(str::trim).find(|l| !l.is_empty())?;
+    let line = strip_line_marker(line);
+    let trim_wrap = |s: &str| -> String {
+        s.trim()
+            .trim_matches(|c: char| matches!(c, '*' | '_' | '`' | '(' | ')' | '"' | '\u{201C}' | '\u{201D}'))
+            .trim()
+            .to_string()
+    };
+    let sentences: Vec<String> = split_sentences(line)
+        .into_iter()
+        .map(|s| trim_wrap(&s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let ask = match sentences.as_slice() {
+        [.., last] if last.ends_with('?') => last.clone(),
+        [.., q, last] if q.ends_with('?') && last.chars().count() <= 40 => q.clone(),
+        _ => return None,
+    };
+    // A bare "?" (or "??") is punctuation, not a question.
+    if ask.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+        return None;
+    }
+    Some(truncate_summary(&ask, ASK_MAX_CHARS))
+}
+
+/// Drop a leading Markdown marker: quote, heading, bullet, numbered item.
+fn strip_line_marker(line: &str) -> &str {
+    let mut l = line.trim_start_matches('>').trim_start();
+    l = l.trim_start_matches('#').trim_start();
+    for bullet in ["- ", "* ", "+ "] {
+        if let Some(rest) = l.strip_prefix(bullet) {
+            return rest.trim_start();
+        }
+    }
+    let digits = l.chars().take_while(char::is_ascii_digit).count();
+    if digits > 0 {
+        let rest = &l[digits..];
+        if let Some(rest) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return rest.trim_start();
+        }
+    }
+    l
+}
+
+/// Split at sentence ends: `.`, `!` or `?` followed by whitespace.
+fn split_sentences(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        cur.push(c);
+        if matches!(c, '.' | '!' | '?') && chars.peek().is_some_and(|n| n.is_whitespace()) {
+            out.push(std::mem::take(&mut cur));
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The brief for a Hobbes chat row at a turn boundary: headline and bullets
+/// from the rolling conversation summary, but the blocker ONLY from the
+/// turn that just ended (`ask`). The summary's `entities.blockers` is a
+/// rolling list the summarizer is told to preserve — feeding it in as the
+/// row's ask kept answered questions on the board for days. With no
+/// summary yet, a question still makes a brief (its own headline).
+pub fn hobbes_turn_brief(
+    summary: Option<&serde_json::Value>,
+    ask: Option<String>,
+    now: DateTime<Utc>,
+    is_final: bool,
+) -> Option<SessionBrief> {
+    let ask = ask.map(|a| a.trim().to_string()).filter(|a| !a.is_empty());
+    match summary.and_then(|v| brief_from_summary_value(v, now, is_final)) {
+        Some(mut b) => {
+            b.blocked_on = ask;
+            Some(b)
+        }
+        None => ask.map(|a| SessionBrief {
+            headline: truncate_summary(&a, HEADLINE_MAX_CHARS),
+            bullets: Vec::new(),
+            blocked_on: Some(a),
+            generated_at: now,
+            final_brief: is_final,
+        }),
+    }
+}
+
 /// A display-safe headline: prose passes through; text that is (or wraps) a
 /// JSON object is parsed and its `summary`/`current_task` taken, salvaging a
 /// truncated `"summary"` string; nothing recoverable gives `None`. Never
@@ -222,12 +372,15 @@ pub fn clean_headline(text: &str) -> Option<String> {
 }
 
 /// One display line from a brief: headline plus blocker, clipped — the shape
-/// written onto linked todos' `latest_progress`.
-pub fn progress_line(brief: &SessionBrief) -> String {
+/// written onto linked todos' `latest_progress`. The blocker is passed in
+/// rather than read off the brief: callers hand over
+/// [`FleetSession::blocked_on`] (or a brief they know is current), so a
+/// blocker from a turn the user already answered never reaches a to-do.
+pub fn progress_line(brief: &SessionBrief, blocked: Option<&str>) -> String {
     // Briefs persisted before the headline was cleaned may still hold JSON.
     let headline = clean_headline(&brief.headline).unwrap_or_default();
     let mut line = truncate_summary(&headline, 160);
-    if let Some(blocked) = &brief.blocked_on {
+    if let Some(blocked) = blocked.map(str::trim).filter(|b| !b.is_empty()) {
         let sep = if line.is_empty() { "" } else { "; " };
         line.push_str(&format!("{sep}blocked: {}", truncate_summary(blocked, 80)));
     }
@@ -308,7 +461,7 @@ fn session_lines(
             let mut line = format!("{} — {}", truncate_summary(s.display_name(), 60), time);
             if let Some(b) = &s.brief {
                 line.push_str(&format!(" — {}", truncate_summary(&b.headline, 140)));
-                if let Some(blocked) = &b.blocked_on {
+                if let Some(blocked) = s.blocked_on() {
                     line.push_str(&format!("; blocked: {}", truncate_summary(blocked, 80)));
                 }
             }
@@ -398,7 +551,7 @@ pub fn status_report(
                 if !b.bullets.is_empty() {
                     brief["details"] = serde_json::json!(b.bullets);
                 }
-                if let Some(blocked) = &b.blocked_on {
+                if let Some(blocked) = s.blocked_on() {
                     brief["blocked_on"] = serde_json::json!(truncate_summary(blocked, 160));
                 }
                 v["brief"] = brief;
@@ -660,7 +813,7 @@ mod tests {
         let v = serde_json::json!({ "summary": cut });
         let b = brief_from_summary_value(&v, now, false).unwrap();
         assert_eq!(b.headline, "Active Composio profile is 'Clearmirror.ai'. Hobbes was asked to verify the cal");
-        assert!(!progress_line(&b).contains('{'));
+        assert!(!progress_line(&b, None).contains('{'));
 
         // A complete object (prose-wrapped, fenced) as the summary string.
         let fenced = "Sure!\n```json\n{\"summary\":\"Shipped the digest\",\"current_task\":\"qa\"}\n```";
@@ -683,7 +836,111 @@ mod tests {
             generated_at: now,
             final_brief: false,
         };
-        assert!(progress_line(&legacy).starts_with("Active Composio"));
+        assert!(progress_line(&legacy, None).starts_with("Active Composio"));
+    }
+
+    #[test]
+    fn progress_and_context_lines_drop_an_overtaken_blocker() {
+        let b = SessionBrief {
+            headline: "Built the exporter".into(),
+            bullets: vec![],
+            blocked_on: Some("needs the API key".into()),
+            generated_at: utc("2026-09-01T10:00:00Z"),
+            final_brief: false,
+        };
+        assert_eq!(progress_line(&b, Some("needs the API key")), "Built the exporter; blocked: needs the API key");
+        assert_eq!(progress_line(&b, None), "Built the exporter");
+        assert_eq!(progress_line(&b, Some("  ")), "Built the exporter");
+
+        let mut s = session("s1");
+        s.brief = Some(b);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let now = utc("2026-09-01T12:00:00Z");
+        assert!(fleet_context_lines(std::slice::from_ref(&s), date, now, 5)[0].contains("blocked:"));
+        // A turn stopped after the brief: its question was overtaken.
+        s.brief_dirty_at = Some(utc("2026-09-01T11:00:00Z"));
+        assert!(!fleet_context_lines(std::slice::from_ref(&s), date, now, 5)[0].contains("blocked:"));
+        let live = FleetState { sessions: [(s.id.clone(), s.clone())].into(), ..Default::default() };
+        let report = status_report(&live, &[], None, &[], now, date);
+        assert!(report["sessions"][0]["brief"].get("blocked_on").is_none());
+    }
+
+    #[test]
+    fn question_in_reply_reads_the_closing_question() {
+        assert_eq!(question_in_reply("All set. Want me to ship it?").as_deref(), Some("Want me to ship it?"));
+        assert_eq!(
+            question_in_reply("Two options:\n- A\n- B\n\n**Which one do you prefer?**").as_deref(),
+            Some("Which one do you prefer?")
+        );
+        assert_eq!(question_in_reply("Should I merge it? Let me know.").as_deref(), Some("Should I merge it?"));
+        assert_eq!(question_in_reply("> Deploy now?\n").as_deref(), Some("Deploy now?"));
+        assert_eq!(question_in_reply("1. Do you want the CSV too?").as_deref(), Some("Do you want the CSV too?"));
+        // Not a closing question.
+        assert_eq!(question_in_reply("Why did it fail? The cache was cold, so the first request timed out."), None);
+        assert_eq!(question_in_reply("Why did it fail?\n\nThe cache was cold."), None);
+        assert_eq!(question_in_reply("Done. The schedule is clear."), None);
+        assert_eq!(question_in_reply("```rust\nfn f() -> Option<u8>?\n```"), None);
+        assert_eq!(question_in_reply("???"), None);
+        assert_eq!(question_in_reply(""), None);
+        // Long questions are clipped.
+        let long = format!("{}?", "word ".repeat(80));
+        assert!(question_in_reply(&long).unwrap().chars().count() <= ASK_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn hobbes_turn_brief_without_a_summary_still_carries_the_ask() {
+        let now = utc("2026-09-01T10:00:00Z");
+        let b = hobbes_turn_brief(None, Some("Ship it?".into()), now, false).unwrap();
+        assert_eq!(b.blocked_on.as_deref(), Some("Ship it?"));
+        assert_eq!(b.generated_at, now);
+        assert!(hobbes_turn_brief(None, None, now, false).is_none());
+        assert!(hobbes_turn_brief(None, Some("  ".into()), now, false).is_none());
+    }
+
+    fn task(id: &str, dirty: &str) -> BriefTask {
+        BriefTask {
+            session_id: id.into(),
+            name: id.into(),
+            cwd: String::new(),
+            transcript_path: String::new(),
+            previous_brief: None,
+            dirty_at: utc(dirty),
+            is_final: false,
+            linked_todo: None,
+            background_active: false,
+        }
+    }
+
+    #[test]
+    fn a_failing_brief_backs_off_and_lets_the_others_through() {
+        let mut b = BriefBackoff::default();
+        let t0 = utc("2026-09-01T10:00:00Z");
+        let due = || vec![task("old", "2026-09-01T09:00:00Z"), task("new", "2026-09-01T09:30:00Z")];
+        assert_eq!(b.pick(due(), t0).unwrap().session_id, "old");
+        b.failed("old", t0);
+        // Next tick: the failing head is skipped, the next session runs.
+        let t1 = t0 + chrono::Duration::seconds(15);
+        assert_eq!(b.pick(due(), t1).unwrap().session_id, "new");
+        // Once its backoff runs out it gets another try.
+        let t2 = t0 + chrono::Duration::seconds(BRIEF_RETRY_BASE_SECS);
+        assert_eq!(b.pick(due(), t2).unwrap().session_id, "old");
+        // Delays double, capped.
+        b.failed("old", t2);
+        assert_eq!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], t2 + chrono::Duration::seconds(59)), None);
+        assert!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], t2 + chrono::Duration::seconds(60)).is_some());
+        for _ in 0..20 {
+            b.failed("old", t2);
+        }
+        let cap = t2 + chrono::Duration::seconds(BRIEF_RETRY_MAX_SECS);
+        assert!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], cap - chrono::Duration::seconds(1)).is_none());
+        assert!(b.pick(vec![task("old", "2026-09-01T09:00:00Z")], cap).is_some());
+        // Success resets; a session that's no longer due is forgotten.
+        b.succeeded("old");
+        assert_eq!(b.pick(due(), t2).unwrap().session_id, "old");
+        b.failed("new", t2);
+        b.pick(vec![task("old", "2026-09-01T09:00:00Z")], t2);
+        assert_eq!(b.pick(due(), t2).unwrap().session_id, "old");
+        assert_eq!(b.pick(vec![task("new", "2026-09-01T09:30:00Z")], t2).unwrap().session_id, "new", "forgotten once it left the due list");
     }
 
     #[test]

@@ -279,8 +279,9 @@ pub struct FleetSession {
 pub enum Disposition {
     /// Working now (foreground, background, or on its own timer).
     Active,
-    /// Waiting on an answer: a permission gate, or a finished turn whose
-    /// brief names what it's blocked on.
+    /// Waiting on an answer: a permission gate or another hook-raised
+    /// question, or a finished turn whose brief names what it's blocked on
+    /// (that last kind only until [`PARKED_ENDS_AFTER_HOURS`] of quiet).
     Decision,
     /// Finished its turn, prompt open, nothing asked.
     Parked,
@@ -288,7 +289,12 @@ pub enum Disposition {
     Ended,
 }
 
-/// A parked session quiet this long reads as ended.
+/// A parked session quiet this long reads as ended. A question the brief
+/// read into the transcript decays on the same clock: half a day without
+/// the session moving means the person dealt with it elsewhere or let it
+/// go, and a stale ask must not hold "Needs you" forever. Questions a hook
+/// raised (gates, permission and input prompts) never decay — Claude Code
+/// is provably still waiting on those.
 pub const PARKED_ENDS_AFTER_HOURS: i64 = 12;
 
 /// Notification kinds that ask nothing of the person: Claude Code's
@@ -325,21 +331,32 @@ impl FleetSession {
         if self.ended_at.is_some() {
             return false;
         }
+        self.hook_asks() || self.brief_asks()
+    }
+
+    /// A question Claude Code itself is holding open: a pending gate, a
+    /// permission request, or a notification that asks (not a bare idle
+    /// prompt). Exempt from decay.
+    fn hook_asks(&self) -> bool {
         if self.pending_gate.is_some() {
             return true;
         }
         match &self.status {
             FleetStatus::NeedsAttention(AttentionKind::Gate) => true,
-            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message })
-                if !is_parked_notification(kind, message) =>
-            {
-                true
-            }
-            FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) | FleetStatus::Idle => {
-                self.blocked_on().is_some()
+            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message }) => {
+                !is_parked_notification(kind, message)
             }
             _ => false,
         }
+    }
+
+    /// A finished turn (idle or at the idle prompt) whose current brief
+    /// names what it's blocked on.
+    fn brief_asks(&self) -> bool {
+        matches!(
+            self.status,
+            FleetStatus::Idle | FleetStatus::NeedsAttention(AttentionKind::Notification { .. })
+        ) && self.blocked_on().is_some()
     }
 
     /// What the session asks, in words, when [`Self::asks_person`]: the
@@ -374,11 +391,15 @@ impl FleetSession {
         ) {
             return Disposition::Active;
         }
-        if self.asks_person() {
+        if self.hook_asks() {
             return Disposition::Decision;
         }
+        // Brief-derived questions decay with the parked clock.
         if now - self.last_event_at >= chrono::Duration::hours(PARKED_ENDS_AFTER_HOURS) {
             return Disposition::Ended;
+        }
+        if self.brief_asks() {
+            return Disposition::Decision;
         }
         Disposition::Parked
     }
@@ -508,8 +529,14 @@ pub struct FleetState {
 }
 
 impl FleetState {
+    /// Sessions that need the person now ([`Disposition::Decision`]) — the
+    /// same rule the Fleet view's "Needs you" group counts by.
     pub fn attention_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.asks_person()).count()
+        let now = Utc::now();
+        self.sessions
+            .values()
+            .filter(|s| s.disposition(now) == Disposition::Decision)
+            .count()
     }
 }
 
@@ -787,6 +814,13 @@ pub fn reduce_with_prompt(
             session.pending_gate = None;
             session.attention_at = None;
             session.active_prompt = prompt_id.map(str::to_string);
+            // The user just answered whatever the last brief asked: its
+            // blocker belongs to a turn that is over. Cleared in the row
+            // itself (not only hidden by the dirty mark), so no reader —
+            // and no later clear of the dirty mark — can resurrect it.
+            if let Some(b) = session.brief.as_mut() {
+                b.blocked_on = None;
+            }
         }
         FleetEvent::SubagentStop { background_tasks, .. }
             if *background_tasks == 0 && session.status == FleetStatus::WorkingBackground =>
@@ -874,11 +908,16 @@ pub fn note_transcript_and_dirty(
     now: DateTime<Utc>,
 ) {
     // PromptSubmit dirties too: the user answering is exactly when blockers
-    // die, so the next brief should regenerate against the fresh turn.
-    let mark_dirty = matches!(
-        ev,
-        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. }
-    );
+    // die, so the next brief should regenerate against the fresh turn. So
+    // does a compaction restart: the transcript the old brief read from was
+    // just summarised away.
+    let mark_dirty = match ev {
+        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. } => {
+            true
+        }
+        FleetEvent::SessionStart { source, .. } => source == "compact",
+        _ => false,
+    };
     let path = transcript_path.filter(|p| !p.is_empty());
     if !mark_dirty && path.is_none() {
         return;
@@ -898,6 +937,21 @@ pub fn note_transcript_and_dirty(
     }
     for row in changed.iter_mut().filter(|r| r.id == ev.session_id()) {
         apply(row);
+    }
+}
+
+/// Clear a session's dirty mark when no new brief replaces the old one
+/// (unreadable transcript, empty digest, unusable reply). The dirty mark is
+/// what hid the old brief's blocker ([`FleetSession::blocked_on`]); clearing
+/// it alone would bring a question from before the latest turn back. So the
+/// blocker goes with it. A dirty mark newer than `started_at` (a turn that
+/// raced in) is left alone.
+pub fn clear_dirty_without_brief(s: &mut FleetSession, started_at: DateTime<Utc>) {
+    if s.brief_dirty_at.is_none_or(|d| d <= started_at) {
+        s.brief_dirty_at = None;
+        if let Some(b) = s.brief.as_mut() {
+            b.blocked_on = None;
+        }
     }
 }
 
@@ -1009,9 +1063,11 @@ pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSessi
 
 /// Retirement sweep: Idle sessions silent past [`RETIRE_MINUTES`] leave the
 /// live map with `ended_at` set to their last event (no span is open — the
-/// stale→Idle sweep or a Stop closed it long before). Working and
-/// needs-attention sessions are exempt: work proves itself with events, and
-/// attention must never fall off the board unanswered.
+/// stale→Idle sweep or a Stop closed it long before). Working sessions and
+/// those that ask the person something ([`FleetSession::asks_person`]) are
+/// exempt: work proves itself with events, and a question must never fall
+/// off the board unanswered. A bare `idle_prompt` (Claude Code's nudge after
+/// every finished turn) asks nothing, so it retires like Idle.
 pub fn sweep_retired(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
     sweep_retired_after(state, now, retire_minutes())
 }
@@ -1026,7 +1082,14 @@ pub fn sweep_retired_after(
     let retire: Vec<String> = state
         .sessions
         .values()
-        .filter(|s| s.status == FleetStatus::Idle && s.last_event_at < cutoff)
+        .filter(|s| {
+            let parked = match &s.status {
+                FleetStatus::Idle => true,
+                FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) => !s.asks_person(),
+                _ => false,
+            };
+            parked && s.last_event_at < cutoff
+        })
         .map(|s| s.id.clone())
         .collect();
     let mut rows = Vec::new();
@@ -1198,7 +1261,7 @@ pub fn sweep_dispatch_continuations(
             run_session_id: s.id.clone(),
             todo_id: s.dispatched_todo.clone(),
             session_name: s.display_name().to_string(),
-            progress: brief.map(briefs::progress_line),
+            progress: brief.map(|b| briefs::progress_line(b, s.blocked_on())),
         })
     };
 
@@ -1530,6 +1593,16 @@ impl FleetShared {
         }
     }
 
+    /// A LIVE session's current blocker, through [`FleetSession::blocked_on`]
+    /// (`None` when the brief was overtaken or the session left the map).
+    pub fn blocked_on_of(&self, session_id: &str) -> Option<String> {
+        let state = self.state.lock().expect("fleet state lock poisoned");
+        state
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.blocked_on().map(str::to_string))
+    }
+
     /// Refresh a LIVE session's Claude Code title (event-ingest path — no
     /// LLM, no debounce). No-op when unchanged or the session left the map.
     pub fn set_session_title(&self, session_id: &str, title: &str) {
@@ -1555,14 +1628,15 @@ impl FleetShared {
 
     /// Clear a LIVE session's dirty mark without writing a brief (unreadable
     /// transcript, empty digest) so the supervisor doesn't spin on it. Same
-    /// `started_at` race rule as [`Self::set_brief`]. Returns false when the
-    /// session isn't in the live map.
+    /// `started_at` race rule as [`Self::set_brief`]. The old brief's
+    /// blocker goes too ([`clear_dirty_without_brief`]). Returns false when
+    /// the session isn't in the live map.
     pub fn clear_brief_dirty(&self, session_id: &str, started_at: DateTime<Utc>) -> bool {
         let row = {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
             match state.sessions.get_mut(session_id) {
                 Some(s) if s.brief_dirty_at.is_some_and(|d| d <= started_at) => {
-                    s.brief_dirty_at = None;
+                    clear_dirty_without_brief(s, started_at);
                     Some(s.clone())
                 }
                 Some(_) => return true, // newer dirty mark: leave it
@@ -1697,10 +1771,17 @@ mod tests {
         assert_eq!(row(serde_json::json!("Working"), Some("x")).disposition(now), Disposition::Active);
         assert_eq!(row(serde_json::json!("Idle"), None).disposition(now), Disposition::Parked);
 
-        // Parked past the cutoff reads as ended; a question never does.
+        // Parked past the cutoff reads as ended; so does a question the brief
+        // read into the transcript. A hook-raised question never decays.
         let later = utc("2026-10-23T20:00:00Z");
         assert_eq!(row(idle_prompt.clone(), None).disposition(later), Disposition::Ended);
-        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(later), Disposition::Decision);
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(utc("2026-10-23T19:59:00Z")), Disposition::Decision);
+        let much_later = utc("2026-10-23T21:00:00Z");
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(much_later), Disposition::Ended);
+        assert_eq!(row(serde_json::json!("Idle"), Some("pick one")).disposition(much_later), Disposition::Ended);
+        let permission_old = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "permission_prompt", "message": "Allow Bash?"}}});
+        assert_eq!(row(permission_old, None).disposition(much_later), Disposition::Decision);
+        assert_eq!(row(serde_json::json!({"NeedsAttention": "Gate"}), None).disposition(much_later), Disposition::Decision);
         let mut ended = row(idle_prompt.clone(), Some("pick one"));
         ended.ended_at = Some(now);
         assert_eq!(ended.disposition(now), Disposition::Ended);
@@ -2299,6 +2380,31 @@ mod tests {
             state.sessions.contains_key("stuck-gate"),
             "attention never falls off the board silently"
         );
+    }
+
+    #[test]
+    fn a_bare_idle_prompt_retires_but_a_real_question_does_not() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        let notify = |id: &str, kind: &str| FleetEvent::Notification {
+            session_id: id.into(),
+            cwd: "/x".into(),
+            kind: kind.into(),
+            message: "Claude is waiting for your input".into(),
+        };
+        reduce(&mut state, &notify("parked", "idle_prompt"), t0);
+        reduce(&mut state, &notify("asks", "elicitation_dialog"), t0);
+        reduce(&mut state, &notify("parked-asking", "idle_prompt"), t0);
+        state.sessions.get_mut("parked-asking").unwrap().brief = Some(SessionBrief {
+            blocked_on: Some("pick a schema".into()),
+            ..brief_at(t0, "h")
+        });
+
+        let retired = sweep_retired_after(&mut state, t0 + chrono::Duration::minutes(95), 60);
+        let ids: Vec<&str> = retired.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["parked"]);
+        assert!(state.sessions.contains_key("asks"));
+        assert!(state.sessions.contains_key("parked-asking"), "its brief still asks something");
     }
 
     #[test]
@@ -2905,6 +3011,32 @@ mod tests {
     }
 
     #[test]
+    fn prompt_submit_clears_the_briefs_blocker_in_the_row_it_persists() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-10-23T08:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        reduce(&mut state, &stop("s1"), t0);
+        state.sessions.get_mut("s1").unwrap().brief = Some(SessionBrief {
+            blocked_on: Some("pick a schema".into()),
+            ..brief_at(t0, "h")
+        });
+        assert_eq!(state.sessions["s1"].blocked_on(), Some("pick a schema"));
+        let mut changed = reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() },
+            utc("2026-10-23T08:05:00Z"),
+        );
+        note_transcript_and_dirty(&mut state, &mut changed, &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() }, None, utc("2026-10-23T08:05:00Z"));
+        assert!(state.sessions["s1"].brief.as_ref().unwrap().blocked_on.is_none());
+        assert!(changed[0].brief.as_ref().unwrap().blocked_on.is_none(), "the persisted clone too");
+        // Even with the dirty mark cleared without a new brief, nothing comes back.
+        let s = state.sessions.get_mut("s1").unwrap();
+        s.brief_dirty_at = None;
+        assert!(s.blocked_on().is_none());
+        assert!(!s.asks_person());
+    }
+
+    #[test]
     fn tool_activity_heartbeat_extends_liveness_and_clears_gates() {
         let mut state = FleetState::default();
         let day = date("2026-08-25");
@@ -2989,6 +3121,23 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_restart_dirties_the_brief() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        let compact = FleetEvent::SessionStart {
+            session_id: "s1".into(),
+            cwd: "/x/proj".into(),
+            source: "compact".into(),
+        };
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let mut changed = reduce(&mut state, &compact, t1);
+        note_transcript_and_dirty(&mut state, &mut changed, &compact, None, t1);
+        assert_eq!(state.sessions["s1"].brief_dirty_at, Some(t1));
+        assert_eq!(changed[0].brief_dirty_at, Some(t1));
+    }
+
+    #[test]
     fn note_transcript_marks_the_removed_row_on_session_end() {
         let mut state = FleetState::default();
         let t0 = utc("2026-08-25T10:00:00Z");
@@ -3046,11 +3195,22 @@ mod tests {
         {
             let mut state = shared.state.lock().unwrap();
             reduce(&mut state, &stop("s1"), t0);
-            state.sessions.get_mut("s1").unwrap().brief_dirty_at = Some(t0);
+            let s = state.sessions.get_mut("s1").unwrap();
+            s.brief_dirty_at = Some(t0);
+            // A brief from before the latest turn, still holding its question.
+            s.brief = Some(SessionBrief {
+                blocked_on: Some("pick a schema".into()),
+                ..brief_at(t0 - chrono::Duration::minutes(5), "h")
+            });
         }
+        assert!(shared.blocked_on_of("s1").is_none(), "hidden while dirty");
         let started = t0 + chrono::Duration::seconds(50);
         assert!(shared.clear_brief_dirty("s1", started));
         assert!(shared.state.lock().unwrap().sessions["s1"].brief_dirty_at.is_none());
+        assert!(
+            shared.blocked_on_of("s1").is_none(),
+            "clearing dirty without a new brief must not resurrect the old blocker"
+        );
 
         // Newer dirty mark stays.
         {
