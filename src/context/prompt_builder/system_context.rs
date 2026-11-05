@@ -413,21 +413,11 @@ impl<'a> PromptBuilder<'a> {
             .iter()
             .any(|p| p.is_fully_configured())
         {
-            let profile_id = self
-                .session
-                .composio_profile
-                .as_deref()
-                .or(self.settings.active_composio_profile.as_deref());
-            let active_profile_name = profile_id
-                .and_then(|id| self.settings.profile_name_for_id(id))
-                .unwrap_or("Default");
-
-            let reach = crate::mcp::manager::profile_reach::session_reach(
-                self.settings,
-                &self.session.id,
-                profile_id,
-                &self.session.profile_reach,
-            );
+            // The same resolution dispatch uses (profile_reach::ProfileScope),
+            // so the prompt never names a profile the tab's calls don't run in.
+            let scope = crate::mcp::manager::profile_reach::ProfileScope::for_session(self.settings, self.session);
+            let active_profile_name = scope.home_name().unwrap_or("none");
+            let reach = &scope.reach;
             if reach.len() > 1 {
                 let others: Vec<&str> = reach[1..].iter().map(|p| p.name.as_str()).collect();
                 system_context_map.insert(
@@ -437,6 +427,20 @@ impl<'a> PromptBuilder<'a> {
                         "home_profile": active_profile_name,
                         "reachable_profiles": others,
                         "instruction": crate::mcp::manager::profile_reach::reach_instruction(active_profile_name, &others),
+                    })
+                );
+            } else if scope.home.is_none() {
+                let why = if scope.pin_removed() {
+                    "This chat's Composio profile was removed"
+                } else {
+                    "This chat has no Composio profile"
+                };
+                system_context_map.insert(
+                    "composio_context".to_string(),
+                    json!({
+                        "info": "Integrations are managed through Composio 'Profiles'.",
+                        "active_profile": serde_json::Value::Null,
+                        "instruction": format!("{why}, so no profile is active: Composio tool calls will be refused until the person picks a profile on the profile chip. Don't try to work around it."),
                     })
                 );
             } else {

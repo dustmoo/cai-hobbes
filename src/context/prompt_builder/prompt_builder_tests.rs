@@ -148,12 +148,14 @@ fn test_prompt_profile_when_the_tab_profile_does_not_resolve() {
         session.composio_profile = pin.map(str::to_string);
         PromptBuilder::new(&session, &settings(active)).build_prompt("Hello".to_string()).prompt.system.unwrap()
     };
-    // Pinned to a removed profile.
+    // Pinned to a removed profile: no profile is active (it used to say
+    // 'Default'), and never the global one.
     let removed = system(Some("gone"), "cm");
-    assert!(removed.contains("connections is: 'Default'"), "{removed}");
-    // Unpinned, the global id dangling.
+    assert!(removed.contains("profile was removed, so no profile is active"), "{removed}");
+    assert!(!removed.contains("'Default'") && !removed.contains("'Clearmirror'"), "{removed}");
+    // Unpinned, the global id dangling: no profile (it used to say 'Default').
     let dangling = system(None, "gone");
-    assert!(dangling.contains("connections is: 'Default'"), "{dangling}");
+    assert!(dangling.contains("has no Composio profile, so no profile is active"), "{dangling}");
     // Unpinned, the global id valid.
     assert!(system(None, "cm").contains("connections is: 'Clearmirror'"));
 }
