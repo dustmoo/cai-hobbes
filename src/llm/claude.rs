@@ -3762,6 +3762,7 @@ mod tests {
                 dispatched_workers: Vec::new(),
                 carried_reads: Vec::new(),
                 profile_reach: Vec::new(),
+                profile_locked: false,
                 summary_sources: Vec::new(),
                 turn_origin: Default::default(),
             }

@@ -695,7 +695,8 @@ impl StreamManagerContext {
                                     &settings_read,
                                     &session_id,
                                     profile_id.as_deref(),
-                                    &[],
+                                    // Not hydrated: home only.
+                                    true,
                                 ),
                             }
                         };
@@ -720,7 +721,7 @@ impl StreamManagerContext {
                             let state = self.session_state.peek();
                             let session = state.sessions.get(&session_id);
                             let home = scope.home_id().map(str::to_string);
-                            // Phase 2: an ordinary tab's ticked profiles join its reach.
+                            // Every set-up profile, unless the tab is locked to home.
                             let reach = &scope.reach;
                             // No profile to act in: a Composio call is refused,
                             // never left to the manager to guess.

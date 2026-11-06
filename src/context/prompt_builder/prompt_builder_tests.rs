@@ -45,6 +45,7 @@ fn create_test_session() -> Session {
         dispatched_workers: Vec::new(),
         carried_reads: Vec::new(),
         profile_reach: Vec::new(),
+        profile_locked: false,
         summary_sources: Vec::new(),
         turn_origin: Default::default(),
     }
@@ -92,11 +93,11 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
     );
 }
 
-/// Multi-profile reach, phase 2: an ordinary tab's ticked profiles add the
-/// reach instruction; nothing ticked (or only deleted profiles) leaves the
-/// prompt exactly as a single-profile tab's.
+/// Multi-profile reach: an ordinary tab reaches every set-up profile by
+/// default, so the prompt carries the reach instruction; a tab locked to its
+/// home (or with no other set-up profile) gets the single-profile prompt.
 #[test]
-fn test_ordinary_tab_reach_changes_the_prompt_only_when_ticked() {
+fn test_ordinary_tab_reach_is_open_unless_locked() {
     use crate::settings::ComposioProfile;
     let profile = |id: &str, name: &str| ComposioProfile {
         id: id.to_string(),
@@ -110,18 +111,20 @@ fn test_ordinary_tab_reach_changes_the_prompt_only_when_ticked() {
         active_composio_profile: Some("cm".to_string()),
         ..Default::default()
     };
-    let system = |reach: &[&str]| {
+    let system = |settings: &Settings, locked: bool| {
         let mut session = create_test_session();
         session.composio_profile = Some("cm".to_string());
-        session.profile_reach = reach.iter().map(|s| s.to_string()).collect();
-        PromptBuilder::new(&session, &settings).build_prompt("Hello".to_string()).prompt.system.unwrap()
+        session.profile_locked = locked;
+        PromptBuilder::new(&session, settings).build_prompt("Hello".to_string()).prompt.system.unwrap()
     };
-    for plain in [system(&[]), system(&["deleted-profile"])] {
+    let mut single = settings.clone();
+    single.composio_profiles.truncate(1);
+    for plain in [system(&settings, true), system(&single, false)] {
         assert!(plain.contains("The currently active profile determining your available tool connections is: 'Clearmirror'"));
         assert!(!plain.contains("hobbes_profile"));
         assert!(!plain.contains("reachable_profiles"));
     }
-    let reach = system(&["pg"]);
+    let reach = system(&settings, false);
     assert!(reach.contains("Your home profile is 'Clearmirror'"));
     assert!(reach.contains("reachable_profiles"));
     assert!(reach.contains("Puget"));

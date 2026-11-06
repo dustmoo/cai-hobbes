@@ -1,7 +1,8 @@
 //! Multi-profile reach: a chat pinned to one Composio profile (its *home*)
-//! may also act in other profiles — phase 1: the Hobbes system session
-//! (Heartbeat wakes, voice and typed turns alike) reaches every configured
-//! profile.
+//! may also act in other profiles. The Hobbes system session (Heartbeat
+//! wakes, voice and typed turns alike) and every ordinary tab reach every
+//! set-up profile, home first; a tab can be kept to its home with the
+//! chip's lock (`Session::profile_locked`, [`session_reach`]).
 //!
 //! - **One tool set.** Composio slugs are identical across profiles (and
 //!   collapse to one provider-facing name), so the session sees each tool
@@ -88,9 +89,10 @@ pub struct ProfileScope {
 }
 
 impl ProfileScope {
-    /// The scope for `session_id` with pin `pin` and the profiles ticked on
-    /// its chip (`selected`), for call sites that hold only those.
-    pub fn resolve(settings: &Settings, session_id: &str, pin: Option<&str>, selected: &[String]) -> Self {
+    /// The scope for `session_id` with pin `pin`, kept to its home when
+    /// `locked` (`Session::profile_locked`), for call sites that hold only
+    /// those. Call sites that need only the home pass `locked = true`.
+    pub fn resolve(settings: &Settings, session_id: &str, pin: Option<&str>, locked: bool) -> Self {
         let pin = pin.filter(|p| !p.is_empty());
         let as_reach = |p: &crate::settings::ComposioProfile| ReachProfile { id: p.id.clone(), name: p.name.clone() };
         let (home, source) = match pin {
@@ -103,13 +105,13 @@ impl ProfileScope {
                 None => (None, ScopeSource::Missing { pinned_id: None }),
             },
         };
-        let reach = session_reach(settings, session_id, home.as_ref().map(|h| h.id.as_str()), selected);
+        let reach = session_reach(settings, session_id, home.as_ref().map(|h| h.id.as_str()), locked);
         ProfileScope { home, reach, source }
     }
 
     /// The scope of a hydrated session.
     pub fn for_session(settings: &Settings, session: &crate::session::Session) -> Self {
-        Self::resolve(settings, &session.id, session.composio_profile.as_deref(), &session.profile_reach)
+        Self::resolve(settings, &session.id, session.composio_profile.as_deref(), session.profile_locked)
     }
 
     pub fn home_id(&self) -> Option<&str> {
@@ -212,26 +214,26 @@ pub fn begin_turn(settings: &Settings, session: &crate::session::Session) -> Pro
 /// `session_pin`): from the pin fixed at [`begin_turn`] while the tab's
 /// pin is unchanged; after a repin, or with no turn started this run, the
 /// tab's own pin (and a repinned turn is re-fixed to it).
-pub fn turn_scope_for(settings: &Settings, session_id: &str, session_pin: Option<&str>, selected: &[String]) -> ProfileScope {
+pub fn turn_scope_for(settings: &Settings, session_id: &str, session_pin: Option<&str>, locked: bool) -> ProfileScope {
     let fixed = turn_pins().lock().ok().and_then(|p| p.get(session_id).cloned());
     match fixed {
         Some(t) if t.tab_pin.as_deref() == session_pin => match t.turn {
-            Some(pin) => ProfileScope::resolve(settings, session_id, Some(&pin), selected),
+            Some(pin) => ProfileScope::resolve(settings, session_id, Some(&pin), locked),
             // The turn started with no profile: it stays without one.
             None => ProfileScope { home: None, reach: Vec::new(), source: ScopeSource::Missing { pinned_id: None } },
         },
         Some(_) => {
-            let scope = ProfileScope::resolve(settings, session_id, session_pin, selected);
+            let scope = ProfileScope::resolve(settings, session_id, session_pin, locked);
             fix_turn(session_id, session_pin, &scope);
             scope
         }
-        None => ProfileScope::resolve(settings, session_id, session_pin, selected),
+        None => ProfileScope::resolve(settings, session_id, session_pin, locked),
     }
 }
 
 /// [`turn_scope_for`] for a hydrated session.
 pub fn turn_scope(settings: &Settings, session: &crate::session::Session) -> ProfileScope {
-    turn_scope_for(settings, &session.id, session.composio_profile.as_deref(), &session.profile_reach)
+    turn_scope_for(settings, &session.id, session.composio_profile.as_deref(), session.profile_locked)
 }
 
 /// `ctx` without any Composio server or toolkit: what a chat with no
@@ -247,7 +249,7 @@ pub fn without_composio(mut ctx: McpContext) -> McpContext {
 /// is still in the conversation). Not a profile to act in — use
 /// [`ProfileScope`] for that.
 pub fn data_profile(settings: &Settings, session_pin: Option<&str>) -> Option<String> {
-    ProfileScope::resolve(settings, "", session_pin, &[]).turn_pin()
+    ProfileScope::resolve(settings, "", session_pin, true).turn_pin()
 }
 
 /// The pin an ordinary tab should have, when it differs from its own: the
@@ -258,7 +260,7 @@ pub fn data_profile(settings: &Settings, session_pin: Option<&str>) -> Option<St
 /// A tab without a pin gets (a) the profile its own most recent Composio
 /// call ran in (the call's `profile_id` stamp, else the profile its
 /// `composio-native:<id|name>` server name names) — preferring a call made
-/// at home over one routed to a ticked profile — else (b) Hobbes' home
+/// at home over one routed to another profile — else (b) Hobbes' home
 /// profile, else (c) nothing — it stays unpinned. Never the global
 /// profile: that follows focus, so it says nothing about this tab.
 /// System sessions keep their own rules (the caller skips them).
@@ -283,7 +285,7 @@ pub fn pin_fix(settings: &Settings, session: &crate::session::Session) -> Option
             _ => None,
         })
     };
-    // A call made at home (not routed to a ticked profile with
+    // A call made at home (not routed to another profile with
     // `hobbes_profile`) says where the tab lives; a routed one only if
     // there is no other.
     let at_home = calls().find(|(_, routed)| !routed).map(|(p, _)| p);
@@ -312,20 +314,17 @@ pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<
     out
 }
 
-/// The profiles a session can act in, home first, with phase 2's per-tab
-/// reach: an ordinary tab reaches its home plus the profiles ticked on its
-/// profile chip (`Session::profile_reach`) that still exist and are set up —
-/// a deleted or broken profile drops out silently. Nothing ticked is exactly
-/// [`reach_for_session`] (home only). System sessions ignore `selected` and
-/// keep their own reach.
-pub fn session_reach(
-    settings: &Settings,
-    session_id: &str,
-    home_id: Option<&str>,
-    selected: &[String],
-) -> Vec<ReachProfile> {
+/// The profiles a session can act in, home first. An ordinary tab reaches
+/// its home plus every other profile that is set up — a deleted or broken
+/// profile drops out silently — unless the tab is `locked`
+/// (`Session::profile_locked`, the chip's "Keep this tab to … only"
+/// switch), which keeps it to home. The cross-profile hold
+/// ([`cross_company_hold_in`]) still asks before data moves between them.
+/// System sessions ignore `locked` and keep their own reach
+/// ([`reach_for_session`]); with no home there is no reach.
+pub fn session_reach(settings: &Settings, session_id: &str, home_id: Option<&str>, locked: bool) -> Vec<ReachProfile> {
     let mut out = reach_for_session(settings, session_id, home_id);
-    if selected.is_empty() || out.is_empty() || crate::system_sessions::is_system(session_id) {
+    if locked || out.is_empty() || crate::system_sessions::is_system(session_id) {
         return out;
     }
     let home_id = out[0].id.clone();
@@ -333,7 +332,7 @@ pub fn session_reach(
         settings
             .composio_profiles
             .iter()
-            .filter(|p| p.id != home_id && p.is_fully_configured() && selected.iter().any(|s| s == &p.id))
+            .filter(|p| p.id != home_id && p.is_fully_configured())
             .map(|p| ReachProfile { id: p.id.clone(), name: p.name.clone() }),
     );
     out
@@ -346,13 +345,15 @@ pub fn reach_of(settings: &Settings, session: &crate::session::Session) -> Vec<R
 
 /// What a tab's profile chip shows, from the same resolution dispatch uses
 /// ([`ProfileScope`]): the home profile's id (`None` when nothing resolves),
-/// whether its reach can be edited here (an ordinary tab with a home), and
-/// the names of the other profiles it reaches, and whether the tab's pin
-/// names a removed profile (the chip warns; its Composio calls are refused).
+/// whether the tab's lock can be edited here (an ordinary tab with a home),
+/// whether it is locked to home, the names of the other profiles it reaches,
+/// and whether the tab's pin names a removed profile (the chip warns; its
+/// Composio calls are refused).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChipReach {
     pub home: Option<String>,
     pub editable: bool,
+    pub locked: bool,
     pub extra: Vec<String>,
     pub pin_removed: bool,
 }
@@ -366,7 +367,8 @@ pub fn chip_reach(settings: &Settings, session: &crate::session::Session) -> Chi
     ChipReach {
         home,
         editable,
-        extra: if editable { reach.into_iter().skip(1).map(|p| p.name).collect() } else { Vec::new() },
+        locked: editable && session.profile_locked,
+        extra: reach.into_iter().skip(1).map(|p| p.name).collect(),
         pin_removed,
     }
 }
@@ -402,10 +404,10 @@ pub fn resume_profile_in(
     settings: &Settings,
     session_id: &str,
     session_profile: Option<&str>,
-    selected: &[String],
+    locked: bool,
     tool_call: &crate::components::shared::ToolCall,
 ) -> Result<Option<String>, String> {
-    let scope = ProfileScope::resolve(settings, session_id, session_profile, selected);
+    let scope = ProfileScope::resolve(settings, session_id, session_profile, locked);
     let home = scope.home_id().map(str::to_string);
     if !is_composio_native(&tool_call.server_name) {
         return Ok(home);
@@ -424,7 +426,7 @@ pub fn resume_profile_in(
             None => Ok(home),
             Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
             Some(_) => Err(format!(
-                "Not run: the profile this was meant for ({}) is no longer available, and it won't be run in another company's account.",
+                "Not run: the profile this was meant for ({}) is no longer available, and it won't be run in another profile's account.",
                 name()
             )),
         };
@@ -436,7 +438,7 @@ pub fn resume_profile_in(
         // never run in the company the tab moved to.
         return match tool_call.profile_id.as_deref() {
             Some(t) if find_profile(settings, t).map(|p| p.id.as_str()) != home.as_deref() => Err(format!(
-                "Not run: this was asked for in another profile ({}) than this tab's current one, and it won't be run in another company's account.",
+                "Not run: this was asked for in another profile ({}) than this tab's current one, and it won't be run in another profile's account.",
                 settings.profile_name_for_id(t).unwrap_or(t)
             )),
             _ => Ok(home),
@@ -446,7 +448,7 @@ pub fn resume_profile_in(
         Some(t) if reach.iter().any(|p| p.id == t) => Ok(Some(t)),
         None if !routed => Ok(home),
         _ => Err(format!(
-            "Not run: the profile this was meant for ({}) is no longer this tab's home or in its reach, and it won't be run in another company's account.",
+            "Not run: the profile this was meant for ({}) is no longer this tab's home or in its reach, and it won't be run in another profile's account.",
             name()
         )),
     }
@@ -539,7 +541,7 @@ pub fn flow_label(settings: &Settings, rule_key: &str, tool: &str) -> Option<Str
     let name = |id: &str| settings.profile_name_for_id(id).unwrap_or(id).to_string();
     let to_name = if to == "local" { "commands and other tabs".to_string() } else { name(to) };
     Some(if from == "act" {
-        format!("Always allow {tool} in {to_name} (with no other company's data in play)")
+        format!("Always allow {tool} in {to_name} (with no other profile's data in play)")
     } else {
         let from: Vec<String> = from.split('+').map(name).collect();
         format!("Always allow {tool} to carry {} data into {to_name}", from.join(" and "))
@@ -551,8 +553,8 @@ pub fn reach_instruction(home: &str, others: &[&str]) -> String {
     format!(
         "Your home profile is '{home}': Composio tools act there unless you pass `hobbes_profile`. You can \
          also act in {}: pass `hobbes_profile` with that name on the tool call (its options list who has \
-         the app connected). Each profile is a different company. Keep each company's content in \
-         its own accounts — never copy one company's documents, emails or data into another's \
+         the app connected). Each profile belongs to a different organisation. Keep each profile's content in \
+         its own accounts — never copy one profile's documents, emails or data into another's \
          tools unless the person explicitly asks; such writes are held for their approval.",
         others.join(", ")
     )
@@ -657,7 +659,7 @@ fn with_profile_arg(mut tool: rmcp::model::Tool, have: &[String], home: &str) ->
                 "type": "string",
                 "enum": have,
                 "description": format!(
-                    "Which company's connected account to use.{default} Keep each company's content in its own account."
+                    "Which profile's connected account to use.{default} Keep each profile's content in its own account."
                 ),
             }),
         );
@@ -1000,7 +1002,7 @@ pub fn cross_company_hold_in(
         let ids: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
         return Some(Hold {
             reason: format!(
-                "{what} in a conversation that has read {} data — check it doesn't carry one company's content into another's.",
+                "{what} in a conversation that has read {} data — check it doesn't carry one profile's content into another's.",
                 from.join(" and ")
             ),
             rule_key: format!("{FLOW_KEY_PREFIX}{}>{to_key}", ids.join("+")),
@@ -1241,7 +1243,7 @@ mod tests {
             flow_label(&settings, "profile-flow:cm>pg", "GMAIL_SEND_EMAIL").unwrap(),
             "Always allow GMAIL_SEND_EMAIL to carry Clearmirror data into Puget"
         );
-        assert!(flow_label(&settings, "profile-flow:act>pg", "X").unwrap().contains("in Puget (with no other company's data"));
+        assert!(flow_label(&settings, "profile-flow:act>pg", "X").unwrap().contains("in Puget (with no other profile's data"));
         assert_eq!(flow_label(&settings, "composio-native:Puget", "X"), None);
     }
 
@@ -1300,15 +1302,15 @@ mod tests {
         held.server_name = "composio-native:Puget".into();
         held.profile_id = Some("pg".into());
         // Still reachable: runs in Puget.
-        assert_eq!(resume_profile_in(&settings, "reach-test-voice", Some("cm"), &[], &held), Ok(Some("pg".into())));
+        assert_eq!(resume_profile_in(&settings, "reach-test-voice", Some("cm"), true, &held), Ok(Some("pg".into())));
         // Puget lost its key before the approval: refused, not run at home.
         let broken = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", false)]);
-        assert!(resume_profile_in(&broken, "reach-test-voice", Some("cm"), &[], &held).is_err());
+        assert!(resume_profile_in(&broken, "reach-test-voice", Some("cm"), true, &held).is_err());
         // An ordinary tab without reach: a call routed to Puget is refused,
         // and with no pin and no global profile there is nowhere to run it
         // (it used to dispatch with no profile, for the manager to pick).
-        assert!(resume_profile_in(&settings, "a-normal-tab", Some("cm"), &[], &held).is_err());
-        let refused = resume_profile_in(&settings, "a-normal-tab", None, &[], &held).unwrap_err();
+        assert!(resume_profile_in(&settings, "a-normal-tab", Some("cm"), true, &held).is_err());
+        let refused = resume_profile_in(&settings, "a-normal-tab", None, true, &held).unwrap_err();
         assert!(refused.contains("no Composio profile"), "{refused}");
     }
 
@@ -1317,7 +1319,7 @@ mod tests {
         crate::system_sessions::set_current("reach-test-hb");
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let reach = ProfileScope::resolve(&settings, "reach-test-hb", None, &[]).reach;
+        let reach = ProfileScope::resolve(&settings, "reach-test-hb", None, true).reach;
         let mut c = call(json!({"hobbes_profile": "Puget"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::To(p("pg", "Puget")));
     }
@@ -1331,38 +1333,57 @@ mod tests {
     }
 
     #[test]
-    fn an_ordinary_tab_reaches_home_plus_its_ticked_profiles() {
+    fn an_ordinary_tab_reaches_every_set_up_profile_unless_locked() {
         let settings = reach_settings();
-        // Nothing ticked: home only, exactly as before.
-        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &[]), vec![p("cm", "Clearmirror")]);
-        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &[]), reach_for_session(&settings, "p2-tab", Some("cm")));
-        // Deleted and not-set-up profiles drop out silently; home isn't repeated.
-        let ticked: Vec<String> = ["gone", "ac", "pg", "cm"].iter().map(|s| s.to_string()).collect();
+        // Open by default: home first, then every other profile that is set
+        // up (Acme isn't, so it drops out).
         assert_eq!(
-            session_reach(&settings, "p2-tab", Some("cm"), &ticked),
+            session_reach(&settings, "p2-tab", Some("cm"), false),
             vec![p("cm", "Clearmirror"), p("pg", "Puget")]
         );
-        // Only deleted profiles ticked: still single-profile.
-        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), &["gone".to_string()]).len(), 1);
-        // System sessions keep their own reach; the tab list is ignored.
+        assert_eq!(
+            session_reach(&settings, "p2-tab", Some("pg"), false),
+            vec![p("pg", "Puget"), p("cm", "Clearmirror")],
+            "home is never repeated"
+        );
+        // Locked: home only, exactly the single-profile reach.
+        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), true), vec![p("cm", "Clearmirror")]);
+        assert_eq!(session_reach(&settings, "p2-tab", Some("cm"), true), reach_for_session(&settings, "p2-tab", Some("cm")));
+        // A home that isn't set up still anchors the tab (as before); only
+        // the others must be set up.
+        assert_eq!(
+            session_reach(&settings, "p2-tab", Some("ac"), false),
+            vec![p("ac", "Acme"), p("cm", "Clearmirror"), p("pg", "Puget")]
+        );
+        // No home: no reach, locked or not.
+        assert!(session_reach(&settings, "p2-tab", Some("gone"), false).is_empty());
+        assert!(session_reach(&settings, "p2-tab", None, false).is_empty());
+        // System sessions keep their own reach; the lock is ignored.
         crate::system_sessions::set_current("reach-test-hb");
         assert_eq!(
-            session_reach(&settings, "reach-test-hb", Some("cm"), &["gone".to_string()]),
+            session_reach(&settings, "reach-test-hb", Some("cm"), true),
             reach_for_session(&settings, "reach-test-hb", Some("cm"))
         );
+        // A tab's reach follows its lock (and old ticks no longer matter).
+        let mut s = tab("p2-open-tab", "cm", false);
+        s.profile_reach = vec!["gone".into()];
+        assert_eq!(reach_of(&settings, &s), vec![p("cm", "Clearmirror"), p("pg", "Puget")]);
+        s.profile_locked = true;
+        s.profile_reach = vec!["pg".into()];
+        assert_eq!(reach_of(&settings, &s), vec![p("cm", "Clearmirror")]);
     }
 
     #[test]
-    fn nothing_ticked_changes_no_tools_and_routes_nothing() {
+    fn a_locked_tab_changes_no_tools_and_routes_nothing() {
         let settings = reach_settings();
-        let reach = session_reach(&settings, "p2-plain", Some("cm"), &[]);
+        let reach = session_reach(&settings, "p2-plain", Some("cm"), true);
         // The tool refresh leaves a single-profile context untouched (no
         // `hobbes_profile` argument added anywhere).
         let names: Vec<String> = reach.iter().map(|p| p.name.clone()).collect();
         let plain = carry_reach(ctx("Clearmirror", &["A"]), Some(&ctx("Clearmirror", &["A"])), &names);
         assert_eq!(plain, ctx("Clearmirror", &["A"]));
         assert!(native_tools(&plain).all(|t| !has_profile_arg(t)));
-        // Calls run as before; naming another company is refused.
+        // Calls run as before; naming another profile is refused.
         let mut c = call(json!({"to": "a@b.c"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::Unchanged);
         let mut c = call(json!({"hobbes_profile": "Puget"}));
@@ -1370,11 +1391,41 @@ mod tests {
         // A held call resumes in the tab's home — explicitly, also for an
         // unpinned tab (the global profile; it used to dispatch with None).
         let held = call(json!({"to": "a@b.c"}));
-        assert_eq!(resume_profile_in(&settings, "p2-plain", Some("cm"), &[], &held), Ok(Some("cm".into())));
-        assert_eq!(resume_profile_in(&settings, "p2-plain", None, &[], &held), Ok(Some("cm".into())));
+        assert_eq!(resume_profile_in(&settings, "p2-plain", Some("cm"), true, &held), Ok(Some("cm".into())));
+        assert_eq!(resume_profile_in(&settings, "p2-plain", None, true, &held), Ok(Some("cm".into())));
         // A removed pin: refused, never the global profile.
-        let removed = resume_profile_in(&settings, "p2-plain", Some("gone"), &[], &held).unwrap_err();
+        let removed = resume_profile_in(&settings, "p2-plain", Some("gone"), true, &held).unwrap_err();
         assert!(removed.contains("profile was removed"), "{removed}");
+    }
+
+    /// An open tab that has only used its home profile: every write is
+    /// checked, but nothing is held — the guard asks only when data or an
+    /// action crosses profiles.
+    #[test]
+    fn an_open_tab_holds_only_writes_that_cross_profiles() {
+        let settings = reach_settings();
+        let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
+        let now = chrono::Utc::now();
+        let mut session = tab("p2-open-guard", "cm", false);
+        session.messages.push(read_at_home(&cm, now));
+        let reach = reach_of(&settings, &session);
+        assert_eq!(reach, vec![cm.clone(), pg.clone()]);
+        let read_from = session_read_profiles(&settings, &session, now);
+        assert!(flow_checked(&reach, &read_from));
+        let named = all_profiles(&settings);
+        // A write at home, or a local write, with only home data: not held.
+        assert_eq!(cross_company_hold_in(Some(&cm), Some(&cm), &read_from, &named, true), None);
+        assert_eq!(cross_company_hold_in(None, Some(&cm), &read_from, &named, true), None);
+        // A write routed to Puget: held under its flow key.
+        let mut c = call(json!({"hobbes_profile": "Puget"}));
+        assert_eq!(route_tool_call(&reach, &mut c), Route::To(pg.clone()));
+        let h = cross_company_hold_in(Some(&pg), Some(&cm), &read_from, &named, true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:cm>pg");
+        assert!(!h.reason.to_lowercase().contains("compan"), "{}", h.reason);
+        // With nothing read yet, acting in Puget is still held (act key).
+        let fresh = BTreeSet::new();
+        let h = cross_company_hold_in(Some(&pg), Some(&cm), &fresh, &named, true).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:act>pg");
     }
 
     fn read_via_reach(profile: &ReachProfile, at: chrono::DateTime<chrono::Utc>) -> Message {
@@ -1395,31 +1446,30 @@ mod tests {
     }
 
     #[test]
-    fn narrowing_reach_refuses_the_profile_but_keeps_its_reads() {
+    fn locking_refuses_the_other_profile_but_keeps_its_reads() {
         let settings = reach_settings();
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
         let now = chrono::Utc::now();
         let mut session = crate::session_events::blank_session();
         session.id = "p2-narrowed".into();
         session.composio_profile = Some("cm".into());
-        session.profile_reach = vec!["pg".into()];
         assert_eq!(reach_of(&settings, &session), vec![cm.clone(), pg.clone()]);
         // The tab read Puget mail through reach…
         session.messages.push(read_via_reach(&pg, now));
         // …and a write to Puget was held, awaiting approval.
         let mut held = call(json!({"hobbes_profile": "Puget"}));
         assert_eq!(route_tool_call(&reach_of(&settings, &session), &mut held), Route::To(pg.clone()));
-        assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), &session.profile_reach, &held), Ok(Some("pg".into())));
+        assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), session.profile_locked, &held), Ok(Some("pg".into())));
 
-        // Puget is unticked.
-        session.profile_reach.clear();
+        // The tab is locked to Clearmirror.
+        session.profile_locked = true;
         let reach = reach_of(&settings, &session);
         assert_eq!(reach, vec![cm.clone()]);
         // A new call naming Puget is refused at mint…
         let mut c = call(json!({"hobbes_profile": "Puget"}));
         assert!(matches!(route_tool_call(&reach, &mut c), Route::Refused(_)));
         // …and the held one is refused on approval, never moved home.
-        assert!(resume_profile_in(&settings, &session.id, Some("cm"), &session.profile_reach, &held).is_err());
+        assert!(resume_profile_in(&settings, &session.id, Some("cm"), session.profile_locked, &held).is_err());
         // The Puget read still counts: a write at home is held as a flow.
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(read_from.contains("pg"));
@@ -1431,11 +1481,12 @@ mod tests {
 
     // ── Review fixes ────────────────────────────────────────────────────
 
-    fn tab(id: &str, home: &str, reach: &[&str]) -> crate::session::Session {
+    /// An ordinary tab at `home`; `locked` keeps it to home.
+    fn tab(id: &str, home: &str, locked: bool) -> crate::session::Session {
         let mut s = crate::session_events::blank_session();
         s.id = id.into();
         s.composio_profile = Some(home.into());
-        s.profile_reach = reach.iter().map(|r| r.to_string()).collect();
+        s.profile_locked = locked;
         s
     }
 
@@ -1454,7 +1505,7 @@ mod tests {
     fn a_repin_never_reroutes_a_held_write() {
         let settings = reach_settings();
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
-        let session = tab("p2-repin-resume", "cm", &["pg"]);
+        let session = tab("p2-repin-resume", "cm", false);
         // Home Clearmirror, Puget ticked: a write with no argument routes home
         // (stamped cm) and, with Puget data read, is held as pg>cm.
         let mut held = call(json!({"to": "a@b.c"}));
@@ -1464,19 +1515,19 @@ mod tests {
         assert_eq!(hold.rule_key, "profile-flow:pg>cm");
         held.hold_rule_key = Some(hold.rule_key);
         // Approved while still home: runs in Clearmirror.
-        assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), &["pg".into()], &held), Ok(Some("cm".into())));
+        assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), false, &held), Ok(Some("cm".into())));
         // "Make Puget home", then approve: refused, not run in Puget.
-        assert!(resume_profile_in(&settings, &session.id, Some("pg"), &[], &held).is_err());
+        assert!(resume_profile_in(&settings, &session.id, Some("pg"), true, &held).is_err());
         // Still in reach after the repin: runs where it was shown, Clearmirror.
-        assert_eq!(resume_profile_in(&settings, &session.id, Some("pg"), &["cm".into()], &held), Ok(Some("cm".into())));
+        assert_eq!(resume_profile_in(&settings, &session.id, Some("pg"), false, &held), Ok(Some("cm".into())));
         // An unheld call in a tab without reach, minted in Puget before a
         // repin to Clearmirror: refused (it used to run in the new home).
         let mut plain = call(json!({"to": "a@b.c"}));
         plain.profile_id = Some(pg.id.clone());
-        assert!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), &[], &plain).is_err());
+        assert!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), true, &plain).is_err());
         // Minted at the current home: runs there.
         plain.profile_id = Some(cm.id.clone());
-        assert_eq!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), &[], &plain), Ok(Some("cm".into())));
+        assert_eq!(resume_profile_in(&settings, "p2-repin-plain", Some("cm"), true, &plain), Ok(Some("cm".into())));
     }
 
     /// 2. Ordinary tabs keep foreign data in play with no clock; system
@@ -1487,7 +1538,7 @@ mod tests {
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
         let then = chrono::Utc::now() - chrono::Duration::minutes(150);
         let now = chrono::Utc::now();
-        let mut session = tab("p2-no-clock", "cm", &["pg"]);
+        let mut session = tab("p2-no-clock", "cm", false);
         session.messages.push(read_via_reach(&pg, then));
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(read_from.contains("pg"), "a read 2.5 h old still counts in an ordinary tab");
@@ -1520,7 +1571,7 @@ mod tests {
 
         // A system session keeps the 2 h window exactly.
         crate::system_sessions::set_current("reach-test-voice");
-        let mut voice = tab("reach-test-voice", "cm", &[]);
+        let mut voice = tab("reach-test-voice", "cm", true);
         voice.messages.push(read_via_reach(&pg, then));
         assert!(session_read_profiles(&settings, &voice, now).is_empty());
     }
@@ -1533,7 +1584,7 @@ mod tests {
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
         let now = chrono::Utc::now();
         // Read Puget at home (no argument), then "Make Clearmirror home".
-        let mut session = tab("p2-repin-flow", "pg", &[]);
+        let mut session = tab("p2-repin-flow", "pg", true);
         session.messages.push(read_at_home(&pg, now));
         session.composio_profile = Some("cm".into());
         let reach = reach_of(&settings, &session);
@@ -1543,8 +1594,8 @@ mod tests {
         let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
         assert_eq!(h.rule_key, "profile-flow:pg>cm");
 
-        // A one-profile tab: never checked.
-        let mut single = tab("p2-single", "cm", &[]);
+        // A tab locked to one profile that only used it: never checked.
+        let mut single = tab("p2-single", "cm", true);
         single.messages.push(read_at_home(&cm, now));
         let reach = reach_of(&settings, &single);
         assert!(!flow_checked(&reach, &session_read_profiles(&settings, &single, now)));
@@ -1557,20 +1608,28 @@ mod tests {
     #[test]
     fn the_chip_shows_the_home_calls_run_in() {
         let settings = reach_settings();
-        let chip = chip_reach(&settings, &tab("p2-chip", "cm", &["pg", "gone"]));
-        assert_eq!(chip, ChipReach { home: Some("cm".into()), editable: true, extra: vec!["Puget".into()], pin_removed: false });
+        let chip = chip_reach(&settings, &tab("p2-chip", "cm", false));
+        assert_eq!(
+            chip,
+            ChipReach { home: Some("cm".into()), editable: true, locked: false, extra: vec!["Puget".into()], pin_removed: false }
+        );
+        // Locked: home only, and the chip says so.
+        let chip = chip_reach(&settings, &tab("p2-chip-locked", "cm", true));
+        assert_eq!(chip, ChipReach { home: Some("cm".into()), editable: true, locked: true, extra: vec![], pin_removed: false });
         // Pinned to a deleted profile: dispatch has no home, so neither does
         // the chip (not the global active profile), and reach can't be edited.
-        let chip = chip_reach(&settings, &tab("p2-chip-gone", "gone", &["pg"]));
+        let chip = chip_reach(&settings, &tab("p2-chip-gone", "gone", false));
         // A removed pin: no home and the chip warns.
-        assert_eq!(chip, ChipReach { home: None, editable: false, extra: vec![], pin_removed: true });
+        assert_eq!(chip, ChipReach { home: None, editable: false, locked: false, extra: vec![], pin_removed: true });
         // Unpinned: the global active profile, as dispatch.
-        let mut unpinned = tab("p2-chip-unpinned", "x", &["pg"]);
+        let mut unpinned = tab("p2-chip-unpinned", "x", false);
         unpinned.composio_profile = None;
         assert_eq!(chip_reach(&settings, &unpinned).home.as_deref(), Some("cm"));
-        // System sessions: no editing.
+        // System sessions: no editing, and never shown as locked.
         crate::system_sessions::set_current("reach-test-hb");
-        assert!(!chip_reach(&settings, &tab("reach-test-hb", "cm", &[])).editable);
+        let chip = chip_reach(&settings, &tab("reach-test-hb", "cm", true));
+        assert!(!chip.editable);
+        assert!(!chip.locked);
     }
 
     /// A. "New chat with memory": the copied summary keeps the old tab's
@@ -1580,13 +1639,13 @@ mod tests {
         let settings = reach_settings();
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
         let now = chrono::Utc::now();
-        let mut old = tab("p2-mem-old", "pg", &[]);
+        let mut old = tab("p2-mem-old", "pg", true);
         old.summary_sources = vec!["ac".into()];
         old.messages.push(read_at_home(&pg, now - chrono::Duration::days(2)));
         let sources = inherited_sources(&settings, &old);
         assert_eq!(sources, ["ac", "pg"]);
         // The new tab (no messages) starts at Clearmirror.
-        let mut fresh = tab("p2-mem-new", "cm", &[]);
+        let mut fresh = tab("p2-mem-new", "cm", true);
         fresh.summary_sources = sources;
         let read_from = session_read_profiles(&settings, &fresh, now);
         assert!(read_from.contains("pg"));
@@ -1609,7 +1668,7 @@ mod tests {
         let settings = reach_settings();
         let pg = p("pg", "Puget");
         let now = chrono::Utc::now();
-        let mut session = tab("p2-undo-inflight", "cm", &[]);
+        let mut session = tab("p2-undo-inflight", "cm", true);
         session.messages.push(read_at_home(&pg, now));
         // Snapshot taken before the LLM call…
         let generated_from = summary_sources(&session);
@@ -1628,20 +1687,10 @@ mod tests {
     fn carried_reads_never_age_out_in_an_ordinary_tab() {
         let settings = reach_settings();
         let now = chrono::Utc::now();
-        let mut session = tab("p2-carried", "cm", &[]);
+        let mut session = tab("p2-carried", "cm", true);
         session.carried_reads =
             vec![crate::session::CarriedRead { profile_id: "pg".into(), read_at: now - chrono::Duration::hours(3) }];
         assert!(session_read_profiles(&settings, &session, now).contains("pg"));
-    }
-
-    /// 5. Repinning to a ticked profile takes it out of the reach list.
-    #[test]
-    fn a_new_home_leaves_the_reach_list() {
-        let mut session = tab("p2-new-home", "cm", &["pg", "ac"]);
-        assert_eq!(session.drop_home_from_reach(), None, "home wasn't ticked");
-        session.composio_profile = Some("pg".into());
-        assert_eq!(session.drop_home_from_reach(), Some(vec!["ac".to_string()]));
-        assert_eq!(session.profile_reach, ["ac"]);
     }
 
     #[test]
@@ -1718,7 +1767,7 @@ mod tests {
         for r in rows {
             let settings = with_global(r.global);
             assert_eq!(home_profile(&settings, r.pin).as_deref(), r.legacy_home, "legacy: {}", r.what);
-            let scope = ProfileScope::resolve(&settings, "plain-tab", r.pin, &[]);
+            let scope = ProfileScope::resolve(&settings, "plain-tab", r.pin, true);
             assert_eq!(scope.home, r.home, "home: {}", r.what);
             assert_eq!(scope.source, r.source, "source: {}", r.what);
             // Reach is anchored on home: none without one.
@@ -1734,18 +1783,21 @@ mod tests {
         crate::system_sessions::set_current("scope-test-hobbes");
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true), ("ac", "Acme", false)]);
         settings.active_composio_profile = Some("cm".into());
-        // An ordinary tab: home plus the ticked profiles that are set up.
-        let s = ProfileScope::resolve(&settings, "plain-tab", Some("cm"), &["pg".into(), "ac".into()]);
+        // An ordinary tab: home plus every other profile that is set up.
+        let s = ProfileScope::resolve(&settings, "plain-tab", Some("cm"), false);
         assert_eq!(s.reach, vec![p("cm", "Clearmirror"), p("pg", "Puget")]);
-        // The Hobbes session reaches every set-up profile, ticks or not.
-        let h = ProfileScope::resolve(&settings, "scope-test-hobbes", Some("pg"), &[]);
+        // Locked: home only.
+        let s = ProfileScope::resolve(&settings, "plain-tab", Some("cm"), true);
+        assert_eq!(s.reach, vec![p("cm", "Clearmirror")]);
+        // The Hobbes session reaches every set-up profile, locked or not.
+        let h = ProfileScope::resolve(&settings, "scope-test-hobbes", Some("pg"), true);
         assert_eq!(h.reach, vec![p("pg", "Puget"), p("cm", "Clearmirror")]);
-        // A removed pin: no reach even with ticks, and a refusal naming the chip.
-        let gone = ProfileScope::resolve(&settings, "plain-tab", Some("gone"), &["pg".into()]);
+        // A removed pin: no reach even when open, and a refusal naming the chip.
+        let gone = ProfileScope::resolve(&settings, "plain-tab", Some("gone"), false);
         assert!(gone.reach.is_empty());
         assert!(gone.pin_removed());
         assert!(gone.missing_refusal().unwrap().contains("profile was removed"));
-        let none = ProfileScope::resolve(&Settings::default(), "plain-tab", None, &[]);
+        let none = ProfileScope::resolve(&Settings::default(), "plain-tab", None, true);
         assert!(!none.pin_removed());
         assert!(none.missing_refusal().unwrap().contains("no Composio profile"));
     }
@@ -1756,7 +1808,7 @@ mod tests {
     fn summary_note_names_the_tabs_own_profile() {
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let mut s = tab("plain-tab", "pg", &[]);
+        let mut s = tab("plain-tab", "pg", true);
         assert_eq!(profile_note_name(&settings, &s), "Puget");
         s.composio_profile = None;
         assert_eq!(profile_note_name(&settings, &s), "Clearmirror");
@@ -1771,7 +1823,7 @@ mod tests {
     fn a_tab_without_a_profile_refuses_composio_calls() {
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let gone = ProfileScope::resolve(&settings, "plain-tab", Some("gone"), &[]);
+        let gone = ProfileScope::resolve(&settings, "plain-tab", Some("gone"), true);
         let mut c = call(json!({}));
         match route_in_scope(&gone, &mut c) {
             Route::Refused(m) => assert!(m.contains("profile was removed"), "{m}"),
@@ -1781,7 +1833,7 @@ mod tests {
         terminal.server_name = "terminal".into();
         assert_eq!(route_in_scope(&gone, &mut terminal), Route::Unchanged);
         // Unpinned with a valid global profile: home is the global one.
-        let global = ProfileScope::resolve(&settings, "plain-tab", None, &[]);
+        let global = ProfileScope::resolve(&settings, "plain-tab", None, true);
         assert_eq!(global.home_id(), Some("cm"));
         assert_eq!(global.turn_pin().as_deref(), Some("cm"));
         assert_eq!(route_in_scope(&global, &mut call(json!({}))), Route::Unchanged);
@@ -1809,17 +1861,17 @@ mod tests {
     fn a_turn_keeps_its_profile_across_rounds() {
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let s = tab("turn-tab", "pg", &[]);
+        let s = tab("turn-tab", "pg", true);
         assert_eq!(turn_scope(&settings, &s).home_id(), Some("pg"), "no turn yet: the tab's pin");
         begin_turn(&settings, &s);
         // An unpinned tab keeps the global profile it started in while
         // focus moves the global profile.
-        let mut unpinned = tab("turn-unpinned", "x", &[]);
+        let mut unpinned = tab("turn-unpinned", "x", true);
         unpinned.composio_profile = None;
         begin_turn(&settings, &unpinned);
         settings.active_composio_profile = Some("pg".into());
         assert_eq!(turn_scope(&settings, &unpinned).home_id(), Some("cm"));
-        let mut none = tab("turn-none", "x", &[]);
+        let mut none = tab("turn-none", "x", true);
         none.composio_profile = None;
         let empty = Settings::default();
         begin_turn(&empty, &none);
@@ -1838,7 +1890,7 @@ mod tests {
     fn a_repin_mid_turn_moves_the_turn_and_refuses_the_old_call() {
         let mut settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         settings.active_composio_profile = Some("cm".into());
-        let mut s = tab("repin-turn", "pg", &[]);
+        let mut s = tab("repin-turn", "pg", true);
         begin_turn(&settings, &s);
         let mut held = call(json!({"to": "a@b.c"}));
         held.profile_id = Some("pg".into());
@@ -1846,10 +1898,10 @@ mod tests {
         s.composio_profile = Some("cm".into());
         let next = turn_scope(&settings, &s);
         assert_eq!(next.home_id(), Some("cm"), "the next continuation acts in the new home");
-        assert_eq!(turn_scope_for(&settings, &s.id, Some("cm"), &[]).home_id(), Some("cm"), "re-fixed");
-        assert!(resume_profile_in(&settings, &s.id, Some("cm"), &[], &held).is_err());
+        assert_eq!(turn_scope_for(&settings, &s.id, Some("cm"), true).home_id(), Some("cm"), "re-fixed");
+        assert!(resume_profile_in(&settings, &s.id, Some("cm"), true, &held).is_err());
         // A repin from no pin (the migration) re-resolves too.
-        let mut m = tab("repin-migrated", "x", &[]);
+        let mut m = tab("repin-migrated", "x", true);
         m.composio_profile = None;
         begin_turn(&settings, &m);
         m.composio_profile = Some("pg".into());
@@ -1861,7 +1913,8 @@ mod tests {
         let i = reach_instruction("Clearmirror", &["Puget", "Acme"]);
         assert!(i.contains("home profile is 'Clearmirror'"));
         assert!(i.contains("Puget, Acme"));
-        assert!(i.contains("different company"));
+        assert!(i.contains("different organisation"));
+        assert!(!i.to_lowercase().contains("compan"), "user-facing wording says profile");
     }
 
     #[test]
@@ -1911,7 +1964,7 @@ mod tests {
         s.composio_profile = Some("gone".into());
         assert_eq!(pin_fix(&settings, &s), None);
         // A name pin resolves in the scope too, to the id.
-        let scope = ProfileScope::resolve(&settings, "fix-tab", Some("Puget"), &[]);
+        let scope = ProfileScope::resolve(&settings, "fix-tab", Some("Puget"), true);
         assert_eq!(scope.home_id(), Some("pg"));
         assert_eq!(data_profile(&settings, Some("Puget")).as_deref(), Some("pg"));
     }

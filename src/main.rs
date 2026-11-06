@@ -3159,7 +3159,6 @@ fn app() -> Element {
                             != Some(&new_profile_id);
 
                         let mut session_changed = false;
-                        let mut reach_after: Option<Vec<String>> = None;
                         // Scope the write lock so it's dropped before setting signals
                         {
                             let mut state = session_state.write();
@@ -3170,7 +3169,6 @@ fn app() -> Element {
                                     session.composio_profile = Some(new_profile_id.clone());
                                     session.active_context.mcp_tools = None;
                                     session_changed = true;
-                                    reach_after = session.drop_home_from_reach();
                                 }
                             }
                         } // write lock dropped here
@@ -3196,41 +3194,32 @@ fn app() -> Element {
                                     profile: settings.peek().active_composio_profile.clone(),
                                 },
                             );
-                            if let Some(profiles) = reach_after {
-                                crate::session_events::log_event(
-                                    &current_session_id.read().clone(),
-                                    crate::session_events::SessionEvent::ProfileReachSet { profiles },
-                                );
-                            }
                             SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }
                     }
                 }
-                ChatCommand::ToggleProfileReach(profile_id) => {
-                    // Multi-profile reach, phase 2: the tab's pin stays home;
-                    // ticked profiles join its reach. System sessions keep
-                    // their own reach. Journaled so a replay rebuild keeps it.
+                ChatCommand::ToggleProfileLock => {
+                    // Keep this tab to its home profile, or open it to every
+                    // set-up profile again (profile_reach::session_reach).
+                    // Per tab; system sessions keep their own reach.
+                    // Journaled so a replay rebuild keeps it.
                     let sid = current_session_id.peek().clone();
                     let changed = if crate::system_sessions::is_system(&sid) {
                         None
                     } else {
                         let mut state = session_state.write();
                         state.sessions.get_mut(&sid).map(|session| {
-                            if let Some(i) = session.profile_reach.iter().position(|p| p == &profile_id) {
-                                session.profile_reach.remove(i);
-                            } else {
-                                session.profile_reach.push(profile_id.clone());
-                            }
+                            session.profile_locked = !session.profile_locked;
                             // The next send re-fetches the tool set for the new reach.
                             session.active_context.mcp_tools = None;
-                            session.profile_reach.clone()
+                            session.profile_locked
                         })
                     };
-                    if let Some(profiles) = changed {
+                    if let Some(locked) = changed {
                         crate::session_events::log_event(
                             &sid,
-                            crate::session_events::SessionEvent::ProfileReachSet { profiles },
+                            crate::session_events::SessionEvent::ProfileLockSet { locked },
                         );
                         SessionState::save_async(&session_state.read(), Some(save_error));
                         mcp_manager.read().invalidate_status_cache();

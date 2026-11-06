@@ -347,7 +347,7 @@ fn resolve_project(projects: &[crate::todo::model::Project], p: &str) -> Option<
 }
 
 fn profile_label(settings: &Settings, pin: Option<&str>) -> String {
-    let scope = crate::mcp::manager::profile_reach::ProfileScope::resolve(settings, "", pin, &[]);
+    let scope = crate::mcp::manager::profile_reach::ProfileScope::resolve(settings, "", pin, true);
     match scope.home_name() {
         Some(name) => name.to_string(),
         None if scope.pin_removed() => "removed profile".to_string(),
@@ -473,9 +473,11 @@ pub async fn read_tab(
 }
 
 /// Every Composio profile whose data `target` may hold: its home (pin, else
-/// the global active profile) and reach, the Composio results still in its
-/// messages, the profiles its summary holds data from, and its carried
-/// reads (`profile_reach::inherited_sources` plus the reach). Server-name
+/// the global active profile), the Composio results still in its messages,
+/// the profiles its summary holds data from, and its carried reads
+/// (`profile_reach::inherited_sources` plus the home). The rest of its reach
+/// is not counted: an unlocked tab can reach every profile, but holds data
+/// only from the ones it actually read, and those reads are already listed. Server-name
 /// sources resolve to profile ids; one that no longer resolves is kept as
 /// it is (its data is still in the conversation).
 pub fn read_sources(settings: &Settings, target: &Session) -> BTreeSet<String> {
@@ -484,7 +486,7 @@ pub fn read_sources(settings: &Settings, target: &Session) -> BTreeSet<String> {
         .into_iter()
         .map(|s| profile_for_server_name(settings, &s).map(str::to_string).unwrap_or(s))
         .collect();
-    out.extend(reach_of(settings, target).into_iter().map(|p| p.id));
+    out.extend(reach_of(settings, target).into_iter().next().map(|home| home.id));
     out
 }
 
@@ -871,6 +873,18 @@ mod tests {
         for want in ["pg", "acme", "cm", "composio-native:Gone"] {
             assert!(got.contains(want), "{want} in {got:?}");
         }
+    }
+
+    /// An unlocked tab reaches every profile, but only its home and what it
+    /// actually read count as sources.
+    #[test]
+    fn read_sources_skip_reach_the_tab_never_read() {
+        let settings = two_companies();
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(Some("pg".into()));
+        let s = state.sessions.get_mut(&id).unwrap();
+        assert!(!s.profile_locked);
+        assert_eq!(read_sources(&settings, s), BTreeSet::from(["pg".to_string()]));
     }
 
     /// The critical case: Hobbes reads a Puget tab, then a write to
