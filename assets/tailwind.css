@@ -1465,6 +1465,10 @@ video {
   left: 0px;
 }
 
+.left-0\.5 {
+  left: 0.125rem;
+}
+
 .left-1 {
   left: 0.25rem;
 }
@@ -1483,10 +1487,6 @@ video {
 
 .left-\[-10px\] {
   left: -10px;
-}
-
-.left-\[-25px\] {
-  left: -25px;
 }
 
 .left-full {
@@ -1523,10 +1523,6 @@ video {
 
 .right-\[-10px\] {
   right: -10px;
-}
-
-.right-\[-25px\] {
-  right: -25px;
 }
 
 .right-auto {
@@ -2477,6 +2473,11 @@ video {
 
 .-translate-y-1\/2 {
   --tw-translate-y: -50%;
+  transform: translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y));
+}
+
+.translate-x-3 {
+  --tw-translate-x: 0.75rem;
   transform: translate(var(--tw-translate-x), var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y));
 }
 
@@ -3648,6 +3649,11 @@ video {
   background-color: transparent;
 }
 
+.bg-white {
+  --tw-bg-opacity: 1;
+  background-color: rgb(255 255 255 / var(--tw-bg-opacity, 1));
+}
+
 .bg-white\/10 {
   background-color: rgb(255 255 255 / 0.1);
 }
@@ -3991,10 +3997,6 @@ video {
 
 .pr-2\.5 {
   padding-right: 0.625rem;
-}
-
-.pr-4 {
-  padding-right: 1rem;
 }
 
 .pr-7 {
@@ -5480,6 +5482,11 @@ video {
 .focus-visible\:ring-primary-300:focus-visible {
   --tw-ring-opacity: 1;
   --tw-ring-color: rgb(132 164 209 / var(--tw-ring-opacity, 1));
+}
+
+.focus-visible\:ring-primary-600:focus-visible {
+  --tw-ring-opacity: 1;
+  --tw-ring-color: rgb(47 71 122 / var(--tw-ring-opacity, 1));
 }
 
 .active\:scale-95:active {

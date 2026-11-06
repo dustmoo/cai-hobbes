@@ -347,7 +347,7 @@ fn resolve_project(projects: &[crate::todo::model::Project], p: &str) -> Option<
 }
 
 fn profile_label(settings: &Settings, pin: Option<&str>) -> String {
-    let scope = crate::mcp::manager::profile_reach::ProfileScope::resolve(settings, "", pin, &[]);
+    let scope = crate::mcp::manager::profile_reach::ProfileScope::resolve(settings, "", pin, true);
     match scope.home_name() {
         Some(name) => name.to_string(),
         None if scope.pin_removed() => "removed profile".to_string(),

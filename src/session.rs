@@ -429,13 +429,18 @@ pub struct Session {
     /// this session's own messages until they age out of the read window.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub carried_reads: Vec<CarriedRead>,
-    /// Multi-profile reach, phase 2: the other Composio profiles (ids) this
-    /// ordinary tab may also act in, ticked on its profile chip. Its pin
-    /// (`composio_profile`) stays home. Empty = single-profile, as before.
-    /// Resolved by `profile_reach::session_reach` (deleted profiles drop out
-    /// there); ignored for system sessions. Journaled as `ProfileReachSet`.
+    /// Retired: the profiles once ticked on the tab's chip as its reach.
+    /// Ordinary tabs now reach every set-up profile unless locked
+    /// (`profile_locked`), so this no longer affects resolution. Kept so old
+    /// rows and `ProfileReachSet` journals still load and replay.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_reach: Vec<String>,
+    /// The chip's "Keep this tab to {home} only" switch: when set, this
+    /// ordinary tab acts only in its home profile instead of reaching every
+    /// set-up profile (`profile_reach::session_reach`). Per tab; new tabs
+    /// start open. Ignored for system sessions. Journaled as `ProfileLockSet`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub profile_locked: bool,
     /// The Composio profiles whose data the conversation summary may hold
     /// (profile ids, or a `composio-native:{name}` server name for an
     /// unstamped call). Set only by `adopt_summary`, never from model
@@ -452,18 +457,6 @@ pub struct Session {
     /// read the call's stamp, so a resumed approval keeps its turn's rules.
     #[serde(default, skip_serializing_if = "TurnOrigin::is_user")]
     pub turn_origin: TurnOrigin,
-}
-
-impl Session {
-    /// After a repin: the new home leaves the tab's reach list (it is home,
-    /// not reach). Returns the new list when it changed, for the caller to
-    /// journal as `ProfileReachSet`.
-    pub fn drop_home_from_reach(&mut self) -> Option<Vec<String>> {
-        let home = self.composio_profile.as_deref()?;
-        let i = self.profile_reach.iter().position(|p| p == home)?;
-        self.profile_reach.remove(i);
-        Some(self.profile_reach.clone())
-    }
 }
 
 /// Who started a turn. Trust follows the turn, not the session: the Hobbes
@@ -1872,6 +1865,7 @@ impl SessionState {
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
+            profile_locked: false,
             summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
         };
@@ -2538,6 +2532,7 @@ mod tests {
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
+            profile_locked: false,
             summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
             }
@@ -3392,6 +3387,7 @@ mod tests {
             dispatched_workers: Vec::new(),
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
+            profile_locked: false,
             summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
             messages: vec![

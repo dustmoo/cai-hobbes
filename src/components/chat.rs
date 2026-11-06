@@ -221,7 +221,8 @@ pub fn ChatWindow(
                 &settings_snapshot,
                 &target_id,
                 session.and_then(|s| s.composio_profile.as_deref()),
-                session.map_or(&[][..], |s| s.profile_reach.as_slice()),
+                // Not hydrated: home only, as before.
+                session.is_none_or(|s| s.profile_locked),
             )
         };
         let profile_id = scope.home_id().map(str::to_string);
@@ -240,8 +241,8 @@ pub fn ChatWindow(
         if scope.home.is_none() {
             fresh = crate::mcp::manager::profile_reach::without_composio(fresh);
         }
-        // Multi-profile reach (Heartbeat / Voice, and ordinary tabs with
-        // profiles ticked on their chip): the other reachable profiles'
+        // Multi-profile reach (Heartbeat / Voice, and every ordinary tab
+        // not locked to its home on the chip): the other reachable profiles'
         // Composio tools join the home set, each call naming its profile
         // (mcp::manager::profile_reach).
         let reach = scope.reach;
@@ -676,17 +677,16 @@ pub fn ChatWindow(
                             // there, not in the tab's home profile.
                             let call_profile = {
                                 let settings_read = settings.peek();
-                                let selected: Vec<String> = session_state
+                                let locked = session_state
                                     .peek()
                                     .sessions
                                     .get(&owning_id)
-                                    .map(|s| s.profile_reach.clone())
-                                    .unwrap_or_default();
+                                    .is_none_or(|s| s.profile_locked);
                                 crate::mcp::manager::profile_reach::resume_profile_in(
                                     &settings_read,
                                     &owning_id,
                                     composio_profile.as_deref(),
-                                    &selected,
+                                    locked,
                                     &tool_call,
                                 )
                             };

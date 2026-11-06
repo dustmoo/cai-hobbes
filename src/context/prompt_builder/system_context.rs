@@ -423,7 +423,7 @@ impl<'a> PromptBuilder<'a> {
                 system_context_map.insert(
                     "composio_context".to_string(),
                     json!({
-                        "info": "You have access to external tools via Composio. Each profile is a separate company's connected accounts.",
+                        "info": "You have access to external tools via Composio. Each profile is a separate organisation's connected accounts.",
                         "home_profile": active_profile_name,
                         "reachable_profiles": others,
                         "instruction": crate::mcp::manager::profile_reach::reach_instruction(active_profile_name, &others),

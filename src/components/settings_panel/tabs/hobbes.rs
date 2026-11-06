@@ -50,7 +50,7 @@ fn HobbesTabCard(ctx: SettingsCtx) -> Element {
                     class: "mb-4",
                     label { class: "block text-sm font-medium text-fg-muted mb-1", "Hobbes home profile" }
                     p { class: "text-xs text-fg-muted mb-1",
-                        "The Composio profile the Hobbes tab (the Heartbeat and voice) acts in by default, as your own company. They can also use your other profiles; a write that lands outside home, or carries one company's data into another's, asks you first."
+                        "The Composio profile the Hobbes tab (the Heartbeat and voice) acts in by default. It can also use your other profiles; a write that lands outside home, or carries one profile's data into another's, asks you first."
                     }
                     select {
                         class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
