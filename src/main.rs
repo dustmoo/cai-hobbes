@@ -1156,10 +1156,15 @@ fn app() -> Element {
         // process holds hydrated API keys (fleet tokio tasks never see
         // Settings). One task per 15s tick — with the 45s quiet period this
         // is the debounce — keeps cost and concurrency trivially bounded.
+        // A finished dispatched run wakes the loop early (fleet ingest →
+        // `wake_briefs`): its parent chat is waiting on the closing brief.
         spawn(async move {
             let mut backoff = fleet::briefs::BriefBackoff::default();
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = fleet::shared().briefs_woken() => {}
+                }
                 let s = settings.peek().clone();
                 if !(s.fleet_enabled
                     && s.fleet_briefs_enabled
@@ -1258,6 +1263,8 @@ fn app() -> Element {
                             let brief_for_merge = brief.clone();
                             let blocked = std::cell::RefCell::new(None);
                             let blocked_ref = &blocked;
+                            let owes_handback = std::cell::Cell::new(false);
+                            let owes_ref = &owes_handback;
                             let merged =
                                 fleet::store::merge_session(&task.session_id, move |row| {
                                     row.brief = Some(brief_for_merge);
@@ -1268,9 +1275,17 @@ fn app() -> Element {
                                         row.brief_dirty_at = None;
                                     }
                                     *blocked_ref.borrow_mut() = row.blocked_on().map(str::to_string);
+                                    owes_ref.set(fleet::awaiting_dispatch_handback(row));
                                 });
                             if merged {
                                 shared.poke();
+                                // A dispatched run's closing brief: hand it
+                                // back to the parent chat now, not at the
+                                // next sweep tick (live rows do this inside
+                                // `set_brief`).
+                                if owes_handback.get() {
+                                    shared.run_dispatch_continuations();
+                                }
                             }
                             blocked.into_inner()
                         };
@@ -2206,13 +2221,15 @@ fn app() -> Element {
     // Dispatch relay: a chat worker's to-do can finish after its last turn
     // (a brief lands later and marks it Done / Review). This sweep hands
     // those completion reports to the parent chat; the worker's turn end
-    // covers the rest. Latched per worker, so a report goes out once.
+    // covers the rest. Latched per worker, so a report goes out once. A
+    // backstop: the worker's turn end and the Fleet drain's agent-state sync
+    // send reports as they happen.
     {
         let planner_state = planner_state;
         let session_state = session_state;
         use_future(move || async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 let streaming = STREAMING_SESSIONS.peek().clone();
                 crate::todo::relay::sweep_completion_reports(
                     crate::todo::relay::RelaySignals {
@@ -2227,7 +2244,7 @@ fn app() -> Element {
     }
 
     // ── AI-settable timer scheduler ──────────────────────────────────────────
-    // Polls every 5s for due timers (HOBBES_SET_TIMER) and fires them: focus the
+    // Wakes at each due timer (HOBBES_SET_TIMER) and fires it: focus the
     // window + toast, and for `prompt` mode enqueue the prompt and switch to its
     // session so ChatInput's drain runs it. A timer with a wake condition
     // (`until`) also fires as soon as the planner shows it met
@@ -2290,13 +2307,19 @@ fn app() -> Element {
                     ));
                 }
 
-                // Poll loop.
+                // Check loop: sleep until the next pending deadline, waking
+                // early when a to-do is saved or a timer is created
+                // (`timers::request_check`); capped as a backstop.
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let nap = crate::timers::next_check_in(
+                        session_state.peek().sessions.values().flat_map(|s| s.scheduled_timers.iter()),
+                        chrono::Utc::now(),
+                    );
+                    crate::timers::wait_for_check(nap).await;
                     let now = chrono::Utc::now();
 
                     // Cheap read-only pass first so we don't mark the signal
-                    // dirty (and re-render) every 5s when nothing is due. It
+                    // dirty (and re-render) on every check when nothing is due. It
                     // collects (session, timer, cause) for the write pass.
                     let wakes: Vec<(String, String, String)> = {
                         let planner = planner_state.peek();

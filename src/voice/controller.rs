@@ -281,6 +281,7 @@ pub fn on_turn_end(
     settings: Signal<crate::settings::Settings>,
     session_id: &str,
 ) {
+    super::brain::wake();
     let Some((text, kind)) = pending_announcement(session_state, settings, session_id) else { return };
     tracing::info!("voice: announcing Hobbes-tab news ({kind:?}, {} chars)", text.chars().count());
     send(VoiceCmd::Announce(text, kind));

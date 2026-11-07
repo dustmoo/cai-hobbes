@@ -43,12 +43,14 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
     // Bumped by the store whenever a write changes what this list shows
     // (sessions added, deleted, renamed, retitled, new messages) — not on
-    // every save of a streaming reply. Polled: an atomic load, and only
-    // while the drawer is open.
+    // every save of a streaming reply. Awaited on a watch channel with a
+    // slow fallback tick.
     let mut list_version = use_signal(session_store::list_version);
     use_future(move || async move {
+        let mut rx = session_store::subscribe_list_version();
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            // Wake on the store's bump; the slow tick covers a missed one.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await;
             let v = session_store::list_version();
             if v != *list_version.peek() {
                 list_version.set(v);

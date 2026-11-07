@@ -16,6 +16,12 @@ use super::{truncate_summary, FleetSession, FleetState, FleetStatus, SessionBrie
 /// been quiet this long (SessionEnd rows skip the wait). Coalesces the
 /// per-turn Stop spam into one call per work burst.
 pub const BRIEF_QUIET_SECS: i64 = 45;
+/// The quiet period for a finished dispatched run still owed its hand-back
+/// ([`super::awaiting_dispatch_handback`]): its parent chat is waiting on
+/// this brief, so it only settles long enough for a headless run's
+/// SessionEnd (which follows its last Stop almost at once) to land. Once the
+/// continuation fires, later turns debounce on [`BRIEF_QUIET_SECS`] again.
+pub const DISPATCH_BRIEF_QUIET_SECS: i64 = 5;
 /// Sessions listed in the AI's `planner_today` fleet block.
 pub const CTX_MAX_FLEET: usize = 6;
 /// Headline clip at generation time (display clips further).
@@ -55,6 +61,11 @@ pub fn brief_due(s: &FleetSession, now: DateTime<Utc>, quiet_secs: i64) -> bool 
         return false;
     }
     let is_final = s.ended_at.is_some();
+    let quiet_secs = if super::awaiting_dispatch_handback(s) {
+        quiet_secs.min(DISPATCH_BRIEF_QUIET_SECS)
+    } else {
+        quiet_secs
+    };
     is_final || (now - dirty_at).num_seconds() >= quiet_secs
 }
 
@@ -744,6 +755,25 @@ mod tests {
         // Brief older than the dirty mark → due again.
         s.brief = Some(brief_at("2026-09-01T09:00:00Z"));
         assert!(brief_due(&s, t0 + chrono::Duration::seconds(60), 45));
+    }
+
+    #[test]
+    fn finished_dispatched_run_skips_most_of_the_quiet_period() {
+        let t0 = utc("2026-09-01T10:00:00Z");
+        let mut s = session("run");
+        s.transcript_path = Some("/tmp/t.jsonl".into());
+        s.brief_dirty_at = Some(t0);
+        s.dispatched_from = Some("parent".into());
+        let settle = t0 + chrono::Duration::seconds(DISPATCH_BRIEF_QUIET_SECS);
+        assert!(!brief_due(&s, settle - chrono::Duration::seconds(1), BRIEF_QUIET_SECS));
+        assert!(brief_due(&s, settle, BRIEF_QUIET_SECS));
+        // Still working → not finished, the normal debounce applies.
+        s.working_since = Some(t0);
+        assert!(!brief_due(&s, settle, BRIEF_QUIET_SECS));
+        s.working_since = None;
+        // Hand-back already delivered → later turns debounce normally.
+        s.continuation_sent = true;
+        assert!(!brief_due(&s, settle, BRIEF_QUIET_SECS));
     }
 
     #[test]

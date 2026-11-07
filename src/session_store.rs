@@ -68,8 +68,20 @@ pub fn list_version() -> u64 {
     LIST_VERSION.load(Ordering::Acquire)
 }
 
+fn list_watch() -> &'static tokio::sync::watch::Sender<u64> {
+    static TX: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+    TX.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+/// A receiver that wakes whenever [`list_version`] is bumped. Await
+/// `changed()`, then re-read [`list_version`] for the value.
+pub fn subscribe_list_version() -> tokio::sync::watch::Receiver<u64> {
+    list_watch().subscribe()
+}
+
 fn bump_list_version() {
-    LIST_VERSION.fetch_add(1, Ordering::AcqRel);
+    let v = LIST_VERSION.fetch_add(1, Ordering::AcqRel) + 1;
+    list_watch().send_replace(v);
 }
 
 /// Bump [`list_version`] if `id`'s listed fields differ from its last write.

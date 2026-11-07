@@ -1132,8 +1132,10 @@ pub fn dismiss_in_state(state: &mut FleetState, session_id: &str) -> Option<Flee
 // the sweep runs on a plain tokio task with no Signal access.
 
 /// How long a finished dispatched run waits for its closing brief before the
-/// continuation fires anyway. The brief supervisor debounces on
-/// [`briefs::BRIEF_QUIET_SECS`]; the extra margin covers the LLM call itself.
+/// continuation fires anyway (the brief-never-comes fallback: briefs off, no
+/// connector, generation failing). Normally the brief lands well inside it —
+/// the supervisor is woken at once for a dispatched run's final brief — and
+/// the sweep runs the moment it does ([`FleetShared::set_brief`]).
 pub const DISPATCH_CONTINUE_GRACE_SECS: i64 = briefs::BRIEF_QUIET_SECS + 30;
 
 /// Supervisor mirror of `settings.dispatch_auto_continue` (the sweep has no
@@ -1186,6 +1188,22 @@ fn dispatch_done_at(s: &FleetSession) -> Option<DateTime<Utc>> {
     // actually completed.
     s.brief_dirty_at
         .or_else(|| s.brief.as_ref().map(|b| b.generated_at))
+}
+
+/// Is this dispatched run finished and still owed its hand-back to the parent
+/// chat? The brief supervisor shortens its quiet period for these rows
+/// ([`briefs::DISPATCH_BRIEF_QUIET_SECS`]) so the continuation carries a
+/// brief without waiting out the per-turn debounce.
+pub fn awaiting_dispatch_handback(s: &FleetSession) -> bool {
+    dispatch_done_at(s).is_some()
+}
+
+/// The instant a finished dispatched run's continuation fires even without
+/// a closing brief: its finish time plus [`DISPATCH_CONTINUE_GRACE_SECS`].
+/// `None` when the row owes no continuation. The ingest path arms a one-shot
+/// sweep for this instant, so the fallback doesn't wait for the 60 s tick.
+pub fn dispatch_continue_deadline(s: &FleetSession) -> Option<DateTime<Utc>> {
+    dispatch_done_at(s).map(|done| done + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
 }
 
 /// The message the parent chat receives. First person to Hobbes, so the
@@ -1431,6 +1449,16 @@ pub struct FleetShared {
     /// Filled by the server's sweep (a plain tokio task), taken by the UI
     /// drain loop in `main.rs` — the one place that may touch the chat queue.
     continuations: Mutex<Vec<PendingContinuation>>,
+    /// Serialises [`Self::run_dispatch_continuations`]. Ended rows are read
+    /// from the store before the state lock and latched in the store after
+    /// it, so two overlapping runs could both see an unlatched ended row;
+    /// this lock closes that window. Lock order: `continuation_sweep` →
+    /// `state` → `continuations`. Never taken while `state` is held.
+    continuation_sweep: Mutex<()>,
+    /// Wakes the brief supervisor (`main.rs`) ahead of its tick when a
+    /// dispatched run finishes. A `notify_one` with no waiter stores a
+    /// permit, so a wake during an in-flight generation is not lost.
+    brief_wake: tokio::sync::Notify,
 }
 
 impl Default for FleetShared {
@@ -1446,7 +1474,55 @@ impl FleetShared {
             gates: Mutex::new(HashMap::new()),
             notify: tokio::sync::watch::channel(0).0,
             continuations: Mutex::new(Vec::new()),
+            continuation_sweep: Mutex::new(()),
+            brief_wake: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Wake the brief supervisor now instead of at its next tick.
+    pub fn wake_briefs(&self) {
+        self.brief_wake.notify_one();
+    }
+
+    /// Resolves when [`Self::wake_briefs`] is called (or a stored wake
+    /// permit is pending).
+    pub async fn briefs_woken(&self) {
+        self.brief_wake.notified().await;
+    }
+
+    /// Hand finished dispatched runs back to their parent chats: sweep the
+    /// live map plus today's ended store rows, latch what fired (live rows
+    /// persisted, ended rows merged in the store), queue the continuations
+    /// for the UI drain loop and poke. Returns whether anything fired.
+    ///
+    /// Event-driven (a brief landing, the post-finish grace timer) with the
+    /// server's 60 s sweep as backstop. Safe to call from anywhere that holds
+    /// no fleet lock: runs are serialised and the `continuation_sent` latch
+    /// is set under the state lock, so no run is delivered twice. A run that
+    /// finished before the last local midnight is stale news and drops.
+    pub fn run_dispatch_continuations(&self) -> bool {
+        if !dispatch_auto_continue() {
+            return false;
+        }
+        let _serial = self
+            .continuation_sweep
+            .lock()
+            .expect("fleet continuation sweep lock poisoned");
+        let ended = store::sessions_active_on(chrono::Local::now().date_naive());
+        let sweep = {
+            let mut state = self.state.lock().expect("fleet state lock poisoned");
+            sweep_dispatch_continuations(&mut state, &ended, Utc::now(), true)
+        };
+        if sweep.is_empty() {
+            return false;
+        }
+        store::persist_sessions(&sweep.live_rows);
+        for id in &sweep.ended_ids {
+            store::merge_session(id, |row| row.continuation_sent = true);
+        }
+        self.push_continuations(sweep.continuations);
+        self.poke();
+        true
     }
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -1587,6 +1663,11 @@ impl FleetShared {
             Some(row) => {
                 store::persist_sessions(std::slice::from_ref(&row));
                 self.poke();
+                // The closing brief a finished dispatched run was waiting on:
+                // hand it back now rather than at the next sweep tick.
+                if awaiting_dispatch_handback(&row) {
+                    self.run_dispatch_continuations();
+                }
                 true
             }
             None => false,
@@ -1923,6 +2004,48 @@ mod tests {
         let text = continuation_text("Ship CSV export", &c.session_name, None);
         assert!(text.contains("has finished"));
         assert!(text.contains("No closing brief was generated"));
+    }
+
+    #[test]
+    fn continue_deadline_is_finish_plus_grace_and_only_while_owed() {
+        let (mut state, stopped) = dispatched_state(Some("parent"));
+        let s = state.sessions.get_mut("run1").unwrap();
+        assert!(awaiting_dispatch_handback(s));
+        assert_eq!(
+            dispatch_continue_deadline(s),
+            Some(stopped + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
+        );
+        // A run that ended keys off its end time.
+        let ended = stopped + chrono::Duration::seconds(3);
+        s.ended_at = Some(ended);
+        assert_eq!(
+            dispatch_continue_deadline(s),
+            Some(ended + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
+        );
+        s.continuation_sent = true;
+        assert_eq!(dispatch_continue_deadline(s), None);
+        assert!(!awaiting_dispatch_handback(s));
+
+        let (state, _) = dispatched_state(None);
+        assert_eq!(dispatch_continue_deadline(&state.sessions["run1"]), None);
+    }
+
+    #[test]
+    fn a_landed_brief_hands_the_run_back_at_once_and_only_once() {
+        let (state, stopped) = dispatched_state(Some("parent"));
+        let shared = FleetShared::new();
+        *shared.state.lock().unwrap() = state;
+        let started = stopped + chrono::Duration::seconds(5);
+        assert!(shared.set_brief("run1", brief_at(started, "Shipped it."), started, None));
+        let queued = shared.take_continuations();
+        assert_eq!(queued.len(), 1, "no wait for the sweep tick");
+        assert_eq!(queued[0].run_session_id, "run1");
+        assert!(queued[0].progress.is_some());
+        assert!(shared.snapshot().sessions["run1"].continuation_sent);
+        // Later sweeps and briefs find the latch set.
+        assert!(!shared.run_dispatch_continuations());
+        shared.set_brief("run1", brief_at(started, "Again."), started, None);
+        assert!(shared.take_continuations().is_empty());
     }
 
     #[test]

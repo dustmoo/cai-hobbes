@@ -379,6 +379,9 @@ impl StreamManagerContext {
             let mut dispatched_tool_calls: std::collections::HashSet<(String, String, u64)> =
                 std::collections::HashSet::new();
             let completed_tool_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Woken by each finishing tool task so the end-of-turn wait below
+            // doesn't poll the counter.
+            let tool_task_done = std::sync::Arc::new(tokio::sync::Notify::new());
             let mut final_text_for_this_turn = String::new();
             let mut thought_signature_for_this_turn: Option<String> = None;
             let mut thought_summary_for_this_turn: Option<String> = None;
@@ -857,6 +860,7 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
+                        let tool_task_done_clone = tool_task_done.clone();
                         // Always the resolved home (never the raw pin), so
                         // the executor runs where the guard checked.
                         let profile_id_inner = scope.home_id().map(str::to_string);
@@ -965,6 +969,7 @@ impl StreamManagerContext {
                                 }
                                 completed_tool_tasks_clone
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                tool_task_done_clone.notify_one();
                                 return;
                             }
 
@@ -1047,6 +1052,7 @@ impl StreamManagerContext {
                                 let _ = tool_results_tx_clone.send(record);
                                 completed_tool_tasks_clone
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                tool_task_done_clone.notify_one();
                                 return;
                             }
 
@@ -1354,6 +1360,7 @@ impl StreamManagerContext {
                             // Signal completion regardless of permission status
                             completed_tool_tasks_clone
                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tool_task_done_clone.notify_one();
                         });
                         is_first_message = false;
                     }
@@ -1561,8 +1568,10 @@ impl StreamManagerContext {
 
             // Wait for all tool execution tasks to complete before proceeding to collect results.
             // This prevents a race condition where the receiver loop closes before all tools are finished.
+            // `notify_one` stores a permit, so a task finishing between the
+            // check and the await is never missed.
             while completed_tool_tasks.load(std::sync::atomic::Ordering::SeqCst) < tool_call_count {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tool_task_done.notified().await;
             }
 
             drop(tool_results_tx);

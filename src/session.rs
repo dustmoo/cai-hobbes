@@ -1250,6 +1250,7 @@ impl SessionState {
             };
             session.scheduled_timers.push(timer.clone());
         }
+        crate::timers::request_check();
         crate::session_events::log_event(
             session_id,
             crate::session_events::SessionEvent::TimerCreated { timer },

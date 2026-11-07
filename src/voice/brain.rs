@@ -19,6 +19,16 @@ use crate::session::SessionState;
 /// Longest the voice tier waits on one brain request.
 const BRAIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const POLL: Duration = Duration::from_millis(300);
+/// Fallback wake while waiting for the turn to end, in case a [`wake`] is missed.
+const END_FALLBACK: Duration = Duration::from_millis(500);
+
+static TURN_END: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Signalled at every turn end (`voice::controller::on_turn_end`) so the
+/// brain wait wakes immediately instead of on its next tick.
+pub fn wake() {
+    TURN_END.notify_one();
+}
 /// Most text handed back to the voice tier.
 const MAX_RESULT_CHARS: usize = 4000;
 
@@ -201,7 +211,14 @@ async fn run_inner(
     let mut seen_stream = false;
     let mut quiet_since: Option<Instant> = None;
     loop {
-        tokio::time::sleep(POLL).await;
+        if seen_stream {
+            // Mid-turn: sleep until the turn ends (or the fallback tick,
+            // which also bounds cancel/detach latency).
+            let _ = tokio::time::timeout(END_FALLBACK, TURN_END.notified()).await;
+        } else {
+            // Waiting for the turn to be picked up and start streaming.
+            tokio::time::sleep(POLL).await;
+        }
         if handle.detach.load(Ordering::SeqCst) {
             return BrainOutcome::Cancelled;
         }
