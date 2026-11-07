@@ -129,11 +129,35 @@ pub fn next_check_in(state: &HeartbeatState, wakes_per_hour: u32) -> Option<Date
     check_in_due(state, wakes_per_hour)
 }
 
+/// What a day off allows the Heartbeat's own wakes (see
+/// [`days_off_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayGate {
+    /// Day anchors may fire.
+    pub anchors_allowed: bool,
+    /// Queued events are held (they stay queued for the next wake).
+    pub events_held: bool,
+}
+
+/// The days-off rule. On a workday everything runs. On a day off:
+/// `MeetingsAndUrgent` changes nothing (day anchors are already only the
+/// meeting ones), `MeetingsOnly` holds events but lets meeting anchors
+/// fire, `Off` holds events and anchors alike.
+pub fn days_off_gate(mode: crate::settings::HeartbeatDaysOff, workday: bool) -> DayGate {
+    use crate::settings::HeartbeatDaysOff::*;
+    match (workday, mode) {
+        (true, _) | (false, MeetingsAndUrgent) => DayGate { anchors_allowed: true, events_held: false },
+        (false, MeetingsOnly) => DayGate { anchors_allowed: true, events_held: true },
+        (false, Off) => DayGate { anchors_allowed: false, events_held: true },
+    }
+}
+
 /// The wake decision. Urgent events wake at once; then due day anchors
 /// (`anchors` is `anchors::due_anchors`); otherwise actionable queued events
 /// wake for a check-in per [`check_in_due`]. Nothing else wakes. A busy
 /// session holds any wake; the budget then defers it (a deferred anchor
 /// retries on later polls until it lapses).
+#[cfg(test)]
 pub fn decide_wake(
     state: &HeartbeatState,
     budget: &Budget,
@@ -142,11 +166,29 @@ pub fn decide_wake(
     session_busy: bool,
     anchors: &[Anchor],
 ) -> WakeVerdict {
-    let urgent = urgent_queued(state);
+    decide_wake_gated(state, budget, spent_today_usd, now, session_busy, anchors, DayGate { anchors_allowed: true, events_held: false })
+}
+
+/// [`decide_wake`] under a [`DayGate`]. Held events never trigger a wake
+/// (Idle, not Defer, so the trail isn't spammed every poll) but stay queued
+/// and ride whichever wake does fire; blocked anchors are ignored.
+pub fn decide_wake_gated(
+    state: &HeartbeatState,
+    budget: &Budget,
+    spent_today_usd: f64,
+    now: DateTime<Utc>,
+    session_busy: bool,
+    anchors: &[Anchor],
+    gate: DayGate,
+) -> WakeVerdict {
+    let urgent = if gate.events_held { Vec::new() } else { urgent_queued(state) };
+    let anchors: &[Anchor] = if gate.anchors_allowed { anchors } else { &[] };
     let trigger = if !urgent.is_empty() {
         WakeTrigger::Urgent(urgent)
     } else if !anchors.is_empty() {
         WakeTrigger::Anchors(anchors.to_vec())
+    } else if gate.events_held {
+        return WakeVerdict::Idle;
     } else {
         match check_in_due(state, budget.wakes_per_hour) {
             Some(due) if now >= due => WakeTrigger::CheckIn,
@@ -192,7 +234,7 @@ pub fn rule_label(trigger: &WakeTrigger, state: &HeartbeatState) -> String {
             return format!("actionable items have been queued for {QUEUE_BATCH_MINUTES}+ minutes and the hourly pace allows a wake, so this is a check-in")
         }
         WakeTrigger::Anchors(_) => {
-            return "a day anchor is due (start of the workday, 45 minutes before a meeting, over capacity, or 30 minutes before the workday ends; each at most once a day)".to_string()
+            return "a day anchor is due (start of the workday, 45 minutes before a meeting, over capacity, or 30 minutes before the workday ends, on your configured workdays; each at most once a day)".to_string()
         }
         WakeTrigger::Urgent(ids) => ids
             .iter()
@@ -829,6 +871,39 @@ mod tests {
         assert!(!is_actionable(&st, &awaited));
         queue(&mut st, &awaited, Choice::WakeNow);
         assert!(is_actionable(&st, &awaited));
+    }
+
+    #[test]
+    fn days_off_modes_gate_events_and_anchors() {
+        use crate::settings::HeartbeatDaysOff::*;
+        let day = crate::heartbeat::anchors::tests::day();
+        let at = day.meetings[0].start - Duration::minutes(40);
+        let s0 = HeartbeatState::default();
+        let due = crate::heartbeat::anchors::due_anchors(&s0, &day, at);
+        let meeting: Vec<Anchor> = due.iter().filter(|a| a.key.starts_with("meeting:")).cloned().collect();
+        assert_eq!(meeting.len(), 1);
+        let mut urgent = HeartbeatState::default();
+        let u = ev(KIND_WORKER_STUCK, 0);
+        queue(&mut urgent, &u, Choice::WakeNow);
+        let run = |mode, workday, st: &HeartbeatState, anchors: &[Anchor]| {
+            decide_wake_gated(st, &B, 0.0, at, false, anchors, days_off_gate(mode, workday))
+        };
+        let fire_urgent = WakeVerdict::Fire(WakeTrigger::Urgent(vec![u.id.clone()]));
+        // Workdays and MeetingsAndUrgent behave as before.
+        for (mode, workday) in [(Off, true), (MeetingsOnly, true), (MeetingsAndUrgent, true), (MeetingsAndUrgent, false)] {
+            assert_eq!(run(mode, workday, &urgent, &[]), fire_urgent, "{mode:?} {workday}");
+        }
+        // MeetingsOnly on a day off: events held as Idle, nothing recorded.
+        assert_eq!(run(MeetingsOnly, false, &urgent, &[]), WakeVerdict::Idle);
+        assert_eq!(urgent.queue.len(), 1, "the event stays queued");
+        // ...but a meeting anchor fires, and the held event rides it.
+        assert_eq!(run(MeetingsOnly, false, &urgent, &meeting), WakeVerdict::Fire(WakeTrigger::Anchors(meeting.clone())));
+        // Off: nothing wakes, anchors included.
+        assert_eq!(run(Off, false, &urgent, &[]), WakeVerdict::Idle);
+        assert_eq!(run(Off, false, &urgent, &meeting), WakeVerdict::Idle);
+        assert_eq!(run(Off, false, &s0, &meeting), WakeVerdict::Idle);
+        // On the next workday the held event wakes normally.
+        assert_eq!(run(Off, true, &urgent, &[]), fire_urgent);
     }
 
     #[test]

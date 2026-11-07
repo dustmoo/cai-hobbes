@@ -15,12 +15,15 @@
 //! Each anchor fires at most once per local day (`HeartbeatState::
 //! fired_anchors`). A due anchor still obeys the budget and the busy rule;
 //! held back, it retries on later polls until it lapses. Workday anchors
-//! skip Saturday and Sunday; meeting anchors run every day.
+//! only run on the configured workdays (`heartbeat_workdays`, default
+//! Monday to Friday); meeting anchors run every day. Each anchor kind has a
+//! switch (`heartbeat_brief_start` / `_meetings` / `_end`); a switched-off
+//! anchor is simply not produced.
 //!
 //! [`look_ahead_section`] renders the same view as the wake message's lead
 //! section, "The next few hours".
 
-use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Utc, Weekday};
+use chrono::{DateTime, Duration, Local, NaiveDate, TimeZone, Utc};
 
 use super::state::HeartbeatState;
 use crate::todo::model::{self, AgentState, BlockSource, Todo};
@@ -65,8 +68,14 @@ pub struct Deadline {
 pub struct DayView {
     /// The local day.
     pub today: NaiveDate,
-    /// Monday to Friday: workday anchors only fire on these.
+    /// A configured workday (`heartbeat_workdays`): workday anchors only
+    /// fire on these.
     pub workday: bool,
+    /// Briefing switches: start of day (with the over-capacity note),
+    /// before meetings, end of day.
+    pub brief_start: bool,
+    pub brief_meetings: bool,
+    pub brief_end: bool,
     pub workday_start: DateTime<Utc>,
     pub workday_end: DateTime<Utc>,
     /// Busy external blocks that end after the capture and start within the
@@ -151,7 +160,10 @@ impl DayView {
 
         Self {
             today,
-            workday: !matches!(today.weekday(), Weekday::Sat | Weekday::Sun),
+            workday: settings.is_heartbeat_workday(today),
+            brief_start: settings.heartbeat_brief_start,
+            brief_meetings: settings.heartbeat_brief_meetings,
+            brief_end: settings.heartbeat_brief_end,
             workday_start,
             workday_end,
             meetings,
@@ -205,10 +217,10 @@ pub fn workday_minutes(start: &str, end: &str) -> (u32, u32) {
     }
 }
 
-/// Today's workday end, or `None` on a weekend (no workday to end).
+/// Today's workday end, or `None` on a day off (no workday to end).
 pub fn workday_end_today(settings: &crate::settings::Settings, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let today = now.with_timezone(&Local).date_naive();
-    if matches!(today.weekday(), Weekday::Sat | Weekday::Sun) {
+    if !settings.is_heartbeat_workday(today) {
         return None;
     }
     let (_, end_min) = workday_minutes(&settings.planner_workday_start, &settings.planner_workday_end);
@@ -261,7 +273,7 @@ pub struct Anchor {
 /// Every anchor the day has, due or not.
 pub fn day_anchors(day: &DayView) -> Vec<Anchor> {
     let mut out = Vec::new();
-    if day.workday {
+    if day.workday && day.brief_start {
         out.push(Anchor {
             key: "workday_start".into(),
             kind: AnchorKind::WorkdayStart,
@@ -270,7 +282,7 @@ pub fn day_anchors(day: &DayView) -> Vec<Anchor> {
             lapses_at: (day.workday_start + Duration::minutes(WORKDAY_START_WINDOW_MINUTES)).min(day.workday_end),
         });
     }
-    for m in day.meetings.iter().filter(|m| !m.tentative) {
+    for m in day.meetings.iter().filter(|m| day.brief_meetings && !m.tentative) {
         out.push(Anchor {
             key: format!("meeting:{}@{}", m.id, m.start.to_rfc3339()),
             kind: AnchorKind::Meeting,
@@ -279,7 +291,7 @@ pub fn day_anchors(day: &DayView) -> Vec<Anchor> {
             lapses_at: m.start,
         });
     }
-    if day.workday && day.over_by_minutes > 0 {
+    if day.workday && day.brief_start && day.over_by_minutes > 0 {
         out.push(Anchor {
             key: "over_capacity".into(),
             kind: AnchorKind::OverCapacity,
@@ -291,7 +303,7 @@ pub fn day_anchors(day: &DayView) -> Vec<Anchor> {
             lapses_at: day.workday_end,
         });
     }
-    if day.workday {
+    if day.workday && day.brief_end {
         out.push(Anchor {
             key: "workday_end".into(),
             kind: AnchorKind::WorkdayEnd,
@@ -421,6 +433,9 @@ pub(crate) mod tests {
         DayView {
             today: NaiveDate::from_ymd_opt(2026, 10, 22).unwrap(),
             workday: true,
+            brief_start: true,
+            brief_meetings: true,
+            brief_end: true,
             workday_start: t(9, 0),
             workday_end: t(17, 0),
             meetings: vec![Meeting {
@@ -513,6 +528,44 @@ pub(crate) mod tests {
         assert_eq!(kinds(&due_anchors(&s, &d, t(14, 0))), vec![AnchorKind::Meeting], "meetings count every day");
         d.meetings[0].tentative = true;
         assert!(due_anchors(&s, &d, t(14, 0)).is_empty());
+    }
+
+    #[test]
+    fn per_anchor_switches_drop_their_anchors() {
+        let s = HeartbeatState::default();
+        let at = |d: &DayView| kinds(&day_anchors(d));
+        assert_eq!(
+            at(&day()),
+            vec![AnchorKind::WorkdayStart, AnchorKind::Meeting, AnchorKind::OverCapacity, AnchorKind::WorkdayEnd]
+        );
+        let mut d = day();
+        d.brief_start = false;
+        assert_eq!(at(&d), vec![AnchorKind::Meeting, AnchorKind::WorkdayEnd], "over-capacity rides the start switch");
+        let mut d = day();
+        d.brief_meetings = false;
+        assert!(!at(&d).contains(&AnchorKind::Meeting));
+        assert!(due_anchors(&s, &d, t(14, 0)).iter().all(|a| a.kind != AnchorKind::Meeting));
+        let mut d = day();
+        d.brief_end = false;
+        assert!(!at(&d).contains(&AnchorKind::WorkdayEnd));
+        let mut d = day();
+        (d.brief_start, d.brief_meetings, d.brief_end) = (false, false, false);
+        assert!(at(&d).is_empty());
+    }
+
+    #[test]
+    fn custom_workdays_drive_the_view_and_the_end_anchor() {
+        // Saturday 24 Oct, local time.
+        let sat = Local.with_ymd_and_hms(2026, 10, 24, 10, 0, 0).unwrap().with_timezone(&Utc);
+        let mut settings = crate::settings::Settings::default();
+        let planner = PlannerState::default();
+        assert!(!DayView::capture(&planner, &settings, sat).workday);
+        assert!(workday_end_today(&settings, sat).is_none());
+        settings.heartbeat_workdays = vec![6];
+        assert!(DayView::capture(&planner, &settings, sat).workday);
+        assert!(workday_end_today(&settings, sat).is_some());
+        settings.heartbeat_workdays.clear();
+        assert!(!DayView::capture(&planner, &settings, sat).workday);
     }
 
     #[test]

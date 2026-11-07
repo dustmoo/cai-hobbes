@@ -5,7 +5,7 @@
 use super::super::SettingsCtx;
 use crate::components::hotkey_recorder::HotkeyRecorder;
 use crate::settings::{
-    realtime_capable, VoiceProfile, VOICE_END_OF_TURN_MAX_MS, VOICE_END_OF_TURN_MIN_MS,
+    realtime_capable, HeartbeatDaysOff, VoiceProfile, VOICE_END_OF_TURN_MAX_MS, VOICE_END_OF_TURN_MIN_MS,
     VOICE_NEEDS_REALTIME,
 };
 use crate::voice::audio::{MicPermission, OutputKind, VoiceEcho};
@@ -647,6 +647,124 @@ fn HeartbeatCard(ctx: SettingsCtx) -> Element {
             onchange: move |e| {
                 local_settings.write().heartbeat_enabled = e.value() == "true";
             }
+        }
+    }
+    div {
+        class: "mb-4",
+        label { class: "block text-sm font-medium text-fg-muted mb-1", "Schedule" }
+        p { class: "text-xs text-fg-muted mb-2", "Morning and end-of-day briefings run on these days." }
+        div {
+            class: "flex items-center gap-2 mb-3",
+            for (n, name, letter) in [(1u8, "Monday", "M"), (2, "Tuesday", "T"), (3, "Wednesday", "W"), (4, "Thursday", "T"), (5, "Friday", "F"), (6, "Saturday", "S"), (7, "Sunday", "S")] {
+                {
+                    let on = hb.heartbeat_workdays.contains(&n);
+                    rsx! {
+                        button {
+                            key: "{n}",
+                            r#type: "button",
+                            title: "{name}",
+                            "aria-label": "{name}",
+                            "aria-pressed": "{on}",
+                            class: if on {
+                                "w-8 h-8 rounded-full border border-primary-600 bg-primary-600 text-sm font-medium text-white"
+                            } else {
+                                "w-8 h-8 rounded-full border border-subtle text-sm font-medium text-fg-muted hover:text-fg"
+                            },
+                            onclick: move |_| {
+                                let mut s = local_settings.write();
+                                if let Some(i) = s.heartbeat_workdays.iter().position(|d| *d == n) {
+                                    s.heartbeat_workdays.remove(i);
+                                } else {
+                                    s.heartbeat_workdays.push(n);
+                                    s.heartbeat_workdays.sort_unstable();
+                                }
+                            },
+                            "{letter}"
+                        }
+                    }
+                }
+            }
+        }
+        div {
+            class: "grid grid-cols-2 gap-4 mb-1 max-w-xs",
+            div {
+                label { class: "block text-xs text-fg-muted mb-1", "Workday starts" }
+                input {
+                    r#type: "time",
+                    class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
+                    value: "{hb.planner_workday_start}",
+                    oninput: move |e| {
+                        let v = e.value();
+                        if !v.is_empty() {
+                            local_settings.write().planner_workday_start = v;
+                        }
+                    }
+                }
+            }
+            div {
+                label { class: "block text-xs text-fg-muted mb-1", "Workday ends" }
+                input {
+                    r#type: "time",
+                    class: "w-full rounded border border-subtle bg-input px-3 py-2 text-sm text-fg",
+                    value: "{hb.planner_workday_end}",
+                    oninput: move |e| {
+                        let v = e.value();
+                        if !v.is_empty() {
+                            local_settings.write().planner_workday_end = v;
+                        }
+                    }
+                }
+            }
+        }
+        p { class: "text-xs text-fg-muted mb-3", "Shared with the Planner." }
+        label { class: "block text-sm font-medium text-fg-muted mb-1", "Briefings" }
+        div {
+            class: "flex items-center gap-6 mb-3",
+            label {
+                class: "flex items-center gap-2 text-sm text-fg-muted",
+                input {
+                    r#type: "checkbox",
+                    class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                    checked: "{hb.heartbeat_brief_start}",
+                    onchange: move |e| { local_settings.write().heartbeat_brief_start = e.value() == "true"; }
+                }
+                "Start of day"
+            }
+            label {
+                class: "flex items-center gap-2 text-sm text-fg-muted",
+                input {
+                    r#type: "checkbox",
+                    class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                    checked: "{hb.heartbeat_brief_meetings}",
+                    onchange: move |e| { local_settings.write().heartbeat_brief_meetings = e.value() == "true"; }
+                }
+                "Before meetings"
+            }
+            label {
+                class: "flex items-center gap-2 text-sm text-fg-muted",
+                input {
+                    r#type: "checkbox",
+                    class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                    checked: "{hb.heartbeat_brief_end}",
+                    onchange: move |e| { local_settings.write().heartbeat_brief_end = e.value() == "true"; }
+                }
+                "End of day"
+            }
+        }
+        label { class: "block text-sm font-medium text-fg-muted mb-1", "On days off" }
+        p { class: "text-xs text-fg-muted mb-1", "You can always talk to Hobbes yourself." }
+        select {
+            class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+            onchange: move |e| {
+                local_settings.write().heartbeat_days_off = match e.value().as_str() {
+                    "meetings_only" => HeartbeatDaysOff::MeetingsOnly,
+                    "off" => HeartbeatDaysOff::Off,
+                    _ => HeartbeatDaysOff::MeetingsAndUrgent,
+                };
+            },
+            option { value: "meetings_and_urgent", selected: hb.heartbeat_days_off == HeartbeatDaysOff::MeetingsAndUrgent, "Meetings and anything urgent" }
+            option { value: "meetings_only", selected: hb.heartbeat_days_off == HeartbeatDaysOff::MeetingsOnly, "Meetings only" }
+            option { value: "off", selected: hb.heartbeat_days_off == HeartbeatDaysOff::Off, "Stay quiet" }
         }
     }
     div {

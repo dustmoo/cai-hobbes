@@ -607,6 +607,21 @@ pub struct Settings {
     /// Daily wake spend cap in USD (local day).
     #[serde(default = "default_heartbeat_daily_usd")]
     pub heartbeat_daily_usd: f64,
+    /// ISO weekday numbers (1 = Mon … 7 = Sun) the Heartbeat treats as
+    /// workdays. Empty means no workdays.
+    #[serde(default = "default_heartbeat_workdays")]
+    pub heartbeat_workdays: Vec<u8>,
+    /// Briefing switches: start of the workday (and the over-capacity note
+    /// that rides it), 45 minutes before meetings, end of the workday.
+    #[serde(default = "default_true")]
+    pub heartbeat_brief_start: bool,
+    #[serde(default = "default_true")]
+    pub heartbeat_brief_meetings: bool,
+    #[serde(default = "default_true")]
+    pub heartbeat_brief_end: bool,
+    /// What the Heartbeat does on a day that is not a workday.
+    #[serde(default)]
+    pub heartbeat_days_off: HeartbeatDaysOff,
     /// Per-source watcher switches.
     #[serde(default = "default_true")]
     pub heartbeat_source_planner: bool,
@@ -656,6 +671,33 @@ impl Settings {
 
 fn default_fleet_retire_minutes() -> u32 {
     360
+}
+
+fn default_heartbeat_workdays() -> Vec<u8> {
+    vec![1, 2, 3, 4, 5]
+}
+
+/// What the Heartbeat's own wakes do on a day that is not a workday. The
+/// person can always still talk to Hobbes directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeartbeatDaysOff {
+    /// Meeting anchors and event wakes still run.
+    #[default]
+    MeetingsAndUrgent,
+    /// Meeting anchors run; events wait (queued) for the next wake.
+    MeetingsOnly,
+    /// Nothing wakes; events wait for the next workday.
+    Off,
+}
+
+impl Settings {
+    /// Is `day` one of the Heartbeat's workdays?
+    pub fn is_heartbeat_workday(&self, day: chrono::NaiveDate) -> bool {
+        use chrono::Datelike;
+        let n = day.weekday().number_from_monday() as u8;
+        self.heartbeat_workdays.contains(&n)
+    }
 }
 
 fn default_heartbeat_wakes_per_hour() -> u32 {
@@ -1307,6 +1349,11 @@ impl Default for Settings {
             voice: VoiceSettings::default(),
             heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
             heartbeat_daily_usd: default_heartbeat_daily_usd(),
+            heartbeat_workdays: default_heartbeat_workdays(),
+            heartbeat_brief_start: true,
+            heartbeat_brief_meetings: true,
+            heartbeat_brief_end: true,
+            heartbeat_days_off: HeartbeatDaysOff::default(),
             heartbeat_source_planner: true,
             heartbeat_source_fleet: true,
             heartbeat_source_ci: true,
@@ -3109,6 +3156,40 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heartbeat_workdays_helper() {
+        let d = |day| chrono::NaiveDate::from_ymd_opt(2026, 10, day).unwrap(); // 22 Thu, 24 Sat, 25 Sun
+        let mut s = Settings::default();
+        assert!(s.is_heartbeat_workday(d(22)));
+        assert!(!s.is_heartbeat_workday(d(24)) && !s.is_heartbeat_workday(d(25)));
+        s.heartbeat_workdays = vec![1, 6, 7];
+        assert!(s.is_heartbeat_workday(d(24)) && s.is_heartbeat_workday(d(25)));
+        assert!(!s.is_heartbeat_workday(d(22)));
+        s.heartbeat_workdays.clear();
+        assert!(!s.is_heartbeat_workday(d(22)));
+    }
+
+    #[test]
+    fn heartbeat_schedule_defaults_when_missing() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in [
+            "heartbeat_workdays",
+            "heartbeat_brief_start",
+            "heartbeat_brief_meetings",
+            "heartbeat_brief_end",
+            "heartbeat_days_off",
+        ] {
+            assert!(o.remove(k).is_some(), "{k}");
+        }
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.heartbeat_workdays, vec![1, 2, 3, 4, 5]);
+        assert!(s.heartbeat_brief_start && s.heartbeat_brief_meetings && s.heartbeat_brief_end);
+        assert_eq!(s.heartbeat_days_off, HeartbeatDaysOff::MeetingsAndUrgent);
+        let j = serde_json::to_string(&HeartbeatDaysOff::MeetingsOnly).unwrap();
+        assert_eq!(j, "\"meetings_only\"");
+    }
+
     fn settings_with_connector() -> Settings {
         let mut s = Settings::default();
         if s.llm_connectors.is_empty() {

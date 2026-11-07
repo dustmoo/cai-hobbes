@@ -306,7 +306,9 @@ fn maybe_wake(
         let hb = HEARTBEAT.peek();
         let anchors: Vec<Anchor> = day.as_ref().map(|d| due_anchors(&hb, d, now)).unwrap_or_default();
         let spent = spent_since(&hb.trail, local_day_start(now));
-        wake::decide_wake(&hb, &budget, spent, now, busy, &anchors)
+        let today = now.with_timezone(&chrono::Local).date_naive();
+        let gate = wake::days_off_gate(settings.heartbeat_days_off, settings.is_heartbeat_workday(today));
+        wake::decide_wake_gated(&hb, &budget, spent, now, busy, &anchors, gate)
     };
     match verdict {
         WakeVerdict::Idle | WakeVerdict::Busy => false,
