@@ -403,17 +403,23 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          short: one to three spoken sentences. When they ask for details, ask you to walk them \
          through something, or the answer genuinely needs it (a plan, a comparison, what an \
          email or result actually says), take the room to explain properly, in plain spoken \
-         paragraphs, and lead with the point. If they interrupt, stop and listen.\n\n\
+         paragraphs, and lead with the point. Room to explain never means answering more \
+         yourself: who answers is decided below, and length only shapes how you say it. If \
+         they interrupt, stop and listen.\n\n\
          You are the voice layer. You can check their coding-agent Fleet, their planner and \
          calendar, timers, and the Heartbeat's notes yourself with your tools. For anything \
-         else — doing or changing things, email, files, code, dispatching work, or questions \
-         that need careful thought — call {brain} with a complete request (the brain cannot \
+         else — doing or changing things, email, files, code, dispatching work, anything \
+         you'd need to look up or explain in depth, anything from before the conversation \
+         below, or questions that need careful thought — call {brain} with a complete request (the brain cannot \
          hear the conversation), tell them briefly that you're on it, and keep talking with \
          them. As you hand something to the brain, say a short holding phrase out loud — \
          \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
          silence. When the result comes back, summarise it naturally, and give the detail if they \
          asked for it. Never read out code, URLs \
          or long ids; say it's in the Hobbes tab. When they say goodbye, call {end}.\n\n\
+         You only see the end of the Hobbes tab below. The brain has the whole history, its \
+         summary and their other tabs, so if they ask what you remember or about anything \
+         earlier, ask the brain rather than saying you can't see it.\n\n\
          It is {time}.",
         brain = tools::ASK_BRAIN,
         end = tools::END_CONVERSATION,
@@ -1072,6 +1078,10 @@ mod tests {
         assert!(s.contains("By default keep replies short"));
         assert!(s.contains("When they ask for details"));
         assert!(!s.contains("Keep replies short and conversational: one to three"));
+        // Length never moves work off the brain.
+        assert!(s.contains("Room to explain never means answering more"));
+        assert!(s.contains("explain in depth"));
+        assert!(s.contains("ask the brain rather than saying you can't see it"));
     }
 
     fn msg(author: &str, text: &str) -> crate::components::chat::Message {
