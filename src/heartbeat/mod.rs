@@ -17,7 +17,7 @@
 //! let decisions = salience.decide(&evs, &ctx);
 //! state.ingest(evs, decisions, now);
 //! let anchors = anchors::due_anchors(&state, &DayView::capture(..), now);
-//! match wake::decide_wake(&state, &budget, spent_today, now, session_busy, &anchors) {
+//! match wake::decide_wake_gated(&state, &budget, spent_today, now, session_busy, &anchors) {
 //!     Fire(trigger)  => { /* drain_queue → wake message → record_wake(fired),
 //!                           mark the anchors fired */ }
 //!     Defer { .. }   => { /* record_wake(deferred); events stay queued */ }
