@@ -35,7 +35,7 @@ fn voice_only_decls() -> Vec<ToolDecl> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "request": {"type": "string", "description": "What the person wants, in full sentences, with every detail they gave. The brain can't hear the conversation."},
+                    "request": {"type": "string", "description": "What the person wants, in full sentences, with every detail they gave, and whether they want a quick answer or the full detail. The brain can't hear the conversation."},
                 },
                 "required": ["request"]
             }),

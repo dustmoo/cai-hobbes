@@ -35,9 +35,12 @@ pub enum BrainOutcome {
 pub fn framed_request(request: &str) -> String {
     format!(
         "🎙 {}\n\n[Voice request, relayed by Hobbes' voice layer from a live spoken conversation. \
-         Do what is asked. Your final reply is read aloud: answer in one to four short plain \
-         sentences, no markdown, no code, no URLs; put anything long in the reply after a line \
-         that says \"Details:\" and the voice will point the person to the Hobbes tab.]",
+         Do what is asked. Your final reply is read aloud, so write it as plain speech: no \
+         markdown, no lists, no code, no URLs. Keep it to a few sentences unless they asked for \
+         detail or a walkthrough, or the answer needs it; then explain fully in spoken \
+         paragraphs, leading with the point. Put anything that can't be spoken (code, links, \
+         tables, long ids) after a line that says \"Details:\" and the voice will point the \
+         person to the Hobbes tab.]",
         request.trim()
     )
 }
@@ -329,6 +332,9 @@ mod tests {
     #[test]
     fn framing_keeps_the_request() {
         assert!(framed_request("  email Sam ").starts_with("🎙 email Sam\n"));
+        // Detail is allowed when asked for; unspeakable material still goes after Details:.
+        assert!(framed_request("x").contains("unless they asked for detail"));
+        assert!(!framed_request("x").contains("one to four short"));
         assert!(is_voice_request(&framed_request("email Sam")));
         assert!(!is_voice_request("🎙 a heard transcript line"));
     }

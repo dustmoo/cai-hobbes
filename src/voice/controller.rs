@@ -399,8 +399,11 @@ pub fn realtime_for(settings: &crate::settings::Settings) -> Result<(Box<dyn Rea
 pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> String {
     let mut s = format!(
         "You are Hobbes, the person's chief-of-staff assistant, talking with them by voice. \
-         Keep replies short and conversational: one to three spoken sentences, no lists, no \
-         markdown. If they interrupt, stop and listen.\n\n\
+         Talk the way a person does, with no lists and no markdown. By default keep replies \
+         short: one to three spoken sentences. When they ask for details, ask you to walk them \
+         through something, or the answer genuinely needs it (a plan, a comparison, what an \
+         email or result actually says), take the room to explain properly, in plain spoken \
+         paragraphs, and lead with the point. If they interrupt, stop and listen.\n\n\
          You are the voice layer. You can check their coding-agent Fleet, their planner and \
          calendar, timers, and the Heartbeat's notes yourself with your tools. For anything \
          else — doing or changing things, email, files, code, dispatching work, or questions \
@@ -408,7 +411,8 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          hear the conversation), tell them briefly that you're on it, and keep talking with \
          them. As you hand something to the brain, say a short holding phrase out loud — \
          \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
-         silence. When the result comes back, summarise it naturally. Never read out code, URLs \
+         silence. When the result comes back, summarise it naturally, and give the detail if they \
+         asked for it. Never read out code, URLs \
          or long ids; say it's in the Hobbes tab. When they say goodbye, call {end}.\n\n\
          It is {time}.",
         brain = tools::ASK_BRAIN,
@@ -1060,6 +1064,14 @@ mod tests {
         assert!(s.contains("CI is red") && s.contains("🎙 hi"));
         let bare = system_instruction(now, "");
         assert!(!bare.contains("The end of the Hobbes tab"));
+    }
+
+    #[test]
+    fn instruction_allows_detail_when_asked() {
+        let s = system_instruction(chrono::Local::now(), "");
+        assert!(s.contains("By default keep replies short"));
+        assert!(s.contains("When they ask for details"));
+        assert!(!s.contains("Keep replies short and conversational: one to three"));
     }
 
     fn msg(author: &str, text: &str) -> crate::components::chat::Message {
