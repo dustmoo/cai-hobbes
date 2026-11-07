@@ -529,8 +529,16 @@ pub fn deliver_queued_relay(
         let Some(s) = state.sessions.get(session_id) else {
             return false;
         };
-        crate::heartbeat::wake::has_pending_approval(&s.messages)
-            || crate::agent_time_runtime::continuation_blocked(
+        // The Heartbeat's rule (`approval_blocks_wake`): a call waiting in
+        // the latest turn, or a recent unattended one. An unanswered
+        // approval further back is a dead bubble, and counting it would
+        // silence every relay into this chat for good (the Hobbes tab
+        // shares one long history).
+        crate::heartbeat::wake::approval_blocks_wake(
+            &s.messages,
+            Utc::now(),
+            chrono::Duration::hours(crate::session_rotation::APPROVAL_STALE_HOURS),
+        ) || crate::agent_time_runtime::continuation_blocked(
                 planner,
                 &crate::agent_time_runtime::LEASED_CHATS.peek(),
                 session_id,

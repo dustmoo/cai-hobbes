@@ -1282,6 +1282,29 @@ mod tests {
         assert_eq!(outcome, "waiting on your approval");
     }
 
+    /// A relay into the Hobbes tab uses this rule too: an approval nobody
+    /// answered in an earlier turn must not hold every later turn back.
+    #[test]
+    fn an_old_unanswered_approval_does_not_block_a_new_turn() {
+        use crate::components::shared::ToolCallStatus as S;
+        let t = now();
+        let mut held = tool("write_to_terminal", "{}", S::Running);
+        held.origin = Some(crate::session::TurnOrigin::User);
+        let stale = Duration::hours(crate::session_rotation::APPROVAL_STALE_HOURS);
+        let msgs = vec![
+            msg_at("User", text("run it"), t - Duration::hours(24)),
+            msg_at("Hobbes", MessageContent::PermissionRequest(held.clone()), t - Duration::hours(24)),
+            msg_at("User", text("something else"), t - Duration::hours(1)),
+            msg_at("Hobbes", text("done"), t - Duration::hours(1)),
+        ];
+        assert!(has_pending_approval(&msgs), "the old bubble is still there");
+        assert!(!approval_blocks_wake(&msgs, t, stale), "but it no longer holds a turn");
+        // One in the latest turn still holds it.
+        let mut latest = msgs.clone();
+        latest.push(msg_at("Hobbes", MessageContent::PermissionRequest(held), t));
+        assert!(approval_blocks_wake(&latest, t, stale));
+    }
+
     #[test]
     fn actions_are_read_from_the_wakes_tool_calls() {
         use crate::components::shared::ToolCallStatus as S;
