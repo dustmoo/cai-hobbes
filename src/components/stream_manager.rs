@@ -2116,17 +2116,6 @@ impl StreamManagerContext {
                 self.session_state,
                 &session_id,
             );
-            // Dispatch relay: a finished worker reports to its parent chat
-            // (once), and a relay-started turn is over.
-            crate::todo::relay::on_turn_complete(
-                crate::todo::relay::RelaySignals {
-                    session_state: self.session_state,
-                    planner: self.planner_state,
-                    settings: self.settings,
-                },
-                &session_id,
-            );
-
             on_complete();
             self.streaming_sessions.write().remove(&session_id);
             *self.stream_activity.write() += 1; // Notify TabBar: stream ended
@@ -2134,6 +2123,17 @@ impl StreamManagerContext {
             self.fleet_report(
                 &session_id,
                 crate::fleet::bridge::HobbesSignal::TurnCompleted,
+            );
+            // Dispatch relay: a finished worker settles its to-do and reports
+            // to its parent chat (once), and a relay-started turn is over.
+            // After the Fleet report, so the worker's row reads this turn end.
+            crate::todo::relay::on_turn_complete(
+                crate::todo::relay::RelaySignals {
+                    session_state: self.session_state,
+                    planner: self.planner_state,
+                    settings: self.settings,
+                },
+                &session_id,
             );
             // Voice-tab news (dispatched work back, a late brain answer) is
             // spoken rather than left for the Fleet toast.

@@ -874,11 +874,86 @@ pub fn send_completion_report(sig: RelaySignals, worker: &str) -> bool {
     }
 }
 
-/// A chat's turn ended: send its completion report if it is a finished
-/// worker, and forget what started the turn.
+/// A chat's turn ended: settle its to-do if it is a dispatched worker, send
+/// its completion report if that finished it, and forget what started the
+/// turn. Runs after the turn's Fleet report, so the live row is current.
 pub fn on_turn_complete(sig: RelaySignals, session_id: &str) {
+    settle_worker_todo(sig, session_id);
     send_completion_report(sig, session_id);
     clear_turn_origin(session_id);
+}
+
+/// What a chat worker's ended turn says about its run, when the Fleet has no
+/// row for it (the bridge is off): waiting on its own timer is still working,
+/// a held approval or a closing question waits on the person, anything else
+/// has finished.
+pub fn turn_end_signal_from_session(session: &Session) -> crate::todo::lanes::WorkerSignal {
+    use crate::todo::lanes::{WorkerSignal, WorkerStatus};
+    let turn_start = session
+        .messages
+        .iter()
+        .rposition(crate::voice::transcript::starts_turn)
+        .unwrap_or(0);
+    let held = crate::heartbeat::wake::has_pending_approval(&session.messages[turn_start..]);
+    let ask = crate::fleet::bridge::latest_turn_ask(&session.messages);
+    let (status, attention_message) = if session.next_pending_timer().is_some() {
+        (WorkerStatus::Working, None)
+    } else if held || ask.is_some() {
+        (WorkerStatus::WaitingOnUser, ask)
+    } else {
+        (WorkerStatus::Idle, None)
+    };
+    WorkerSignal {
+        status,
+        ended: false,
+        gate: None,
+        attention_message,
+        attention_at: None,
+        brief: None,
+        worker_name: session.display_title(),
+        idle_settled: status == WorkerStatus::Idle,
+    }
+}
+
+/// Re-read a dispatched chat worker's to-do state at its turn end, instead
+/// of waiting for a periodic sync to notice the worker went quiet. Uses the
+/// live Fleet row when there is one (it carries the brief's open item),
+/// else the session itself. Persists what changed.
+pub fn settle_worker_todo(sig: RelaySignals, worker: &str) {
+    let signal = {
+        let state = sig.session_state.peek();
+        let Some(session) = state.sessions.get(worker) else {
+            return;
+        };
+        let Some(link) = session.dispatch_link.as_ref().filter(|l| !l.report_sent) else {
+            return;
+        };
+        let open = link
+            .todo_id
+            .as_deref()
+            .and_then(|id| sig.planner.peek().todo(id).map(|t| !t.status.is_closed()))
+            .unwrap_or(false);
+        if !open {
+            return;
+        }
+        let now = Utc::now();
+        crate::fleet::shared()
+            .snapshot()
+            .sessions
+            .get(worker)
+            .map(|row| crate::todo::handlers::worker_signal_from_fleet(row, now))
+            .unwrap_or_else(|| turn_end_signal_from_session(session))
+    };
+    let mut planner = sig.planner;
+    let changed = crate::todo::handlers::apply_signal_to_linked(&mut planner.write(), worker, &signal, Utc::now());
+    let p = planner.peek();
+    for id in &changed {
+        if let Some(t) = p.todo(id) {
+            if let Err(e) = crate::todo::store::save_todo(t) {
+                tracing::error!("dispatch relay: to-do persist failed: {e}");
+            }
+        }
+    }
 }
 
 /// Workers owing a report, skipping any still mid-turn (their turn end
@@ -1310,9 +1385,9 @@ mod tests {
             // Mid-turn workers are left to their turn end.
             assert!(reports_due(&ctx.session_state.peek(), &ctx.planner.peek(), &[worker.clone()].into()).is_empty());
 
-            on_turn_complete(ctx.into(), &worker);
             sweep_completion_reports(ctx.into(), &HashSet::new());
             on_turn_complete(ctx.into(), &worker);
+            sweep_completion_reports(ctx.into(), &HashSet::new());
             let q = queued_relays(&parent);
             assert_eq!(q.len(), 1, "once");
             assert_eq!(q[0].kind, RelayKind::Report);
@@ -1327,6 +1402,66 @@ mod tests {
             assert!(send_completion_report(ctx.into(), &worker));
             assert!(queued_relays(&parent).is_empty());
             assert_eq!(relays(&ctx, &parent)[0].kind, RelayKind::Report);
+        });
+    }
+
+    fn push_reply(ctx: &mut BuiltinToolCtx, session: &str, text: &str) {
+        ctx.session_state.write().sessions.get_mut(session).unwrap().messages.push(Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".into(),
+            content: MessageContent::Text {
+                content: text.into(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+            usage: None,
+        });
+    }
+
+    #[test]
+    fn a_worker_turn_end_settles_its_todo_and_reports_at_once() {
+        run!({
+            let (mut ctx, parent, worker, _, todo_id) = linked(Settings::default());
+            push_reply(&mut ctx, &worker, "Raised the foundation base by 0.2m; tested in VR.");
+            on_turn_complete(ctx.into(), &worker);
+            let t = ctx.planner.peek().todo(&todo_id).unwrap().clone();
+            assert_eq!(t.status, crate::todo::model::TodoStatus::Completed, "a clean finish closes (default)");
+            let q = queued_relays(&parent);
+            assert_eq!(q.len(), 1, "reported at the turn end, no settle wait");
+            assert!(q[0].text.contains("(completed)"), "{}", q[0].text);
+        });
+    }
+
+    #[test]
+    fn a_worker_turn_that_asks_or_waits_is_not_finished() {
+        run!({
+            let (mut ctx, parent, worker, _, todo_id) = linked(Settings::default());
+            push_reply(&mut ctx, &worker, "I found two venues. Which one should I book?");
+            on_turn_complete(ctx.into(), &worker);
+            let t = ctx.planner.peek().todo(&todo_id).unwrap().clone();
+            assert!(!t.status.is_closed());
+            assert_eq!(t.agent_state, Some(AgentState::NeedsYou));
+            assert!(queued_relays(&parent).is_empty(), "a question is not a finish");
+        });
+    }
+
+    #[test]
+    fn turn_end_signal_reads_timer_ask_and_finish() {
+        use crate::todo::lanes::WorkerStatus;
+        run!({
+            let (mut ctx, _, worker, _, _) = linked(Settings::default());
+            push_reply(&mut ctx, &worker, "Done.");
+            let sig = turn_end_signal_from_session(ctx.session_state.peek().sessions.get(&worker).unwrap());
+            assert_eq!(sig.status, WorkerStatus::Idle);
+            assert!(sig.idle_settled);
+            push_reply(&mut ctx, &worker, "Should I also update the docs?");
+            let sig = turn_end_signal_from_session(ctx.session_state.peek().sessions.get(&worker).unwrap());
+            assert_eq!(sig.status, WorkerStatus::WaitingOnUser);
+            assert!(!sig.idle_settled);
         });
     }
 

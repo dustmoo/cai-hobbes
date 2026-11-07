@@ -329,6 +329,35 @@ fn default_prev_tab_group() -> String {
     "CmdOrCtrl+Alt+Shift+[".to_string()
 }
 
+/// What happens to a dispatched agent's to-do when its run finishes with
+/// nothing open (`todo::lanes::apply_finish_policy`; Settings → Planner).
+/// A run that leaves an open item always waits for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFinishAction {
+    /// Complete the to-do.
+    #[default]
+    Close,
+    /// Leave it open, marked for review.
+    Review,
+}
+
+impl AgentFinishAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentFinishAction::Close => "close",
+            AgentFinishAction::Review => "review",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "review" => AgentFinishAction::Review,
+            _ => AgentFinishAction::Close,
+        }
+    }
+}
+
 /// How a chat and the chat workers it dispatched may message each other
 /// (`todo::relay`; Settings → Planner).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -574,6 +603,10 @@ pub struct Settings {
     /// (`todo::relay`): off, worker → parent reports (default), or two-way.
     #[serde(default)]
     pub dispatch_relay_mode: DispatchRelayMode,
+    /// A dispatched agent's to-do when its run finishes with nothing open:
+    /// close it (default) or leave it marked for review.
+    #[serde(default)]
+    pub agent_finish_action: AgentFinishAction,
 
     // ── Terminal ────────────────────────────────────────────────────────────
     /// Register the native `hobbes-terminal` MCP server (persistent per-chat
@@ -1343,6 +1376,7 @@ impl Default for Settings {
             fleet_retire_minutes: default_fleet_retire_minutes(),
             dispatch_auto_continue: true,
             dispatch_relay_mode: DispatchRelayMode::default(),
+            agent_finish_action: AgentFinishAction::default(),
             terminal_enabled: false,
             heartbeat_enabled: false,
             hobbes_read_tabs: false,

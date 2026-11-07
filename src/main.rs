@@ -964,6 +964,8 @@ fn app() -> Element {
         spawn(async move {
             let shared = fleet::shared().clone();
             let mut rx = shared.subscribe();
+            // Ended Fleet rows read for the agent-state sync below.
+            let mut ended_rows = crate::components::planner_view::agent_lane::EndedRowCache::new();
             loop {
                 if rx.changed().await.is_err() {
                     break;
@@ -986,6 +988,29 @@ fn app() -> Element {
                         if s.asks_person() && !was && !voice_speaks {
                             flash_timer_toast(format!("🛰 {} needs your attention", s.name));
                         }
+                    }
+                }
+                // Agent to-dos follow their workers on every Fleet change,
+                // whether or not the Planner is open or the Heartbeat is on;
+                // a worker that just finished reports to its parent chat now
+                // rather than at the next sweep.
+                {
+                    let mut planner = planner_state;
+                    let changed = crate::components::planner_view::agent_lane::sync_agent_states_cached(
+                        &mut planner,
+                        &snapshot,
+                        &mut ended_rows,
+                        chrono::Utc::now(),
+                    );
+                    if changed > 0 {
+                        crate::todo::relay::sweep_completion_reports(
+                            crate::todo::relay::RelaySignals {
+                                session_state,
+                                planner: planner_state,
+                                settings,
+                            },
+                            &STREAMING_SESSIONS.peek().clone(),
+                        );
                     }
                 }
                 fleet_state.set(snapshot);
@@ -1073,6 +1098,7 @@ fn app() -> Element {
                 fleet::bridge::set_enabled(want);
                 fleet::set_retire_minutes(settings.peek().fleet_retire_minutes);
                 fleet::set_dispatch_auto_continue(settings.peek().dispatch_auto_continue);
+                crate::todo::lanes::set_finish_action(settings.peek().agent_finish_action);
                 if want && server.is_none() {
                     if !hydrated {
                         // Sessions left live by a previous process re-enter

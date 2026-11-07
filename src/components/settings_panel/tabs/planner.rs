@@ -237,6 +237,28 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                             }
                                         }
                                     }
+
+                                    // What a dispatched agent's to-do does when its run
+                                    // finishes cleanly (todo::lanes::apply_finish_policy).
+                                    {
+                                        use crate::settings::AgentFinishAction;
+                                        let action = local_settings.read().agent_finish_action;
+                                        rsx! {
+                                            div {
+                                                class: "mt-4 mb-1",
+                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "When an Agent Finishes" }
+                                                p { class: "text-xs text-fg-muted mb-1", "A dispatched agent that finishes with nothing open. A run that leaves an open item always waits for your review." }
+                                                select {
+                                                    class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+                                                    onchange: move |e| {
+                                                        local_settings.write().agent_finish_action = AgentFinishAction::from_str_lossy(&e.value());
+                                                    },
+                                                    option { value: AgentFinishAction::Close.as_str(), selected: action == AgentFinishAction::Close, "Close the task" }
+                                                    option { value: AgentFinishAction::Review.as_str(), selected: action == AgentFinishAction::Review, "Leave it for my review" }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
