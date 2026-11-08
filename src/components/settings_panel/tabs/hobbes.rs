@@ -11,9 +11,56 @@ use crate::settings::{
 use crate::voice::audio::{MicPermission, OutputKind, VoiceEcho};
 use dioxus::prelude::*;
 
-const GEMINI_VOICES: &[&str] = &[
-    "Kore", "Puck", "Charon", "Fenrir", "Aoede", "Leda", "Orus", "Zephyr",
+/// Gemini Live's prebuilt voices with Google's one-word style for each
+/// (Vertex AI "Configure language and voice", 30 voices).
+const GEMINI_VOICES: &[(&str, &str)] = &[
+    ("Zephyr", "Bright"),
+    ("Puck", "Upbeat"),
+    ("Charon", "Informative"),
+    ("Kore", "Firm"),
+    ("Fenrir", "Excitable"),
+    ("Leda", "Youthful"),
+    ("Orus", "Firm"),
+    ("Aoede", "Breezy"),
+    ("Callirrhoe", "Easy-going"),
+    ("Autonoe", "Bright"),
+    ("Enceladus", "Breathy"),
+    ("Iapetus", "Clear"),
+    ("Umbriel", "Easy-going"),
+    ("Algieba", "Smooth"),
+    ("Despina", "Smooth"),
+    ("Erinome", "Clear"),
+    ("Algenib", "Gravelly"),
+    ("Rasalgethi", "Informative"),
+    ("Laomedeia", "Upbeat"),
+    ("Achernar", "Soft"),
+    ("Alnilam", "Firm"),
+    ("Schedar", "Even"),
+    ("Gacrux", "Mature"),
+    ("Pulcherrima", "Forward"),
+    ("Achird", "Friendly"),
+    ("Zubenelgenubi", "Casual"),
+    ("Vindemiatrix", "Gentle"),
+    ("Sadachbia", "Lively"),
+    ("Sadaltager", "Knowledgeable"),
+    ("Sulafat", "Warm"),
 ];
+
+/// The voices whose name or style contains `filter` (case-insensitive),
+/// in list order; an empty filter keeps them all.
+fn filter_voices(filter: &str) -> Vec<(&'static str, &'static str)> {
+    let f = filter.trim().to_lowercase();
+    GEMINI_VOICES
+        .iter()
+        .copied()
+        .filter(|(name, style)| f.is_empty() || name.to_lowercase().contains(&f) || style.to_lowercase().contains(&f))
+        .collect()
+}
+
+/// A voice's style, when it is one of Gemini's.
+fn voice_style(name: &str) -> Option<&'static str> {
+    GEMINI_VOICES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, s)| *s)
+}
 
 const CARD: &str = "border border-subtle rounded-lg mb-4";
 const CARD_HEAD: &str = "p-4 bg-section rounded-t-lg";
@@ -108,6 +155,7 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
     let mut check_result = use_signal(|| None::<String>);
     let mut test_result = use_signal(|| None::<String>);
     let mut testing = use_signal(|| false);
+    let mut voice_filter = use_signal(String::new);
     let mut live_models = use_signal(Vec::<String>::new);
     let mut live_models_loading = use_signal(|| false);
     let mut live_models_error = use_signal(|| Option::<String>::None);
@@ -201,8 +249,8 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                         }
                         if let Some((cid, vp, default_model, api_key)) = model_section {
                             {
-                                let (model_id, load_id, name_id, sel_id, lang_id) =
-                                    (cid.clone(), cid.clone(), cid.clone(), cid.clone(), cid.clone());
+                                let (model_id, load_id, sel_id, lang_id) =
+                                    (cid.clone(), cid.clone(), cid.clone(), cid.clone());
                                 rsx! {
                                     div {
                                         label { class: "block text-sm font-medium text-fg-muted mb-1", "Realtime model" }
@@ -253,33 +301,55 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                                         }
                                     }
                                     div {
-                                        label { class: "block text-sm font-medium text-fg-muted mb-1", "Voice" }
-                                        div {
-                                            class: "flex gap-2",
-                                            input {
-                                                class: "flex-1 min-w-0 px-3 py-2 bg-input border border-subtle rounded-md text-sm",
-                                                placeholder: "Kore",
-                                                value: "{vp.voice_name.clone().unwrap_or_default()}",
-                                                oninput: move |e| {
-                                                    let v = e.value();
-                                                    if let Some(c) = local_settings.write().connector_by_id_mut(&name_id) {
-                                                        c.voice.get_or_insert_with(VoiceProfile::default).voice_name =
-                                                            if v.trim().is_empty() { None } else { Some(v) };
-                                                    }
+                                        class: "md:col-span-2",
+                                        {
+                                            let current = vp.voice_name.clone().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| "Kore".into());
+                                            let current_label = match voice_style(&current) {
+                                                Some(style) => format!("{current} · {style}"),
+                                                None => current.clone(),
+                                            };
+                                            let matches = filter_voices(&voice_filter.read());
+                                            rsx! {
+                                                div {
+                                                    class: "flex items-center gap-2 mb-1",
+                                                    label { class: "text-sm font-medium text-fg-muted", "Voice" }
+                                                    span { class: PILL, "{current_label}" }
                                                 }
-                                            }
-                                            select {
-                                                class: "px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
-                                                onchange: move |e| {
-                                                    let v = e.value();
-                                                    if v.is_empty() { return; }
-                                                    if let Some(c) = local_settings.write().connector_by_id_mut(&sel_id) {
-                                                        c.voice.get_or_insert_with(VoiceProfile::default).voice_name = Some(v);
+                                                input {
+                                                    class: "block w-full px-3 py-2 bg-input border border-subtle rounded-md text-sm",
+                                                    placeholder: "Filter by name or style: warm, firm, bright…",
+                                                    value: "{voice_filter}",
+                                                    oninput: move |e| voice_filter.set(e.value()),
+                                                }
+                                                div {
+                                                    class: "flex flex-wrap gap-1.5 mt-2",
+                                                    for (name, style) in matches.iter().copied() {
+                                                        {
+                                                            let pick_id = sel_id.clone();
+                                                            let on = name.eq_ignore_ascii_case(&current);
+                                                            rsx! {
+                                                                button {
+                                                                    key: "{name}",
+                                                                    class: if on {
+                                                                        "px-2 py-1 rounded-md text-xs border border-primary-500 text-fg bg-input"
+                                                                    } else {
+                                                                        "px-2 py-1 rounded-md text-xs border border-subtle text-fg-muted hover:text-fg bg-input"
+                                                                    },
+                                                                    title: "{style}",
+                                                                    onclick: move |_| {
+                                                                        if let Some(c) = local_settings.write().connector_by_id_mut(&pick_id) {
+                                                                            c.voice.get_or_insert_with(VoiceProfile::default).voice_name = Some(name.to_string());
+                                                                        }
+                                                                    },
+                                                                    "{name} "
+                                                                    span { class: "text-fg-muted", "· {style}" }
+                                                                }
+                                                            }
+                                                        }
                                                     }
-                                                },
-                                                option { value: "", "Common voices" }
-                                                for v in GEMINI_VOICES.iter().copied() {
-                                                    option { value: "{v}", "{v}" }
+                                                    if matches.is_empty() {
+                                                        span { class: "text-xs text-fg-muted", "No voice matches." }
+                                                    }
                                                 }
                                             }
                                         }
@@ -875,5 +945,22 @@ fn HeartbeatCard(ctx: SettingsCtx) -> Element {
     }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod voice_list_tests {
+    use super::*;
+
+    #[test]
+    fn the_voice_filter_matches_name_or_style() {
+        assert_eq!(filter_voices("").len(), 30);
+        assert_eq!(filter_voices("warm"), vec![("Sulafat", "Warm")]);
+        let firm: Vec<_> = filter_voices("FIRM").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(firm, vec!["Kore", "Orus", "Alnilam"]);
+        assert_eq!(filter_voices("pu").first(), Some(&("Puck", "Upbeat")));
+        assert!(filter_voices("nope").is_empty());
+        assert_eq!(voice_style("kore"), Some("Firm"));
+        assert_eq!(voice_style("Custom"), None);
     }
 }
