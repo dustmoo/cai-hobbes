@@ -190,16 +190,20 @@ pub struct TurnNews {
     pub voice_request: bool,
     pub reply: String,
     pub needs_approval: bool,
+    /// The turn was a Heartbeat wake (not returned work, a relay or a timer).
+    pub heartbeat_wake: bool,
 }
 
 pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNews> {
     let trigger = messages.iter().rposition(|m| m.author != "Hobbes")?;
-    let voice_request = messages[trigger]
-        .content
-        .get_text_content()
-        .is_some_and(|t| brain::is_voice_request(t.trim()));
+    let trigger_text = messages[trigger].content.get_text_content();
+    let voice_request = trigger_text.as_deref().is_some_and(|t| brain::is_voice_request(t.trim()));
+    let heartbeat_wake = trigger_text
+        .as_deref()
+        .is_some_and(|t| t.trim_start().starts_with(crate::heartbeat::wake::WAKE_HEADER));
     Some(TurnNews {
         voice_request,
+        heartbeat_wake,
         reply: brain::collect_reply(messages, trigger),
         needs_approval: crate::heartbeat::wake::has_pending_approval(&messages[trigger + 1..]),
     })
@@ -207,29 +211,35 @@ pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNe
 
 /// Whether a finished Hobbes-tab turn should be spoken. A voice request the
 /// live conversation is still waiting on is delivered by that wait; with no
-/// conversation, a turn in the tab the person is looking at is theirs (they
-/// typed it), unless it answers an earlier voice request.
-pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, viewing: bool) -> bool {
+/// conversation, a turn the person started (`attended`) in the tab they are
+/// looking at is theirs (they typed it), unless it answers an earlier voice
+/// request. A turn nobody started — returned work, a relay, a Heartbeat
+/// wake — is news even with the tab open.
+pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, viewing: bool, attended: bool) -> bool {
     if news.reply.is_empty() && !news.needs_approval {
         return false;
     }
     if live && news.voice_request && waits_in_flight > 0 {
         return false;
     }
-    !(!live && viewing && !news.voice_request)
+    live || !viewing || !attended || news.voice_request
 }
 
 /// Whether a finished turn's news should be spoken, given who started it:
-/// a Heartbeat wake speaks only with `speak_heartbeat` on, and only when it
-/// found something for the person (not its "nothing to report" line).
+/// an unattended turn never speaks its "nothing to report" line; a
+/// Heartbeat wake speaks only with `speak_heartbeat` on. Returned work, a
+/// relay or a timer is a result, whatever origin it ran under.
 pub fn announce_kind(origin: crate::session::TurnOrigin, news: &TurnNews, speak_heartbeat: bool) -> Option<AnnounceKind> {
     if !origin.is_unattended() {
         return Some(AnnounceKind::Result);
     }
-    if !speak_heartbeat || (!news.needs_approval && crate::heartbeat::wake::is_quiet_reply(&news.reply)) {
+    if !news.needs_approval && crate::heartbeat::wake::is_quiet_reply(&news.reply) {
         return None;
     }
-    Some(AnnounceKind::Heartbeat)
+    if !news.heartbeat_wake {
+        return Some(AnnounceKind::Result);
+    }
+    speak_heartbeat.then_some(AnnounceKind::Heartbeat)
 }
 
 /// What the voice would say about the Hobbes session's latest finished
@@ -257,7 +267,7 @@ pub fn pending_announcement(
         let news = turn_news(&session.messages)?;
         (news, state.active_session_id == session_id, session.turn_origin)
     };
-    if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing) {
+    if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing, origin.is_user()) {
         return None;
     }
     let kind = announce_kind(origin, &news, speak_heartbeat)?;
@@ -1107,10 +1117,22 @@ mod tests {
         assert!(!news.voice_request);
         assert_eq!(news.reply, "The rollup is done: 14 items filed.");
         // Live conversation: say it now. Not live and not looking: announce.
-        assert!(should_announce(&news, true, 0, false));
-        assert!(should_announce(&news, false, 0, false));
-        // Not live but looking at the Hobbes tab: they typed it; stay quiet.
-        assert!(!should_announce(&news, false, 0, true));
+        assert!(should_announce(&news, true, 0, false, false));
+        assert!(should_announce(&news, false, 0, false, false));
+        // Not live, looking at the Hobbes tab: nobody typed it, so it is
+        // still news (the conversation may just have idled out).
+        assert!(should_announce(&news, false, 0, true, false));
+        // It speaks as returned work, not as the Heartbeat.
+        use crate::session::TurnOrigin;
+        assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), Some(AnnounceKind::Result));
+    }
+
+    #[test]
+    fn a_turn_the_person_typed_in_the_open_tab_stays_quiet() {
+        let msgs = vec![msg("User", "What's on my calendar?"), msg("Hobbes", "Nothing until 3.")];
+        let news = turn_news(&msgs).unwrap();
+        assert!(!should_announce(&news, false, 0, true, true));
+        assert!(should_announce(&news, false, 0, false, true));
     }
 
     #[test]
@@ -1119,12 +1141,12 @@ mod tests {
         let news = turn_news(&msgs).unwrap();
         assert!(news.voice_request);
         // The live conversation's wait delivers it.
-        assert!(!should_announce(&news, true, 1, false));
+        assert!(!should_announce(&news, true, 1, false, true));
         // The conversation ended first: announce it, even in the Hobbes tab.
-        assert!(should_announce(&news, false, 0, true));
+        assert!(should_announce(&news, false, 0, true, true));
         // Nothing to say: nothing announced.
-        let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false };
-        assert!(!should_announce(&empty, true, 0, false));
+        let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false, heartbeat_wake: false };
+        assert!(!should_announce(&empty, true, 0, false, true));
     }
 
     #[test]
@@ -1145,15 +1167,16 @@ mod tests {
         let news = turn_news(&msgs).unwrap();
         assert!(!news.voice_request);
         // Same rule as a returned result: live, or not looking at the tab.
-        assert!(should_announce(&news, false, 0, false));
+        assert!(news.heartbeat_wake);
+        assert!(should_announce(&news, false, 0, false, false));
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, true), Some(AnnounceKind::Heartbeat));
         // Off by the Heartbeat-specific switch.
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), None);
         // Nothing for the person: stay quiet.
-        let quiet = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: false };
+        let quiet = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: false, heartbeat_wake: true };
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &quiet, true), None);
         // Held on an approval: say so.
-        let held = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: true };
+        let held = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: true, heartbeat_wake: true };
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &held, true), Some(AnnounceKind::Heartbeat));
         // A turn the person started is a result, whatever the switch.
         assert_eq!(announce_kind(TurnOrigin::User, &news, false), Some(AnnounceKind::Result));
