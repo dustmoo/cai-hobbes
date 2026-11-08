@@ -158,8 +158,10 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
     let mut testing = use_signal(|| false);
     let mut voice_filter = use_signal(String::new);
     // The voice whose sample is being fetched or played, and the last
-    // sample problem (shown under the list).
+    // sample problem (shown under the list). `sample_playing` flips once
+    // the clip is in hand: a spinner while connecting, a speaker while it plays.
     let mut sampling = use_signal(|| None::<&'static str>);
+    let mut sample_playing = use_signal(|| false);
     let mut sample_note = use_signal(|| None::<String>);
     let mut live_models = use_signal(Vec::<String>::new);
     let mut live_models_loading = use_signal(|| false);
@@ -355,12 +357,13 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                                                                     }
                                                                     button {
                                                                         class: "pl-1 pr-2 py-1 text-fg-muted hover:text-fg disabled:opacity-50",
-                                                                        title: if this_one { "Playing…" } else { "Hear {name}" },
+                                                                        title: if this_one && *sample_playing.read() { "Playing…" } else if this_one { "Connecting…" } else { "Hear {name}" },
                                                                         "aria-label": "Hear {name}",
                                                                         disabled: busy,
                                                                         onclick: move |_| {
                                                                             let built = crate::voice::controller::realtime_for(&local_settings.read());
                                                                             sampling.set(Some(name));
+                                                                            sample_playing.set(false);
                                                                             sample_note.set(None);
                                                                             spawn(async move {
                                                                                 let r = match built {
@@ -368,11 +371,14 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                                                                                     Ok((provider, setup)) => {
                                                                                         match crate::voice::probe::voice_sample(provider.as_ref(), setup, name).await {
                                                                                             Err(e) => Err(format!("Couldn't get a sample of {name}: {e}")),
-                                                                                            Ok((pcm, rate)) => tokio::task::spawn_blocking(move || crate::voice::audio::play_clip(&pcm, rate))
+                                                                                            Ok((pcm, rate)) => {
+                                                                                                sample_playing.set(true);
+                                                                                                tokio::task::spawn_blocking(move || crate::voice::audio::play_clip(&pcm, rate))
                                                                                                 .await
                                                                                                 .map_err(|e| e.to_string())
                                                                                                 .and_then(|r| r.map_err(|e| e.to_string()))
-                                                                                                .map_err(|e| format!("Couldn't play the sample: {e}")),
+                                                                                                .map_err(|e| format!("Couldn't play the sample: {e}"))
+                                                                                            }
                                                                                         }
                                                                                     }
                                                                                 };
@@ -380,9 +386,12 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                                                                                     sample_note.set(Some(e));
                                                                                 }
                                                                                 sampling.set(None);
+                                                                                sample_playing.set(false);
                                                                             });
                                                                         },
-                                                                        if this_one {
+                                                                        if this_one && !*sample_playing.read() {
+                                                                            span { class: "inline-block animate-spin h-2.5 w-2.5 border-2 border-primary-400 border-t-transparent rounded-full" }
+                                                                        } else if this_one {
                                                                             Icon { width: 10, height: 10, icon: fi_icons::FiVolume2 }
                                                                         } else {
                                                                             Icon { width: 10, height: 10, icon: fi_icons::FiPlay }
