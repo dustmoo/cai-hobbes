@@ -222,6 +222,12 @@ pub async fn request_mic_permission() -> MicPermission {
     }
 }
 
+/// Play one clip on the default output (no mic). Blocking; see
+/// `cpal_io::play_clip`.
+pub fn play_clip(pcm: &[i16], sample_rate: u32) -> Result<(), AudioError> {
+    cpal_io::play_clip(pcm, sample_rate)
+}
+
 /// Linear resample of mono 16-bit PCM (good enough for speech).
 pub fn resample_linear(input: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
     if from_rate == to_rate || input.is_empty() {

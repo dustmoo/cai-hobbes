@@ -10,6 +10,7 @@ use crate::settings::{
 };
 use crate::voice::audio::{MicPermission, OutputKind, VoiceEcho};
 use dioxus::prelude::*;
+use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// Gemini Live's prebuilt voices with Google's one-word style for each
 /// (Vertex AI "Configure language and voice", 30 voices).
@@ -156,6 +157,10 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
     let mut test_result = use_signal(|| None::<String>);
     let mut testing = use_signal(|| false);
     let mut voice_filter = use_signal(String::new);
+    // The voice whose sample is being fetched or played, and the last
+    // sample problem (shown under the list).
+    let mut sampling = use_signal(|| None::<&'static str>);
+    let mut sample_note = use_signal(|| None::<String>);
     let mut live_models = use_signal(Vec::<String>::new);
     let mut live_models_loading = use_signal(|| false);
     let mut live_models_error = use_signal(|| Option::<String>::None);
@@ -327,22 +332,62 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                                                         {
                                                             let pick_id = sel_id.clone();
                                                             let on = name.eq_ignore_ascii_case(&current);
+                                                            let busy = sampling.read().is_some() || crate::voice::controller::is_live();
+                                                            let this_one = *sampling.read() == Some(name);
                                                             rsx! {
-                                                                button {
+                                                                div {
                                                                     key: "{name}",
                                                                     class: if on {
-                                                                        "px-2 py-1 rounded-md text-xs border border-primary-500 text-fg bg-input"
+                                                                        "flex items-center rounded-md text-xs border border-primary-500 bg-input"
                                                                     } else {
-                                                                        "px-2 py-1 rounded-md text-xs border border-subtle text-fg-muted hover:text-fg bg-input"
+                                                                        "flex items-center rounded-md text-xs border border-subtle bg-input"
                                                                     },
-                                                                    title: "{style}",
-                                                                    onclick: move |_| {
-                                                                        if let Some(c) = local_settings.write().connector_by_id_mut(&pick_id) {
-                                                                            c.voice.get_or_insert_with(VoiceProfile::default).voice_name = Some(name.to_string());
+                                                                    button {
+                                                                        class: if on { "pl-2 pr-1 py-1 text-fg" } else { "pl-2 pr-1 py-1 text-fg-muted hover:text-fg" },
+                                                                        title: "Use {name}",
+                                                                        onclick: move |_| {
+                                                                            if let Some(c) = local_settings.write().connector_by_id_mut(&pick_id) {
+                                                                                c.voice.get_or_insert_with(VoiceProfile::default).voice_name = Some(name.to_string());
+                                                                            }
+                                                                        },
+                                                                        "{name} "
+                                                                        span { class: "text-fg-muted", "· {style}" }
+                                                                    }
+                                                                    button {
+                                                                        class: "pl-1 pr-2 py-1 text-fg-muted hover:text-fg disabled:opacity-50",
+                                                                        title: if this_one { "Playing…" } else { "Hear {name}" },
+                                                                        "aria-label": "Hear {name}",
+                                                                        disabled: busy,
+                                                                        onclick: move |_| {
+                                                                            let built = crate::voice::controller::realtime_for(&local_settings.read());
+                                                                            sampling.set(Some(name));
+                                                                            sample_note.set(None);
+                                                                            spawn(async move {
+                                                                                let r = match built {
+                                                                                    Err(e) => Err(e),
+                                                                                    Ok((provider, setup)) => {
+                                                                                        match crate::voice::probe::voice_sample(provider.as_ref(), setup, name).await {
+                                                                                            Err(e) => Err(format!("Couldn't get a sample of {name}: {e}")),
+                                                                                            Ok((pcm, rate)) => tokio::task::spawn_blocking(move || crate::voice::audio::play_clip(&pcm, rate))
+                                                                                                .await
+                                                                                                .map_err(|e| e.to_string())
+                                                                                                .and_then(|r| r.map_err(|e| e.to_string()))
+                                                                                                .map_err(|e| format!("Couldn't play the sample: {e}")),
+                                                                                        }
+                                                                                    }
+                                                                                };
+                                                                                if let Err(e) = r {
+                                                                                    sample_note.set(Some(e));
+                                                                                }
+                                                                                sampling.set(None);
+                                                                            });
+                                                                        },
+                                                                        if this_one {
+                                                                            Icon { width: 10, height: 10, icon: fi_icons::FiVolume2 }
+                                                                        } else {
+                                                                            Icon { width: 10, height: 10, icon: fi_icons::FiPlay }
                                                                         }
-                                                                    },
-                                                                    "{name} "
-                                                                    span { class: "text-fg-muted", "· {style}" }
+                                                                    }
                                                                 }
                                                             }
                                                         }
@@ -350,6 +395,10 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
                                                     if matches.is_empty() {
                                                         span { class: "text-xs text-fg-muted", "No voice matches." }
                                                     }
+                                                }
+                                                p { class: "text-xs text-fg-muted mt-1", "▶ plays a one-sentence sample through your speakers (one short call to the voice model; replays are free)." }
+                                                if let Some(n) = sample_note.read().clone() {
+                                                    p { class: "text-xs text-red-400 mt-1", "{n}" }
                                                 }
                                             }
                                         }

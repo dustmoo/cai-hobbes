@@ -355,3 +355,62 @@ where
         )
         .map_err(map_build_err)
 }
+
+/// Play one clip of mono PCM on the default output device and return once
+/// it has finished. Output only: the mic is never opened. Blocking — call it
+/// from `spawn_blocking`. Used for the voice samples in Settings.
+pub fn play_clip(pcm: &[i16], sample_rate: u32) -> Result<(), AudioError> {
+    let host = cpal::default_host();
+    let device = host.default_output_device().ok_or(AudioError::NoDevice)?;
+    let cfg = device.default_output_config().map_err(backend("output config"))?;
+    let format = cfg.sample_format();
+    let cfg: StreamConfig = cfg.into();
+    let resampled = super::resample_linear(pcm, sample_rate.max(1), cfg.sample_rate.0);
+    let total = resampled.len();
+    let samples: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(resampled.into_iter().map(i16_to_f32).collect()));
+    let channels = (cfg.channels as usize).max(1);
+    fn build<T: SizedSample + FromSample<f32>>(
+        device: &cpal::Device,
+        cfg: &StreamConfig,
+        channels: usize,
+        samples: Arc<Mutex<VecDeque<f32>>>,
+    ) -> Result<cpal::Stream, AudioError> {
+        device
+            .build_output_stream(
+                cfg,
+                move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                    let mut q = samples.try_lock().ok();
+                    for frame in data.chunks_mut(channels) {
+                        let v = T::from_sample(q.as_mut().and_then(|q| q.pop_front()).unwrap_or(0.0));
+                        for out in frame.iter_mut() {
+                            *out = v;
+                        }
+                    }
+                },
+                |e| tracing::warn!("voice audio: sample playback error: {e}"),
+                None,
+            )
+            .map_err(map_build_err)
+    }
+    let stream = match format {
+        SampleFormat::F32 => build::<f32>(&device, &cfg, channels, samples.clone()),
+        SampleFormat::I16 => build::<i16>(&device, &cfg, channels, samples.clone()),
+        SampleFormat::U16 => build::<u16>(&device, &cfg, channels, samples.clone()),
+        SampleFormat::I32 => build::<i32>(&device, &cfg, channels, samples.clone()),
+        other => Err(AudioError::Backend(format!("unsupported output sample format {other:?}"))),
+    }?;
+    stream.play().map_err(|e| AudioError::Backend(format!("start stream: {e}")))?;
+    // Wait for the queue to drain (bounded by the clip's length plus slack),
+    // then let the device's buffer play out.
+    let limit = std::time::Instant::now()
+        + std::time::Duration::from_secs_f64(total as f64 / cfg.sample_rate.0.max(1) as f64 + 2.0);
+    while std::time::Instant::now() < limit {
+        if samples.lock().map(|q| q.is_empty()).unwrap_or(true) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    drop(stream);
+    Ok(())
+}

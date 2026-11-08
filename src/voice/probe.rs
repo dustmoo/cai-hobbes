@@ -286,6 +286,66 @@ pub async fn speech_round_trip(
     result.map(|()| out)
 }
 
+/// The sentence a voice sample reads.
+pub fn sample_line(voice: &str) -> String {
+    format!("Hi, I'm {voice}. This is how I'll sound when I bring you news from your day.")
+}
+
+/// Voice samples already fetched this run, by voice name: replaying one
+/// costs nothing.
+type SampleCache = std::collections::HashMap<String, (Vec<i16>, u32)>;
+static SAMPLES: std::sync::Mutex<Option<SampleCache>> = std::sync::Mutex::new(None);
+
+/// A short clip of `voice` reading [`sample_line`]: from this run's cache,
+/// else one realtime connection with that voice, asked to read the line.
+/// Mono PCM and its sample rate. No mic, no speaker.
+pub async fn voice_sample(
+    provider: &dyn RealtimeVoice,
+    mut setup: RealtimeSetup,
+    voice: &str,
+) -> Result<(Vec<i16>, u32), String> {
+    if let Some(hit) = SAMPLES.lock().ok().and_then(|m| m.as_ref().and_then(|m| m.get(voice).cloned())) {
+        return Ok(hit);
+    }
+    setup.voice_name = Some(voice.to_string());
+    setup.system_instruction =
+        "You are a voice sample. When given a sentence, read it aloud exactly as written, in a natural, friendly tone. Say nothing else.".into();
+    setup.tools.clear();
+    let mut s = provider.connect(setup).await?;
+    let _ = s.control.send(RealtimeControl::InjectContext {
+        text: format!("Read this aloud exactly: \"{}\"", sample_line(voice)),
+        respond: true,
+    });
+    let mut pcm: Vec<i16> = Vec::new();
+    let mut rate = 24_000u32;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let result = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break Err("the voice didn't finish the sample within 20 s".to_string());
+        }
+        match tokio::time::timeout(left, s.events.recv()).await {
+            Err(_) => continue,
+            Ok(None) => break Err("the connection ended".into()),
+            Ok(Some(ev)) => match ev {
+                RealtimeEvent::Audio { pcm: chunk, sample_rate } => {
+                    pcm.extend_from_slice(&chunk);
+                    rate = sample_rate.max(1);
+                }
+                RealtimeEvent::TurnComplete if !pcm.is_empty() => break Ok(()),
+                RealtimeEvent::Closed { reason } => break Err(format!("the connection closed: {reason}")),
+                _ => {}
+            },
+        }
+    };
+    let _ = s.control.send(RealtimeControl::Close);
+    result?;
+    if let Ok(mut m) = SAMPLES.lock() {
+        m.get_or_insert_with(Default::default).insert(voice.to_string(), (pcm.clone(), rate));
+    }
+    Ok((pcm, rate))
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Handoff {
     /// Speech before the slow tool was called.
@@ -422,6 +482,11 @@ mod tests {
         b.extend_from_slice(&(data.len() as u32).to_le_bytes());
         b.extend_from_slice(&data);
         b
+    }
+
+    #[test]
+    fn the_sample_line_names_the_voice() {
+        assert!(sample_line("Sulafat").starts_with("Hi, I'm Sulafat."));
     }
 
     #[test]
