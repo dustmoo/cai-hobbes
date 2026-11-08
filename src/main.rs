@@ -2825,6 +2825,11 @@ fn app() -> Element {
     let window_for_resize = window.clone();
     use_wry_event_handler(move |event, _| {
         if let Event::WindowEvent { event, .. } = event {
+            // The voice only announces a Hobbes-tab turn the person isn't
+            // already reading: the tab active in the focused window.
+            if let WindowEvent::Focused(focused) = event {
+                crate::voice::controller::set_app_focused(*focused);
+            }
             if let WindowEvent::Resized(new_size) = event {
                 last_known_size.set(*new_size);
                 let logical = new_size

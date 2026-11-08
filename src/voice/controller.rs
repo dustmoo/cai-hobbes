@@ -209,20 +209,31 @@ pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNe
     })
 }
 
+/// Whether the Hobbes window has keyboard focus (fed by the window's focus
+/// events in `main.rs`). A tab on screen behind other apps isn't being read.
+static APP_FOCUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_app_focused(focused: bool) {
+    APP_FOCUSED.store(focused, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn app_focused() -> bool {
+    APP_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether a finished Hobbes-tab turn should be spoken. A voice request the
 /// live conversation is still waiting on is delivered by that wait; with no
-/// conversation, a turn the person started (`attended`) in the tab they are
-/// looking at is theirs (they typed it), unless it answers an earlier voice
-/// request. A turn nobody started — returned work, a relay, a Heartbeat
-/// wake — is news even with the tab open.
-pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, viewing: bool, attended: bool) -> bool {
+/// conversation, a turn the person is reading as it lands (`viewing`: the
+/// Hobbes tab active in the focused window) needs no announcement, whoever
+/// started it, unless it answers an earlier voice request.
+pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, viewing: bool) -> bool {
     if news.reply.is_empty() && !news.needs_approval {
         return false;
     }
     if live && news.voice_request && waits_in_flight > 0 {
         return false;
     }
-    live || !viewing || !attended || news.voice_request
+    live || !viewing || news.voice_request
 }
 
 /// Whether a finished turn's news should be spoken, given who started it:
@@ -265,9 +276,9 @@ pub fn pending_announcement(
         let state = session_state.peek();
         let session = state.sessions.get(session_id)?;
         let news = turn_news(&session.messages)?;
-        (news, state.active_session_id == session_id, session.turn_origin)
+        (news, state.active_session_id == session_id && app_focused(), session.turn_origin)
     };
-    if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing, origin.is_user()) {
+    if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing) {
         return None;
     }
     let kind = announce_kind(origin, &news, speak_heartbeat)?;
@@ -1117,23 +1128,15 @@ mod tests {
         assert!(!news.voice_request);
         assert_eq!(news.reply, "The rollup is done: 14 items filed.");
         // Live conversation: say it now. Not live and not looking: announce.
-        assert!(should_announce(&news, true, 0, false, false));
-        assert!(should_announce(&news, false, 0, false, false));
-        // Not live, looking at the Hobbes tab: nobody typed it, so it is
-        // still news (the conversation may just have idled out).
-        assert!(should_announce(&news, false, 0, true, false));
+        assert!(should_announce(&news, true, 0, false));
+        assert!(should_announce(&news, false, 0, false));
+        // Not live, reading the Hobbes tab as it lands: no need to say it.
+        assert!(!should_announce(&news, false, 0, true));
         // It speaks as returned work, not as the Heartbeat.
         use crate::session::TurnOrigin;
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), Some(AnnounceKind::Result));
     }
 
-    #[test]
-    fn a_turn_the_person_typed_in_the_open_tab_stays_quiet() {
-        let msgs = vec![msg("User", "What's on my calendar?"), msg("Hobbes", "Nothing until 3.")];
-        let news = turn_news(&msgs).unwrap();
-        assert!(!should_announce(&news, false, 0, true, true));
-        assert!(should_announce(&news, false, 0, false, true));
-    }
 
     #[test]
     fn voice_requests_are_left_to_the_live_wait() {
@@ -1141,12 +1144,12 @@ mod tests {
         let news = turn_news(&msgs).unwrap();
         assert!(news.voice_request);
         // The live conversation's wait delivers it.
-        assert!(!should_announce(&news, true, 1, false, true));
+        assert!(!should_announce(&news, true, 1, false));
         // The conversation ended first: announce it, even in the Hobbes tab.
-        assert!(should_announce(&news, false, 0, true, true));
+        assert!(should_announce(&news, false, 0, true));
         // Nothing to say: nothing announced.
         let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false, heartbeat_wake: false };
-        assert!(!should_announce(&empty, true, 0, false, true));
+        assert!(!should_announce(&empty, true, 0, false));
     }
 
     #[test]
@@ -1168,7 +1171,7 @@ mod tests {
         assert!(!news.voice_request);
         // Same rule as a returned result: live, or not looking at the tab.
         assert!(news.heartbeat_wake);
-        assert!(should_announce(&news, false, 0, false, false));
+        assert!(should_announce(&news, false, 0, false));
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, true), Some(AnnounceKind::Heartbeat));
         // Off by the Heartbeat-specific switch.
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), None);
