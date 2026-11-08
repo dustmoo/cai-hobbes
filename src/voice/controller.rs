@@ -192,6 +192,9 @@ pub struct TurnNews {
     pub needs_approval: bool,
     /// The turn was a Heartbeat wake (not returned work, a relay or a timer).
     pub heartbeat_wake: bool,
+    /// The chat tab the full details live in, when the turn answered a
+    /// report from a chat worker (its tab, not the Hobbes tab's summary).
+    pub details_tab: Option<String>,
 }
 
 pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNews> {
@@ -201,9 +204,18 @@ pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNe
     let heartbeat_wake = trigger_text
         .as_deref()
         .is_some_and(|t| t.trim_start().starts_with(crate::heartbeat::wake::WAKE_HEADER));
+    let details_tab = match &messages[trigger].content {
+        crate::components::shared::MessageContent::Relay(note)
+            if note.direction == crate::todo::relay::RelayDirection::FromWorker =>
+        {
+            Some(note.peer_title.trim().to_string()).filter(|t| !t.is_empty())
+        }
+        _ => None,
+    };
     Some(TurnNews {
         voice_request,
         heartbeat_wake,
+        details_tab,
         reply: brain::collect_reply(messages, trigger),
         needs_approval: crate::heartbeat::wake::has_pending_approval(&messages[trigger + 1..]),
     })
@@ -289,9 +301,24 @@ pub fn pending_announcement(
         (true, AnnounceKind::Result) => {
             "The brain needs your approval in the Hobbes tab before it can continue.".to_string()
         }
-        (false, _) => news.reply,
+        (false, _) => match &news.details_tab {
+            Some(tab) => point_at_tab(&news.reply, tab),
+            None => news.reply,
+        },
     };
     Some((text, kind))
+}
+
+/// A reply about a chat worker's report, pointing at the worker's tab for
+/// the details rather than the Hobbes tab.
+pub fn point_at_tab(reply: &str, tab: &str) -> String {
+    let note = format!("(Full details are in the \"{tab}\" tab.)");
+    let hobbes = "(Full details are in the Hobbes tab.)";
+    if reply.contains(hobbes) {
+        reply.replace(hobbes, &note)
+    } else {
+        format!("{} {note}", reply.trim_end())
+    }
 }
 
 /// Called when any turn ends (stream_manager): speak Hobbes-tab news —
@@ -339,7 +366,11 @@ pub fn announce_prompt_merged(text: &str, mid_conversation: bool, kind: Announce
     } else {
         String::new()
     };
-    format!("[{how}{earlier} If there's more, say it's in the Hobbes tab.]\n\n{}", text.trim())
+    format!(
+        "[{how}{earlier} If there's more, say where: the tab the news names for its details, \
+         else the Hobbes tab.]\n\n{}",
+        text.trim()
+    )
 }
 
 /// Shown once per app run when a conversation starts without echo
@@ -1148,8 +1179,38 @@ mod tests {
         // The conversation ended first: announce it, even in the Hobbes tab.
         assert!(should_announce(&news, false, 0, true));
         // Nothing to say: nothing announced.
-        let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false, heartbeat_wake: false };
+        let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false, heartbeat_wake: false, details_tab: None };
         assert!(!should_announce(&empty, true, 0, false));
+    }
+
+    #[test]
+    fn a_chat_workers_report_points_at_its_tab() {
+        use crate::todo::relay::{RelayDirection, RelayKind, RelayNote};
+        let mut report = msg("Relay", "");
+        report.content = crate::components::shared::MessageContent::Relay(RelayNote {
+            direction: RelayDirection::FromWorker,
+            kind: RelayKind::Report,
+            peer_session_id: "w".into(),
+            peer_title: "NMS VR: adjust elevation".into(),
+            todo_id: None,
+            text: "Finished.".into(),
+            hop: 0,
+            woke_turn: true,
+        });
+        let msgs = vec![report, msg("Hobbes", "The foundation parts are raised 0.2m.")];
+        let news = turn_news(&msgs).unwrap();
+        assert_eq!(news.details_tab.as_deref(), Some("NMS VR: adjust elevation"));
+        assert_eq!(
+            point_at_tab(&news.reply, "NMS VR: adjust elevation"),
+            "The foundation parts are raised 0.2m. (Full details are in the \"NMS VR: adjust elevation\" tab.)"
+        );
+        assert_eq!(
+            point_at_tab("Two PRs. (Full details are in the Hobbes tab.)", "CI"),
+            "Two PRs. (Full details are in the \"CI\" tab.)"
+        );
+        // Returned work with no worker tab keeps the Hobbes tab.
+        let plain = turn_news(&[msg("User", "The background agent you dispatched has finished."), msg("Hobbes", "Done.")]).unwrap();
+        assert_eq!(plain.details_tab, None);
     }
 
     #[test]
@@ -1176,10 +1237,10 @@ mod tests {
         // Off by the Heartbeat-specific switch.
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), None);
         // Nothing for the person: stay quiet.
-        let quiet = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: false, heartbeat_wake: true };
+        let quiet = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: false, heartbeat_wake: true, details_tab: None };
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &quiet, true), None);
         // Held on an approval: say so.
-        let held = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: true, heartbeat_wake: true };
+        let held = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: true, heartbeat_wake: true, details_tab: None };
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &held, true), Some(AnnounceKind::Heartbeat));
         // A turn the person started is a result, whatever the switch.
         assert_eq!(announce_kind(TurnOrigin::User, &news, false), Some(AnnounceKind::Result));
