@@ -34,13 +34,17 @@
 //!   archive leaves memory (it stays on disk, in History) so it no longer
 //!   rides every save.
 //!
-//! The decision ([`should_rotate`]) is pure; [`check_all`] runs it from the
+//! It can also rotate once a day at a time the person sets
+//! (`Settings::hobbes_rotate_daily` / `hobbes_rotate_at`, [`daily_due`]),
+//! at the first quiet moment after that time, whatever its size.
+//!
+//! The decision ([`should_rotate_when`]) is pure; [`check_all`] runs it from the
 //! Heartbeat runtime's tick, which runs every 30 s whether or not the
 //! Heartbeat is on, at most every [`CHECK_EVERY_MINUTES`].
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Datelike, Duration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveTime, TimeZone, Utc};
 use dioxus::prelude::*;
 
 use crate::components::chat::Message;
@@ -209,10 +213,50 @@ impl Activity {
     }
 }
 
-/// Rotate now: over a threshold, at a quiet moment (the soft rules give way
-/// once the session is [`oversized`]).
-pub fn should_rotate(size: SessionSize, activity: &Activity) -> bool {
-    over_threshold(size) && activity.hard_quiet() && (activity.soft_quiet() || oversized(size))
+/// Rotate now: over a threshold, or `daily_due` ([`daily_due`]) whatever
+/// the size, at a quiet moment (the soft rules give way once the session is
+/// [`oversized`]).
+pub fn should_rotate_when(size: SessionSize, daily_due: bool, activity: &Activity) -> bool {
+    (over_threshold(size) || daily_due) && activity.hard_quiet() && (activity.soft_quiet() || oversized(size))
+}
+
+/// Parse the daily rotation time ("HH:MM"); `None` when it isn't one.
+pub fn parse_rotate_at(raw: &str) -> Option<NaiveTime> {
+    NaiveTime::parse_from_str(raw.trim(), "%H:%M").ok()
+}
+
+/// The most recent moment, at or before `now`, the local clock read `at`:
+/// today's when it has passed, else yesterday's. A time a DST jump skips
+/// counts from the hour after.
+pub fn last_daily_boundary(at: NaiveTime, now: DateTime<Local>) -> DateTime<Utc> {
+    let on = |day: chrono::NaiveDate| {
+        let naive = day.and_time(at);
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .or_else(|| Local.from_local_datetime(&(naive + Duration::hours(1))).earliest())
+            .map(|t| t.with_timezone(&Utc))
+    };
+    let today = now.date_naive();
+    match on(today) {
+        Some(t) if t <= now.with_timezone(&Utc) => t,
+        _ => on(today - Duration::days(1)).unwrap_or_else(|| (now - Duration::days(1)).with_timezone(&Utc)),
+    }
+}
+
+/// The daily rotation is due: the session began before the latest daily
+/// boundary and someone has used it (a successor holding only its opening
+/// message never is, so a quiet day doesn't stack up empty archives).
+pub fn daily_due(
+    at: Option<NaiveTime>,
+    first_message: Option<DateTime<Utc>>,
+    user_messages: usize,
+    now: DateTime<Local>,
+) -> bool {
+    match (at, first_message) {
+        (Some(at), Some(first)) => user_messages > 0 && first < last_daily_boundary(at, now),
+        _ => false,
+    }
 }
 
 /// Unresolved approvals: (any in the latest turn, any newer than
@@ -641,19 +685,26 @@ pub fn check_all(
         let state = session_state.peek();
         let Some(session) = state.sessions.get(&id) else { return };
         let messages = session.messages.len();
-        if messages < MIN_MESSAGES {
+        let at = settings.hobbes_rotate_daily.then(|| parse_rotate_at(&settings.hobbes_rotate_at)).flatten();
+        let daily = daily_due(
+            at,
+            session.messages.iter().map(|m| m.created_at).min(),
+            session.user_message_count(),
+            now.with_timezone(&Local),
+        );
+        if messages < MIN_MESSAGES && !daily {
             return;
         }
         let size = SessionSize { messages, bytes: crate::session_store::row_bytes(&id) };
-        if !over_threshold(size) {
+        if !over_threshold(size) && !daily {
             return;
         }
         let a = activity(session, streaming, now);
-        if !should_rotate(size, &a) {
+        if !should_rotate_when(size, daily, &a) {
             tracing::debug!(session_id = %id, "rotation: the Hobbes session is due but busy");
             return;
         }
-        tracing::info!(session_id = %id, messages, bytes = size.bytes.unwrap_or(0), "rotation: rotating the Hobbes session");
+        tracing::info!(session_id = %id, messages, bytes = size.bytes.unwrap_or(0), daily, "rotation: rotating the Hobbes session");
         prepare(session, settings, &uuid::Uuid::new_v4().to_string(), now)
     };
     rotate(session_state, prepared);
@@ -766,6 +817,48 @@ pub fn apply_merge(mut session_state: Signal<SessionState>, p: PreparedMerge) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at_local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
+        Local.with_ymd_and_hms(y, mo, d, h, mi, 0).earliest().unwrap()
+    }
+
+    #[test]
+    fn the_daily_boundary_is_todays_time_once_passed_else_yesterdays() {
+        let at = parse_rotate_at("04:00").unwrap();
+        assert_eq!(last_daily_boundary(at, at_local(2026, 11, 8, 9, 0)), at_local(2026, 11, 8, 4, 0).with_timezone(&Utc));
+        assert_eq!(last_daily_boundary(at, at_local(2026, 11, 8, 3, 59)), at_local(2026, 11, 7, 4, 0).with_timezone(&Utc));
+        assert_eq!(last_daily_boundary(at, at_local(2026, 11, 8, 4, 0)), at_local(2026, 11, 8, 4, 0).with_timezone(&Utc));
+        assert!(parse_rotate_at("junk").is_none());
+        assert!(parse_rotate_at(" 23:30 ").is_some());
+    }
+
+    #[test]
+    fn the_daily_rotation_is_due_once_per_boundary_and_only_when_used() {
+        let at = parse_rotate_at("04:00");
+        let now = at_local(2026, 11, 8, 9, 0);
+        let yesterday = Some(at_local(2026, 11, 7, 15, 0).with_timezone(&Utc));
+        let this_morning = Some(at_local(2026, 11, 8, 4, 2).with_timezone(&Utc));
+        assert!(daily_due(at, yesterday, 3, now));
+        // A successor made after the boundary waits for the next one.
+        assert!(!daily_due(at, this_morning, 3, now));
+        // Nobody used it: no empty archives.
+        assert!(!daily_due(at, yesterday, 0, now));
+        // Off, or an empty session.
+        assert!(!daily_due(None, yesterday, 3, now));
+        assert!(!daily_due(at, None, 3, now));
+    }
+
+    #[test]
+    fn a_daily_rotation_ignores_size_but_keeps_the_quiet_rules() {
+        let tiny = SessionSize { messages: 4, bytes: Some(1_000) };
+        let quiet = Activity::default();
+        assert!(should_rotate_when(tiny, true, &quiet));
+        assert!(!should_rotate_when(tiny, false, &quiet));
+        let busy = Activity { turn_in_flight: true, ..Activity::default() };
+        assert!(!should_rotate_when(tiny, true, &busy));
+        let approval = Activity { recent_approval: true, ..Activity::default() };
+        assert!(!should_rotate_when(tiny, true, &approval));
+    }
     use crate::timers::ScheduledTimer;
     use chrono::TimeZone;
 
@@ -803,8 +896,8 @@ mod tests {
         let big = SessionSize { messages: MAX_MESSAGES + 1, bytes: Some(10) };
         let small = SessionSize { messages: 10, bytes: Some(10) };
         let quiet = Activity::default();
-        assert!(should_rotate(big, &quiet));
-        assert!(!should_rotate(small, &quiet));
+        assert!(should_rotate_when(big, false, &quiet));
+        assert!(!should_rotate_when(small, false, &quiet));
         let hard = [
             Activity { turn_in_flight: true, ..quiet },
             Activity { queued_messages: true, ..quiet },
@@ -816,16 +909,16 @@ mod tests {
         ];
         let huge = SessionSize { messages: MAX_MESSAGES * 3, bytes: Some(MAX_BYTES * 3) };
         for a in hard {
-            assert!(!should_rotate(big, &a), "{a:?}");
+            assert!(!should_rotate_when(big, false, &a), "{a:?}");
             // Hard rules hold however large the session.
-            assert!(!should_rotate(huge, &a), "{a:?}");
+            assert!(!should_rotate_when(huge, false, &a), "{a:?}");
         }
         let soft = [Activity { recent_approval: true, ..quiet }];
         for a in soft {
-            assert!(!should_rotate(big, &a), "{a:?}");
+            assert!(!should_rotate_when(big, false, &a), "{a:?}");
             // Past twice a threshold the soft rules give way.
-            assert!(should_rotate(huge, &a), "{a:?}");
-            assert!(should_rotate(SessionSize { messages: 30, bytes: Some(MAX_BYTES * FORCE_FACTOR + 1) }, &a));
+            assert!(should_rotate_when(huge, false, &a), "{a:?}");
+            assert!(should_rotate_when(SessionSize { messages: 30, bytes: Some(MAX_BYTES * FORCE_FACTOR + 1) }, false, &a));
         }
         assert!(!oversized(SessionSize { messages: MAX_MESSAGES * 2, bytes: Some(MAX_BYTES * 2) }));
     }

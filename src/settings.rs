@@ -630,6 +630,15 @@ pub struct Settings {
     /// Read live at every call, so turning it off revokes at once.
     #[serde(default)]
     pub hobbes_read_tabs: bool,
+    /// Also rotate the Hobbes chat once a day at [`Self::hobbes_rotate_at`],
+    /// not only when it grows past the size caps (`session_rotation`). Off
+    /// by default.
+    #[serde(default)]
+    pub hobbes_rotate_daily: bool,
+    /// The local time of day ("HH:MM") the daily rotation is due. It runs at
+    /// the first quiet moment after this time.
+    #[serde(default = "default_hobbes_rotate_at")]
+    pub hobbes_rotate_at: String,
     /// Voice: a realtime speech layer that orchestrates through the harness.
     #[serde(default)]
     pub voice: VoiceSettings,
@@ -743,6 +752,10 @@ fn default_heartbeat_daily_usd() -> f64 {
 
 fn default_planner_block_minutes() -> u32 {
     30
+}
+
+fn default_hobbes_rotate_at() -> String {
+    "04:00".to_string()
 }
 
 fn default_workday_start() -> String {
@@ -1380,6 +1393,8 @@ impl Default for Settings {
             terminal_enabled: false,
             heartbeat_enabled: false,
             hobbes_read_tabs: false,
+            hobbes_rotate_daily: false,
+            hobbes_rotate_at: default_hobbes_rotate_at(),
             voice: VoiceSettings::default(),
             heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
             heartbeat_daily_usd: default_heartbeat_daily_usd(),

@@ -140,6 +140,38 @@ fn HobbesTabCard(ctx: SettingsCtx) -> Element {
                         }
                     }
                 }
+                div {
+                    class: "flex items-center justify-between mt-4",
+                    div {
+                        label { class: "text-sm font-medium text-fg-muted", "Start a fresh chat daily" }
+                        p { class: "text-xs text-fg-muted",
+                            "Each day at this time, the Hobbes chat moves to History and a new one picks up its summary and notes. It waits for a quiet moment. Off: it rotates only when it grows large."
+                        }
+                    }
+                    div {
+                        class: "flex items-center gap-3",
+                        input {
+                            r#type: "time",
+                            class: "w-28 rounded border border-subtle bg-input px-2 py-1 text-sm text-fg disabled:opacity-50",
+                            disabled: !s.hobbes_rotate_daily,
+                            value: "{s.hobbes_rotate_at}",
+                            oninput: move |e| {
+                                let v = e.value();
+                                if crate::session_rotation::parse_rotate_at(&v).is_some() {
+                                    local_settings.write().hobbes_rotate_at = v;
+                                }
+                            }
+                        }
+                        input {
+                            r#type: "checkbox",
+                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                            checked: "{s.hobbes_rotate_daily}",
+                            onchange: move |e| {
+                                local_settings.write().hobbes_rotate_daily = e.value() == "true";
+                            }
+                        }
+                    }
+                }
             }
         }
     }
