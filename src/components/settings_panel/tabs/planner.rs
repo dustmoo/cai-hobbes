@@ -238,6 +238,27 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                         }
                                     }
 
+                                    // Whether a chat dispatch switches to the worker's tab
+                                    // (todo::dispatch::handle_dispatch).
+                                    {
+                                        let focus = local_settings.read().dispatch_focus_tab;
+                                        rsx! {
+                                            div {
+                                                class: "mt-4 mb-1",
+                                                label { class: "block text-sm font-medium text-fg-muted mb-1", "When an Agent Starts" }
+                                                p { class: "text-xs text-fg-muted mb-1", "A task dispatched to a chat opens in a new tab. Choose whether Hobbes takes you there." }
+                                                select {
+                                                    class: "block w-64 px-3 py-2 bg-input border border-subtle rounded-md text-sm text-fg",
+                                                    onchange: move |e| {
+                                                        local_settings.write().dispatch_focus_tab = e.value() == "switch";
+                                                    },
+                                                    option { value: "switch", selected: focus, "Switch to its tab" }
+                                                    option { value: "stay", selected: !focus, "Open it in the background" }
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // What a dispatched agent's to-do does when its run
                                     // finishes cleanly (todo::lanes::apply_finish_policy).
                                     {
@@ -256,24 +277,6 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                                     option { value: AgentFinishAction::Close.as_str(), selected: action == AgentFinishAction::Close, "Close the task" }
                                                     option { value: AgentFinishAction::Review.as_str(), selected: action == AgentFinishAction::Review, "Leave it for my review" }
                                                 }
-                                            }
-                                        }
-                                    }
-
-                                    // Whether a chat dispatch switches to the worker's tab
-                                    // (todo::dispatch::handle_dispatch).
-                                    div {
-                                        class: "mt-4 mb-1 flex items-center justify-between max-w-md",
-                                        div {
-                                            label { class: "text-sm font-medium text-fg-muted", "Switch to Dispatched Tabs" }
-                                            p { class: "text-xs text-fg-muted", "Off: a dispatched chat opens its tab in the background and you stay where you are." }
-                                        }
-                                        input {
-                                            r#type: "checkbox",
-                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
-                                            checked: "{local_settings.read().dispatch_focus_tab}",
-                                            onchange: move |e| {
-                                                local_settings.write().dispatch_focus_tab = e.value() == "true";
                                             }
                                         }
                                     }
