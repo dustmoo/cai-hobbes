@@ -607,6 +607,10 @@ pub struct Settings {
     /// close it (default) or leave it marked for review.
     #[serde(default)]
     pub agent_finish_action: AgentFinishAction,
+    /// A chat dispatch switches to the worker's new tab. Off: the tab opens
+    /// in the background and you stay where you are.
+    #[serde(default = "default_true")]
+    pub dispatch_focus_tab: bool,
 
     // ── Terminal ────────────────────────────────────────────────────────────
     /// Register the native `hobbes-terminal` MCP server (persistent per-chat
@@ -1390,6 +1394,7 @@ impl Default for Settings {
             dispatch_auto_continue: true,
             dispatch_relay_mode: DispatchRelayMode::default(),
             agent_finish_action: AgentFinishAction::default(),
+            dispatch_focus_tab: true,
             terminal_enabled: false,
             heartbeat_enabled: false,
             hobbes_read_tabs: false,

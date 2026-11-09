@@ -259,6 +259,24 @@ pub(in super::super) fn PlannerTab(ctx: SettingsCtx) -> Element {
                                             }
                                         }
                                     }
+
+                                    // Whether a chat dispatch switches to the worker's tab
+                                    // (todo::dispatch::handle_dispatch).
+                                    div {
+                                        class: "mt-4 mb-1 flex items-center justify-between max-w-md",
+                                        div {
+                                            label { class: "text-sm font-medium text-fg-muted", "Switch to Dispatched Tabs" }
+                                            p { class: "text-xs text-fg-muted", "Off: a dispatched chat opens its tab in the background and you stay where you are." }
+                                        }
+                                        input {
+                                            r#type: "checkbox",
+                                            class: "toggle-checkbox text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
+                                            checked: "{local_settings.read().dispatch_focus_tab}",
+                                            onchange: move |e| {
+                                                local_settings.write().dispatch_focus_tab = e.value() == "true";
+                                            }
+                                        }
+                                    }
                                 }
                             }
 

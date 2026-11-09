@@ -388,11 +388,13 @@ pub fn handle_dispatch(
                 .peek()
                 .resolve_dispatch_profile(args.get("profile").and_then(|v| v.as_str()))
                 .map_err(|e| format!("Not dispatched: {e}."))?;
-            // New tab, project-tagged, pinned, linked, seeded, focused.
+            // New tab, project-tagged, pinned, linked, seeded; focused
+            // unless the person turned that off.
+            let focus = deps.settings.peek().dispatch_focus_tab;
             let d = dispatch_to_chat(
                 deps,
                 todo_id,
-                ChatDispatchOpts { instructions, choice, parent_session_id, profile, focus: true },
+                ChatDispatchOpts { instructions, choice, parent_session_id, profile, focus },
             )?;
             Ok(format!(
                 "Dispatched '{}' to a new chat tab (session {}) on {}{}. The assignment \
@@ -709,6 +711,34 @@ pub(crate) mod tests {
         }
         settings.active_composio_profile = Some("p-cm".into());
         settings
+    }
+
+    #[test]
+    fn the_focus_setting_decides_whether_a_chat_dispatch_switches_tabs() {
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let spawner = RecordingSpawner(Default::default());
+            for focus in [true, false] {
+                let (planner, id) = planner_with("Draft the release notes");
+                let mut settings = settings_with_profiles();
+                settings.dispatch_focus_tab = focus;
+                let mut ctx = test_ctx_with(planner, settings);
+                let here = ctx.session_state.write().create_session_raw(None);
+                ctx.session_state.write().active_session_id = here.clone();
+                handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&here)).unwrap();
+                let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
+                if focus {
+                    assert_eq!(
+                        *ctx.chat_command.peek(),
+                        Some(crate::components::chat_input::ChatCommand::SwitchToSession(sid))
+                    );
+                } else {
+                    assert_eq!(ctx.session_state.peek().active_session_id, here, "focus stays put");
+                    assert_eq!(*ctx.chat_command.peek(), None, "no tab switch");
+                }
+            }
+            dioxus::prelude::rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[test]
