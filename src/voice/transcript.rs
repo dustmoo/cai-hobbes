@@ -118,6 +118,11 @@ fn transcript_line(m: &Message) -> bool {
             }))
 }
 
+/// An auto-recovery prompt: "User"-authored, but part of the turn it is in.
+pub fn is_recovery_prompt(m: &Message) -> bool {
+    m.content.get_text_content().is_some_and(|t| t.starts_with(RECOVERY_PREFIX))
+}
+
 /// Whether `m` opens a new unit: a request / relay / transcript line. An
 /// auto-recovery prompt is "User"-authored but continues the turn it is in.
 fn starts_unit(m: &Message) -> bool {
@@ -415,6 +420,26 @@ mod tests {
             call(12),
             text("Hobbes", "Two sessions are blocked.", 30),
         ]
+    }
+
+    /// A spoken line is always a message of its own: no existing message's
+    /// text changes, whether the tail is a finished reply, an open turn, or
+    /// the line's stamp falls after or inside the reply.
+    #[test]
+    fn a_spoken_line_never_merges_into_an_existing_message() {
+        for (tail_open, secs) in [(false, 40), (false, 25), (true, 40), (true, 11)] {
+            let mut msgs = brain_turn();
+            let before = bodies(&msgs);
+            let inserted = insert_between_turns(&mut msgs, vec![line(false, "Confirmed. Your reminder.", secs)], tail_open);
+            assert_eq!(inserted.len(), 1);
+            assert_eq!(msgs.len(), before.len() + 1);
+            let after = bodies(&msgs);
+            let mut rest = after.clone();
+            let at = rest.iter().position(|b| b == "🔊 Confirmed. Your reminder.").expect("its own message");
+            rest.remove(at);
+            assert_eq!(rest, before, "tail_open={tail_open} at={secs}");
+            assert!(monotonic(&msgs));
+        }
     }
 
     /// The person's question and the voice's "one moment" were buffered

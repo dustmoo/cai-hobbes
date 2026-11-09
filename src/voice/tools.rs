@@ -30,7 +30,9 @@ fn voice_only_decls() -> Vec<ToolDecl> {
                 agents, editing the planner, and careful reasoning. Use it for anything you \
                 can't answer from your own quick tools, anything that changes something, and \
                 anything that needs real thought. It runs in the background: tell the person \
-                you're on it, keep talking with them, and relay the result when it arrives."
+                you're on it, keep talking with them, and relay the result when it arrives. \
+                Call it ONCE per request and wait for the result, even if it takes a minute or \
+                more; never repeat or reword a request that is still running."
                 .into(),
             parameters: json!({
                 "type": "object",

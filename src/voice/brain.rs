@@ -25,9 +25,12 @@ const END_FALLBACK: Duration = Duration::from_millis(500);
 static TURN_END: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Signalled at every turn end (`voice::controller::on_turn_end`) so the
-/// brain wait wakes immediately instead of on its next tick.
+/// brain waits wake immediately instead of on their next tick. Every
+/// waiter is woken (several requests can be queued at once, each wait
+/// resolving at its own turn's end); a wait not parked at that instant
+/// catches up on its [`END_FALLBACK`] tick.
 pub fn wake() {
-    TURN_END.notify_one();
+    TURN_END.notify_waiters();
 }
 /// Most text handed back to the voice tier.
 const MAX_RESULT_CHARS: usize = 4000;
@@ -62,8 +65,11 @@ pub fn framed_request(request: &str) -> String {
 pub fn collect_reply(messages: &[Message], anchor: usize) -> String {
     let mut parts = Vec::new();
     for m in messages.iter().skip(anchor + 1) {
-        if m.author == "User" {
+        if ends_turn(m) {
             break;
+        }
+        if m.author == "User" {
+            continue; // an auto-recovery prompt inside the turn
         }
         if let MessageContent::Text { content, .. } = &m.content {
             let t = content.trim();
@@ -82,6 +88,21 @@ pub fn collect_reply(messages: &[Message], anchor: usize) -> String {
         text = text.chars().take(MAX_RESULT_CHARS).collect::<String>() + "…";
     }
     text
+}
+
+/// Whether `m` closes the turn before it: a user-authored message (a later
+/// request, a heard transcript line, a typed message) that is not an
+/// auto-recovery prompt (those continue the turn they are in).
+fn ends_turn(m: &Message) -> bool {
+    m.author == "User" && !crate::voice::transcript::is_recovery_prompt(m)
+}
+
+/// The turn answering the request at `anchor` is over because a later
+/// request or message follows it. True even while the session streams that
+/// later turn (queued requests run back to back, so "the session is
+/// streaming" says nothing about this one).
+pub fn turn_ended_by_later_message(messages: &[Message], anchor: usize) -> bool {
+    messages.iter().skip(anchor + 1).any(ends_turn)
 }
 
 /// Index of this request's own message (the drain appends it as a User
@@ -105,7 +126,7 @@ fn turn_needs_approval(messages: &[Message], anchor: usize) -> bool {
         .iter()
         .enumerate()
         .skip(anchor + 1)
-        .find(|(_, m)| m.author == "User")
+        .find(|(_, m)| ends_turn(m))
         .map(|(i, _)| i)
         .unwrap_or(messages.len());
     crate::heartbeat::wake::has_pending_approval(&messages[anchor + 1..end])
@@ -234,7 +255,7 @@ async fn run_inner(
             return BrainOutcome::Failed("The brain took too long; it may still finish in the Hobbes tab.".into());
         }
         let is_streaming = streaming(&session_id);
-        let (reply, pending) = {
+        let (reply, pending, later_turn) = {
             let state = session_state.peek();
             let Some(s) = state.sessions.get(&session_id) else {
                 return BrainOutcome::Failed("The Hobbes session was closed.".into());
@@ -243,13 +264,29 @@ async fn run_inner(
                 anchor = find_anchor(&s.messages, before, &framed);
             }
             match anchor {
-                Some(a) => (collect_reply(&s.messages, a), turn_needs_approval(&s.messages, a)),
-                None => (String::new(), false),
+                Some(a) => (
+                    collect_reply(&s.messages, a),
+                    turn_needs_approval(&s.messages, a),
+                    turn_ended_by_later_message(&s.messages, a),
+                ),
+                None => (String::new(), false, false),
             }
         };
         let Some(_) = anchor else {
             continue; // still queued (another turn may be ahead of it)
         };
+        // A later message follows this request: its own turn is over, even if
+        // the session is already streaming the next queued one.
+        if later_turn {
+            if pending {
+                return BrainOutcome::NeedsApproval("The brain is waiting for your approval in the Hobbes tab.".into());
+            }
+            return if reply.is_empty() {
+                BrainOutcome::Failed("The brain finished without a reply; check the Hobbes tab.".into())
+            } else {
+                BrainOutcome::Done(reply)
+            };
+        }
         if is_streaming {
             seen_stream = true;
             quiet_since = None;
@@ -367,6 +404,27 @@ mod tests {
         assert_eq!(collect_reply(&msgs, 0), "Answer A.");
         assert_eq!(find_anchor(&msgs, 1, &framed_request("B")), Some(2));
         assert_eq!(collect_reply(&msgs, 2), "Answer B.");
+    }
+
+    #[test]
+    fn a_turn_is_over_once_a_later_message_follows_it() {
+        let msgs = vec![
+            text("User", &framed_request("A")),
+            text("Hobbes", "Answer A."),
+            text("User", &framed_request("B")),
+            text("Hobbes", ""),
+        ];
+        assert!(turn_ended_by_later_message(&msgs, 0));
+        assert!(!turn_ended_by_later_message(&msgs, 2));
+        // An auto-recovery prompt continues the turn it is in.
+        let msgs = vec![
+            text("User", &framed_request("A")),
+            text("Hobbes", "Part one."),
+            text("User", "[System: Auto-recovery triggered, carry on]"),
+            text("Hobbes", "Part two."),
+        ];
+        assert!(!turn_ended_by_later_message(&msgs, 0));
+        assert_eq!(collect_reply(&msgs, 0), "Part one.\n\nPart two.");
     }
 
     #[test]

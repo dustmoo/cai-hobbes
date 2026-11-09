@@ -465,7 +465,9 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          you'd need to look up or explain in depth, anything from before the conversation \
          below, or questions that need careful thought — call {brain} with a complete request (the brain cannot \
          hear the conversation), tell them briefly that you're on it, and keep talking with \
-         them. As you hand something to the brain, say a short holding phrase out loud — \
+         them. Call {brain} once per request and wait: its result always arrives on that same \
+         call, however long it takes. Never call it again for something you've already \
+         asked, not even reworded; only call it again when the person asks for something new. As you hand something to the brain, say a short holding phrase out loud — \
          \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
          silence. When the result comes back, summarise it naturally, and give the detail if they \
          asked for it. Never read out code, URLs \
@@ -611,6 +613,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut pending_lines: Vec<PendingLine> = Vec::new();
     let mut brain_cancel: HashMap<String, BrainHandle> = HashMap::new();
     let mut abandoned: HashSet<String> = HashSet::new();
+    // Brain requests still running (not cancelled), for spotting repeats;
+    // and when the person's latest utterance began (input transcript).
+    let mut in_flight_asks: HashMap<String, InFlightAsk> = HashMap::new();
+    let mut last_speech_start: Option<Instant> = None;
     let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<(String, BrainOutcome)>();
     let mut ending_at: Option<Instant> = None;
     // When the voice last told them it was thinking (rate-limits the phrase).
@@ -703,6 +709,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     RealtimeEvent::InputTranscript(t) => {
                         floor_state.person_transcript(Instant::now());
                         stats.heard_fragments += 1;
+                        // A new utterance from the person (not noise or a
+                        // continuation): what lets a new brain request through.
+                        if heard.is_blank() && t.chars().any(char::is_alphanumeric) {
+                            last_speech_start = Some(Instant::now());
+                        }
                         heard.push(&t);
                         last_activity = Instant::now();
                         ui.heard = live_tail(heard.text());
@@ -741,9 +752,17 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         match name.as_str() {
                             tools::ASK_BRAIN => {
                                 let request = args.get("request").and_then(Value::as_str).unwrap_or_default().to_string();
+                                let norm = normalize_request(&request);
                                 if request.trim().is_empty() {
                                     respond(&rt.control, &id, &name, json!({"error": "request is empty"}), None);
+                                } else if is_duplicate_ask(in_flight_asks.values(), &norm, last_speech_start) {
+                                    // The realtime model repeating itself while it
+                                    // waits: absorb it silently, queue nothing.
+                                    stats.duplicate_asks += 1;
+                                    tracing::info!("voice: repeated brain request ignored ({} in flight)", in_flight_asks.len());
+                                    respond(&rt.control, &id, &name, brain_duplicate_response(), Some(Scheduling::Silent));
                                 } else {
+                                    in_flight_asks.insert(id.clone(), InFlightAsk { asked_at: Instant::now(), norm });
                                     // Transcript so far goes in before the brain's turn
                                     // (unless an earlier request's turn is in flight).
                                     if brain_cancel.is_empty() {
@@ -780,6 +799,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                 for h in brain_cancel.values() {
                                     h.cancel.store(true, Ordering::SeqCst);
                                 }
+                                // A cancelled request no longer blocks a new one.
+                                in_flight_asks.clear();
                                 respond(&rt.control, &id, &name, json!({"result": "cancelled"}), None);
                             }
                             tools::END_CONVERSATION => {
@@ -803,6 +824,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
             done = brain_rx.recv() => {
                 if let Some((id, outcome)) = done {
                     brain_cancel.remove(&id);
+                    in_flight_asks.remove(&id);
                     ui.brain_busy = brain_cancel.len();
                     last_activity = Instant::now();
                     let text = match outcome {
@@ -993,6 +1015,8 @@ struct Stats {
     spoke_fragments: u64,
     turns: u64,
     tool_calls: u64,
+    /// Repeated brain requests absorbed without queuing a turn.
+    duplicate_asks: u64,
     /// Local barge-ins (echo-unsafe only).
     barge_ins: u64,
     /// Muted mic frames discarded as Hobbes' own echo.
@@ -1006,7 +1030,7 @@ struct Stats {
 impl Stats {
     fn summary(&self) -> String {
         format!(
-            "mic frames {} (sent {}, echo dropped {}), peak {:.3}, model audio {:.1}s (cut {:.1}s), heard/spoke fragments {}/{}, turns {}, tool calls {}, barge-ins {}, queued out {}",
+            "mic frames {} (sent {}, echo dropped {}), peak {:.3}, model audio {:.1}s (cut {:.1}s), heard/spoke fragments {}/{}, turns {}, tool calls {} (repeated asks {}), barge-ins {}, queued out {}",
             self.mic_frames,
             self.sent_frames,
             self.echo_frames_dropped,
@@ -1017,6 +1041,7 @@ impl Stats {
             self.spoke_fragments,
             self.turns,
             self.tool_calls,
+            self.duplicate_asks,
             self.barge_ins,
             self.queued_out,
         )
@@ -1084,6 +1109,55 @@ pub fn brain_started_response() -> Value {
                  know you're thinking about it and will be right back (for example \"Let me \
                  think about that, one moment.\"). Don't guess the answer. The result arrives \
                  later on this same call.",
+    })
+}
+
+/// The answer to a repeated `VOICE_ASK_BRAIN` (see [`is_duplicate_ask`]):
+/// sent silently, and nothing is queued.
+pub fn brain_duplicate_response() -> Value {
+    json!({
+        "status": "already_working",
+        "note": "Already working on that request; its result will arrive on the earlier call when \
+                 it's done. Don't ask again, and say nothing more about it now.",
+    })
+}
+
+/// Input transcription can trail the audio: fragments of the speech that
+/// prompted an ask may arrive just after the call. Speech that starts within
+/// this long after an ask doesn't count as "spoken since".
+pub const TRANSCRIPT_LAG: Duration = Duration::from_millis(2000);
+
+/// A `VOICE_ASK_BRAIN` whose brain turn is still running.
+#[derive(Debug, Clone)]
+pub struct InFlightAsk {
+    pub asked_at: Instant,
+    /// [`normalize_request`] of its text.
+    pub norm: String,
+}
+
+/// Case, punctuation and whitespace folded, for comparing request texts.
+pub fn normalize_request(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_lowercase().next().unwrap_or(c) } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a new ask repeats one already in flight: the same text (whatever
+/// was said since), or any text when the person hasn't started speaking since
+/// that ask (`last_speech_start`: when their latest utterance began). The
+/// realtime model re-issues the call while it waits; only the person can
+/// start a genuinely new request.
+pub fn is_duplicate_ask<'a>(
+    in_flight: impl IntoIterator<Item = &'a InFlightAsk>,
+    norm: &str,
+    last_speech_start: Option<Instant>,
+) -> bool {
+    in_flight.into_iter().any(|a| {
+        let spoken_since = last_speech_start.is_some_and(|s| s > a.asked_at + TRANSCRIPT_LAG);
+        a.norm == norm || !spoken_since
     })
 }
 
@@ -1259,6 +1333,36 @@ mod tests {
         // After the cooldown: say it again.
         assert!(holding_should_speak(false, Some(t0), t0 + HOLDING_COOLDOWN));
         assert_eq!(brain_started_quiet_response()["status"], "working");
+    }
+
+    #[test]
+    fn repeated_brain_requests_are_absorbed() {
+        let t0 = Instant::now();
+        let first = InFlightAsk { asked_at: t0, norm: normalize_request("Check my email for the Puget invoice.") };
+        let inflight = [first];
+        let after_lag = Some(t0 + TRANSCRIPT_LAG + Duration::from_millis(500));
+        // Nothing in flight: never a duplicate.
+        assert!(!is_duplicate_ask(&[], "anything", None));
+        assert!(!is_duplicate_ask(&[], "anything", after_lag));
+        // No new speech since: a duplicate, whatever its wording.
+        assert!(is_duplicate_ask(&inflight, &normalize_request("Look for the Puget invoice email"), None));
+        // Speech that started before the ask (or trailing transcript just
+        // after it) isn't new speech.
+        assert!(is_duplicate_ask(&inflight, "something else", Some(t0)));
+        assert!(is_duplicate_ask(&inflight, "something else", Some(t0 + Duration::from_millis(800))));
+        // The same text after new speech: still a duplicate.
+        assert!(is_duplicate_ask(&inflight, &normalize_request("  check MY email for the puget invoice "), after_lag));
+        // A different request after new speech: goes through.
+        assert!(!is_duplicate_ask(&inflight, &normalize_request("What's on my calendar tomorrow?"), after_lag));
+        assert_eq!(brain_duplicate_response()["status"], "already_working");
+    }
+
+    #[test]
+    fn requests_normalise_case_space_and_punctuation() {
+        assert_eq!(normalize_request("  Check   my\nEmail, please! "), "check my email please");
+        assert_eq!(normalize_request("Check my email please"), normalize_request("check my email, please."));
+        let s = system_instruction(chrono::Local::now(), "");
+        assert!(s.contains("once per request"));
     }
 
     #[test]
