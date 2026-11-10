@@ -637,6 +637,10 @@ pub struct Settings {
     /// Also rotate the Hobbes chat once a day at [`Self::hobbes_rotate_at`],
     /// not only when it grows past the size caps (`session_rotation`). Off
     /// by default.
+    /// Gemini 4 Carbon has been offered a quick-switch slot on this install
+    /// (`seed_gemini_4_carbon_slot`). One-time, so removing it later sticks.
+    #[serde(default)]
+    pub gemini_4_carbon_slot_seeded: bool,
     #[serde(default)]
     pub hobbes_rotate_daily: bool,
     /// The local time of day ("HH:MM") the daily rotation is due. It runs at
@@ -1398,6 +1402,8 @@ impl Default for Settings {
             terminal_enabled: false,
             heartbeat_enabled: false,
             hobbes_read_tabs: false,
+            // Fresh installs get it from `default_model_slots`.
+            gemini_4_carbon_slot_seeded: true,
             hobbes_rotate_daily: false,
             hobbes_rotate_at: default_hobbes_rotate_at(),
             voice: VoiceSettings::default(),
@@ -1898,6 +1904,33 @@ impl Settings {
         if let Some(s) = self.calendar_subscription_by_id_mut(id) {
             s.name = trimmed.to_string();
         }
+    }
+
+    /// One-time, for installs whose settings predate Gemini 4 Carbon: put it
+    /// in the first empty quick-switch slot of every Gemini connector (and
+    /// the legacy Gemini buffer) that doesn't list it. A full slot list is
+    /// left alone. Returns true when it changed anything (caller persists).
+    pub fn seed_gemini_4_carbon_slot(&mut self) -> bool {
+        if self.gemini_4_carbon_slot_seeded {
+            return false;
+        }
+        self.gemini_4_carbon_slot_seeded = true;
+        let carbon = crate::llm::gemini::GeminiModel::Gemini4Carbon.canonical_slug();
+        let seed = |slots: &mut Vec<String>| {
+            if slots.iter().any(|m| m.trim().trim_start_matches("models/") == carbon) {
+                return;
+            }
+            if let Some(empty) = slots.iter_mut().find(|m| m.trim().is_empty()) {
+                *empty = carbon.to_string();
+            }
+        };
+        seed(&mut self.gemini_config.model_slots);
+        for connector in &mut self.llm_connectors {
+            if let crate::llm::config::ProviderInstanceConfig::Gemini(c) = &mut connector.config {
+                seed(&mut c.model_slots);
+            }
+        }
+        true
     }
 
     /// One-time migration: convert the legacy `planner_calendar_profile` stub
@@ -2626,7 +2659,9 @@ impl SettingsManager {
             settings.seed_default_claude_slots_if_empty();
             let migrated_llm = settings.migrate_legacy_llm_config();
             let migrated_calendar = settings.migrate_legacy_calendar_profile();
-            if (migrated_llm || migrated_calendar) && self.save(&settings).is_err() {
+            // After the connector migration, so every Gemini connector exists.
+            let seeded_carbon = settings.seed_gemini_4_carbon_slot();
+            if (migrated_llm || migrated_calendar || seeded_carbon) && self.save(&settings).is_err() {
                 tracing::error!("Failed to persist migrated settings.");
             }
             return settings;
@@ -3757,6 +3792,58 @@ mod tests {
             }
             _ => panic!("wrong config variant"),
         }
+    }
+
+    #[test]
+    fn gemini_4_carbon_is_offered_a_slot_once_on_existing_installs() {
+        use crate::llm::config::ProviderInstanceConfig;
+        // An install from before Carbon: slots without it, flag absent.
+        let mut settings = Settings { gemini_4_carbon_slot_seeded: false, ..Settings::default() };
+        let old_slots = |n_empty: usize| {
+            let mut v = vec!["gemini-3.7-flash".to_string(), "gemini-2.5-flash".to_string()];
+            v.extend(std::iter::repeat_n(String::new(), n_empty));
+            v
+        };
+        settings.gemini_config.model_slots = old_slots(2);
+        settings.migrate_legacy_llm_config();
+        for c in &mut settings.llm_connectors {
+            if let ProviderInstanceConfig::Gemini(g) = &mut c.config {
+                g.model_slots = old_slots(2);
+            }
+        }
+        assert!(settings.seed_gemini_4_carbon_slot());
+        assert_eq!(settings.gemini_config.model_slots[2], "gemini-4-carbon");
+        assert_eq!(settings.gemini_config.model_slots[3], "");
+        let gemini: Vec<_> = settings
+            .llm_connectors
+            .iter()
+            .filter_map(|c| match &c.config {
+                ProviderInstanceConfig::Gemini(g) => Some(g.model_slots.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!gemini.is_empty());
+        assert!(gemini.iter().all(|s| s[2] == "gemini-4-carbon" && s[..2] == old_slots(0)[..]));
+
+        // Once only: removing it afterwards sticks.
+        settings.gemini_config.model_slots[2].clear();
+        assert!(!settings.seed_gemini_4_carbon_slot());
+        assert_eq!(settings.gemini_config.model_slots[2], "");
+
+        // Already listed, or no empty slot: nothing is added or replaced.
+        let mut listed = Settings { gemini_4_carbon_slot_seeded: false, ..Settings::default() };
+        let before = listed.gemini_config.model_slots.clone();
+        listed.seed_gemini_4_carbon_slot();
+        assert_eq!(listed.gemini_config.model_slots, before);
+        let mut full = Settings { gemini_4_carbon_slot_seeded: false, ..Settings::default() };
+        full.gemini_config.model_slots = vec!["a".to_string(), "b".to_string()];
+        full.seed_gemini_4_carbon_slot();
+        assert_eq!(full.gemini_config.model_slots, vec!["a".to_string(), "b".to_string()]);
+
+        // A fresh install never needs it; an old settings file does.
+        assert!(Settings::default().gemini_4_carbon_slot_seeded);
+        let old: Settings = serde_json::from_str("{}").unwrap_or_default();
+        let _ = old;
     }
 
     #[test]

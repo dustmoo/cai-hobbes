@@ -82,7 +82,7 @@ pub fn default_model_slots() -> Vec<String> {
         GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
         // Paid tier only, so it sits after the defaults rather than in slot 0
         GeminiModel::Gemini4Argon.canonical_slug().to_string(),
-        "".to_string(), // Slot 8
+        GeminiModel::Gemini4Carbon.canonical_slug().to_string(),
         "".to_string(), // Slot 9
         "".to_string(), // Slot 10
     ]
@@ -483,14 +483,15 @@ mod tests {
     fn test_default_model_slots_has_gemini_slugs() {
         let slots = default_model_slots();
         assert_eq!(slots.len(), 10);
-        // First 7 should be non-empty Gemini slugs, latest-gen Flash first
+        // First 8 should be non-empty Gemini slugs, latest-gen Flash first
         assert_eq!(slots[0], "gemini-3.7-flash");
-        for i in 0..7 {
+        for i in 0..8 {
             assert!(slots[i].contains("gemini"), "Slot {} should be a Gemini model", i);
         }
         assert_eq!(slots[6], "gemini-4-argon");
-        // Last 3 should be empty
-        for i in 7..10 {
+        assert_eq!(slots[7], "gemini-4-carbon");
+        // Last 2 should be empty
+        for i in 8..10 {
             assert!(slots[i].is_empty(), "Slot {} should be empty", i);
         }
     }
