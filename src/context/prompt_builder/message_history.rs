@@ -519,7 +519,18 @@ impl<'a> PromptBuilder<'a> {
                 // provenance filter for legacy (unstamped) rows.
                 let in_latest_turn = abs_idx >= current_turn_start_idx;
 
+                // Voice: a spoken (🔊) line is never presented as the
+                // assistant's own words. After a brain reply it is a
+                // restatement (omitted); otherwise it rides as a labelled
+                // context line. A System-role message, like ledger entries:
+                // it never starts a turn and alternation stays untouched.
+                let spoken = crate::voice::display::classify_spoken(session_messages, abs_idx);
                 match &message.content {
+                    MessageContent::Text { .. } if spoken != crate::voice::display::SpokenLine::Normal => {
+                        if let crate::voice::display::SpokenLine::Context(text) = spoken {
+                            messages.push(ledger::system_message(text));
+                        }
+                    }
                     MessageContent::Text {
                         thought_signature,
                         signature_provider,

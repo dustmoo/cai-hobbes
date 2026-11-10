@@ -15,6 +15,18 @@ use super::shared::{
     SessionIdContext,
 };
 
+/// The message as the bubble shows it: a voice request without its
+/// bracketed frame (the stored message is untouched; copy then yields the
+/// request line, and edits restore the frame via `restore_frame`).
+fn display_message(message: &crate::components::chat::Message) -> crate::components::chat::Message {
+    let mut shown = message.clone();
+    if let MessageContent::Text { content, .. } = &mut shown.content {
+        let visible = crate::voice::display::display_text(content).len();
+        content.truncate(visible);
+    }
+    shown
+}
+
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 
 /// What occupies one slot in the rendered list: either a plain message, or a
@@ -392,7 +404,7 @@ pub fn MessageList(
                                                     if should_render {
                                                         rsx! {
                                                             MessageBubble {
-                                                                message: message.clone(),
+                                                                message: display_message(message),
                                                                 on_content_update: move |_| stream_update_trigger += 1,
                                                                 on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
                                                                 on_delete: {
@@ -405,11 +417,13 @@ pub fn MessageList(
                                                                 },
                                                                 on_edit_save: {
                                                                     let msg_id = message.id;
-                                                                    move |text: String| on_edit_save.call((msg_id, text))
+                                                                    let original = text.clone();
+                                                                    move |t: String| on_edit_save.call((msg_id, crate::voice::display::restore_frame(&original, t)))
                                                                 },
                                                                 on_edit_resend: {
                                                                     let msg_id = message.id;
-                                                                    move |text: String| on_edit_resend.call((msg_id, text))
+                                                                    let original = text.clone();
+                                                                    move |t: String| on_edit_resend.call((msg_id, crate::voice::display::restore_frame(&original, t)))
                                                                 },
                                                                 on_comment: move |_| on_comment.call(()),
                                                                 show_time: stamp.show_time,

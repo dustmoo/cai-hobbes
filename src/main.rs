@@ -112,6 +112,29 @@ pub(crate) fn session_streaming(session_id: &str) -> bool {
     STREAMING_SESSIONS.peek().contains(session_id)
 }
 
+/// Mirror of `StreamManagerContext::turn_in_flight_sessions` (streaming, a
+/// stream mapped to the session, or a continuation between tool rounds;
+/// never proactive summarization), kept in sync by `StreamBridge`. Unlike
+/// `STREAMING_SESSIONS` it stays set through the gap between rounds.
+static TURN_IN_FLIGHT: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Whether a turn is under way in `session_id` (no subscription: a peek),
+/// for code outside the component tree (the voice brain wait): a turn in
+/// flight, or a queued message popped and handed to the send but not yet
+/// streaming (`chat_queue::DISPATCHING`). Lags the stream manager by one
+/// reactive tick (it is a mirror), so callers should see it idle twice
+/// before treating a turn as over.
+pub(crate) fn session_turn_in_flight(session_id: &str) -> bool {
+    session_turn_started(session_id) || crate::components::chat_queue::DISPATCHING.peek().contains(session_id)
+}
+
+/// As [`session_turn_in_flight`], without the drain's hand-over: the turn
+/// itself has started (a stream registered) and is still running.
+pub(crate) fn session_turn_started(session_id: &str) -> bool {
+    TURN_IN_FLIGHT.peek().contains(session_id)
+}
+
 /// Drain `CANCEL_STREAM_REQUEST`, subscribing the caller to it.
 ///
 /// Must be called from inside a `use_effect`: only `.read()` registers the
@@ -4127,6 +4150,20 @@ fn StreamBridge() -> Element {
         let busy = stream_manager.turn_activity();
         if *crate::session_rotation::TURN_ACTIVITY.peek() != busy {
             *crate::session_rotation::TURN_ACTIVITY.write() = busy;
+        }
+    });
+    // Narrower: a turn in flight (no summarization), for the voice brain's
+    // wait. When a session leaves the set its turn is over (or held on an
+    // approval), so the waits wake now — after the mirror has updated —
+    // rather than on their next fallback tick.
+    use_effect(move || {
+        let in_flight = stream_manager.turn_in_flight_sessions();
+        if *TURN_IN_FLIGHT.peek() != in_flight {
+            let dropped = TURN_IN_FLIGHT.peek().iter().any(|s| !in_flight.contains(s));
+            *TURN_IN_FLIGHT.write() = in_flight;
+            if dropped {
+                crate::voice::brain::wake();
+            }
         }
     });
     // Reverse direction: root-scope code (delete_session_fn) can't call

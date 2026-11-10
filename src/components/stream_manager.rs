@@ -25,6 +25,34 @@ pub(crate) fn proactive_summary_sources(session: &crate::session::Session) -> Ve
     crate::mcp::manager::profile_reach::durable_summary_sources(session)
 }
 
+/// Sessions whose running turn was asked to stop from outside the tree (a
+/// voice VOICE_CANCEL_BRAIN) at a moment no stream may be registered — the
+/// gap between tool rounds, where `request_stream_cancel` has nothing to
+/// cancel. The continuation flow (`chat.rs` `continue_prompt_flow`) checks
+/// it before starting the next round. Cleared when the turn ends, is
+/// stopped, or a new turn starts (a send, a queue pop).
+static ABORT_TURN: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn with_abort_turn<R>(f: impl FnOnce(&mut HashSet<String>) -> R) -> R {
+    let mut guard = ABORT_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(HashSet::new))
+}
+
+/// Ask `session_id`'s running turn not to start another round.
+pub fn request_turn_abort(session_id: &str) {
+    with_abort_turn(|s| s.insert(session_id.to_string()));
+}
+
+/// Consume an abort request for `session_id` (the continuation obeys it).
+pub fn take_turn_abort(session_id: &str) -> bool {
+    with_abort_turn(|s| s.remove(session_id))
+}
+
+/// Drop any abort request for `session_id` (its turn ended, or a new one starts).
+pub fn clear_turn_abort(session_id: &str) {
+    with_abort_turn(|s| s.remove(session_id));
+}
+
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
@@ -65,6 +93,18 @@ impl StreamManagerContext {
         let mut out = self.streaming_sessions.read().clone();
         out.extend(self.stream_session_map.read().values().cloned());
         out.extend(self.summarizing_sessions.read().iter().cloned());
+        out.extend(self.continuation_controller.read().in_flight_sessions());
+        out
+    }
+
+    /// Sessions with a turn in flight, exactly as [`Self::turn_in_flight`]
+    /// judges one (streaming, a stream mapped to it, or a continuation
+    /// between rounds) — without proactive summarization, which runs beside
+    /// a turn and outlives it. Reads subscribe the caller (the `StreamBridge`
+    /// mirror behind `crate::session_turn_in_flight`).
+    pub fn turn_in_flight_sessions(&self) -> HashSet<String> {
+        let mut out = self.streaming_sessions.read().clone();
+        out.extend(self.stream_session_map.read().values().cloned());
         out.extend(self.continuation_controller.read().in_flight_sessions());
         out
     }
@@ -186,6 +226,10 @@ impl StreamManagerContext {
         self.streaming_sessions.write().insert(session_id.to_string());
         self.stream_session_map.write().insert(message_id, session_id.to_string());
         self.continuation_controller.write().clear_in_flight(session_id);
+        // A message the queue drain handed over has started: release its
+        // guard here, not only from the drain's backlog loop (which skips a
+        // session whose queue this pop emptied).
+        crate::components::chat_queue::release_dispatch(session_id);
     }
 
     /// Whether any part of a turn is in flight for `session_id`: streaming,
@@ -1610,6 +1654,9 @@ impl StreamManagerContext {
                     on_complete();
                     self.streaming_sessions.write().remove(&session_id);
                     *self.stream_activity.write() += 1; // Notify TabBar: stream ended
+                    // Held on approval: the turn has stopped. An abort aimed
+                    // at it must not drop the person's later resume.
+                    clear_turn_abort(&session_id);
                     self.scheduler.send(SchedulerSignal::Activity);
                     self.fleet_report(
                         &session_id,
@@ -2128,6 +2175,8 @@ impl StreamManagerContext {
             on_complete();
             self.streaming_sessions.write().remove(&session_id);
             *self.stream_activity.write() += 1; // Notify TabBar: stream ended
+            // The turn is over: an abort aimed at it has nothing left to stop.
+            clear_turn_abort(&session_id);
             self.scheduler.send(SchedulerSignal::Activity);
             self.fleet_report(
                 &session_id,
@@ -2535,6 +2584,7 @@ impl StreamManagerContext {
         // Stop ends the turn: no continuation of it is in flight any more
         // (a cancelled task never runs its `on_complete`).
         self.continuation_controller.write().clear_in_flight(session_id);
+        clear_turn_abort(session_id);
         self.fleet_report(
             session_id,
             crate::fleet::bridge::HobbesSignal::TurnCompleted,

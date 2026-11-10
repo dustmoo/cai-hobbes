@@ -3491,3 +3491,75 @@ fn tab_tools_are_offered_only_in_the_hobbes_session_and_the_setting_stays_out_of
     assert!(!free.volatile["other_tabs"].as_str().unwrap().contains("asks the user first"));
     assert!(!asks.system.contains("other_tabs"));
 }
+
+// =========================================================================
+// Voice transcript lines in the model's view
+// =========================================================================
+
+fn hobbes_text_msg(text: &str) -> Message {
+    let mut m = user_text_msg(text);
+    m.author = "Hobbes".to_string();
+    m
+}
+
+fn prompt_texts(session: &Session) -> Vec<(ChatRole, String)> {
+    let settings = Settings::default();
+    let prompt = PromptBuilder::new(session, &settings).build_prompt(String::new());
+    prompt
+        .prompt
+        .messages
+        .iter()
+        .map(|m| {
+            let t = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (m.role.clone(), t)
+        })
+        .collect()
+}
+
+#[test]
+fn spoken_line_after_reply_is_dropped_from_model_view() {
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg(&crate::voice::brain::framed_request("status?")),
+        hobbes_text_msg("All green."),
+        hobbes_text_msg("🔊 Everything is green."),
+        user_text_msg("thanks"),
+    ];
+    let texts = prompt_texts(&session);
+    assert!(texts.iter().all(|(_, t)| !t.contains("Everything is green")));
+    assert!(texts.iter().any(|(r, t)| *r == ChatRole::Assistant && t == "All green."));
+    // The frame of the current request is still sent.
+    assert!(texts.iter().any(|(_, t)| t.contains("[Voice request, relayed")));
+}
+
+#[test]
+fn standalone_spoken_line_becomes_labelled_context_not_assistant() {
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg("🎙 hello"),
+        hobbes_text_msg("🔊 Which project?"),
+        user_text_msg("🎙 the website"),
+    ];
+    let texts = prompt_texts(&session);
+    assert!(texts.iter().any(|(r, t)| *r != ChatRole::Assistant && t == "[Hobbes' voice said aloud: Which project?]"));
+    assert!(texts.iter().all(|(r, _)| *r != ChatRole::Assistant));
+    assert_eq!(texts.last().map(|(r, _)| r.clone()), Some(ChatRole::System)); // tail, as ever
+}
+
+#[test]
+fn chat_without_voice_lines_is_unchanged_by_spoken_handling() {
+    let mut session = create_test_session();
+    session.messages = vec![user_text_msg("hi"), hobbes_text_msg("hello"), user_text_msg("again")];
+    let texts = prompt_texts(&session);
+    assert_eq!(texts[0], (ChatRole::User, "hi".to_string()));
+    assert_eq!(texts[1], (ChatRole::Assistant, "hello".to_string()));
+    assert_eq!(texts[2], (ChatRole::User, "again".to_string()));
+}

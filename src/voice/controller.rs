@@ -43,7 +43,9 @@ use tokio::sync::mpsc;
 
 use crate::components::builtin_tools::BuiltinToolCtx;
 use crate::voice::audio::{self, AudioIo, MicPermission, VoiceEcho};
-use crate::voice::floor::{self, BargeIn, Delivery, Floor, MicRing, NoiseGate, Pending, SpeechQueue};
+use crate::voice::floor::{
+    self, BargeIn, Delivery, Floor, MicGate, MicRing, ModelTurn, NoiseGate, Pending, PlaybackTail, SpeechQueue,
+};
 use crate::voice::probe;
 use crate::voice::brain::{self, BrainHandle, BrainOutcome};
 use crate::voice::realtime::{
@@ -565,11 +567,41 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // own messages, so their cross-company reads already count there.
     setup.system_instruction =
         system_instruction(chrono::Local::now(), &session::session_tail(ctx.session_state, &voice_session, 10));
-    let mut rt = match provider.connect(setup).await {
-        Ok(s) => s,
-        Err(e) => {
+    // Commands during the connect: a stop (or a tap that ends the
+    // conversation) is honoured at once; the rest wait for the loop.
+    let mut early_cmds: std::collections::VecDeque<VoiceCmd> = std::collections::VecDeque::new();
+    let connected = {
+        let connect = provider.connect(setup);
+        tokio::pin!(connect);
+        let mut early_mode: Option<Mode> = announcing_text.as_ref().map(|_| Mode::PushToTalk);
+        loop {
+            tokio::select! {
+                r = &mut connect => break Some(r),
+                cmd = rx.recv() => match cmd {
+                    None | Some(VoiceCmd::Stop) => break None,
+                    Some(cmd) => {
+                        if let VoiceCmd::Release { held_ms } = &cmd {
+                            match release_step(early_mode, *held_ms < threshold_ms) {
+                                ReleaseStep::End => break None,
+                                ReleaseStep::Mode(m, _) => early_mode = Some(m),
+                            }
+                        }
+                        early_cmds.push_back(cmd);
+                    }
+                },
+            }
+        }
+    };
+    let mut rt = match connected {
+        Some(Ok(s)) => s,
+        Some(Err(e)) => {
             audio_io.stop();
             fail(format!("Couldn't reach the voice model: {e}"));
+            return;
+        }
+        None => {
+            audio_io.stop();
+            tracing::info!("voice: stopped while connecting");
             return;
         }
     };
@@ -591,10 +623,23 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // that notices the person talking over it.
     let mut barge = BargeIn::default();
     let mut ring = MicRing::default();
-    // After a local barge-in the rest of the interrupted turn is neither
-    // played nor transcribed, until the model ends it (`Interrupted` /
-    // `TurnComplete`); otherwise its next audio would mute the mic again.
-    let mut muting_turn = false;
+    // After a local barge-in (or a key press over the voice) the rest of
+    // the interrupted turn is neither played nor transcribed, until the
+    // model ends it (`Interrupted` / `TurnComplete`); otherwise its next
+    // audio would mute the mic again. Only a turn still open is muted.
+    let mut model_turn = ModelTurn::default();
+    // Playback with a short hangover (the speaker's tail), and the window
+    // after a cut in which mic frames are dropped as that tail.
+    let mut playback = PlaybackTail::default();
+    let mut mic_drop_until: Option<Instant> = None;
+    // When a queued item last went out (an announcement session's cap).
+    let mut last_delivery = Instant::now();
+    // Model turns, for telling a new ask from the model repeating one: bumps
+    // at each turn end, and at the first model output after a tool call.
+    let mut model_turn_seq: u64 = 0;
+    let mut after_tool_call = false;
+    // Voice-tier tool results (dispatched off the loop).
+    let (tool_tx, mut tool_rx) = mpsc::unbounded_channel::<(String, String, Value)>();
     if let Some((text, kind)) = &announcing_text {
         // Speaking-only start: nobody is talking (the mic is off).
         let _ = rt.control.send(RealtimeControl::InjectContext { text: announce_prompt(text, false, *kind), respond: true });
@@ -614,11 +659,13 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut brain_cancel: HashMap<String, BrainHandle> = HashMap::new();
     let mut abandoned: HashSet<String> = HashSet::new();
     // Brain requests still running (not cancelled), for spotting repeats;
-    // and when the person's latest utterance began (input transcript).
+    // and when the person last said something (input transcript).
     let mut in_flight_asks: HashMap<String, InFlightAsk> = HashMap::new();
-    let mut last_speech_start: Option<Instant> = None;
+    let mut last_speech: Option<Instant> = None;
     let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<(String, BrainOutcome)>();
     let mut ending_at: Option<Instant> = None;
+    // Goodbye audio seen since the end was asked for.
+    let mut goodbye_audio = false;
     // When the voice last told them it was thinking (rate-limits the phrase).
     let mut last_holding: Option<Instant> = None;
     // When the voice last produced speech (any turn): Gemini often says its
@@ -645,55 +692,86 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 stats.max_peak = stats.max_peak.max(p);
                 level_window = level_window.max(p);
                 let mic_open = held || mode == Some(Mode::Conversation);
-                // Without echo cancellation or headphones the model would hear itself.
-                let echo_risk = !ui.echo_safe && audio_io.is_playing() && !held;
                 let now = Instant::now();
-                if !mic_open {
-                    // Push-to-talk between holds: nothing goes out.
-                } else if echo_risk {
-                    // Keep the muted frame; send it after all if the person
-                    // is talking over Hobbes.
-                    let ms = floor::frame_ms(frame.len());
-                    ring.push(frame);
-                    if barge.observe(p, ms) {
-                        audio_io.flush();
-                        muting_turn = true;
-                        stats.barge_ins += 1;
-                        spoke.finish_into(true, &mut pending_lines);
-                        let buffered = ring.drain();
-                        tracing::info!("voice: local barge-in; sending {} buffered mic frames", buffered.len());
-                        for f in buffered {
-                            stats.sent_frames += 1;
-                            let _ = rt.control.send(RealtimeControl::Audio(f));
+                // Without echo cancellation or headphones the model would
+                // hear itself (playback, and its tail just after).
+                let audible = playback.observe(audio_io.is_playing(), now);
+                match floor::mic_gate(mic_open, held, ui.echo_safe, audible, mic_drop_until, now) {
+                    MicGate::Closed => {}
+                    MicGate::Drop => stats.echo_frames_dropped += 1,
+                    MicGate::Hold => {
+                        // Keep the muted frame; send it after all if the
+                        // person is talking over Hobbes.
+                        let ms = floor::frame_ms(frame.len());
+                        ring.push(frame);
+                        if let Some(rise_ms) = barge.observe(p, ms) {
+                            audio_io.flush();
+                            playback.reset();
+                            model_turn.cut();
+                            stats.barge_ins += 1;
+                            spoke.finish_into(true, &mut pending_lines);
+                            // From where their voice rose above the echo, with
+                            // a short pre-roll; the rest was Hobbes' own echo.
+                            let (buffered, echo) = ring.drain_recent(rise_ms + floor::BARGE_PREROLL_MS);
+                            stats.echo_frames_dropped += echo as u64;
+                            tracing::info!(
+                                "voice: local barge-in; sending {} buffered mic frames ({echo} echo dropped)",
+                                buffered.len()
+                            );
+                            for f in buffered {
+                                stats.sent_frames += 1;
+                                let _ = rt.control.send(RealtimeControl::Audio(f));
+                            }
+                            floor_state.person_spoke(now);
+                            ui.phase = Phase::Listening;
+                            last_activity = now;
                         }
-                        floor_state.person_spoke(now);
-                        ui.phase = Phase::Listening;
-                        last_activity = now;
                     }
-                } else {
-                    // Playback over without a barge-in: what was kept was
-                    // Hobbes' own echo.
-                    if !ring.is_empty() {
-                        stats.echo_frames_dropped += ring.clear() as u64;
-                        barge.playback_ended();
+                    MicGate::Send => {
+                        // Playback over without a barge-in: what was kept was
+                        // Hobbes' own echo.
+                        if !ring.is_empty() {
+                            stats.echo_frames_dropped += ring.clear() as u64;
+                            barge.playback_ended();
+                        }
+                        // The level counts toward the floor only when it can't
+                        // be Hobbes' own voice.
+                        if noise.is_speech(p) && (ui.echo_safe || !audible) {
+                            floor_state.person_spoke(now);
+                        }
+                        stats.sent_frames += 1;
+                        let _ = rt.control.send(RealtimeControl::Audio(frame));
                     }
-                    // The level counts toward the floor only when it can't
-                    // be Hobbes' own voice.
-                    if noise.is_speech(p) && (ui.echo_safe || !audio_io.is_playing()) {
-                        floor_state.person_spoke(now);
-                    }
-                    stats.sent_frames += 1;
-                    let _ = rt.control.send(RealtimeControl::Audio(frame));
                 }
             }
             ev = rt.events.recv() => {
                 let Some(ev) = ev else { break "connection ended".to_string() };
                 match ev {
-                    RealtimeEvent::Ready | RealtimeEvent::Reconnected => {}
+                    RealtimeEvent::Ready => {}
+                    RealtimeEvent::Reconnected => {
+                        // The new connection may not hold the open calls:
+                        // every result still owed goes back as context.
+                        abandoned.extend(brain_cancel.keys().cloned());
+                        let moved = queue.abandon_brain_results(|_| true);
+                        // A turn cut off by the reconnect won't complete.
+                        model_turn.ended();
+                        floor_state.model_turn_ended(Instant::now());
+                        tracing::info!(
+                            "voice: reconnected; {} brain call(s) in flight and {moved} queued result(s) go as context",
+                            brain_cancel.len()
+                        );
+                    }
                     RealtimeEvent::Audio { pcm, sample_rate } => {
                         floor_state.model_active(Instant::now());
+                        model_turn.audio();
+                        if std::mem::take(&mut after_tool_call) {
+                            model_turn_seq += 1;
+                        }
                         let audio_ms = (pcm.len() as u64 * 1000) / sample_rate.max(1) as u64;
-                        if muting_turn {
+                        if ending_at.is_some() && !model_turn.muting() {
+                            goodbye_audio = true;
+                        }
+                        if model_turn.muting() {
                             // The rest of a turn the person talked over.
                             stats.muted_model_ms += audio_ms;
                         } else {
@@ -709,10 +787,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     RealtimeEvent::InputTranscript(t) => {
                         floor_state.person_transcript(Instant::now());
                         stats.heard_fragments += 1;
-                        // A new utterance from the person (not noise or a
-                        // continuation): what lets a new brain request through.
-                        if heard.is_blank() && t.chars().any(char::is_alphanumeric) {
-                            last_speech_start = Some(Instant::now());
+                        // The person saying something (not noise): what lets
+                        // a new brain request through — a new utterance, or
+                        // more of the same one after the ask.
+                        if t.chars().any(char::is_alphanumeric) {
+                            last_speech = Some(Instant::now());
                         }
                         heard.push(&t);
                         last_activity = Instant::now();
@@ -721,9 +800,12 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     }
                     RealtimeEvent::OutputTranscript(t) => {
                         floor_state.model_active(Instant::now());
+                        if std::mem::take(&mut after_tool_call) {
+                            model_turn_seq += 1;
+                        }
                         // Not while muting a talked-over turn: those words
                         // were never played (its line already ends in "—").
-                        if !muting_turn {
+                        if !model_turn.muting() {
                             last_spoke = Some(Instant::now());
                             stats.spoke_fragments += 1;
                             spoke.push(&t);
@@ -731,7 +813,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     }
                     RealtimeEvent::Interrupted => {
                         floor_state.model_turn_ended(Instant::now());
-                        muting_turn = false;
+                        model_turn.ended();
+                        model_turn_seq += 1;
+                        after_tool_call = false;
                         audio_io.flush();
                         spoke.finish_into(true, &mut pending_lines);
                         ui.phase = Phase::Listening;
@@ -739,15 +823,17 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     }
                     RealtimeEvent::TurnComplete => {
                         floor_state.model_turn_ended(Instant::now());
-                        muting_turn = false;
+                        model_turn.ended();
+                        model_turn_seq += 1;
+                        after_tool_call = false;
                         stats.turns += 1;
-                        heard.finish_into(false, &mut pending_lines);
-                        spoke.finish_into(false, &mut pending_lines);
+                        finish_in_order(&mut heard, &mut spoke, &mut pending_lines);
                         ui.heard.clear();
                         last_activity = Instant::now();
                     }
                     RealtimeEvent::ToolCall { id, name, args } => {
                         stats.tool_calls += 1;
+                        after_tool_call = true;
                         last_activity = Instant::now();
                         match name.as_str() {
                             tools::ASK_BRAIN => {
@@ -755,14 +841,14 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                 let norm = normalize_request(&request);
                                 if request.trim().is_empty() {
                                     respond(&rt.control, &id, &name, json!({"error": "request is empty"}), None);
-                                } else if is_duplicate_ask(in_flight_asks.values(), &norm, last_speech_start) {
+                                } else if is_duplicate_ask(in_flight_asks.values(), &norm, last_speech, model_turn_seq) {
                                     // The realtime model repeating itself while it
                                     // waits: absorb it silently, queue nothing.
                                     stats.duplicate_asks += 1;
                                     tracing::info!("voice: repeated brain request ignored ({} in flight)", in_flight_asks.len());
                                     respond(&rt.control, &id, &name, brain_duplicate_response(), Some(Scheduling::Silent));
                                 } else {
-                                    in_flight_asks.insert(id.clone(), InFlightAsk { asked_at: Instant::now(), norm });
+                                    in_flight_asks.insert(id.clone(), InFlightAsk { asked_at: Instant::now(), norm, turn: model_turn_seq });
                                     // Transcript so far goes in before the brain's turn
                                     // (unless an earlier request's turn is in flight).
                                     if brain_cancel.is_empty() {
@@ -805,16 +891,29 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                             }
                             tools::END_CONVERSATION => {
                                 respond(&rt.control, &id, &name, json!({"result": "ending"}), None);
+                                if ending_at.is_none() {
+                                    // A goodbye said just before the call counts.
+                                    goodbye_audio = audio_io.is_playing()
+                                        || last_spoke.is_some_and(|t| t.elapsed() < GOODBYE_RECENT);
+                                }
                                 ending_at = Some(Instant::now());
                             }
                             _ => {
-                                let result = tools::dispatch(ctx, &voice_session, &name, &args).await;
-                                respond(&rt.control, &id, &name, result, None);
+                                // Off the loop: barge-in, results and Stop keep
+                                // being handled while the tool runs.
+                                let tx = tool_tx.clone();
+                                let sid = voice_session.clone();
+                                spawn(async move {
+                                    let result = tools::dispatch(ctx, &sid, &name, &args).await;
+                                    let _ = tx.send((id, name, result));
+                                });
                             }
                         }
                     }
                     RealtimeEvent::ToolCallCancelled(ids) => {
-                        // Brain work keeps going; its result is injected instead.
+                        // Brain work keeps going; its result is injected
+                        // instead (also one already waiting in the queue).
+                        queue.abandon_brain_results(|id| ids.iter().any(|c| c == id));
                         abandoned.extend(ids);
                     }
                     RealtimeEvent::Warning(w) => tracing::warn!("voice: provider warning: {}", crate::log_utils::truncate_for_log(&w, 200)),
@@ -841,37 +940,57 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     queue.push(item, Instant::now());
                 }
             }
-            cmd = rx.recv() => {
+            Some((id, name, result)) = tool_rx.recv() => {
+                last_activity = Instant::now();
+                respond(&rt.control, &id, &name, result, None);
+            }
+            cmd = next_cmd(&mut early_cmds, &mut *rx) => {
                 let Some(cmd) = cmd else { break "app closing".to_string() };
                 match cmd {
                     // In a conversation a press is decided on release.
                     VoiceCmd::Press => {
+                        let now = Instant::now();
+                        // On speakers without echo cancellation, a held key
+                        // would send Hobbes' own voice with theirs: cut it
+                        // off, and drop the speaker's tail.
+                        if !ui.echo_safe && playback.observe(audio_io.is_playing(), now) {
+                            audio_io.flush();
+                            playback.reset();
+                            model_turn.cut();
+                            spoke.finish_into(true, &mut pending_lines);
+                            stats.echo_frames_dropped += ring.clear() as u64;
+                            barge.playback_ended();
+                            mic_drop_until = Some(now + floor::SPEAKER_TAIL);
+                            ui.phase = Phase::Listening;
+                        }
                         held = true;
                         announcing = false;
                     }
                     VoiceCmd::Release { held_ms } => {
                         // Speech captured while the key was down (including
-                        // during the connect) goes out before the release.
+                        // during the connect) goes out before the release,
+                        // through the same echo gate as any mic frame.
                         while let Ok(frame) = mic_rx.try_recv() {
-                            let _ = rt.control.send(RealtimeControl::Audio(frame));
+                            let now = Instant::now();
+                            let audible = playback.observe(audio_io.is_playing(), now);
+                            match floor::mic_gate(true, false, ui.echo_safe, audible, mic_drop_until, now) {
+                                MicGate::Closed => {}
+                                MicGate::Drop => stats.echo_frames_dropped += 1,
+                                MicGate::Hold => ring.push(frame),
+                                MicGate::Send => {
+                                    stats.sent_frames += 1;
+                                    let _ = rt.control.send(RealtimeControl::Audio(frame));
+                                }
+                            }
                         }
                         held = false;
-                        let tap = held_ms < threshold_ms;
-                        match (mode, tap) {
-                            // First release: decides the mode.
-                            (None, true) => mode = Some(Mode::Conversation),
-                            (None, false) => {
-                                mode = Some(Mode::PushToTalk);
-                                let _ = rt.control.send(RealtimeControl::AudioStreamEnd);
-                            }
-                            (Some(Mode::Conversation), true) => break "ended".to_string(),
-                            (Some(Mode::Conversation), false) => {}
-                            (Some(Mode::PushToTalk), true) => {
-                                // Tap during push-to-talk: become a conversation.
-                                mode = Some(Mode::Conversation);
-                            }
-                            (Some(Mode::PushToTalk), false) => {
-                                let _ = rt.control.send(RealtimeControl::AudioStreamEnd);
+                        match release_step(mode, held_ms < threshold_ms) {
+                            ReleaseStep::End => break "ended".to_string(),
+                            ReleaseStep::Mode(m, stream_end) => {
+                                mode = Some(m);
+                                if stream_end {
+                                    let _ = rt.control.send(RealtimeControl::AudioStreamEnd);
+                                }
                             }
                         }
                         last_activity = Instant::now();
@@ -902,15 +1021,14 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         && queue.is_empty()
                         && !audio_io.is_playing()
                         && last_activity.elapsed() >= Duration::from_secs(5);
-                    if said || live_at.elapsed() > Duration::from_secs(60) {
+                    if said || last_delivery.elapsed() > ANNOUNCE_CAP {
                         break "announced".to_string();
                     }
                 }
                 if let Some(at) = ending_at {
                     // Let the goodbye arrive and play out (it may come after
                     // the tool response).
-                    let grace = at.elapsed() >= Duration::from_millis(1500) && !audio_io.is_playing();
-                    if grace || at.elapsed() > Duration::from_secs(8) {
+                    if goodbye_done(at.elapsed(), goodbye_audio, audio_io.is_playing()) {
                         break "goodbye".to_string();
                     }
                 }
@@ -932,9 +1050,16 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         // Speech that waited for the floor: one item, once it's free.
         let now = Instant::now();
         let free = floor_state.is_free(held, audio_io.is_playing(), now);
-        if let Some(d) = queue.next(free, now) {
+        if let Some(d) = queue.next(free, held, now) {
             stats.queued_out += 1;
             last_activity = now;
+            last_delivery = now;
+            // A call the model gave up on after its result was queued: the
+            // result goes as context, not to the dead call.
+            let d = match d {
+                Delivery::BrainResult { id, text, .. } if abandoned.remove(&id) => Delivery::Abandoned { text },
+                d => d,
+            };
             match d {
                 Delivery::Announce { text, kind, merged } => {
                     tracing::info!("voice: queued news out ({kind:?}, {merged} merged, {} still queued)", queue.len());
@@ -951,7 +1076,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 }
                 Delivery::BrainResult { id, text, forced } => {
                     if forced {
-                        tracing::info!("voice: brain result held {}s for the floor; sending anyway", floor::BRAIN_RESULT_CAP.as_secs());
+                        tracing::info!(
+                            "voice: brain result held {}s for the floor ({}); sending anyway",
+                            floor::BRAIN_RESULT_CAP.as_secs(),
+                            floor_state.blocker(held, audio_io.is_playing(), now).unwrap_or("free")
+                        );
                     } else {
                         floor_state.model_active(now);
                     }
@@ -987,12 +1116,22 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let _ = rt.control.send(RealtimeControl::Close);
     audio_io.flush();
     audio_io.stop();
-    heard.finish_into(false, &mut pending_lines);
-    spoke.finish_into(false, &mut pending_lines);
+    finish_in_order(&mut heard, &mut spoke, &mut pending_lines);
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
     if !queue.is_empty() {
-        // Their text is in the Hobbes tab already.
-        tracing::info!("voice: {} queued item(s) not spoken before the end", queue.len());
+        // Said afterwards, as announcements (the announce settings apply).
+        // Not after an announcement that never found the floor (it would
+        // only start the same one again), nor when the app is closing, nor
+        // after Stop (they asked for quiet; the text is in the Hobbes tab).
+        let unspoken = queue.drain_as_announcements();
+        if matches!(close_reason.as_str(), "announced" | "app closing" | "stopped") {
+            tracing::info!("voice: {} queued item(s) not spoken before the end", unspoken.len());
+        } else {
+            tracing::info!("voice: {} queued item(s) not spoken; announcing them afterwards", unspoken.len());
+            for (text, kind) in unspoken {
+                send(VoiceCmd::Announce(text, kind));
+            }
+        }
     }
     tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
     if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic).filter(|_| ever_captured) {
@@ -1133,6 +1272,9 @@ pub struct InFlightAsk {
     pub asked_at: Instant,
     /// [`normalize_request`] of its text.
     pub norm: String,
+    /// The model turn it was asked in (several asks in one turn are the
+    /// person asking for several things, not the model repeating itself).
+    pub turn: u64,
 }
 
 /// Case, punctuation and whitespace folded, for comparing request texts.
@@ -1146,19 +1288,83 @@ pub fn normalize_request(s: &str) -> String {
 }
 
 /// Whether a new ask repeats one already in flight: the same text (whatever
-/// was said since), or any text when the person hasn't started speaking since
-/// that ask (`last_speech_start`: when their latest utterance began). The
+/// was said since), or — from a later model turn than that ask — any text
+/// when the person hasn't said anything since it (`last_speech`: their
+/// latest transcribed speech, a new utterance or more of the same one). The
 /// realtime model re-issues the call while it waits; only the person can
-/// start a genuinely new request.
+/// start a genuinely new request. Different asks in one model turn (one
+/// sentence, two requests) all go through.
 pub fn is_duplicate_ask<'a>(
     in_flight: impl IntoIterator<Item = &'a InFlightAsk>,
     norm: &str,
-    last_speech_start: Option<Instant>,
+    last_speech: Option<Instant>,
+    turn: u64,
 ) -> bool {
     in_flight.into_iter().any(|a| {
-        let spoken_since = last_speech_start.is_some_and(|s| s > a.asked_at + TRANSCRIPT_LAG);
-        a.norm == norm || !spoken_since
+        let spoken_since = last_speech.is_some_and(|s| s > a.asked_at + TRANSCRIPT_LAG);
+        a.norm == norm || (a.turn != turn && !spoken_since)
     })
+}
+
+/// What a key release does to the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReleaseStep {
+    /// The mode from here on; `true` = end the audio stream (a hold ended).
+    Mode(Mode, bool),
+    /// A tap in a hands-free conversation: end it.
+    End,
+}
+
+/// The release of a key held in `mode` (`None`: the press that opened the
+/// conversation); `tap` = shorter than the hold threshold.
+pub fn release_step(mode: Option<Mode>, tap: bool) -> ReleaseStep {
+    match (mode, tap) {
+        // First release: decides the mode.
+        (None, true) => ReleaseStep::Mode(Mode::Conversation, false),
+        (None, false) => ReleaseStep::Mode(Mode::PushToTalk, true),
+        (Some(Mode::Conversation), true) => ReleaseStep::End,
+        (Some(Mode::Conversation), false) => ReleaseStep::Mode(Mode::Conversation, false),
+        // Tap during push-to-talk: become a conversation.
+        (Some(Mode::PushToTalk), true) => ReleaseStep::Mode(Mode::Conversation, false),
+        (Some(Mode::PushToTalk), false) => ReleaseStep::Mode(Mode::PushToTalk, true),
+    }
+}
+
+/// The next command: those that arrived during the connect first.
+async fn next_cmd(early: &mut std::collections::VecDeque<VoiceCmd>, rx: &mut mpsc::UnboundedReceiver<VoiceCmd>) -> Option<VoiceCmd> {
+    match early.pop_front() {
+        Some(cmd) => Some(cmd),
+        None => rx.recv().await,
+    }
+}
+
+/// Finish both sides' utterances into `lines`, in the order they began.
+fn finish_in_order(heard: &mut Utterance, spoke: &mut Utterance, lines: &mut Vec<PendingLine>) {
+    let mut done = Vec::new();
+    heard.finish_into(false, &mut done);
+    spoke.finish_into(false, &mut done);
+    lines.extend(by_start(done));
+}
+
+/// Lines sorted by when each began (stable for equal starts).
+fn by_start(mut lines: Vec<PendingLine>) -> Vec<PendingLine> {
+    lines.sort_by_key(|l| l.at);
+    lines
+}
+
+/// An announcement session (nobody pressed the key) hangs up this long after
+/// its last queued item went out.
+pub const ANNOUNCE_CAP: Duration = Duration::from_secs(60);
+
+/// Voice speech this recent when the conversation is ended counts as the
+/// goodbye (said before the call).
+pub const GOODBYE_RECENT: Duration = Duration::from_secs(2);
+
+/// Whether the goodbye has been said: some of it arrived and finished
+/// playing after a short grace, or the hard cap passed.
+pub fn goodbye_done(since_end: Duration, goodbye_audio: bool, playing: bool) -> bool {
+    let grace = since_end >= Duration::from_millis(1500) && goodbye_audio && !playing;
+    grace || since_end > Duration::from_secs(8)
 }
 
 /// Write buffered transcript lines into the Hobbes session, unless its last
@@ -1338,23 +1544,89 @@ mod tests {
     #[test]
     fn repeated_brain_requests_are_absorbed() {
         let t0 = Instant::now();
-        let first = InFlightAsk { asked_at: t0, norm: normalize_request("Check my email for the Puget invoice.") };
+        let first = InFlightAsk { asked_at: t0, norm: normalize_request("Check my email for the Puget invoice."), turn: 1 };
         let inflight = [first];
         let after_lag = Some(t0 + TRANSCRIPT_LAG + Duration::from_millis(500));
         // Nothing in flight: never a duplicate.
-        assert!(!is_duplicate_ask(&[], "anything", None));
-        assert!(!is_duplicate_ask(&[], "anything", after_lag));
+        assert!(!is_duplicate_ask(&[], "anything", None, 2));
+        assert!(!is_duplicate_ask(&[], "anything", after_lag, 2));
         // No new speech since: a duplicate, whatever its wording.
-        assert!(is_duplicate_ask(&inflight, &normalize_request("Look for the Puget invoice email"), None));
+        assert!(is_duplicate_ask(&inflight, &normalize_request("Look for the Puget invoice email"), None, 2));
         // Speech that started before the ask (or trailing transcript just
         // after it) isn't new speech.
-        assert!(is_duplicate_ask(&inflight, "something else", Some(t0)));
-        assert!(is_duplicate_ask(&inflight, "something else", Some(t0 + Duration::from_millis(800))));
+        assert!(is_duplicate_ask(&inflight, "something else", Some(t0), 2));
+        assert!(is_duplicate_ask(&inflight, "something else", Some(t0 + Duration::from_millis(800)), 2));
         // The same text after new speech: still a duplicate.
-        assert!(is_duplicate_ask(&inflight, &normalize_request("  check MY email for the puget invoice "), after_lag));
+        assert!(is_duplicate_ask(&inflight, &normalize_request("  check MY email for the puget invoice "), after_lag, 2));
         // A different request after new speech: goes through.
-        assert!(!is_duplicate_ask(&inflight, &normalize_request("What's on my calendar tomorrow?"), after_lag));
+        assert!(!is_duplicate_ask(&inflight, &normalize_request("What's on my calendar tomorrow?"), after_lag, 2));
         assert_eq!(brain_duplicate_response()["status"], "already_working");
+    }
+
+    #[test]
+    fn two_requests_in_one_turn_both_go_through() {
+        let t0 = Instant::now();
+        let inflight = [InFlightAsk { asked_at: t0, norm: normalize_request("Check my email"), turn: 3 }];
+        // Same model turn (one toolCall batch), different text: a new request.
+        assert!(!is_duplicate_ask(&inflight, &normalize_request("Book a table for two"), None, 3));
+        // Same text in the same turn: still a repeat.
+        assert!(is_duplicate_ask(&inflight, &normalize_request("check my email."), None, 3));
+        // A later turn with nothing said since: the model repeating itself.
+        assert!(is_duplicate_ask(&inflight, &normalize_request("Book a table for two"), None, 4));
+    }
+
+    #[test]
+    fn talking_on_after_an_ask_lets_a_new_one_through() {
+        let t0 = Instant::now();
+        let inflight = [InFlightAsk { asked_at: t0, norm: normalize_request("Check my email"), turn: 1 }];
+        // More of the same utterance, well after the ask: new speech.
+        let later_fragment = Some(t0 + TRANSCRIPT_LAG + Duration::from_millis(300));
+        assert!(!is_duplicate_ask(&inflight, &normalize_request("and move my 3pm"), later_fragment, 2));
+        assert!(is_duplicate_ask(&inflight, &normalize_request("check my email"), later_fragment, 2));
+    }
+
+    #[test]
+    fn releases_decide_the_mode() {
+        assert_eq!(release_step(None, true), ReleaseStep::Mode(Mode::Conversation, false));
+        assert_eq!(release_step(None, false), ReleaseStep::Mode(Mode::PushToTalk, true));
+        assert_eq!(release_step(Some(Mode::Conversation), true), ReleaseStep::End);
+        assert_eq!(release_step(Some(Mode::Conversation), false), ReleaseStep::Mode(Mode::Conversation, false));
+        assert_eq!(release_step(Some(Mode::PushToTalk), true), ReleaseStep::Mode(Mode::Conversation, false));
+        assert_eq!(release_step(Some(Mode::PushToTalk), false), ReleaseStep::Mode(Mode::PushToTalk, true));
+    }
+
+    #[test]
+    fn the_goodbye_waits_for_its_audio() {
+        let s = Duration::from_secs;
+        // Nothing arrived yet: keep waiting past the grace.
+        assert!(!goodbye_done(s(3), false, false));
+        // Arrived and played out.
+        assert!(goodbye_done(s(2), true, false));
+        // Still playing, or too early.
+        assert!(!goodbye_done(s(2), true, true));
+        assert!(!goodbye_done(Duration::from_millis(500), true, false));
+        // The hard cap.
+        assert!(goodbye_done(s(9), false, true));
+    }
+
+    #[test]
+    fn transcript_lines_go_in_by_start_time() {
+        let t0 = chrono::Utc::now();
+        let lines = vec![
+            PendingLine::new(true, "heard".into(), Some(t0 + chrono::Duration::seconds(2))),
+            PendingLine::new(false, "spoke".into(), Some(t0)),
+        ];
+        let sorted = by_start(lines);
+        assert_eq!(sorted.iter().map(|l| l.text.as_str()).collect::<Vec<_>>(), ["spoke", "heard"]);
+        // Both sides finished together keep that order.
+        let mut heard = Utterance::new(true);
+        let mut spoke = Utterance::new(false);
+        spoke.push("Hello.");
+        std::thread::sleep(Duration::from_millis(5));
+        heard.push("Hi.");
+        let mut out = Vec::new();
+        finish_in_order(&mut heard, &mut spoke, &mut out);
+        assert_eq!(out.iter().map(|l| l.heard).collect::<Vec<_>>(), [false, true]);
     }
 
     #[test]

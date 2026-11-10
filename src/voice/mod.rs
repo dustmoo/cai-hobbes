@@ -17,6 +17,7 @@
 pub mod audio;
 pub mod brain;
 pub mod controller;
+pub mod display;
 pub mod floor;
 pub mod gemini_live;
 pub mod hotkey;

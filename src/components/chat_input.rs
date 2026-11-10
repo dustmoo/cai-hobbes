@@ -947,10 +947,9 @@ pub fn ChatInput(
         for session_id in backlog {
             if stream_manager.is_session_streaming(&session_id) {
                 // The message we dispatched has started streaming — release
-                // this session's guard.
-                if chat_queue::DISPATCHING.peek().contains(&session_id) {
-                    chat_queue::DISPATCHING.write().remove(&session_id);
-                }
+                // this session's guard (start_stream also does, for a
+                // session whose queue emptied with this pop).
+                chat_queue::release_dispatch(&session_id);
                 continue;
             }
             if chat_queue::DISPATCHING.peek().contains(&session_id) {
@@ -983,7 +982,11 @@ pub fn ChatInput(
             // borrowed.
             let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
             if let Some(qm) = popped {
-                chat_queue::DISPATCHING.write().insert(session_id.clone());
+                let popped_id = qm.id;
+                chat_queue::begin_dispatch(&session_id, popped_id);
+                // A new turn starts here: a voice cancel aimed at the
+                // previous one must not stop it (stream_manager::request_turn_abort).
+                crate::components::stream_manager::clear_turn_abort(&session_id);
                 // Who this turn belongs to (trust follows the turn: an
                 // unattended one in the Hobbes session gets the Heartbeat's
                 // rules). Harness-decided here, never by the model.
@@ -1015,10 +1018,13 @@ pub fn ChatInput(
                 // Failsafe: a queued no-op (e.g. a command that starts no stream)
                 // must not wedge the queue. Real turns clear the guard sooner via
                 // the is_streaming branch above; this only fires if nothing ever
-                // streams.
+                // streams. Tied to this pop: a later pop in the same session
+                // owns the guard from then on, and this timer must not
+                // release it (that would let a third message pop into the
+                // later pop's turn).
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    chat_queue::DISPATCHING.write().remove(&session_id);
+                    chat_queue::end_dispatch(&session_id, popped_id);
                 });
             }
         }

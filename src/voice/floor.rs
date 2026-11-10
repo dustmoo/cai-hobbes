@@ -136,7 +136,122 @@ impl Floor {
 
     /// Unsolicited speech may start now.
     pub fn is_free(&self, held: bool, playing: bool, now: Instant) -> bool {
-        !self.person_has_floor(held, now) && !self.model_busy(playing, now)
+        self.blocker(held, playing, now).is_none()
+    }
+
+    /// Which condition keeps the floor taken right now (for logs; no
+    /// content), or `None` when it's free.
+    pub fn blocker(&self, held: bool, playing: bool, now: Instant) -> Option<&'static str> {
+        if held {
+            return Some("key held");
+        }
+        if self.person_has_floor(false, now) {
+            return Some("person speaking");
+        }
+        if playing {
+            return Some("playing");
+        }
+        if self.model_busy(false, now) {
+            let mid_turn = self.model_turn_open
+                && self.last_model_event.is_some_and(|t| now.saturating_duration_since(t) < MODEL_TURN_STALE);
+            return Some(if mid_turn { "model mid-turn" } else { "model owes a reply" });
+        }
+        None
+    }
+}
+
+/// Playback is treated as ongoing this long after the output queue empties:
+/// the speaker and the room still carry the last of it.
+pub const PLAYBACK_HANGOVER: Duration = Duration::from_millis(250);
+
+/// After the voice is cut off for a key press (no echo cancellation), mic
+/// frames are dropped this long: the speaker's tail.
+pub const SPEAKER_TAIL: Duration = Duration::from_millis(200);
+
+/// Audio kept from before a barge-in's rise above the threshold.
+pub const BARGE_PREROLL_MS: u32 = 200;
+
+/// "Is Hobbes audible?" with a [`PLAYBACK_HANGOVER`] after the output queue
+/// empties.
+#[derive(Clone, Debug, Default)]
+pub struct PlaybackTail {
+    last_playing: Option<Instant>,
+}
+
+impl PlaybackTail {
+    /// Note the output queue's state; true while playing or within the
+    /// hangover after it stopped.
+    pub fn observe(&mut self, playing: bool, now: Instant) -> bool {
+        if playing {
+            self.last_playing = Some(now);
+            return true;
+        }
+        self.last_playing.is_some_and(|t| now.saturating_duration_since(t) < PLAYBACK_HANGOVER)
+    }
+
+    /// Playback was cut deliberately (barge-in, key press): no hangover.
+    pub fn reset(&mut self) {
+        self.last_playing = None;
+    }
+}
+
+/// What to do with one mic frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MicGate {
+    /// Push-to-talk between holds: nothing goes out.
+    Closed,
+    /// The speaker's tail after a cut: discard.
+    Drop,
+    /// The model could hear itself: keep it muted (ring + barge-in detector).
+    Hold,
+    /// Stream it.
+    Send,
+}
+
+/// The gate for a mic frame: `audible` is playback with its hangover;
+/// `drop_until` the speaker-tail window after a cut.
+pub fn mic_gate(mic_open: bool, held: bool, echo_safe: bool, audible: bool, drop_until: Option<Instant>, now: Instant) -> MicGate {
+    if !mic_open {
+        MicGate::Closed
+    } else if drop_until.is_some_and(|t| now < t) {
+        MicGate::Drop
+    } else if !echo_safe && audible && !held {
+        MicGate::Hold
+    } else {
+        MicGate::Send
+    }
+}
+
+/// The model's current turn, for muting the rest of one the person cut off.
+/// A cut after the model already finished its turn mutes nothing (its next
+/// reply is a new turn and must be heard).
+#[derive(Clone, Debug, Default)]
+pub struct ModelTurn {
+    open: bool,
+    muting: bool,
+}
+
+impl ModelTurn {
+    /// Model audio arrived: its turn is open.
+    pub fn audio(&mut self) {
+        self.open = true;
+    }
+
+    /// `TurnComplete` / `Interrupted` (or a reconnect): the turn is over.
+    pub fn ended(&mut self) {
+        self.open = false;
+        self.muting = false;
+    }
+
+    /// The person cut the voice off locally: mute the rest of the turn, if
+    /// one is still open.
+    pub fn cut(&mut self) {
+        self.muting = self.open;
+    }
+
+    /// The rest of a cut turn: neither played nor transcribed.
+    pub fn muting(&self) -> bool {
+        self.muting
     }
 }
 
@@ -195,8 +310,12 @@ impl SpeechQueue {
     /// The next thing to say, if any may be said now. Several queued
     /// Heartbeat notes go as one: the newest (its information supersedes the
     /// older ones), noting how many there were.
-    pub fn next(&mut self, floor_free: bool, now: Instant) -> Option<Delivery> {
+    /// `held`: the push-to-talk key is down — nothing is forced over it.
+    pub fn next(&mut self, floor_free: bool, held: bool, now: Instant) -> Option<Delivery> {
         if !floor_free {
+            if held {
+                return None;
+            }
             let overdue = self.items.iter().position(|(p, at)| {
                 matches!(p, Pending::BrainResult { .. }) && now.saturating_duration_since(*at) >= BRAIN_RESULT_CAP
             })?;
@@ -223,6 +342,35 @@ impl SpeechQueue {
             Pending::BrainResult { id, text } => Delivery::BrainResult { id, text, forced: false },
         })
     }
+
+    /// The model no longer holds these calls (`abandoned(id)`: cancelled,
+    /// or every call after a reconnect): their queued results go as
+    /// injected context instead. Order is kept.
+    pub fn abandon_brain_results(&mut self, abandoned: impl Fn(&str) -> bool) -> usize {
+        let mut n = 0;
+        for (p, _) in self.items.iter_mut() {
+            if let Pending::BrainResult { id, text } = p {
+                if !abandoned(id) {
+                    continue;
+                }
+                *p = Pending::Abandoned { text: std::mem::take(text) };
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Everything still waiting, as announcements (the conversation is
+    /// ending: they're said afterwards instead). Oldest first.
+    pub fn drain_as_announcements(&mut self) -> Vec<(String, AnnounceKind)> {
+        self.items
+            .drain(..)
+            .map(|(p, _)| match p {
+                Pending::Announce { text, kind } => (text, kind),
+                Pending::Abandoned { text } | Pending::BrainResult { text, .. } => (text, AnnounceKind::Result),
+            })
+            .collect()
+    }
 }
 
 /// Local barge-in on a muted mic (no echo cancellation, Hobbes talking on
@@ -236,6 +384,9 @@ pub struct BargeIn {
     heard_ms: u32,
     /// Net time above the threshold.
     above_ms: u32,
+    /// Audio since the current rise above the threshold began (while
+    /// `above_ms` > 0).
+    rise_ms: u32,
 }
 
 impl BargeIn {
@@ -243,32 +394,42 @@ impl BargeIn {
         BARGE_MIN_PEAK.max(self.echo_peak * BARGE_ECHO_RATIO)
     }
 
-    /// One muted mic frame during playback. True = the person barged in
-    /// (the detector re-arms itself).
-    pub fn observe(&mut self, peak: f32, ms: u32) -> bool {
+    /// One muted mic frame during playback. `Some(ms)` = the person barged
+    /// in, their speech having risen above the threshold `ms` ago (this
+    /// frame included); the detector re-arms itself.
+    pub fn observe(&mut self, peak: f32, ms: u32) -> Option<u32> {
         self.heard_ms = self.heard_ms.saturating_add(ms);
         if self.heard_ms <= BARGE_WARMUP_MS {
             self.echo_peak = self.echo_peak.max(peak);
-            return false;
+            return None;
         }
         if peak > self.threshold() {
+            if self.above_ms == 0 {
+                self.rise_ms = 0;
+            }
             self.above_ms += ms;
         } else {
             self.above_ms = self.above_ms.saturating_sub(ms);
             let decay = 0.5f32.powf(ms as f32 / ECHO_DECAY_MS);
             self.echo_peak = peak.max(self.echo_peak * decay);
         }
+        if self.above_ms > 0 {
+            self.rise_ms = self.rise_ms.saturating_add(ms);
+        } else {
+            self.rise_ms = 0;
+        }
         if self.above_ms >= BARGE_SUSTAIN_MS {
             self.above_ms = 0;
-            return true;
+            return Some(std::mem::take(&mut self.rise_ms));
         }
-        false
+        None
     }
 
     /// Playback stopped: start the next detection fresh (the echo level is
     /// kept: same speaker, same room).
     pub fn playback_ended(&mut self) {
         self.above_ms = 0;
+        self.rise_ms = 0;
     }
 }
 
@@ -295,10 +456,21 @@ impl MicRing {
         self.frames.is_empty()
     }
 
-    /// Everything kept, oldest first; the ring is left empty.
-    pub fn drain(&mut self) -> Vec<Vec<i16>> {
+    /// The last `ms` of audio kept (whole frames, oldest first; at least the
+    /// newest frame), and how many older frames were discarded; the ring is
+    /// left empty.
+    pub fn drain_recent(&mut self, ms: u32) -> (Vec<Vec<i16>>, usize) {
+        let want = ms as usize * SAMPLES_PER_MS;
+        let mut kept = 0usize;
+        let mut start = self.frames.len();
+        while start > 0 && (kept < want || start == self.frames.len()) {
+            start -= 1;
+            kept += self.frames[start].len();
+        }
+        let dropped = start;
+        let out = self.frames.drain(..).skip(start).collect();
         self.samples = 0;
-        self.frames.drain(..).collect()
+        (out, dropped)
     }
 
     /// Discard (no barge-in: it was Hobbes' own echo). Returns the count.
@@ -385,15 +557,15 @@ mod tests {
         let mut q = SpeechQueue::default();
         q.push(Pending::Announce { text: "result".into(), kind: AnnounceKind::Result }, t0);
         q.push(Pending::Abandoned { text: "late".into() }, t0);
-        assert_eq!(q.next(false, t0), None);
+        assert_eq!(q.next(false, false, t0), None);
         assert_eq!(q.len(), 2);
         assert_eq!(
-            q.next(true, t0),
+            q.next(true, false, t0),
             Some(Delivery::Announce { text: "result".into(), kind: AnnounceKind::Result, merged: 1 })
         );
-        assert_eq!(q.next(true, t0), Some(Delivery::Abandoned { text: "late".into() }));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { text: "late".into() }));
         assert!(q.is_empty());
-        assert_eq!(q.next(true, t0), None);
+        assert_eq!(q.next(true, false, t0), None);
     }
 
     #[test]
@@ -405,11 +577,11 @@ mod tests {
         q.push(Pending::Announce { text: "hb2".into(), kind: AnnounceKind::Heartbeat }, t0);
         q.push(Pending::Announce { text: "hb3".into(), kind: AnnounceKind::Heartbeat }, t0);
         assert_eq!(
-            q.next(true, t0),
+            q.next(true, false, t0),
             Some(Delivery::Announce { text: "hb3".into(), kind: AnnounceKind::Heartbeat, merged: 3 })
         );
         assert_eq!(
-            q.next(true, t0),
+            q.next(true, false, t0),
             Some(Delivery::Announce { text: "res".into(), kind: AnnounceKind::Result, merged: 1 })
         );
         assert!(q.is_empty());
@@ -422,18 +594,18 @@ mod tests {
         q.push(Pending::Announce { text: "hb".into(), kind: AnnounceKind::Heartbeat }, t0);
         q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0 + ms(100));
         // Person still talking: held.
-        assert_eq!(q.next(false, t0 + ms(5000)), None);
+        assert_eq!(q.next(false, false, t0 + ms(5000)), None);
         // Past the cap: the brain result goes out anyway; the announcement waits.
         assert_eq!(
-            q.next(false, t0 + ms(100) + BRAIN_RESULT_CAP),
+            q.next(false, false, t0 + ms(100) + BRAIN_RESULT_CAP),
             Some(Delivery::BrainResult { id: "c1".into(), text: "done".into(), forced: true })
         );
         assert_eq!(q.len(), 1);
-        assert_eq!(q.next(false, t0 + ms(60_000)), None);
+        assert_eq!(q.next(false, false, t0 + ms(60_000)), None);
         // Free floor: in order, not forced.
         q.push(Pending::BrainResult { id: "c2".into(), text: "two".into() }, t0);
-        assert!(matches!(q.next(true, t0), Some(Delivery::Announce { .. })));
-        assert_eq!(q.next(true, t0), Some(Delivery::BrainResult { id: "c2".into(), text: "two".into(), forced: false }));
+        assert!(matches!(q.next(true, false, t0), Some(Delivery::Announce { .. })));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::BrainResult { id: "c2".into(), text: "two".into(), forced: false }));
     }
 
     #[test]
@@ -442,15 +614,15 @@ mod tests {
         // Hobbes' voice through the speakers into the mic: varying, up to 0.15.
         for i in 0..500 {
             let p = 0.05 + 0.1 * ((i % 7) as f32 / 6.0);
-            assert!(!b.observe(p, 20), "echo frame {i} triggered");
+            assert!(b.observe(p, 20).is_none(), "echo frame {i} triggered");
         }
         b.playback_ended();
         // A single loud click doesn't either.
         for _ in 0..3 {
-            assert!(!b.observe(0.9, 20));
+            assert!(b.observe(0.9, 20).is_none());
         }
         for _ in 0..20 {
-            assert!(!b.observe(0.05, 20));
+            assert!(b.observe(0.05, 20).is_none());
         }
     }
 
@@ -465,7 +637,7 @@ mod tests {
         let mut fired_at = None;
         for i in 0..40 {
             let p = if i % 4 == 3 { 0.12 } else { 0.5 };
-            if b.observe(p, 20) {
+            if b.observe(p, 20).is_some() {
                 fired_at = Some(i);
                 break;
             }
@@ -480,11 +652,11 @@ mod tests {
         let mut b = BargeIn::default();
         // Loud echo from the first frame: learned, not mistaken for speech.
         for _ in 0..(BARGE_WARMUP_MS / 20) {
-            assert!(!b.observe(0.3, 20));
+            assert!(b.observe(0.3, 20).is_none());
         }
         assert!(b.threshold() >= 0.6 - f32::EPSILON);
         for _ in 0..30 {
-            assert!(!b.observe(0.3, 20));
+            assert!(b.observe(0.3, 20).is_none());
         }
     }
 
@@ -494,13 +666,144 @@ mod tests {
         for i in 0..100 {
             r.push(vec![i as i16; 320]); // 20 ms frames
         }
-        let frames = r.drain();
-        assert_eq!(frames.len(), 75);
+        let (frames, dropped) = r.drain_recent(ECHO_RING.as_millis() as u32);
+        assert_eq!((frames.len(), dropped), (75, 0));
         assert_eq!(frames.first().unwrap()[0], 25);
         assert_eq!(frames.last().unwrap()[0], 99);
         assert!(r.is_empty());
         r.push(vec![0; 320]);
         assert_eq!(r.clear(), 1);
         assert_eq!(frame_ms(320), 20);
+    }
+
+    #[test]
+    fn a_held_key_is_never_talked_over_by_a_forced_result() {
+        let t0 = Instant::now();
+        let mut q = SpeechQueue::default();
+        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0);
+        let late = t0 + BRAIN_RESULT_CAP + ms(1);
+        assert_eq!(q.next(false, true, late), None);
+        assert!(matches!(q.next(false, false, late), Some(Delivery::BrainResult { forced: true, .. })));
+    }
+
+    #[test]
+    fn the_floor_names_what_blocks_it() {
+        let t0 = Instant::now();
+        let mut f = Floor::default();
+        assert_eq!(f.blocker(false, false, t0), None);
+        assert_eq!(f.blocker(true, false, t0), Some("key held"));
+        assert_eq!(f.blocker(false, true, t0), Some("playing"));
+        f.model_active(t0);
+        assert_eq!(f.blocker(false, false, t0 + ms(10)), Some("model mid-turn"));
+        f.model_turn_ended(t0 + ms(20));
+        f.person_transcript(t0 + ms(30));
+        assert_eq!(f.blocker(false, false, t0 + ms(40)), Some("person speaking"));
+        assert_eq!(f.blocker(false, false, t0 + ms(30) + FLOOR_QUIET), Some("model owes a reply"));
+    }
+
+    #[test]
+    fn a_reconnect_turns_queued_results_into_context() {
+        let t0 = Instant::now();
+        let mut q = SpeechQueue::default();
+        q.push(Pending::Announce { text: "hb".into(), kind: AnnounceKind::Heartbeat }, t0);
+        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0);
+        q.push(Pending::BrainResult { id: "c2".into(), text: "two".into() }, t0);
+        // A cancelled call: only its result moves.
+        assert_eq!(q.abandon_brain_results(|id| id == "c2"), 1);
+        // A reconnect: all of them.
+        assert_eq!(q.abandon_brain_results(|_| true), 1);
+        assert!(matches!(q.next(true, false, t0), Some(Delivery::Announce { .. })));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { text: "done".into() }));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { text: "two".into() }));
+    }
+
+    #[test]
+    fn unspoken_items_become_announcements() {
+        let t0 = Instant::now();
+        let mut q = SpeechQueue::default();
+        q.push(Pending::Announce { text: "hb".into(), kind: AnnounceKind::Heartbeat }, t0);
+        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0);
+        q.push(Pending::Abandoned { text: "late".into() }, t0);
+        assert_eq!(
+            q.drain_as_announcements(),
+            vec![
+                ("hb".to_string(), AnnounceKind::Heartbeat),
+                ("done".to_string(), AnnounceKind::Result),
+                ("late".to_string(), AnnounceKind::Result),
+            ]
+        );
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn a_barge_in_sends_from_where_the_person_started() {
+        let mut b = BargeIn::default();
+        let mut r = MicRing::default();
+        // Echo for a second: learned, kept muted.
+        for _ in 0..50 {
+            r.push(vec![1; 320]);
+            assert!(b.observe(0.1, 20).is_none());
+        }
+        // The person starts talking over it.
+        let mut rise = None;
+        for _ in 0..40 {
+            r.push(vec![2; 320]);
+            if let Some(ms) = b.observe(0.5, 20) {
+                rise = Some(ms);
+                break;
+            }
+        }
+        let rise = rise.expect("barge-in");
+        assert_eq!(rise, BARGE_SUSTAIN_MS);
+        let (frames, dropped) = r.drain_recent(rise + BARGE_PREROLL_MS);
+        // Their speech, plus ~200 ms of what came just before.
+        assert_eq!(frames.len() as u32, (rise + BARGE_PREROLL_MS) / 20);
+        assert_eq!(frames.iter().filter(|f| f[0] == 2).count() as u32, rise / 20);
+        assert_eq!(frames.len() + dropped, 62);
+        assert!(r.is_empty());
+        // Always at least the newest frame.
+        r.push(vec![3; 320]);
+        assert_eq!(r.drain_recent(0), (vec![vec![3; 320]], 0));
+    }
+
+    #[test]
+    fn playback_lingers_briefly_after_the_queue_empties() {
+        let t0 = Instant::now();
+        let mut p = PlaybackTail::default();
+        assert!(!p.observe(false, t0));
+        assert!(p.observe(true, t0));
+        assert!(p.observe(false, t0 + ms(100)));
+        assert!(!p.observe(false, t0 + PLAYBACK_HANGOVER));
+        p.observe(true, t0);
+        p.reset();
+        assert!(!p.observe(false, t0 + ms(10)));
+    }
+
+    #[test]
+    fn the_mic_gate() {
+        let t0 = Instant::now();
+        assert_eq!(mic_gate(false, false, false, true, None, t0), MicGate::Closed);
+        // The speaker's tail after a cut: dropped, held key or not.
+        assert_eq!(mic_gate(true, true, false, false, Some(t0 + SPEAKER_TAIL), t0), MicGate::Drop);
+        assert_eq!(mic_gate(true, true, false, false, Some(t0), t0), MicGate::Send);
+        // Hobbes audible on speakers: muted unless the key is held.
+        assert_eq!(mic_gate(true, false, false, true, None, t0), MicGate::Hold);
+        assert_eq!(mic_gate(true, true, false, true, None, t0), MicGate::Send);
+        assert_eq!(mic_gate(true, false, true, true, None, t0), MicGate::Send);
+    }
+
+    #[test]
+    fn a_cut_after_the_turn_ended_mutes_nothing() {
+        let mut m = ModelTurn::default();
+        m.audio();
+        m.cut();
+        assert!(m.muting());
+        m.ended();
+        assert!(!m.muting());
+        // Server already finished the turn; only the local queue was playing.
+        m.audio();
+        m.ended();
+        m.cut();
+        assert!(!m.muting());
     }
 }

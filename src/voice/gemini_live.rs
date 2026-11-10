@@ -8,7 +8,7 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
@@ -29,6 +29,16 @@ const WS_BASE: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.gene
 const MODELS_URL: &str = "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(15);
 const BACKOFFS_MS: [u64; 3] = [500, 1000, 2000];
+/// Wait before retrying when the server still holds the old session.
+const HELD_SESSION_BACKOFF_MS: u64 = 2000;
+/// Max retries of the "already connected" refusal (separate from `BACKOFFS_MS`).
+const HELD_SESSION_RETRIES: usize = 5;
+/// Bound on the close handshake of the old socket before resuming.
+const CLOSE_WAIT: Duration = Duration::from_secs(1);
+/// Safety margin kept before the goAway `timeLeft` runs out.
+const GO_AWAY_MARGIN: Duration = Duration::from_millis(1500);
+/// Hard cap on waiting after goAway when no `timeLeft` was given.
+const GO_AWAY_HARD_CAP: Duration = Duration::from_secs(8);
 /// ~2 s of mic audio buffered during a reconnect.
 const MAX_BUFFERED_AUDIO_SAMPLES: usize = 2 * INPUT_SAMPLE_RATE as usize;
 const MAX_BUFFERED_CONTROLS: usize = 256;
@@ -255,6 +265,8 @@ pub struct ParsedServerMessage {
     /// New resumption handle (only when resumable and non-empty).
     pub handle: Option<String>,
     pub go_away: bool,
+    /// `goAway.timeLeft`, when present and parseable (e.g. "10s").
+    pub go_away_time_left: Option<Duration>,
     pub setup_complete: bool,
     /// Top-level server `error` payload, if any.
     pub error: Option<String>,
@@ -364,8 +376,52 @@ pub fn parse_server_message(text: &str) -> ParsedServerMessage {
     }
     if obj.contains_key("goAway") {
         out.go_away = true;
+        out.go_away_time_left = obj
+            .get("goAway")
+            .and_then(|g| g.get("timeLeft"))
+            .and_then(Value::as_str)
+            .and_then(parse_duration_str);
     }
     out
+}
+
+/// Parse a protobuf-style duration string such as "10s" or "1.5s".
+fn parse_duration_str(s: &str) -> Option<Duration> {
+    let n: f64 = s.trim().strip_suffix('s')?.trim().parse().ok()?;
+    if n.is_finite() && n >= 0.0 {
+        Some(Duration::from_secs_f64(n))
+    } else {
+        None
+    }
+}
+
+/// Should the pump cut over to a resumed socket now, `since` the goAway?
+/// Yes once the model turn has ended, or the `timeLeft` (less a margin) is
+/// nearly up, or the hard cap passes when no `timeLeft` was given.
+fn should_cut_over(turn_open: bool, since: Duration, time_left: Option<Duration>) -> bool {
+    let deadline = match time_left {
+        Some(t) => t.saturating_sub(GO_AWAY_MARGIN),
+        None => GO_AWAY_HARD_CAP,
+    };
+    !turn_open || since >= deadline
+}
+
+/// Close `ws` cleanly (Close frame, bounded wait for the handshake) so the
+/// server releases the session before we resume it. `Err(())` = caller closed.
+async fn close_old(
+    mut ws: Conn,
+    rx: &mut mpsc::UnboundedReceiver<RealtimeControl>,
+    buf: &mut ControlBuffer,
+) -> Result<(), ()> {
+    let work = async {
+        let _ = ws.send(Message::Close(None)).await;
+        while let Some(m) = ws.next().await {
+            if matches!(m, Ok(Message::Close(_)) | Err(_)) {
+                break;
+            }
+        }
+    };
+    drive(tokio::time::timeout(CLOSE_WAIT, work), rx, buf).await.map(|_| ())
 }
 
 fn message_kinds(text: &str) -> String {
@@ -523,7 +579,10 @@ async fn reconnect(
     buf: &mut ControlBuffer,
 ) -> Reconnect {
     let mut last = String::new();
-    for ms in BACKOFFS_MS {
+    let mut held_retries = 0;
+    let mut attempts = BACKOFFS_MS.into_iter();
+    let mut next_ms = attempts.next();
+    while let Some(ms) = next_ms {
         if drive(tokio::time::sleep(Duration::from_millis(ms)), rx, buf).await.is_err() {
             return Reconnect::CallerClosed;
         }
@@ -532,6 +591,13 @@ async fn reconnect(
             Ok(Ok(ws)) => return Reconnect::Ok(Box::new(ws)),
             Ok(Err(e)) => {
                 tracing::debug!("voice: gemini live reconnect attempt failed: {e}");
+                if e.contains("already connected to an existing client") && held_retries < HELD_SESSION_RETRIES {
+                    // Old session not released yet: wait longer, don't burn a normal attempt.
+                    held_retries += 1;
+                    next_ms = Some(HELD_SESSION_BACKOFF_MS);
+                } else {
+                    next_ms = attempts.next();
+                }
                 last = e;
             }
         }
@@ -553,8 +619,14 @@ async fn pump(
 ) -> String {
     let mut handle: Option<String> = None;
     let mut buf = ControlBuffer::default();
+    // Model audio seen with no turnComplete/interrupted since.
+    let mut turn_open = false;
+    // Set on goAway: when it arrived and its timeLeft. The old socket keeps
+    // being served until `should_cut_over` says to resume.
+    let mut go_away: Option<(Instant, Option<Duration>)> = None;
     loop {
         let next: Option<&'static str> = tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)), if go_away.is_some() => None,
             c = rx.recv() => match c {
                 None | Some(RealtimeControl::Close) => {
                     let _ = ws.send(Message::Close(None)).await;
@@ -588,21 +660,40 @@ async fn pump(
                             let _ = emit(tx, RealtimeEvent::Warning(scrub(&key, &e)));
                         }
                         for e in p.events {
+                            match &e {
+                                RealtimeEvent::Audio { .. } => turn_open = true,
+                                RealtimeEvent::TurnComplete | RealtimeEvent::Interrupted => turn_open = false,
+                                _ => {}
+                            }
                             if !emit(tx, e) {
                                 return "event receiver dropped".to_string();
                             }
                         }
-                        if p.go_away { Some("goAway") } else { None }
+                        if p.go_away && go_away.is_none() {
+                            tracing::debug!("voice: gemini live goAway received; serving old socket until cut-over");
+                            go_away = Some((Instant::now(), p.go_away_time_left));
+                        }
+                        None
                     }
                 },
             },
         };
 
-        let Some(why) = next else { continue };
+        let why = match (next, go_away) {
+            (Some(w), _) => w,
+            (None, Some((at, left))) if should_cut_over(turn_open, at.elapsed(), left) => "goAway",
+            (None, _) => continue,
+        };
         let Some(h) = handle.clone() else {
             return format!("{why} (no resumption handle)");
         };
         tracing::debug!("voice: gemini live reconnecting ({why})");
+        // Release the old session server-side before resuming it.
+        if close_old(ws, &mut rx, &mut buf).await.is_err() {
+            return "closed".to_string();
+        }
+        go_away = None;
+        turn_open = false;
         match reconnect(&key, &setup, &h, top_level, &mut rx, &mut buf).await {
             Reconnect::CallerClosed => return "closed".to_string(),
             Reconnect::Failed(e) => return format!("reconnect failed after {why}: {e}"),
@@ -874,11 +965,40 @@ mod tests {
         assert!(p.handle.is_none());
         let p = parse_server_message(&json!({"goAway": {"timeLeft": "50s"}}).to_string());
         assert!(p.go_away && p.events.is_empty());
+        assert_eq!(p.go_away_time_left, Some(Duration::from_secs(50)));
+        let p = parse_server_message("{\"goAway\":{}}");
+        assert!(p.go_away && p.go_away_time_left.is_none());
         let p = parse_server_message("{\"setupComplete\":{}}");
         assert!(p.setup_complete);
         let p = parse_server_message("{\"mystery\":1}");
         assert_eq!(p, ParsedServerMessage::default());
         assert_eq!(parse_server_message("not json"), ParsedServerMessage::default());
+    }
+
+    #[test]
+    fn duration_strings() {
+        assert_eq!(parse_duration_str("10s"), Some(Duration::from_secs(10)));
+        assert_eq!(parse_duration_str("1.5s"), Some(Duration::from_millis(1500)));
+        assert_eq!(parse_duration_str("abc"), None);
+        assert_eq!(parse_duration_str("-3s"), None);
+        assert_eq!(parse_duration_str("10"), None);
+    }
+
+    #[test]
+    fn cut_over_timing() {
+        let s = Duration::from_secs;
+        // Idle: cut over at once.
+        assert!(should_cut_over(false, s(0), Some(s(10))));
+        // Mid-turn: wait while there is time.
+        assert!(!should_cut_over(true, s(2), Some(s(10))));
+        assert!(!should_cut_over(true, s(8), Some(s(10))));
+        // Near the end of timeLeft (margin 1.5 s): go even mid-turn.
+        assert!(should_cut_over(true, Duration::from_millis(8500), Some(s(10))));
+        // Tiny timeLeft: immediately.
+        assert!(should_cut_over(true, s(0), Some(s(1))));
+        // No timeLeft: hard cap.
+        assert!(!should_cut_over(true, s(7), None));
+        assert!(should_cut_over(true, s(8), None));
     }
 
     #[test]

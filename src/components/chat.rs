@@ -571,6 +571,9 @@ pub fn ChatWindow(
                             let state = session_state.peek();
                             no_tools_continuation_origin(&owning_id, state.sessions.get(&owning_id))
                         };
+                        // The person's approval resumes the turn: no
+                        // earlier stop request applies to it.
+                        crate::components::stream_manager::clear_turn_abort(&owning_id);
                         continuation_controller
                             .write()
                             .trigger_continuation(owning_id.clone(), origin);
@@ -801,6 +804,9 @@ pub fn ChatWindow(
                     *stream_manager.stream_activity.write() += 1;
                     return;
                 }
+                // The person's approval resumes the turn: no earlier stop
+                // request applies to it.
+                crate::components::stream_manager::clear_turn_abort(&owning_id);
                 continuation_controller
                     .write()
                     .trigger_continuation(owning_id.clone(), resumed_origin);
@@ -870,6 +876,8 @@ pub fn ChatWindow(
                 tracing::warn!(session_id = %target_id, "send refused: archived system session");
                 return;
             }
+            // A new turn: a stop aimed at an earlier one must not end it.
+            crate::components::stream_manager::clear_turn_abort(&target_id);
             spawn({
                 let mut session_state = session_state;
                 let settings = settings;
@@ -1221,6 +1229,13 @@ pub fn ChatWindow(
                     continuation_controller,
                     target_id.clone(),
                 );
+                // A stop asked for between rounds (voice VOICE_CANCEL_BRAIN):
+                // no next round. Dropping the guard ends the turn.
+                if crate::components::stream_manager::take_turn_abort(&target_id) {
+                    tracing::info!(session_id = %target_id, "Continuation skipped: the turn was stopped.");
+                    crate::components::chat_queue::request_drain();
+                    return;
+                }
                 let mut session_state = session_state;
                 let settings = settings.read().clone();
 
@@ -1311,6 +1326,15 @@ pub fn ChatWindow(
                 }
 
                 crate::session::SessionState::save_async(&session_state.read(), None);
+
+                // Stopped while this round's prompt was built: drop the
+                // empty placeholder and end the turn here.
+                if crate::components::stream_manager::take_turn_abort(&target_id) {
+                    tracing::info!(session_id = %target_id, "Continuation dropped before streaming: the turn was stopped.");
+                    session_state.write().remove_message_in_session(&target_id, &hobbes_message_id);
+                    crate::components::chat_queue::request_drain();
+                    return;
+                }
 
                 let mcp_context = if fresh_mcp_context.servers.is_empty() {
                     None

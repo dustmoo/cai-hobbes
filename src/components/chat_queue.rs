@@ -129,8 +129,64 @@ pub static QUEUE_DRAIN_TICK: GlobalSignal<u64> = Signal::global(|| 0);
 
 /// Sessions whose queued message was popped and handed to `submit`, until
 /// its stream starts (or a 5 s failsafe): the drain's in-flight guard.
+/// Change it only through [`begin_dispatch`] / [`end_dispatch`] /
+/// [`release_dispatch`], which keep [`DISPATCH_IDS`] in step.
 pub static DISPATCHING: GlobalSignal<std::collections::HashSet<String>> =
     Signal::global(std::collections::HashSet::new);
+
+/// Which popped message each `DISPATCHING` entry is for, so a pop's
+/// failsafe only ever releases its own guard (a later pop in the same
+/// session owns the entry from then on), and so a voice brain wait can tell
+/// its message is still on its way into the session.
+static DISPATCH_IDS: std::sync::Mutex<Option<HashMap<String, Uuid>>> = std::sync::Mutex::new(None);
+
+fn with_dispatch_ids<R>(f: impl FnOnce(&mut HashMap<String, Uuid>) -> R) -> R {
+    let mut guard = DISPATCH_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(HashMap::new))
+}
+
+/// Pure bookkeeping for [`end_dispatch`]: whether the entry for
+/// `session_id` belongs to the pop of `id` (and so may be released by it).
+pub fn dispatch_owned_by(ids: &HashMap<String, Uuid>, session_id: &str, id: Uuid) -> bool {
+    ids.get(session_id) == Some(&id)
+}
+
+/// The drain popped `id` for `session_id` and is handing it to `submit`.
+pub fn begin_dispatch(session_id: &str, id: Uuid) {
+    with_dispatch_ids(|ids| ids.insert(session_id.to_string(), id));
+    DISPATCHING.write().insert(session_id.to_string());
+}
+
+/// The failsafe of the pop of `id`: release the guard only if it is still
+/// that pop's (a later pop owns it otherwise). Returns whether it released.
+pub fn end_dispatch(session_id: &str, id: Uuid) -> bool {
+    let owned = with_dispatch_ids(|ids| {
+        let owned = dispatch_owned_by(ids, session_id, id);
+        if owned {
+            ids.remove(session_id);
+        }
+        owned
+    });
+    if owned && DISPATCHING.peek().contains(session_id) {
+        DISPATCHING.write().remove(session_id);
+    }
+    owned
+}
+
+/// The session's stream registered: whatever was dispatched has started.
+pub fn release_dispatch(session_id: &str) {
+    with_dispatch_ids(|ids| ids.remove(session_id));
+    if DISPATCHING.peek().contains(session_id) {
+        DISPATCHING.write().remove(session_id);
+    }
+}
+
+/// Whether the queued message `id` is still on its way into `session_id`:
+/// waiting in the queue, or popped and handed to `submit` but not started.
+pub fn is_pending(session_id: &str, id: Uuid) -> bool {
+    let queued = CHAT_QUEUE.peek().get(session_id).is_some_and(|q| q.iter().any(|m| m.id == id));
+    queued || with_dispatch_ids(|ids| dispatch_owned_by(ids, session_id, id))
+}
 
 /// Ask the active session's queue to drain on the next reactive tick.
 pub fn request_drain() {
@@ -172,21 +228,28 @@ pub fn queue_pop_next(
 }
 
 /// Remove a single queued message by id, preserving the order of the rest.
+/// Returns whether it was there to remove.
 pub fn queue_remove(
     map: &mut HashMap<String, VecDeque<QueuedMessage>>,
     session_id: &str,
     id: Uuid,
-) {
+) -> bool {
+    let mut removed = false;
     if let Some(q) = map.get_mut(session_id) {
+        let before = q.len();
         q.retain(|m| m.id != id);
+        removed = q.len() != before;
         if q.is_empty() {
             map.remove(session_id);
         }
     }
+    removed
 }
 
 /// Take a session's queued user messages back out (Esc puts them in the input
 /// box), oldest first. Queued relays stay: they aren't the person's words.
+/// Nor do voice brain requests: a live voice wait is tied to each, and the
+/// framed request is not text the person typed.
 pub fn queue_take_user_messages(
     map: &mut HashMap<String, VecDeque<QueuedMessage>>,
     session_id: &str,
@@ -194,7 +257,9 @@ pub fn queue_take_user_messages(
     let Some(q) = map.get_mut(session_id) else {
         return Vec::new();
     };
-    let (relays, mine): (VecDeque<_>, VecDeque<_>) = q.drain(..).partition(|m| m.relay.is_some());
+    let (relays, mine): (VecDeque<_>, VecDeque<_>) = q
+        .drain(..)
+        .partition(|m| m.relay.is_some() || crate::voice::brain::is_voice_request(m.text.trim()));
     *q = relays;
     if q.is_empty() {
         map.remove(session_id);
@@ -246,6 +311,30 @@ mod tests {
         assert_eq!(map["s"].len(), 1, "the relay stays");
         assert!(queue_take_user_messages(&mut map, "s").is_empty());
         assert!(queue_take_user_messages(&mut map, "missing").is_empty());
+    }
+
+    #[test]
+    fn esc_leaves_voice_requests_queued_and_remove_reports_success() {
+        let mut map = HashMap::new();
+        let voice = msg(&crate::voice::brain::framed_request("check CI"));
+        let voice_id = voice.id;
+        queue_push(&mut map, "s", msg("typed"));
+        queue_push(&mut map, "s", voice);
+        let taken: Vec<String> = queue_take_user_messages(&mut map, "s").into_iter().map(|m| m.text).collect();
+        assert_eq!(taken, ["typed"]);
+        assert_eq!(map["s"][0].id, voice_id, "the voice request stays queued");
+        assert!(queue_remove(&mut map, "s", voice_id));
+        assert!(!queue_remove(&mut map, "s", voice_id), "already gone");
+    }
+
+    #[test]
+    fn a_pop_s_failsafe_only_releases_its_own_guard() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut ids = HashMap::new();
+        ids.insert("s".to_string(), b); // pop B took over after pop A
+        assert!(!dispatch_owned_by(&ids, "s", a), "A's timer must not clear B's guard");
+        assert!(dispatch_owned_by(&ids, "s", b));
+        assert!(!dispatch_owned_by(&ids, "other", b));
     }
 
     #[test]
@@ -307,9 +396,9 @@ mod tests {
     fn remove_unknown_id_is_a_no_op() {
         let mut map = HashMap::new();
         queue_push(&mut map, "s1", msg("a"));
-        queue_remove(&mut map, "s1", Uuid::new_v4());
+        assert!(!queue_remove(&mut map, "s1", Uuid::new_v4()));
         assert_eq!(texts(&map, "s1"), vec!["a"]);
-        queue_remove(&mut map, "missing", Uuid::new_v4()); // no panic on missing session
+        assert!(!queue_remove(&mut map, "missing", Uuid::new_v4())); // no panic on missing session
     }
 
     #[test]
