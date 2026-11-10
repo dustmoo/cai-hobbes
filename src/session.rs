@@ -441,6 +441,13 @@ pub struct Session {
     /// start open. Ignored for system sessions. Journaled as `ProfileLockSet`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub profile_locked: bool,
+    /// Profile pairs content may move along in this chat without asking
+    /// (from → to, profile ids), from a flow hold's "Allow in this chat"
+    /// (`mcp::manager::profile_flow::FlowPolicy`). Journaled as
+    /// `FlowsAllowed`. Not carried through a rotation: the successor asks
+    /// again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_flows: Vec<crate::context::permissions::ProfileFlow>,
     /// The Composio profiles whose data the conversation summary may hold
     /// (profile ids, or a `composio-native:{name}` server name for an
     /// unstamped call). Set only by `adopt_summary`, never from model
@@ -1889,6 +1896,7 @@ impl SessionState {
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
             profile_locked: false,
+            allowed_flows: Vec::new(),
             summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
         };
@@ -2594,6 +2602,7 @@ mod tests {
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
             profile_locked: false,
+            allowed_flows: Vec::new(),
             summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
             }
@@ -3449,6 +3458,7 @@ mod tests {
             carried_reads: Vec::new(),
             profile_reach: Vec::new(),
             profile_locked: false,
+            allowed_flows: Vec::new(),
             summary_sources: Vec::new(),
             turn_origin: TurnOrigin::User,
             messages: vec![

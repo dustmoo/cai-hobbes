@@ -717,6 +717,36 @@ impl Settings {
         self.permission_settings.trust_rules.retain(|r| r.id != id);
         self.permission_settings.trust_rules.len() != before
     }
+
+    /// Always allow content from profile `from` into profile `to` (ids).
+    /// Returns false when the pair was already listed.
+    pub fn add_profile_flow(&mut self, from: &str, to: &str) -> bool {
+        let flow = crate::context::permissions::ProfileFlow { from: from.to_string(), to: to.to_string() };
+        if from == to || self.permission_settings.profile_flows.contains(&flow) {
+            return false;
+        }
+        self.permission_settings.profile_flows.push(flow);
+        true
+    }
+
+    /// Stop always allowing `from` → `to`. Returns whether it was listed.
+    pub fn remove_profile_flow(&mut self, from: &str, to: &str) -> bool {
+        let before = self.permission_settings.profile_flows.len();
+        self.permission_settings.profile_flows.retain(|f| !(f.from == from && f.to == to));
+        self.permission_settings.profile_flows.len() != before
+    }
+
+    /// Load-time migration: drop the trust rules the old cross-company
+    /// guard authored (server `profile-flow:…`); flow holds are remembered
+    /// by profile pair now. Idempotent; other rules are untouched. Returns
+    /// whether anything was dropped (the caller persists).
+    pub fn drop_legacy_flow_trust_rules(&mut self) -> bool {
+        let before = self.permission_settings.trust_rules.len();
+        self.permission_settings
+            .trust_rules
+            .retain(|r| !r.server.starts_with(crate::mcp::manager::profile_flow::FLOW_KEY_PREFIX));
+        self.permission_settings.trust_rules.len() != before
+    }
 }
 
 fn default_fleet_retire_minutes() -> u32 {
@@ -1260,6 +1290,10 @@ pub struct ComposioProfile {
     /// reauth dance and must not lose curation).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub retained_curation: HashMap<String, Vec<String>>,
+    /// A personal profile: content moves freely between it and every other
+    /// profile (`mcp::manager::profile_flow::FlowPolicy`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub personal: bool,
 }
 
 fn default_profile_color() -> String {
@@ -1283,6 +1317,7 @@ impl Default for ComposioProfile {
             color: default_profile_color(),
             chrome_profile_directory: None,
             retained_curation: HashMap::new(),
+            personal: false,
         }
     }
 }
@@ -1346,6 +1381,7 @@ impl Default for Settings {
                 mcp_server_permissions: HashMap::new(),
                 skill_permissions: HashMap::new(),
                 trust_rules: Vec::new(),
+                profile_flows: Vec::new(),
                 max_ai_turns: 25,
             },
             confirm_on_delete: true,
@@ -2420,6 +2456,7 @@ impl Settings {
                 color: default_profile_color(),
                 chrome_profile_directory: None,
                 retained_curation: HashMap::new(),
+                personal: false,
             };
             let profile_id = profile.id.clone();
             self.add_profile(profile);
@@ -2661,7 +2698,8 @@ impl SettingsManager {
             let migrated_calendar = settings.migrate_legacy_calendar_profile();
             // After the connector migration, so every Gemini connector exists.
             let seeded_carbon = settings.seed_gemini_4_carbon_slot();
-            if (migrated_llm || migrated_calendar || seeded_carbon) && self.save(&settings).is_err() {
+            let dropped_flow_rules = settings.drop_legacy_flow_trust_rules();
+            if (migrated_llm || migrated_calendar || seeded_carbon || dropped_flow_rules) && self.save(&settings).is_err() {
                 tracing::error!("Failed to persist migrated settings.");
             }
             return settings;
@@ -2786,6 +2824,7 @@ impl SettingsManager {
         settings.migrate_active_profile_name_to_id();
         settings.migrate_legacy_llm_config();
         settings.migrate_legacy_calendar_profile();
+        settings.drop_legacy_flow_trust_rules();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
@@ -3606,6 +3645,52 @@ mod tests {
         assert_eq!(count, 1, "only settings.json should remain");
     }
 
+    /// The old cross-company guard's trust rules (`profile-flow:…`) are
+    /// dropped at load, once; every other rule, the pair list and the
+    /// personal flag survive, and a second load changes nothing.
+    #[test]
+    fn load_drops_legacy_flow_trust_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SettingsManager::new(dir.path().join("settings.json"));
+        let rule = |id: &str, server: &str| crate::context::permissions::TrustRule {
+            id: id.into(),
+            server: server.into(),
+            tool: Some("GMAIL_SEND_EMAIL".into()),
+            command_prefix: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let mut settings = Settings::default();
+        settings.permission_settings.trust_rules = vec![
+            rule("keep-1", "composio-native:Puget"),
+            rule("flow-1", "profile-flow:pg>cm"),
+            rule("flow-2", "profile-flow:act>pg"),
+            rule("flow-3", "profile-flow:ac+pg>local"),
+            rule("keep-2", "hobbes-terminal"),
+        ];
+        settings.composio_profiles = vec![ComposioProfile { id: "pg".into(), personal: true, ..Default::default() }];
+        assert!(settings.add_profile_flow("pg", "cm"));
+        assert!(!settings.add_profile_flow("pg", "cm"), "deduplicated");
+        assert!(!settings.add_profile_flow("cm", "cm"), "a profile never flows into itself");
+        mgr.save(&settings).unwrap();
+
+        let loaded = mgr.load();
+        let ids: Vec<&str> = loaded.permission_settings.trust_rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["keep-1", "keep-2"]);
+        assert_eq!(
+            loaded.permission_settings.profile_flows,
+            vec![crate::context::permissions::ProfileFlow { from: "pg".into(), to: "cm".into() }]
+        );
+        assert!(loaded.composio_profiles[0].personal);
+        // Persisted, and idempotent.
+        let again = mgr.load();
+        assert_eq!(again.permission_settings.trust_rules, loaded.permission_settings.trust_rules);
+        let mut twice = again.clone();
+        assert!(!twice.drop_legacy_flow_trust_rules());
+        assert!(twice.remove_profile_flow("pg", "cm"));
+        assert!(!twice.remove_profile_flow("pg", "cm"));
+    }
+
     #[test]
     fn settings_manager_save_load_roundtrip_repeats() {
         let dir = tempfile::tempdir().unwrap();
@@ -3753,6 +3838,7 @@ mod tests {
         carried_reads: Vec::new(),
         profile_reach: Vec::new(),
         profile_locked: false,
+        allowed_flows: Vec::new(),
         summary_sources: Vec::new(),
         turn_origin: Default::default(),
         }

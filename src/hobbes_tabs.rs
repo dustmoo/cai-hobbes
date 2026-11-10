@@ -891,7 +891,8 @@ mod tests {
     /// Clearmirror tools is held as a cross-company flow.
     #[test]
     fn reading_a_puget_tab_holds_a_clearmirror_write() {
-        use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile};
+        use crate::mcp::manager::profile_flow::{flow_hold, FlowClass, FlowPolicy};
+        use crate::mcp::manager::profile_reach::{session_read_profiles, ReachProfile};
         let mut dom = VirtualDom::new(|| {
             let settings = two_companies();
             let mut state = SessionState::new();
@@ -906,8 +907,13 @@ mod tests {
             let home = ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
             let reach = vec![home.clone(), ReachProfile { id: "pg".into(), name: "Puget".into() }];
             let now = chrono::Utc::now();
+            let none = Vec::new();
+            let policy = FlowPolicy::new(&settings, &none);
+            let carry = |read: &std::collections::BTreeSet<String>| {
+                flow_hold(FlowClass::Carry, Some(&home), Some(&home), read, true, &policy, &reach)
+            };
             let before = session_read_profiles(&settings, &sig.peek().sessions[&hobbes], now);
-            assert!(cross_company_hold(Some(&home), &home, &before, &reach, true).is_none());
+            assert!(carry(&before).is_none());
 
             // Hobbes reads the Puget tab ...
             let sources = read_sources(&settings, &sig.peek().sessions[&puget]);
@@ -915,9 +921,9 @@ mod tests {
             // ... and now a write to Clearmirror is held, naming Puget.
             let read_from = session_read_profiles(&settings, &sig.peek().sessions[&hobbes], now);
             assert!(read_from.contains("pg"));
-            let hold = cross_company_hold(Some(&home), &home, &read_from, &reach, true).expect("held");
+            let hold = carry(&read_from).expect("held");
             assert!(hold.reason.contains("Puget"), "{}", hold.reason);
-            assert!(hold.rule_key.starts_with("profile-flow:pg>cm"), "{}", hold.rule_key);
+            assert_eq!(hold.rule_key, "profile-flow:v2:pg>cm");
             // It ages out with the read window, like any system-session read.
             let later = now + crate::mcp::manager::profile_reach::READ_WINDOW + chrono::Duration::minutes(1);
             let aged = session_read_profiles(&settings, &sig.peek().sessions[&hobbes], later);

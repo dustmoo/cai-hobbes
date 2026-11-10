@@ -3763,6 +3763,7 @@ mod tests {
                 carried_reads: Vec::new(),
                 profile_reach: Vec::new(),
                 profile_locked: false,
+                allowed_flows: Vec::new(),
                 summary_sources: Vec::new(),
                 turn_origin: Default::default(),
             }

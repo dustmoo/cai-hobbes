@@ -1189,7 +1189,8 @@ mod tests {
 
     #[test]
     fn the_merge_archives_both_and_starts_hobbes_fresh_keeping_the_reads() {
-        use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile};
+        use crate::mcp::manager::profile_flow::{flow_hold, FlowClass, FlowPolicy};
+        use crate::mcp::manager::profile_reach::{session_read_profiles, ReachProfile};
         let settings = crate::settings::Settings::default();
         let now = Utc::now();
         let (mut state, hb) = rotated_session();
@@ -1245,7 +1246,9 @@ mod tests {
         assert_eq!(read, ["ac", "pg"]);
         let home = ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
         let reach = vec![home.clone(), ReachProfile { id: "pg".into(), name: "Puget".into() }];
-        let hold = cross_company_hold(Some(&home), &home, &session_read_profiles(&settings, h, now), &reach, true);
+        let policy = FlowPolicy::new(&settings, &h.allowed_flows);
+        let read_from = session_read_profiles(&settings, h, now);
+        let hold = flow_hold(FlowClass::Carry, Some(&home), Some(&home), &read_from, true, &policy, &reach);
         assert!(hold.is_some_and(|h| h.reason.contains("Puget")));
         // Replay reproduces it: the journal carries the icon, name and reads.
         assert!(p.successor_events.iter().any(|e| matches!(e, SessionEvent::TabTitled { emoji: Some(e), .. } if e == crate::hobbes_session::SESSION_EMOJI)));
@@ -1278,7 +1281,8 @@ mod tests {
 
     #[test]
     fn recent_reads_carry_into_the_successor_and_keep_the_hold() {
-        use crate::mcp::manager::profile_reach::{cross_company_hold, session_read_profiles, ReachProfile, READ_WINDOW};
+        use crate::mcp::manager::profile_flow::{flow_hold, FlowClass, FlowPolicy};
+        use crate::mcp::manager::profile_reach::{session_read_profiles, ReachProfile, READ_WINDOW};
         let settings = crate::settings::Settings::default();
         let now = Utc::now();
         let (mut state, old) = rotated_session();
@@ -1304,11 +1308,16 @@ mod tests {
         let reach = vec![home.clone(), puget];
         let read_from = session_read_profiles(&settings, &p.successor, now);
         assert!(read_from.contains("pg"));
-        let hold = cross_company_hold(Some(&home), &home, &read_from, &reach, true);
+        // A rotation doesn't carry the chat's allowed pairs: it asks again.
+        assert!(p.successor.allowed_flows.is_empty());
+        let policy = FlowPolicy::new(&settings, &p.successor.allowed_flows);
+        let carry = |target: &ReachProfile, read: &std::collections::BTreeSet<String>| {
+            flow_hold(FlowClass::Carry, Some(target), Some(&home), read, true, &policy, &reach)
+        };
+        let hold = carry(&home, &read_from);
         assert!(hold.is_some_and(|h| h.reason.contains("Puget")), "a carried read holds the write");
-        // A write to Puget itself carries no other company's data.
-        assert!(cross_company_hold(Some(&reach[1]), &home, &read_from, &reach, true)
-            .is_none_or(|h| !h.reason.contains("has read")));
+        // Content into Puget itself carries no other company's data.
+        assert!(carry(&reach[1], &read_from).is_none());
 
         // It ages out with the window (the system-session rule; an
         // ordinary tab's carried reads have no clock).
@@ -1318,7 +1327,7 @@ mod tests {
         registered.id = "reach-test-hb".into();
         let aged = session_read_profiles(&settings, &registered, later);
         assert!(aged.is_empty(), "{aged:?}");
-        assert!(cross_company_hold(Some(&home), &home, &aged, &reach, true).is_none());
+        assert!(carry(&home, &aged).is_none());
 
         // The journal keeps it, so a replayed successor holds the same way.
         let projected = crate::session_events::project(None, &events_with_seq(p.successor_events.clone()));

@@ -51,7 +51,20 @@ pub struct PermissionSettings {
     pub skill_permissions: HashMap<String, bool>,
     #[serde(default)]
     pub trust_rules: Vec<TrustRule>,
+    /// Profile pairs content may always move along (from → to, profile
+    /// ids), authored from a flow hold's "Always allow" and listed in
+    /// Settings (`mcp::manager::profile_flow`). Direction matters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_flows: Vec<ProfileFlow>,
     pub max_ai_turns: u32,
+}
+
+/// One allowed direction of content between two Composio profiles (ids):
+/// content read from `from` may be carried into `to` without asking.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProfileFlow {
+    pub from: String,
+    pub to: String,
 }
 
 impl Default for PermissionSettings {
@@ -62,6 +75,7 @@ impl Default for PermissionSettings {
             mcp_server_permissions: HashMap::new(),
             skill_permissions: HashMap::new(),
             trust_rules: Vec::new(),
+            profile_flows: Vec::new(),
             max_ai_turns: 25,
         }
     }

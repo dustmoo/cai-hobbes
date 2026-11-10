@@ -30,11 +30,14 @@
 //! context when the model already abandoned the call.
 //!
 //! **Spoken confirmation.** A voice turn held on a destructive call
-//! (`call_risk`) is confirmed out loud when the model can't hear itself:
-//! the voice asks, and the person's own transcribed yes or no (never the
-//! model's words) approves or denies it through the bubble's own path
-//! (`floor::Confirm`, `spoken_decision`). Otherwise, or without a clear
-//! answer, the button in the Hobbes tab decides.
+//! (`call_risk`) or on content crossing profiles (the flow guard,
+//! `profile_flow`; found by the same `call_risk::pending_risk_hold`) is
+//! confirmed out loud when the model can't hear itself: the voice asks, and
+//! the person's own transcribed yes or no (never the model's words)
+//! approves (once: a spoken yes never allows a flow for good) or denies it
+//! through the bubble's own path (`floor::Confirm`, `spoken_decision`).
+//! Otherwise, or without a clear answer, the button in the Hobbes tab
+//! decides.
 //!
 //! Runs on the Dioxus runtime: signals are only peeked/written between
 //! awaits, never held across one.
@@ -316,7 +319,8 @@ pub fn pending_announcement(
         if !announce_results && !confirmed {
             return None;
         }
-        // A voice turn held on a destructive call: say what it would do.
+        // A voice turn held on a destructive call, or on content crossing
+        // profiles: say what it would do.
         let risk = news
             .needs_approval
             .then(|| crate::call_risk::pending_risk_hold(&session.messages))
@@ -1048,7 +1052,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     last_activity = Instant::now();
                     let (mut status, mut text) = BrainStatus::of(outcome);
                     if status == BrainStatus::NeedsApproval {
-                        // Held as destructive on this voice turn: spoken
+                        // Held as destructive (or as a flow) on this voice turn: spoken
                         // confirmation, or the button (see `held_status`).
                         let sid = crate::system_sessions::current_for(&voice_session);
                         let hold = {
@@ -1618,7 +1622,7 @@ fn held_news(result: &str) -> String {
     format!("The brain needs your approval in the Hobbes tab before it can continue: this {r}")
 }
 
-/// The result told for a call held as destructive: "This {reason}."
+/// The result told for a call held as destructive, or as a flow: "This {reason}."
 pub fn risk_result(reason: &str) -> String {
     format!("This {}.", reason.trim().trim_end_matches('.'))
 }

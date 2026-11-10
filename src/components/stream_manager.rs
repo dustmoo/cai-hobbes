@@ -759,10 +759,11 @@ impl StreamManagerContext {
 
                         // Multi-profile reach (profile_reach): route a Composio
                         // call to the profile it names (restamped before it is
-                        // stored), and in a session with reach, hold any write
-                        // that crosses companies unless a trust rule for that
-                        // flow already allows it.
+                        // stored), and hold a call that carries one profile's
+                        // content into another's tools unless that pair is
+                        // allowed (profile_flow: rules only, no trust rules).
                         let route = {
+                            use crate::mcp::manager::profile_flow as flow_mod;
                             use crate::mcp::manager::profile_reach as reach_mod;
                             let settings_read = self.settings.peek();
                             let state = self.session_state.peek();
@@ -779,6 +780,7 @@ impl StreamManagerContext {
                             // Checked with reach, or with another company's data
                             // in play (reach since narrowed, or an earlier home).
                             if reach_mod::flow_checked(reach, &read_from) && !matches!(route, reach_mod::Route::Refused(_)) {
+                                // Only calls into a Composio profile are judged.
                                 let target = match &route {
                                     reach_mod::Route::To(t) => Some(t),
                                     // Narrowed to home: a Composio call still lands at home.
@@ -792,39 +794,17 @@ impl StreamManagerContext {
                                 let mut args: serde_json::Value =
                                     serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                                 reach_mod::strip_profile_arg(&tool_call.tool_name, &mut args);
-                                let write = match target {
-                                    Some(_) => reach_mod::is_write(&tool_call.tool_name, &args),
-                                    None => reach_mod::local_write(&tool_call.server_name, &tool_call.tool_name, &args),
-                                };
+                                let class = flow_mod::classify_flow(&tool_call.tool_name, &args);
+                                // The harness's origin stamp (set just above), never the model's.
+                                let person = crate::components::builtin_tools::effective_origin(&tool_call, &session_id).is_person();
+                                let chat_flows = session.map(|s| s.allowed_flows.as_slice()).unwrap_or_default();
+                                let policy = flow_mod::FlowPolicy::new(&settings_read, chat_flows);
                                 let named = reach_mod::all_profiles(&settings_read);
-                                let hold = reach_mod::cross_company_hold_in(target, reach.first(), &read_from, &named, write);
-                                if let Some(hold) = hold {
-                                    let project_id = session.and_then(|s| s.project_id.clone());
-                                    let rule = crate::context::trust::evaluate(
-                                        &settings_read.permission_settings.trust_rules,
-                                        &hold.rule_key,
-                                        &tool_call.tool_name,
-                                        &args,
-                                        &crate::context::trust::TrustCtx { project_id: project_id.as_deref() },
-                                    )
-                                    .map(|r| r.id.clone());
-                                    match rule {
-                                        Some(rule_id) => crate::context::trust_store::log_decision(
-                                            crate::context::trust_store::TrustDecision::new(
-                                                crate::context::trust_store::DecisionKind::RuleHit,
-                                                &hold.rule_key,
-                                                &tool_call.tool_name,
-                                                crate::context::trust_store::arg_summary(&args),
-                                                Some(session_id.clone()),
-                                                project_id,
-                                                Some(rule_id),
-                                            ),
-                                        ),
-                                        None => {
-                                            tool_call.hold_reason = Some(hold.reason);
-                                            tool_call.hold_rule_key = Some(hold.rule_key);
-                                        }
-                                    }
+                                if let Some(hold) =
+                                    flow_mod::flow_hold(class, target, reach.first(), &read_from, person, &policy, &named)
+                                {
+                                    tool_call.hold_reason = Some(hold.reason);
+                                    tool_call.hold_rule_key = Some(hold.rule_key);
                                 }
                             }
                             // Only another company's client may need connecting
@@ -965,8 +945,8 @@ impl StreamManagerContext {
                                     &session_id_inner,
                                     false,
                                 );
-                            // Reach: an unknown profile is refused; a write
-                            // crossing companies is held (hold_reason above).
+                            // Reach: an unknown profile is refused; content
+                            // crossing profiles is held (hold_reason above).
                             match &route {
                                 crate::mcp::manager::profile_reach::Route::Refused(msg) => {
                                     agent_time_gate = crate::components::builtin_tools::AgentTimeGate::Refuse(msg.clone());

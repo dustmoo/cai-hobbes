@@ -17,6 +17,7 @@ mod config;
 mod lifecycle;
 mod oauth;
 mod profile_scope;
+pub mod profile_flow;
 pub mod profile_reach;
 mod status;
 mod tool_call;

@@ -87,20 +87,22 @@ pub(super) fn flush_draft_into_instance(draft: &mut Settings, connector_id: &str
 /// phantom "unsaved changes" when a connector is merely selected for editing.
 /// A change saved from outside the panel that touches only fields the app
 /// writes on its own — `hobbes_read_tabs` (the Read other tabs toggle's
-/// immediate save, the approval prompt's "always") and trust rules (made
-/// at an approval) — patched into the panel's `draft` so its other unsaved
+/// immediate save, the approval prompt's "always"), trust rules and
+/// always-allowed profile flows (made at an approval) — patched into the panel's `draft` so its other unsaved
 /// edits survive. `None` when `new` differs from `prev` in anything else:
 /// the caller then replaces the draft as before.
 pub(super) fn patch_draft(prev: &Settings, new: &Settings, draft: &Settings) -> Option<Settings> {
     let mut probe = comparable(new);
     probe.hobbes_read_tabs = prev.hobbes_read_tabs;
     probe.permission_settings.trust_rules = prev.permission_settings.trust_rules.clone();
+    probe.permission_settings.profile_flows = prev.permission_settings.profile_flows.clone();
     if probe != comparable(prev) {
         return None;
     }
     let mut out = draft.clone();
     out.hobbes_read_tabs = new.hobbes_read_tabs;
     out.permission_settings.trust_rules = new.permission_settings.trust_rules.clone();
+    out.permission_settings.profile_flows = new.permission_settings.profile_flows.clone();
     Some(out)
 }
 
@@ -142,6 +144,12 @@ mod draft_patch_tests {
         });
         let patched = patch_draft(&prev, &ruled, &draft).unwrap();
         assert_eq!(patched.permission_settings.trust_rules.len(), 1);
+        assert_eq!(patched.user_name.as_deref(), Some("unsaved edit"));
+        // So does a profile flow allowed "always" at an approval.
+        let mut flowed = prev.clone();
+        flowed.add_profile_flow("pg", "cm");
+        let patched = patch_draft(&prev, &flowed, &draft).unwrap();
+        assert_eq!(patched.permission_settings.profile_flows.len(), 1);
         assert_eq!(patched.user_name.as_deref(), Some("unsaved edit"));
         // Anything else: not patchable (the caller replaces the draft).
         let mut other = prev.clone();

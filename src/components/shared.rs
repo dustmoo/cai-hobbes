@@ -186,9 +186,12 @@ pub struct ToolCall {
     /// the approval bubble.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_reason: Option<String>,
-    /// The trust-rule key a held call is remembered under, when it isn't the
-    /// server name (a cross-company write: `profile-flow:{from}>{to}`), so an
-    /// ordinary "always allow" for the tool never waves it through.
+    /// A flow hold's profile pairs (`profile_flow::pair_key`:
+    /// `profile-flow:v2:{from+from}>{to}`), harness-set, cleared at mint, so
+    /// the bubble can allow exactly those pairs; also the key decisions are
+    /// logged under. Never a trust rule's server. Older rows may carry the
+    /// retired format (`profile-flow:{from}>{to|local}`, `…:act>{to}`),
+    /// which is approved or denied once.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_rule_key: Option<String>,
     /// Who started the turn that minted this call (`Session::turn_origin`),

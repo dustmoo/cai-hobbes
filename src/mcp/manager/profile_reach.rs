@@ -15,11 +15,15 @@
 //!   which company a call hit) and is stripped only on its way to Composio
 //!   ([`strip_profile_arg`]).
 //! - **Company boundary.** Each profile is a company (Clearmirror, and the
-//!   clients it works for). [`cross_company_hold`] holds a write that lands
-//!   outside home, or that follows reading another company's data anywhere
-//!   in the session (it stays in the model's context and summary). The hold
-//!   is remembered under its own trust key — the direction of the flow — so
-//!   ordinary "always allow" rules never wave it through.
+//!   clients it works for). This module counts which companies' data a
+//!   chat holds ([`session_read_profiles`]: reads stay in the model's
+//!   context and summary); the flow guard (`super::profile_flow`) holds a
+//!   call that carries content into a Composio profile from a chat that has
+//!   read another profile's data, unless that pair of profiles is allowed
+//!   (personal profile, always-allowed pair, or allowed in this chat), and,
+//!   on an unattended turn, any non-read call into a profile other than
+//!   home. Reads, state changes on a person's turn and calls outside
+//!   Composio (terminal, files, dispatch, relay) are never held by it.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -38,9 +42,6 @@ pub const PROFILE_ARG: &str = "hobbes_profile";
 
 /// The meta tool that runs another Composio tool by name.
 const EXECUTE_TOOL: &str = "COMPOSIO_EXECUTE_TOOL";
-
-/// Trust-rule server key prefix for cross-company holds.
-pub const FLOW_KEY_PREFIX: &str = "profile-flow:";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReachProfile {
@@ -318,8 +319,8 @@ pub fn reach_for_session(settings: &Settings, session_id: &str, home_id: Option<
 /// its home plus every other profile that is set up — a deleted or broken
 /// profile drops out silently — unless the tab is `locked`
 /// (`Session::profile_locked`, the chip's "Keep this tab to … only"
-/// switch), which keeps it to home. The cross-profile hold
-/// ([`cross_company_hold_in`]) still asks before data moves between them.
+/// switch), which keeps it to home. The flow guard
+/// (`super::profile_flow::flow_hold`) still asks before content moves between them.
 /// System sessions ignore `locked` and keep their own reach
 /// ([`reach_for_session`]); with no home there is no reach.
 pub fn session_reach(settings: &Settings, session_id: &str, home_id: Option<&str>, locked: bool) -> Vec<ReachProfile> {
@@ -465,15 +466,14 @@ pub fn inherited_sources(settings: &Settings, old: &crate::session::Session) -> 
     out.into_iter().collect()
 }
 
-/// Whether the cross-company hold applies to a call: the session has reach,
-/// or it holds data read from a profile other than its current `home` —
-/// through reach since narrowed, or at an earlier home before a repin. A
-/// tab that has only ever used one profile is never checked.
+/// Whether the flow guard (`super::profile_flow::flow_hold`) needs to look
+/// at a call: the session has reach, or it holds data read from a profile
+/// other than its current `home` — through reach since narrowed, or at an
+/// earlier home before a repin. A tab that has only ever used one profile
+/// is never checked (nothing it does can cross profiles).
 pub fn flow_checked(reach: &[ReachProfile], read_from: &BTreeSet<String>) -> bool {
     match reach.first() {
-        // No profile to act in: Composio calls are refused, but other
-        // writes (dispatch, relay, terminal) can still carry data the
-        // conversation read.
+        // No profile to act in: Composio calls are refused anyway.
         None => !read_from.is_empty(),
         Some(home) => reach.len() >= 2 || read_from.iter().any(|id| id != &home.id),
     }
@@ -534,20 +534,6 @@ pub fn system_summary_sources(session: &crate::session::Session) -> Vec<String> 
     out.into_iter().collect()
 }
 
-/// The bubble's "always allow" wording for a flow key, in profile names.
-pub fn flow_label(settings: &Settings, rule_key: &str, tool: &str) -> Option<String> {
-    let rest = rule_key.strip_prefix(FLOW_KEY_PREFIX)?;
-    let (from, to) = rest.split_once('>')?;
-    let name = |id: &str| settings.profile_name_for_id(id).unwrap_or(id).to_string();
-    let to_name = if to == "local" { "commands and other tabs".to_string() } else { name(to) };
-    Some(if from == "act" {
-        format!("Always allow {tool} in {to_name} (with no other profile's data in play)")
-    } else {
-        let from: Vec<String> = from.split('+').map(name).collect();
-        format!("Always allow {tool} to carry {} data into {to_name}", from.join(" and "))
-    })
-}
-
 /// The system-prompt instruction for a session with reach.
 pub fn reach_instruction(home: &str, others: &[&str]) -> String {
     format!(
@@ -555,7 +541,8 @@ pub fn reach_instruction(home: &str, others: &[&str]) -> String {
          also act in {}: pass `hobbes_profile` with that name on the tool call (its options list who has \
          the app connected). Each profile belongs to a different organisation. Keep each profile's content in \
          its own accounts — never copy one profile's documents, emails or data into another's \
-         tools unless the person explicitly asks; such writes are held for their approval.",
+         tools unless the person explicitly asks; a call that carries one profile's content into \
+         another's tools is held for their approval unless they have allowed that flow.",
         others.join(", ")
     )
 }
@@ -919,108 +906,23 @@ pub fn session_read_profiles(
     out
 }
 
-/// Whether a call changes something outside. Composio meta tools that only
-/// discover or load tools don't; the execute meta tool is judged by the
-/// tool it runs.
-pub fn is_write(tool_name: &str, args: &Value) -> bool {
-    // Only Hobbes' own discovery / loading meta tools; any other COMPOSIO_*
-    // tool (multi-execute, workbench, …) is judged like a normal tool.
-    if matches!(tool_name, "COMPOSIO_DISCOVER_APPS" | "COMPOSIO_GET_APP_TOOLS" | "COMPOSIO_CLEAR_TOOLS") {
-        return false;
-    }
-    let (tool, inner) = if tool_name == EXECUTE_TOOL {
-        (
-            args.get("tool_name").and_then(Value::as_str).unwrap_or(tool_name),
-            args.get("arguments").cloned().unwrap_or(Value::Null),
-        )
-    } else {
-        (tool_name, args.clone())
-    };
-    crate::todo::agent_time::agent_time_scope_allows(tool, &inner) != crate::todo::agent_time::ScopeVerdict::Allow
-}
-
-/// Whether a call that isn't routed to a Composio profile moves data out of
-/// the session: terminal commands and other MCP writes, and handing work or
-/// messages to another tab. Hobbes' own space (timers, todos, planner,
-/// scratchpad) is not another company.
-pub fn local_write(server_name: &str, tool_name: &str, args: &Value) -> bool {
-    use super::{HOBBES_CORE_SERVER, HOBBES_META_SERVER, HOBBES_PLANNER_SERVER};
-    if matches!(server_name, HOBBES_CORE_SERVER | HOBBES_META_SERVER | HOBBES_PLANNER_SERVER) || tool_name.starts_with("HOBBES_") {
-        return matches!(tool_name, "HOBBES_DISPATCH" | "HOBBES_MESSAGE_PARENT" | "HOBBES_MESSAGE_WORKER");
-    }
-    is_write(tool_name, args)
-}
-
-/// A held cross-company write: why, and the trust key that remembers it.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Hold {
-    pub reason: String,
-    /// `profile-flow:{source ids}>{target id or "local"}` (data flowing) or
-    /// `profile-flow:act>{target id}` (acting outside home, no foreign data)
-    /// — distinct, so allowing one never allows the other; matched only by
-    /// trust rules created from such a bubble.
-    pub rule_key: String,
-}
-
-/// Hold a write that lands outside home, or after reading another company's
-/// data. `target` = the Composio profile written to; `None` = a non-Composio
-/// write (terminal, dispatch, …), which counts as home-side.
-#[cfg(test)]
-pub fn cross_company_hold(
-    target: Option<&ReachProfile>,
-    home: &ReachProfile,
-    read_from: &BTreeSet<String>,
-    reach: &[ReachProfile],
-    write: bool,
-) -> Option<Hold> {
-    cross_company_hold_in(target, Some(home), read_from, reach, write)
-}
-
-/// [`cross_company_hold`] for a chat that may have no home (its profile was
-/// removed): every company it read from counts as a source, so a write
-/// outside the connected accounts is still held.
-pub fn cross_company_hold_in(
-    target: Option<&ReachProfile>,
-    home: Option<&ReachProfile>,
-    read_from: &BTreeSet<String>,
-    reach: &[ReachProfile],
-    write: bool,
-) -> Option<Hold> {
-    if !write {
-        return None;
-    }
-    let dest_id = target.or(home).map_or("", |t| t.id.as_str());
-    let name_of = |id: &str| reach.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| id.to_string());
-    let sources: Vec<&String> = read_from.iter().filter(|id| id.as_str() != dest_id).collect();
-    let to_key = target.map_or("local".to_string(), |t| t.id.clone());
-    if !sources.is_empty() {
-        let from: Vec<String> = sources.iter().map(|id| name_of(id)).collect();
-        let what = match target {
-            Some(t) => format!("This writes to {}", t.name),
-            None => "This acts outside your connected accounts".to_string(),
-        };
-        let ids: Vec<&str> = sources.iter().map(|s| s.as_str()).collect();
-        return Some(Hold {
-            reason: format!(
-                "{what} in a conversation that has read {} data — check it doesn't carry one profile's content into another's.",
-                from.join(" and ")
-            ),
-            rule_key: format!("{FLOW_KEY_PREFIX}{}>{to_key}", ids.join("+")),
-        });
-    }
-    match (target, home) {
-        (Some(t), Some(home)) if t.id != home.id => Some(Hold {
-            reason: format!("This acts in {}, outside {} (this chat's home profile).", t.name, home.name),
-            rule_key: format!("{FLOW_KEY_PREFIX}act>{}", t.id),
-        }),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::components::shared::ToolCall;
+    use crate::mcp::manager::profile_flow::{flow_hold, FlowClass, FlowHold, FlowPolicy};
+
+    /// The flow guard for a call carrying content into `target` on a
+    /// person's turn, with nothing allowed.
+    fn carry_hold(
+        settings: &Settings,
+        target: Option<&ReachProfile>,
+        home: &ReachProfile,
+        read_from: &BTreeSet<String>,
+    ) -> Option<FlowHold> {
+        let none = Vec::new();
+        flow_hold(FlowClass::Carry, target, Some(home), read_from, true, &FlowPolicy::new(settings, &none), &all_profiles(settings))
+    }
 
     fn tool(name: &str) -> rmcp::model::Tool {
         let schema = json!({"type": "object", "properties": {"q": {"type": "string"}}});
@@ -1168,83 +1070,24 @@ mod tests {
     }
 
     #[test]
-    fn writes_across_companies_hold_under_their_own_trust_key() {
+    fn content_across_companies_holds_by_pair() {
+        let settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
         let (cm, pg) = (p("cm", "Clearmirror"), p("pg", "Puget"));
-        let reach = vec![cm.clone(), pg.clone()];
         let none = BTreeSet::new();
         let read_cm: BTreeSet<String> = ["cm".to_string()].into();
         let read_pg: BTreeSet<String> = ["pg".to_string()].into();
-        // Reads never hold.
-        assert_eq!(cross_company_hold(Some(&pg), &cm, &read_cm, &reach, false), None);
-        // A write at home with only home data: as today.
-        assert_eq!(cross_company_hold(Some(&cm), &cm, &read_cm, &reach, true), None);
+        // Content at home with only home data: not held.
+        assert_eq!(carry_hold(&settings, Some(&cm), &cm, &read_cm), None);
         // Clearmirror content into Puget's tools.
-        let h = cross_company_hold(Some(&pg), &cm, &read_cm, &reach, true).unwrap();
-        assert!(h.reason.contains("writes to Puget") && h.reason.contains("read Clearmirror data"));
-        assert_eq!(h.rule_key, "profile-flow:cm>pg");
-        // Puget content into Clearmirror's tools.
-        let h = cross_company_hold(Some(&cm), &cm, &read_pg, &reach, true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:pg>cm");
-        // Puget content out through a non-Composio write (terminal, dispatch).
-        let h = cross_company_hold(None, &cm, &read_pg, &reach, true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:pg>local");
-        // Home data out through a non-Composio write: as today.
-        assert_eq!(cross_company_hold(None, &cm, &read_cm, &reach, true), None);
-        // Any write outside home holds.
-        let h = cross_company_hold(Some(&pg), &cm, &none, &reach, true).unwrap();
-        assert!(h.reason.contains("outside Clearmirror"));
-        // Distinct from "Clearmirror data into Puget", so allowing one never allows the other.
-        assert_eq!(h.rule_key, "profile-flow:act>pg");
-    }
-
-    #[test]
-    fn flow_keys_never_match_ordinary_rules() {
-        // An "always allow Puget GMAIL_SEND_EMAIL" rule from an ordinary tab.
-        let ordinary = crate::context::permissions::TrustRule {
-            id: "r1".into(),
-            server: "composio-native:Puget".into(),
-            tool: Some("GMAIL_SEND_EMAIL".into()),
-            command_prefix: None,
-            project_id: None,
-            created_at: chrono::Utc::now(),
-        };
-        let ctx = crate::context::trust::TrustCtx { project_id: None };
-        let rules = [ordinary];
-        assert!(crate::context::trust::evaluate(&rules, "profile-flow:cm>pg", "GMAIL_SEND_EMAIL", &json!({}), &ctx).is_none());
-    }
-
-    #[test]
-    fn writes_are_told_from_reads() {
-        assert!(is_write("GMAIL_SEND_EMAIL", &json!({})));
-        assert!(!is_write("GMAIL_FETCH_EMAILS", &json!({})));
-        assert!(is_write(EXECUTE_TOOL, &json!({"tool_name": "GOOGLEDOCS_CREATE_DOCUMENT", "arguments": {}})));
-        assert!(!is_write(EXECUTE_TOOL, &json!({"tool_name": "GOOGLEDOCS_GET_DOCUMENT", "arguments": {}})));
-        // Discovery / loading meta tools are not writes.
-        assert!(!is_write("COMPOSIO_DISCOVER_APPS", &json!({})));
-        assert!(!is_write("COMPOSIO_CLEAR_TOOLS", &json!({})));
-        // Other COMPOSIO_* tools are judged by their verbs.
-        assert!(is_write("COMPOSIO_MULTI_EXECUTE_TOOL", &json!({})));
-    }
-
-    #[test]
-    fn hobbes_own_space_is_not_another_company() {
-        assert!(!local_write("hobbes-core", "HOBBES_SET_TIMER", &json!({})));
-        assert!(!local_write("hobbes-planner", "HOBBES_TODO_CREATE", &json!({})));
-        // Data leaving the session for another tab or the shell.
-        assert!(local_write("hobbes-planner", "HOBBES_DISPATCH", &json!({})));
-        assert!(local_write("hobbes-core", "HOBBES_MESSAGE_WORKER", &json!({})));
-        assert!(local_write("hobbes-terminal", "RUN_COMMAND", &json!({"command": "curl -X POST x"})));
-    }
-
-    #[test]
-    fn flow_labels_say_what_is_allowed() {
-        let settings = settings_with(&[("cm", "Clearmirror", true), ("pg", "Puget", true)]);
-        assert_eq!(
-            flow_label(&settings, "profile-flow:cm>pg", "GMAIL_SEND_EMAIL").unwrap(),
-            "Always allow GMAIL_SEND_EMAIL to carry Clearmirror data into Puget"
-        );
-        assert!(flow_label(&settings, "profile-flow:act>pg", "X").unwrap().contains("in Puget (with no other profile's data"));
-        assert_eq!(flow_label(&settings, "composio-native:Puget", "X"), None);
+        let h = carry_hold(&settings, Some(&pg), &cm, &read_cm).unwrap();
+        assert!(h.reason.contains("into Puget") && h.reason.contains("read Clearmirror data"), "{}", h.reason);
+        assert_eq!(h.rule_key, "profile-flow:v2:cm>pg");
+        // Puget content into Clearmirror's tools: its own pair.
+        assert_eq!(carry_hold(&settings, Some(&cm), &cm, &read_pg).unwrap().rule_key, "profile-flow:v2:pg>cm");
+        // Outside Composio (terminal, dispatch): never held by this guard.
+        assert_eq!(carry_hold(&settings, None, &cm, &read_pg), None);
+        // Acting in Puget on the person's turn with nothing read: not held.
+        assert_eq!(carry_hold(&settings, Some(&pg), &cm, &none), None);
     }
 
     #[test]
@@ -1412,20 +1255,23 @@ mod tests {
         assert_eq!(reach, vec![cm.clone(), pg.clone()]);
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(flow_checked(&reach, &read_from));
-        let named = all_profiles(&settings);
-        // A write at home, or a local write, with only home data: not held.
-        assert_eq!(cross_company_hold_in(Some(&cm), Some(&cm), &read_from, &named, true), None);
-        assert_eq!(cross_company_hold_in(None, Some(&cm), &read_from, &named, true), None);
-        // A write routed to Puget: held under its flow key.
+        // Content at home, or outside Composio, with only home data: not held.
+        assert_eq!(carry_hold(&settings, Some(&cm), &cm, &read_from), None);
+        assert_eq!(carry_hold(&settings, None, &cm, &read_from), None);
+        // Content routed to Puget: held under its pair.
         let mut c = call(json!({"hobbes_profile": "Puget"}));
         assert_eq!(route_tool_call(&reach, &mut c), Route::To(pg.clone()));
-        let h = cross_company_hold_in(Some(&pg), Some(&cm), &read_from, &named, true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:cm>pg");
+        let h = carry_hold(&settings, Some(&pg), &cm, &read_from).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:v2:cm>pg");
         assert!(!h.reason.to_lowercase().contains("compan"), "{}", h.reason);
-        // With nothing read yet, acting in Puget is still held (act key).
+        // With nothing read yet, acting in Puget on the person's turn is
+        // not held; on an unattended turn it is (approved once).
         let fresh = BTreeSet::new();
-        let h = cross_company_hold_in(Some(&pg), Some(&cm), &fresh, &named, true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:act>pg");
+        assert_eq!(carry_hold(&settings, Some(&pg), &cm, &fresh), None);
+        let none = Vec::new();
+        let h = flow_hold(FlowClass::Act, Some(&pg), Some(&cm), &fresh, false, &FlowPolicy::new(&settings, &none), &all_profiles(&settings))
+            .unwrap();
+        assert_eq!(h.rule_key, "profile-flow:v2:>pg");
     }
 
     fn read_via_reach(profile: &ReachProfile, at: chrono::DateTime<chrono::Utc>) -> Message {
@@ -1474,8 +1320,8 @@ mod tests {
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(read_from.contains("pg"));
         assert!(flow_checked(&reach, &read_from));
-        let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+        let h = carry_hold(&settings, Some(&cm), &cm, &read_from).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:v2:pg>cm");
         assert!(h.reason.contains("read Puget data"), "named although Puget left the reach");
     }
 
@@ -1511,8 +1357,8 @@ mod tests {
         let mut held = call(json!({"to": "a@b.c"}));
         assert_eq!(route_tool_call(&reach_of(&settings, &session), &mut held), Route::To(cm.clone()));
         let read_from: BTreeSet<String> = ["cm".to_string(), "pg".to_string()].into();
-        let hold = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
-        assert_eq!(hold.rule_key, "profile-flow:pg>cm");
+        let hold = carry_hold(&settings, Some(&cm), &cm, &read_from).unwrap();
+        assert_eq!(hold.rule_key, "profile-flow:v2:pg>cm");
         held.hold_rule_key = Some(hold.rule_key);
         // Approved while still home: runs in Clearmirror.
         assert_eq!(resume_profile_in(&settings, &session.id, Some("cm"), false, &held), Ok(Some("cm".into())));
@@ -1542,8 +1388,8 @@ mod tests {
         session.messages.push(read_via_reach(&pg, then));
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(read_from.contains("pg"), "a read 2.5 h old still counts in an ordinary tab");
-        let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+        let h = carry_hold(&settings, Some(&cm), &cm, &read_from).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:v2:pg>cm");
 
         // Summarised, then the messages are gone: the summary still counts.
         let (value, _) = crate::session::adopt_summary(&mut session, Default::default(), &[]);
@@ -1591,8 +1437,8 @@ mod tests {
         assert_eq!(reach, vec![cm.clone()]);
         let read_from = session_read_profiles(&settings, &session, now);
         assert!(flow_checked(&reach, &read_from));
-        let h = cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:pg>cm");
+        let h = carry_hold(&settings, Some(&cm), &cm, &read_from).unwrap();
+        assert_eq!(h.rule_key, "profile-flow:v2:pg>cm");
 
         // A tab locked to one profile that only used it: never checked.
         let mut single = tab("p2-single", "cm", true);
@@ -1651,8 +1497,8 @@ mod tests {
         assert!(read_from.contains("pg"));
         assert!(flow_checked(&reach_of(&settings, &fresh), &read_from));
         assert_eq!(
-            cross_company_hold(Some(&cm), &cm, &read_from, &all_profiles(&settings), true).unwrap().rule_key,
-            "profile-flow:ac+pg>cm"
+            carry_hold(&settings, Some(&cm), &cm, &read_from).unwrap().rule_key,
+            "profile-flow:v2:ac+pg>cm"
         );
         // Journaled with the seeded summary, so a replay keeps it.
         let payload = crate::session::summary_payload(&fresh.active_context.conversation_summary, &fresh.summary_sources);
@@ -1691,34 +1537,6 @@ mod tests {
         session.carried_reads =
             vec![crate::session::CarriedRead { profile_id: "pg".into(), read_at: now - chrono::Duration::hours(3) }];
         assert!(session_read_profiles(&settings, &session, now).contains("pg"));
-    }
-
-    #[test]
-    fn a_flow_allowed_in_a_project_is_allowed_only_there() {
-        let rule = crate::context::permissions::TrustRule {
-            id: "r-flow".into(),
-            server: "profile-flow:pg>cm".into(),
-            tool: Some("GMAIL_SEND_EMAIL".into()),
-            command_prefix: None,
-            project_id: Some("proj-cm".into()),
-            created_at: chrono::Utc::now(),
-        };
-        let rules = [rule];
-        let eval = |key: &str, project: Option<&str>| {
-            crate::context::trust::evaluate(
-                &rules,
-                key,
-                "GMAIL_SEND_EMAIL",
-                &json!({}),
-                &crate::context::trust::TrustCtx { project_id: project },
-            )
-            .is_some()
-        };
-        assert!(eval("profile-flow:pg>cm", Some("proj-cm")));
-        assert!(!eval("profile-flow:pg>cm", Some("proj-other")));
-        assert!(!eval("profile-flow:pg>cm", None));
-        // The other direction is its own decision.
-        assert!(!eval("profile-flow:cm>pg", Some("proj-cm")));
     }
 
     /// The tab states the resolver must cover, with the rule every site
@@ -1842,17 +1660,18 @@ mod tests {
     }
 
     /// A tab whose profile was removed still holds data it read: the guard
-    /// stays on for writes outside the connected accounts.
+    /// still looks at its calls, but its Composio calls are refused and
+    /// calls outside Composio are left to the normal permission flow.
     #[test]
-    fn a_tab_without_a_profile_keeps_the_flow_guard() {
+    fn a_tab_without_a_profile_keeps_the_flow_check() {
         let read_pg: BTreeSet<String> = ["pg".to_string()].into();
         assert!(flow_checked(&[], &read_pg));
         assert!(!flow_checked(&[], &BTreeSet::new()));
-        let named = vec![p("pg", "Puget")];
-        let hold = cross_company_hold_in(None, None, &read_pg, &named, true).expect("held");
-        assert_eq!(hold.rule_key, "profile-flow:pg>local");
-        assert!(hold.reason.contains("read Puget data"));
-        assert!(cross_company_hold_in(None, None, &read_pg, &named, false).is_none());
+        let settings = settings_with(&[("pg", "Puget", true)]);
+        let none = Vec::new();
+        let policy = FlowPolicy::new(&settings, &none);
+        assert!(flow_hold(FlowClass::Carry, None, None, &read_pg, true, &policy, &all_profiles(&settings)).is_none());
+        assert!(flow_hold(FlowClass::Carry, None, None, &read_pg, false, &policy, &all_profiles(&settings)).is_none());
     }
 
     /// A turn keeps the profile it started in while the global profile

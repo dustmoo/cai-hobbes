@@ -2241,6 +2241,7 @@ mod tests {
                 color: color.to_string(),
                 chrome_profile_directory: None,
                 retained_curation: Default::default(),
+                personal: false,
             });
         settings
     }

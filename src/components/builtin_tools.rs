@@ -267,8 +267,11 @@ pub fn stamp_turn_origin(tool_call: &mut ToolCall, origin: crate::session::TurnO
     // Like the origin, a tab read's sources are the harness's to stamp
     // (`hobbes_tabs::stamp_read_sources`), never carried in from a mint.
     tool_call.read_sources.clear();
-    // So is a risk hold's reason (`risk_hold_reason`).
+    // So is a risk hold's reason (`risk_hold_reason`), and a flow hold's
+    // reason and pairs (`profile_flow::flow_hold`, stamped after this).
     tool_call.risk_reason = None;
+    tool_call.hold_reason = None;
+    tool_call.hold_rule_key = None;
 }
 
 /// **The Heartbeat scope gate**, run by BOTH tool-call sites right after

@@ -162,6 +162,10 @@ pub enum SessionEvent {
     /// An ordinary tab was locked to its home profile, or opened again
     /// (`Session::profile_locked`, the chip's "Keep this tab to … only").
     ProfileLockSet { locked: bool },
+    /// The profile pairs allowed in this chat changed (a flow hold's "Allow
+    /// in this chat"): the whole list, so the last event wins
+    /// (`Session::allowed_flows`).
+    FlowsAllowed { flows: Vec<crate::context::permissions::ProfileFlow> },
 }
 
 impl SessionEvent {
@@ -200,6 +204,7 @@ impl SessionEvent {
             SessionEvent::ReadsCarried { .. } => "ReadsCarried",
             SessionEvent::ProfileReachSet { .. } => "ProfileReachSet",
             SessionEvent::ProfileLockSet { .. } => "ProfileLockSet",
+            SessionEvent::FlowsAllowed { .. } => "FlowsAllowed",
         }
     }
 }
@@ -266,6 +271,7 @@ pub(crate) fn blank_session() -> Session {
         carried_reads: Vec::new(),
         profile_reach: Vec::new(),
         profile_locked: false,
+        allowed_flows: Vec::new(),
         summary_sources: Vec::new(),
         turn_origin: crate::session::TurnOrigin::User,
     }
@@ -341,6 +347,7 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         E::ReadsCarried { reads } => session.carried_reads = reads.clone(),
         E::ProfileReachSet { profiles } => session.profile_reach = profiles.clone(),
         E::ProfileLockSet { locked } => session.profile_locked = *locked,
+        E::FlowsAllowed { flows } => session.allowed_flows = flows.clone(),
         E::ScratchpadSet { content } => session.scratchpad = content.clone(),
         E::HandoffWritten { note } => session.handoff = Some(note.clone()),
         E::SkillLoaded { name, payload } => {
@@ -822,11 +829,16 @@ mod tests {
             SessionEvent::ProfileLockSet { locked: true },
             SessionEvent::ProfileLockSet { locked: false },
             SessionEvent::ProfileLockSet { locked: true },
+            // A pair allowed in this chat.
+            SessionEvent::FlowsAllowed {
+                flows: vec![crate::context::permissions::ProfileFlow { from: "pg".into(), to: "cm".into() }],
+            },
         ]);
 
         let s = project(None, &events);
         assert_eq!(s.profile_reach, ["profile-3"], "old reach journals still replay");
         assert!(s.profile_locked, "a replay rebuild keeps the tab's lock");
+        assert_eq!(s.allowed_flows.len(), 1, "a replay rebuild keeps the chat's allowed pairs");
         assert_eq!(s.id, "s1");
         assert_eq!(s.name, "Renamed");
         assert_eq!(s.composio_profile.as_deref(), Some("profile-1"));

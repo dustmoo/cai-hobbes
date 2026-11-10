@@ -1,5 +1,5 @@
 use super::super::SettingsCtx;
-use super::super::trust_rules::TrustRulesSection;
+use super::super::trust_rules::{ProfileFlowsSection, TrustRulesSection};
 use super::super::shared::INPUT;
 use crate::context::permissions::{SkillPolicy, ToolCategory};
 use dioxus::prelude::*;
@@ -120,6 +120,8 @@ pub(in super::super) fn PermissionsTab(
 
             // Trust rules: user-authored allow-rules from permission prompts.
             TrustRulesSection {}
+            // Profile pairs content may always move along (flow holds).
+            ProfileFlowsSection {}
 
             // Skill Permissions Section
             div {

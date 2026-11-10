@@ -135,7 +135,8 @@ pub fn refusal_message(reason: &str) -> String {
 // Risk holds (for the voice controller)
 // ---------------------------------------------------------------------------
 
-/// A call the risk gate is holding for the person.
+/// A call the risk gate (or the flow guard, `profile_flow`) is holding for
+/// the person.
 #[allow(dead_code)] // read by the voice controller's spoken confirmation (next task)
 #[derive(Debug, Clone, PartialEq)]
 pub struct RiskHold {
@@ -144,24 +145,34 @@ pub struct RiskHold {
     pub message_id: uuid::Uuid,
     pub execution_id: String,
     pub tool: String,
-    /// Why it was held (`ToolCall::risk_reason`), a verb phrase.
+    /// Why it was held (`ToolCall::risk_reason`, else a flow hold's
+    /// `ToolCall::hold_reason` without its leading "This "), a verb phrase.
     pub reason: String,
     /// The harness stamp of the turn that minted it.
     pub origin: Option<crate::session::TurnOrigin>,
 }
 
-/// The latest unresolved risk-held request in a session's messages: a
-/// `PermissionRequest` whose call carries a harness-stamped `risk_reason`.
+/// The latest unresolved risk- or flow-held request in a session's
+/// messages: a `PermissionRequest` whose call carries a harness-stamped
+/// `risk_reason`, or a flow hold's `hold_reason` (`profile_flow`, "This
+/// sends content into …", given here as a verb phrase like a risk reason;
+/// with both, the risk reason). Confirming either aloud approves it once.
 /// A resolved request is a `ToolCall` again, so it never matches.
 #[allow(dead_code)] // the voice controller's spoken confirmation calls it (next task)
 pub fn pending_risk_hold(messages: &[crate::components::chat::Message]) -> Option<RiskHold> {
     messages.iter().rev().find_map(|m| match &m.content {
         crate::components::shared::MessageContent::PermissionRequest(tc) => {
-            tc.risk_reason.as_ref().map(|reason| RiskHold {
+            let flow_reason = || {
+                tc.hold_reason.as_deref().map(|r| {
+                    let r = r.trim();
+                    r.strip_prefix("This ").unwrap_or(r).trim_end_matches('.').to_string()
+                })
+            };
+            tc.risk_reason.clone().or_else(flow_reason).map(|reason| RiskHold {
                 message_id: m.id,
                 execution_id: tc.execution_id.clone(),
                 tool: tc.tool_name.clone(),
-                reason: reason.clone(),
+                reason,
                 origin: tc.origin,
             })
         }
@@ -2661,5 +2672,23 @@ mod tests {
         assert_eq!(hold.tool, TERMINAL_EXEC);
         assert_eq!(hold.origin, Some(crate::session::TurnOrigin::Voice));
         assert!(pending_risk_hold(&msgs[1..]).is_none());
+
+        // A flow hold is confirmable the same way, its reason as a verb phrase.
+        let mut flow = held("e4", None);
+        flow.tool_name = "GMAIL_SEND_EMAIL".into();
+        flow.hold_reason = Some("This sends content into Clearmirror.ai from a chat that has read Puget data.".into());
+        flow.hold_rule_key = Some("profile-flow:v2:pg>cm".into());
+        let flow_msg = msg(MessageContent::PermissionRequest(flow.clone()));
+        let hold = pending_risk_hold(&[flow_msg.clone()]).unwrap();
+        assert_eq!(hold.message_id, flow_msg.id);
+        assert_eq!(hold.reason, "sends content into Clearmirror.ai from a chat that has read Puget data");
+        assert_eq!(
+            crate::voice::controller::risk_result(&hold.reason),
+            "This sends content into Clearmirror.ai from a chat that has read Puget data."
+        );
+        // Risk-held too: the risk reason wins.
+        flow.risk_reason = Some("deletes d".into());
+        let both = msg(MessageContent::PermissionRequest(flow));
+        assert_eq!(pending_risk_hold(&[both]).unwrap().reason, "deletes d");
     }
 }
