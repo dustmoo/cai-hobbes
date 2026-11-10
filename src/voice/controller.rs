@@ -29,6 +29,13 @@
 //! result goes back as the tool response (`WHEN_IDLE`), or as injected
 //! context when the model already abandoned the call.
 //!
+//! **Spoken confirmation.** A voice turn held on a destructive call
+//! (`call_risk`) is confirmed out loud when the model can't hear itself:
+//! the voice asks, and the person's own transcribed yes or no (never the
+//! model's words) approves or denies it through the bubble's own path
+//! (`floor::Confirm`, `spoken_decision`). Otherwise, or without a clear
+//! answer, the button in the Hobbes tab decides.
+//!
 //! Runs on the Dioxus runtime: signals are only peeked/written between
 //! awaits, never held across one.
 
@@ -44,7 +51,8 @@ use tokio::sync::mpsc;
 use crate::components::builtin_tools::BuiltinToolCtx;
 use crate::voice::audio::{self, AudioIo, MicPermission, VoiceEcho};
 use crate::voice::floor::{
-    self, BargeIn, Delivery, Floor, MicGate, MicRing, ModelTurn, NoiseGate, Pending, PlaybackTail, SpeechQueue,
+    self, BargeIn, ConfirmStep, Delivery, Floor, MicGate, MicRing, ModelTurn, NoiseGate, Pending, PlaybackTail,
+    SpeechQueue,
 };
 use crate::voice::probe;
 use crate::voice::brain::{self, BrainHandle, BrainOutcome};
@@ -185,7 +193,7 @@ async fn controller_loop(ctx: BuiltinToolCtx, mut rx: mpsc::UnboundedReceiver<Vo
 }
 
 /// What to say for a finished Hobbes-tab turn: the reply after its trigger
-/// (the message that started the turn, see [`starts_turn`]), whether that
+/// (the message that started the turn, see [`brain::ends_turn`]), whether that
 /// trigger was a voice request, and whether the turn is held on an approval.
 #[derive(Debug, PartialEq)]
 pub struct TurnNews {
@@ -202,17 +210,10 @@ pub struct TurnNews {
     pub trigger_text: String,
 }
 
-/// Whether `m` started a turn of its own: a user-authored message that is
-/// not an auto-recovery prompt, or an incoming relay that woke a turn. The
-/// same rule as the brain wait's turn boundary (`brain::ends_turn`), so a
-/// relay the brain sent mid-turn, a non-waking relay or a recovery prompt is
-/// never taken for the trigger.
-fn starts_turn(m: &crate::components::chat::Message) -> bool {
-    (m.author == "User" && !crate::voice::transcript::is_recovery_prompt(m)) || crate::todo::relay::starts_turn(m)
-}
-
 pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNews> {
-    let trigger = messages.iter().rposition(starts_turn)?;
+    // The message that started the turn: the same boundary as the brain
+    // wait's (`brain::ends_turn`).
+    let trigger = messages.iter().rposition(brain::ends_turn)?;
     let trigger_text = messages[trigger].content.get_text_content();
     let voice_request = trigger_text.as_deref().is_some_and(|t| brain::is_voice_request(t.trim()));
     let heartbeat_wake = trigger_text
@@ -297,18 +298,32 @@ pub fn pending_announcement(
     if !crate::system_sessions::is_current(session_id) {
         return None;
     }
-    let speak_heartbeat = {
+    let (speak_heartbeat, announce_results) = {
         let s = settings.peek();
-        if !crate::voice::voice_active(&s) || !s.voice.announce_results {
+        if !crate::voice::voice_active(&s) {
             return None;
         }
-        s.voice.speak_heartbeat
+        (s.voice.speak_heartbeat, s.voice.announce_results)
     };
-    let (news, viewing, origin) = {
+    let (news, viewing, origin, risk) = {
         let state = session_state.peek();
         let session = state.sessions.get(session_id)?;
         let news = turn_news(&session.messages)?;
-        (news, state.active_session_id == session_id && app_focused(), session.turn_origin)
+        // The person said yes to this turn's held call in the live
+        // conversation: its result is theirs to hear, whatever the
+        // announcement setting (no brain wait delivers it any more).
+        let confirmed = is_live() && confirmed_in_turn(session_id, &session.messages, news.trigger_id);
+        if !announce_results && !confirmed {
+            return None;
+        }
+        // A voice turn held on a destructive call: say what it would do.
+        let risk = news
+            .needs_approval
+            .then(|| crate::call_risk::pending_risk_hold(&session.messages))
+            .flatten()
+            .filter(|h| h.origin == Some(crate::session::TurnOrigin::Voice))
+            .map(|h| h.reason);
+        (news, state.active_session_id == session_id && app_focused(), session.turn_origin, risk)
     };
     let owned = news.voice_request && brain::wait_owns(session_id, &news.trigger_text, Some(news.trigger_id));
     if !should_announce(&news, is_live(), owned, viewing) {
@@ -319,15 +334,58 @@ pub fn pending_announcement(
         (true, AnnounceKind::Heartbeat) => {
             "The Heartbeat needs your approval in the Hobbes tab before it can continue.".to_string()
         }
-        (true, AnnounceKind::Result) => {
-            "The brain needs your approval in the Hobbes tab before it can continue.".to_string()
-        }
+        (true, AnnounceKind::Result) => match &risk {
+            Some(reason) => held_news(&risk_result(reason)),
+            None => "The brain needs your approval in the Hobbes tab before it can continue.".to_string(),
+        },
         (false, _) => match &news.details_tab {
             Some(tab) => point_at_tab(&news.reply, tab),
             None => news.reply,
         },
     };
     Some((text, kind))
+}
+
+/// The held call the person last confirmed by voice (session, message), so
+/// its turn's result is spoken when it lands (see [`pending_announcement`]).
+static CONFIRMED_HOLD: Mutex<Option<(String, uuid::Uuid)>> = Mutex::new(None);
+
+fn set_confirmed_hold(hold: Option<(String, uuid::Uuid)>) {
+    *CONFIRMED_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = hold;
+}
+
+/// Whether the call the person confirmed by voice is in the turn started by
+/// `trigger_id` in `session_id`.
+fn confirmed_in_turn(session_id: &str, messages: &[crate::components::chat::Message], trigger_id: uuid::Uuid) -> bool {
+    let Some((sid, held)) = CONFIRMED_HOLD.lock().unwrap_or_else(|e| e.into_inner()).clone() else { return false };
+    sid == session_id
+        && messages
+            .iter()
+            .position(|m| m.id == trigger_id)
+            .is_some_and(|t| messages[t + 1..].iter().any(|m| m.id == held))
+}
+
+/// Whether the voice will speak the Hobbes session's latest turn's news: a
+/// live brain wait owns the turn (it delivers the result itself), or the
+/// turn-end announcement will say it ([`pending_announcement`]). The Fleet
+/// toast's suppression asks this.
+pub fn voice_will_speak(
+    session_state: Signal<crate::session::SessionState>,
+    settings: Signal<crate::settings::Settings>,
+    session_id: &str,
+) -> bool {
+    if !crate::system_sessions::is_current(session_id) {
+        return false;
+    }
+    let owned = {
+        let state = session_state.peek();
+        state
+            .sessions
+            .get(session_id)
+            .and_then(|s| turn_news(&s.messages))
+            .is_some_and(|n| n.voice_request && brain::live_wait_owns(session_id, &n.trigger_text, Some(n.trigger_id)))
+    };
+    owned || pending_announcement(session_state, settings, session_id).is_some()
 }
 
 /// A reply about a chat worker's report: when it says written details are
@@ -497,8 +555,9 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          something done unless its status is done. Mention the Hobbes tab only when the \
          result says written details are there. When a result is a question for them, ask it \
          and wait; pass their answer back to the brain in their own words, as nearly as you \
-         heard them, and if they didn't answer, send nothing. Never read out code, URLs or \
-         long ids. Work still pending when the conversation ends is announced later. When \
+         heard them, and if they didn't answer, send nothing. When a result needs confirmation, \
+         ask them and wait; Hobbes hears their yes or no itself, so don't relay it. Never read \
+         out code, URLs or long ids. Work still pending when the conversation ends is announced later. When \
          they say goodbye, call {end}.\n\n\
          You only see the end of the Hobbes tab below. The brain has the whole history, its \
          summary and their other tabs, so if they ask what you remember or about anything \
@@ -698,6 +757,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // When the voice last produced speech (any turn): Gemini often says its
     // holding phrase in one turn and calls the brain in the next.
     let mut last_spoke: Option<Instant> = None;
+    // A spoken confirmation of a held destructive call (see `floor::Confirm`),
+    // and the session whose approved call is running again (keeps the
+    // conversation from idling out before its result is announced).
+    let mut confirm: Option<floor::Confirm> = None;
+    let mut resumed: Option<(String, Instant)> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     // Once per app run: on speakers without echo cancellation Hobbes only
     // hears them over its own voice when they speak up.
@@ -711,6 +775,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     *VOICE_UI.write() = ui.clone();
 
     let close_reason = loop {
+        // Utterances finished during this iteration are the ones after this.
+        let lines_before = pending_lines.len();
         tokio::select! {
             frame = mic_rx.recv() => {
                 let Some(frame) = frame else { break "audio stopped".to_string() };
@@ -802,6 +868,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                             // The rest of a turn the person talked over.
                             stats.muted_model_ms += audio_ms;
                         } else {
+                            if let Some(c) = confirm.as_mut() {
+                                c.model_output();
+                            }
                             last_spoke = Some(Instant::now());
                             stats.model_audio_ms += audio_ms;
                             heard.finish_into(false, &mut pending_lines);
@@ -833,12 +902,18 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         // Not while muting a talked-over turn: those words
                         // were never played (its line already ends in "—").
                         if !model_turn.muting() {
+                            if let Some(c) = confirm.as_mut() {
+                                c.model_output();
+                            }
                             last_spoke = Some(Instant::now());
                             stats.spoke_fragments += 1;
                             spoke.push(&t);
                         }
                     }
                     RealtimeEvent::Interrupted => {
+                        if let Some(c) = confirm.as_mut() {
+                            c.model_turn_ended();
+                        }
                         floor_state.model_turn_ended(Instant::now());
                         model_turn.ended();
                         model_turn_seq += 1;
@@ -849,6 +924,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         last_activity = Instant::now();
                     }
                     RealtimeEvent::TurnComplete => {
+                        if let Some(c) = confirm.as_mut() {
+                            c.model_turn_ended();
+                        }
                         floor_state.model_turn_ended(Instant::now());
                         model_turn.ended();
                         model_turn_seq += 1;
@@ -868,6 +946,12 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                 let norm = normalize_request(&request);
                                 if request.trim().is_empty() {
                                     respond(&rt.control, &id, &name, json!({"error": "request is empty"}), None);
+                                } else if confirm.is_some() {
+                                    // Their answer to the confirmation is Hobbes'
+                                    // to hear, not a new request: absorb it.
+                                    stats.duplicate_asks += 1;
+                                    tracing::info!("voice: brain request absorbed while a confirmation is open");
+                                    respond(&rt.control, &id, &name, waiting_for_confirmation_response(), Some(Scheduling::Silent));
                                 } else if is_duplicate_ask(in_flight_asks.values(), &norm, last_speech, model_turn_seq) {
                                     // The realtime model repeating itself while it
                                     // waits: absorb it silently, queue nothing.
@@ -909,6 +993,13 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                 }
                             }
                             tools::CANCEL_BRAIN => {
+                                // A held call waiting for their yes or no is denied.
+                                if let Some(c) = confirm.take() {
+                                    if ui.echo_safe && hold_still_pending(ctx.session_state, &c) {
+                                        crate::request_permission_decision(&c.session_id, c.message_id, false);
+                                        tracing::info!("voice: confirmation denied (cancelled)");
+                                    }
+                                }
                                 for h in brain_cancel.values() {
                                     h.cancel.store(true, Ordering::SeqCst);
                                 }
@@ -953,13 +1044,29 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     in_flight_asks.remove(&id);
                     ui.brain_busy = brain_cancel.len();
                     last_activity = Instant::now();
-                    let (status, text) = BrainStatus::of(outcome);
-                    let text = queued_brain_text(status, &text);
+                    let (mut status, mut text) = BrainStatus::of(outcome);
+                    if status == BrainStatus::NeedsApproval {
+                        // Held as destructive on this voice turn: spoken
+                        // confirmation, or the button (see `held_status`).
+                        let sid = crate::system_sessions::current_for(&voice_session);
+                        let hold = {
+                            let state = ctx.session_state.peek();
+                            state.sessions.get(&sid).and_then(|s| crate::call_risk::pending_risk_hold(&s.messages))
+                        };
+                        if let Some(h) = hold.filter(|h| h.origin == Some(crate::session::TurnOrigin::Voice)) {
+                            status = held_status(ui.echo_safe, confirm.is_some());
+                            text = risk_result(&h.reason);
+                            if status == BrainStatus::NeedsConfirmation {
+                                tracing::info!("voice: confirmation armed");
+                                confirm = Some(floor::Confirm::new(sid, h.message_id, h.reason, Instant::now()));
+                            }
+                        }
+                    }
                     // Either way it makes the voice speak: wait for the floor.
                     let item = if abandoned.remove(&id) {
-                        Pending::Abandoned { text }
+                        Pending::Abandoned { status, text }
                     } else {
-                        Pending::BrainResult { id, text }
+                        Pending::BrainResult { id, status, text }
                     };
                     queue.push(item, Instant::now());
                 }
@@ -1056,7 +1163,15 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         break "goodbye".to_string();
                     }
                 }
-                let busy = !brain_cancel.is_empty() || !queue.is_empty() || audio_io.is_playing() || held;
+                let resumed_running = resumed.as_ref().is_some_and(|(sid, until)| {
+                    Instant::now() < *until && (crate::session_turn_in_flight(sid) || crate::session_streaming(sid))
+                });
+                let busy = !brain_cancel.is_empty()
+                    || !queue.is_empty()
+                    || audio_io.is_playing()
+                    || held
+                    || confirm.is_some()
+                    || resumed_running;
                 if !busy && last_activity.elapsed() > idle {
                     break "idle".to_string();
                 }
@@ -1064,6 +1179,12 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 // threshold: show it as push-to-talk right away.
                 if mode.is_none() && pressed_at.elapsed() >= Duration::from_millis(threshold_ms) && held {
                     ui.mode = Some(Mode::PushToTalk);
+                }
+                // The held call was decided in the tab (or the session moved
+                // on): stop listening for an answer, quietly.
+                if confirm.as_ref().is_some_and(|c| !hold_still_pending(ctx.session_state, c)) {
+                    tracing::info!("voice: confirmation closed (decided elsewhere)");
+                    confirm = None;
                 }
                 // Transcript lines wait while the brain's turn is running.
                 if brain_cancel.is_empty() {
@@ -1081,9 +1202,34 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
             // A call the model gave up on after its result was queued: the
             // result goes as context, not to the dead call.
             let d = match d {
-                Delivery::BrainResult { id, text, .. } if abandoned.remove(&id) => Delivery::Abandoned { text },
+                Delivery::BrainResult { id, status, text, .. } if abandoned.remove(&id) => Delivery::Abandoned { status, text },
                 d => d,
             };
+            // A question nobody is listening for any more (the call was
+            // decided in the tab meanwhile): plain approval wording.
+            let d = match d {
+                Delivery::BrainResult { id, status: BrainStatus::NeedsConfirmation, text, forced } if confirm.is_none() => {
+                    Delivery::BrainResult { id, status: BrainStatus::NeedsApproval, text, forced }
+                }
+                Delivery::Abandoned { status: BrainStatus::NeedsConfirmation, text } if confirm.is_none() => {
+                    Delivery::Abandoned { status: BrainStatus::NeedsApproval, text }
+                }
+                d => d,
+            };
+            // The confirmation question (or its re-ask) going out: the answer
+            // window follows once the voice has finished saying it.
+            let asks = match &d {
+                Delivery::BrainResult { status, .. } | Delivery::Abandoned { status, .. } => {
+                    *status == BrainStatus::NeedsConfirmation
+                }
+                Delivery::Note { ask, .. } => *ask,
+                Delivery::Announce { .. } => false,
+            };
+            if asks {
+                if let Some(c) = confirm.as_mut() {
+                    c.asked(now);
+                }
+            }
             match d {
                 Delivery::Announce { text, kind, merged } => {
                     tracing::info!("voice: queued news out ({kind:?}, {merged} merged, {} still queued)", queue.len());
@@ -1091,15 +1237,18 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     let _ = rt.control.send(RealtimeControl::InjectContext { text, respond: true });
                     floor_state.model_active(now);
                 }
-                Delivery::Abandoned { text } => {
-                    let (status, text) = parse_queued_brain_text(&text);
+                Delivery::Abandoned { status, text } => {
                     let _ = rt.control.send(RealtimeControl::InjectContext {
-                        text: brain_result_context(status, text),
+                        text: brain_result_context(status, &text),
                         respond: true,
                     });
                     floor_state.model_active(now);
                 }
-                Delivery::BrainResult { id, text, forced } => {
+                Delivery::Note { text, .. } => {
+                    let _ = rt.control.send(RealtimeControl::InjectContext { text, respond: true });
+                    floor_state.model_active(now);
+                }
+                Delivery::BrainResult { id, status, text, forced } => {
                     if forced {
                         tracing::info!(
                             "voice: brain result held {}s for the floor ({}); sending anyway",
@@ -1109,9 +1258,30 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     } else {
                         floor_state.model_active(now);
                     }
-                    let (status, text) = parse_queued_brain_text(&text);
-                    respond(&rt.control, &id, tools::ASK_BRAIN, brain_result_response(status, text), Some(Scheduling::WhenIdle));
+                    respond(&rt.control, &id, tools::ASK_BRAIN, brain_result_response(status, &text), Some(Scheduling::WhenIdle));
                 }
+            }
+        }
+        // A spoken confirmation: open its window once the question has been
+        // said, judge what the person said in it (their own transcript, never
+        // the model's), and time out.
+        if confirm.is_some() {
+            let now = Instant::now();
+            let audible = playback.observe(audio_io.is_playing(), now);
+            let step = confirm.as_mut().map_or(ConfirmStep::Wait, |c| {
+                let mut step = c.poll(audible, now);
+                if step == ConfirmStep::Wait {
+                    for line in pending_lines.iter().skip(lines_before).filter(|l| l.heard) {
+                        step = c.on_heard(&line.text, instant_at(line.at, now), now);
+                        if step != ConfirmStep::Wait {
+                            break;
+                        }
+                    }
+                }
+                step
+            });
+            if let Some(sid) = confirm_step(step, &mut confirm, &mut queue, ctx.session_state, ui.echo_safe, now) {
+                resumed = Some((sid, now + RESUME_WATCH));
             }
         }
         // The mic is open only while the key is held, or for the whole of a
@@ -1135,6 +1305,11 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         }
     };
 
+    // A confirmation still open: the button in the Hobbes tab decides.
+    if confirm.take().is_some() {
+        tracing::info!("voice: confirmation fell back to the button (conversation ended)");
+    }
+    set_confirmed_hold(None);
     // Wind down: stop the brain waits (their turns keep running in the tab).
     for h in brain_cancel.values() {
         h.detach.store(true, Ordering::SeqCst);
@@ -1149,7 +1324,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         // Not after an announcement that never found the floor (it would
         // only start the same one again), nor when the app is closing, nor
         // after Stop (they asked for quiet; the text is in the Hobbes tab).
-        let unspoken = unspoken_announcements(queue.drain_as_announcements());
+        let unspoken = queue.drain_as_announcements();
         if matches!(close_reason.as_str(), "announced" | "app closing" | "stopped") {
             tracing::info!("voice: {} queued item(s) not spoken before the end", unspoken.len());
         } else {
@@ -1240,6 +1415,83 @@ fn respond(control: &mpsc::UnboundedSender<RealtimeControl>, id: &str, name: &st
     });
 }
 
+/// How long after a spoken yes the conversation stays open for the
+/// approved call's turn to finish (its result is announced at the turn end).
+const RESUME_WATCH: Duration = Duration::from_secs(10 * 60);
+
+/// The `Instant` of a wall-clock stamp (an utterance's start), for comparing
+/// with the confirmation window.
+fn instant_at(at: chrono::DateTime<chrono::Utc>, now: Instant) -> Instant {
+    let ago = (chrono::Utc::now() - at).to_std().unwrap_or_default();
+    now.checked_sub(ago).unwrap_or(now)
+}
+
+/// The call a confirmation is about is still held, in the current Hobbes
+/// session (not decided with the button, not rotated away).
+fn hold_still_pending(session_state: Signal<crate::session::SessionState>, c: &floor::Confirm) -> bool {
+    if !crate::system_sessions::is_current(&c.session_id) {
+        return false;
+    }
+    let state = session_state.peek();
+    state
+        .sessions
+        .get(&c.session_id)
+        .and_then(|s| crate::call_risk::pending_risk_hold(&s.messages))
+        .is_some_and(|h| h.message_id == c.message_id)
+}
+
+/// Act on a confirmation step: approve or deny the held call through the
+/// bubble's own path, ask again, or leave it to the button; and tell the
+/// voice (through the floor queue). Re-checks first that the call is still
+/// held and the conversation echo-safe; if not, closes quietly. Returns the
+/// session of an approved call (its turn is running again). Logs the step,
+/// never what was said or the reason.
+fn confirm_step(
+    step: ConfirmStep,
+    confirm: &mut Option<floor::Confirm>,
+    queue: &mut SpeechQueue,
+    session_state: Signal<crate::session::SessionState>,
+    echo_safe: bool,
+    now: Instant,
+) -> Option<String> {
+    if step == ConfirmStep::Wait {
+        return None;
+    }
+    let c = confirm.take()?;
+    if !echo_safe || !hold_still_pending(session_state, &c) {
+        tracing::info!("voice: confirmation closed (decided elsewhere)");
+        return None;
+    }
+    let note = |text: String, ask: bool| Pending::Note { text, ask };
+    match step {
+        ConfirmStep::Wait => None,
+        ConfirmStep::Approve => {
+            tracing::info!("voice: confirmation confirmed");
+            set_confirmed_hold(Some((c.session_id.clone(), c.message_id)));
+            crate::request_permission_decision(&c.session_id, c.message_id, true);
+            queue.push(note(CONFIRMED_NOTE.into(), false), now);
+            Some(c.session_id)
+        }
+        ConfirmStep::Deny => {
+            tracing::info!("voice: confirmation denied");
+            crate::request_permission_decision(&c.session_id, c.message_id, false);
+            queue.push(note(DENIED_NOTE.into(), false), now);
+            None
+        }
+        ConfirmStep::AskAgain => {
+            tracing::info!("voice: confirmation unclear; asking again");
+            queue.push(note(ask_again_note(&c.reason), true), now);
+            *confirm = Some(c);
+            None
+        }
+        ConfirmStep::FallBack => {
+            tracing::info!("voice: confirmation fell back to the button (attempts {})", c.attempts);
+            queue.push(note(FALLBACK_NOTE.into(), false), now);
+            None
+        }
+    }
+}
+
 /// The interim answer to `VOICE_ASK_BRAIN`, sent the moment the brain
 /// starts: it prompts the voice to say it's thinking (instead of going
 /// quiet), and keeps the call open for the real result (`willContinue`).
@@ -1283,13 +1535,18 @@ pub fn brain_started_response() -> Value {
 pub enum BrainStatus {
     Done,
     NeedsApproval,
+    /// A call the voice request made was held as destructive (`call_risk`)
+    /// and Hobbes will listen for the person's spoken yes or no.
+    NeedsConfirmation,
+    /// Held as destructive, but spoken confirmation isn't available (open
+    /// speakers without echo cancellation): approve in the Hobbes tab.
+    /// Reported to the voice as `needs_approval`.
+    RiskApproval,
     Failed,
     Cancelled,
 }
 
 impl BrainStatus {
-    const ALL: [BrainStatus; 4] = [Self::Done, Self::NeedsApproval, Self::Failed, Self::Cancelled];
-
     /// The status and the text to relay for a finished wait.
     pub fn of(outcome: BrainOutcome) -> (Self, String) {
         match outcome {
@@ -1303,7 +1560,8 @@ impl BrainStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Done => "done",
-            Self::NeedsApproval => "needs_approval",
+            Self::NeedsApproval | Self::RiskApproval => "needs_approval",
+            Self::NeedsConfirmation => "needs_confirmation",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
         }
@@ -1322,9 +1580,55 @@ impl BrainStatus {
                 "NOT done. It is waiting for the person to approve in the Hobbes tab. Tell them \
                  that; do not say it is done."
             }
+            Self::NeedsConfirmation => {
+                "NOT done, and nothing has been changed yet. Tell the person plainly what this \
+                 will do and ask for a clear yes or no. Then stop and wait for their answer. Do \
+                 not pass their answer to the brain and do not call any tool about it: Hobbes \
+                 listens for the answer itself."
+            }
+            Self::RiskApproval => {
+                "NOT done. Tell them what it will do and that they need to approve it in the \
+                 Hobbes tab; spoken confirmation is only available with headphones or with echo \
+                 cancellation turned on."
+            }
             Self::Failed => "It did not work. Say so plainly; don't retry unless they ask.",
             Self::Cancelled => "Cancelled. Nothing more to say unless they ask.",
         }
+    }
+
+    /// The result as news announced after the conversation (it ended before
+    /// the result could be said): nothing for a cancelled request; a held
+    /// call says where to approve it.
+    pub fn announcement(self, text: &str) -> Option<String> {
+        match self {
+            Self::Cancelled => None,
+            Self::NeedsConfirmation | Self::RiskApproval => Some(held_news(text)),
+            _ => Some(text.to_string()),
+        }
+    }
+}
+
+/// "The brain needs your approval…: this {reason}." from a held call's
+/// result ("This {reason}.").
+fn held_news(result: &str) -> String {
+    let r = result.trim();
+    let r = r.strip_prefix("This ").unwrap_or(r);
+    format!("The brain needs your approval in the Hobbes tab before it can continue: this {r}")
+}
+
+/// The result told for a call held as destructive: "This {reason}."
+pub fn risk_result(reason: &str) -> String {
+    format!("This {}.", reason.trim().trim_end_matches('.'))
+}
+
+/// What a voice turn held on a destructive call gets: spoken confirmation
+/// when the model can't hear itself and no other confirmation is running;
+/// the button otherwise.
+pub fn held_status(echo_safe: bool, confirming_other: bool) -> BrainStatus {
+    match (echo_safe, confirming_other) {
+        (false, _) => BrainStatus::RiskApproval,
+        (true, false) => BrainStatus::NeedsConfirmation,
+        (true, true) => BrainStatus::NeedsApproval,
     }
 }
 
@@ -1343,39 +1647,29 @@ pub fn brain_result_context(status: BrainStatus, text: &str) -> String {
     )
 }
 
-/// Marks a brain result's status inside the floor queue's plain text (the
-/// queue carries text only); never spoken or sent as is.
-const STATUS_TAG: char = '\u{1}';
+// What the voice is told at each step of a spoken confirmation (injected
+// context, through the floor queue).
+pub const CONFIRMED_NOTE: &str =
+    "[They confirmed. It is going ahead now; say so in a few words. The result will follow.]";
+pub const DENIED_NOTE: &str = "[They said no. It was not done; say so briefly.]";
+pub const FALLBACK_NOTE: &str = "[Not confirmed. Tell them to approve or deny it in the Hobbes tab.]";
 
-/// A brain result as queued for the floor: its status tagged in front.
-pub fn queued_brain_text(status: BrainStatus, text: &str) -> String {
-    format!("{STATUS_TAG}{}{STATUS_TAG}{text}", status.as_str())
+/// Asking once more after an unclear answer.
+pub fn ask_again_note(reason: &str) -> String {
+    format!(
+        "[You didn't get a clear yes or no. Ask again, briefly: say what it will do and ask yes or \
+         no. ({}) Then stop and wait; Hobbes listens for the answer itself.]",
+        risk_result(reason)
+    )
 }
 
-/// The status and text of a queued brain result (untagged text reads as done).
-pub fn parse_queued_brain_text(text: &str) -> (BrainStatus, &str) {
-    let parsed = text.strip_prefix(STATUS_TAG).and_then(|rest| {
-        let (tag, body) = rest.split_once(STATUS_TAG)?;
-        let status = BrainStatus::ALL.into_iter().find(|s| s.as_str() == tag)?;
-        Some((status, body))
-    });
-    parsed.unwrap_or((BrainStatus::Done, text))
-}
-
-/// Queued items left at the end of a conversation, to announce afterwards:
-/// brain results lose their status tag, and a cancelled one is dropped
-/// (there is nothing to say about it).
-fn unspoken_announcements(items: Vec<(String, AnnounceKind)>) -> Vec<(String, AnnounceKind)> {
-    items
-        .into_iter()
-        .filter_map(|(text, kind)| {
-            if !text.starts_with(STATUS_TAG) {
-                return Some((text, kind));
-            }
-            let (status, body) = parse_queued_brain_text(&text);
-            (status != BrainStatus::Cancelled).then(|| (body.to_string(), kind))
-        })
-        .collect()
+/// The answer to `VOICE_ASK_BRAIN` while Hobbes listens for a yes or no:
+/// sent silently, and nothing is queued.
+pub fn waiting_for_confirmation_response() -> Value {
+    json!({
+        "status": "waiting_for_confirmation",
+        "note": "Hobbes is listening for their yes or no itself. Don't send their answer to the brain.",
+    })
 }
 
 /// The answer to a repeated `VOICE_ASK_BRAIN` (see [`is_duplicate_ask`]):
@@ -1903,31 +2197,85 @@ mod tests {
             // The injected-context path says the same.
             let c = brain_result_context(s, &text);
             assert!(c.contains(&format!("Status: {status}.")) && c.contains(s.note()) && c.ends_with(result));
-            // Through the floor queue's text and back.
-            let q = queued_brain_text(s, &text);
-            assert_eq!(parse_queued_brain_text(&q), (s, result));
         }
         assert!(BrainStatus::NeedsApproval.note().contains("do not say it is done"));
-        // Untagged text reads as done.
-        assert_eq!(parse_queued_brain_text("plain"), (BrainStatus::Done, "plain"));
     }
 
     #[test]
-    fn unspoken_results_are_announced_without_their_tag() {
-        let items = vec![
-            ("News.".to_string(), AnnounceKind::Heartbeat),
-            (queued_brain_text(BrainStatus::Done, "CI is green."), AnnounceKind::Result),
-            (queued_brain_text(BrainStatus::Cancelled, "The request was cancelled."), AnnounceKind::Result),
-            (queued_brain_text(BrainStatus::NeedsApproval, "Waiting for approval."), AnnounceKind::Result),
-        ];
-        assert_eq!(
-            unspoken_announcements(items),
-            vec![
-                ("News.".to_string(), AnnounceKind::Heartbeat),
-                ("CI is green.".to_string(), AnnounceKind::Result),
-                ("Waiting for approval.".to_string(), AnnounceKind::Result),
-            ]
-        );
+    fn unspoken_results_are_announced_by_status() {
+        assert_eq!(BrainStatus::Done.announcement("CI is green."), Some("CI is green.".into()));
+        assert_eq!(BrainStatus::Cancelled.announcement("The request was cancelled."), None);
+        assert_eq!(BrainStatus::NeedsApproval.announcement("Waiting."), Some("Waiting.".into()));
+        let held = "The brain needs your approval in the Hobbes tab before it can continue: this erases disk 10.";
+        assert_eq!(BrainStatus::RiskApproval.announcement(&risk_result("erases disk 10")).as_deref(), Some(held));
+        assert_eq!(BrainStatus::NeedsConfirmation.announcement(&risk_result("erases disk 10.")).as_deref(), Some(held));
+    }
+
+    /// A destructive call held on a voice turn: spoken confirmation only
+    /// when the model can't hear itself; the button otherwise.
+    #[test]
+    fn held_calls_are_confirmed_by_voice_only_when_echo_safe() {
+        assert_eq!(held_status(true, false), BrainStatus::NeedsConfirmation);
+        assert_eq!(held_status(false, false), BrainStatus::RiskApproval);
+        assert_eq!(held_status(false, true), BrainStatus::RiskApproval);
+        // One confirmation at a time: another held call uses the button.
+        assert_eq!(held_status(true, true), BrainStatus::NeedsApproval);
+        assert_eq!(risk_result("erases the whole disk /dev/disk10"), "This erases the whole disk /dev/disk10.");
+
+        let r = brain_result_response(BrainStatus::NeedsConfirmation, &risk_result("erases disk 10"));
+        assert_eq!(r["status"], "needs_confirmation");
+        assert_eq!(r["result"], "This erases disk 10.");
+        let note = r["note"].as_str().unwrap();
+        assert!(note.starts_with("NOT done, and nothing has been changed yet."));
+        assert!(note.contains("ask for a clear yes or no") && note.contains("Do not pass their answer to the brain"));
+        assert!(note.contains("Hobbes listens for the answer itself"));
+
+        let r = brain_result_response(BrainStatus::RiskApproval, &risk_result("erases disk 10"));
+        assert_eq!(r["status"], "needs_approval");
+        let note = r["note"].as_str().unwrap();
+        assert!(note.starts_with("NOT done.") && note.contains("approve it in the Hobbes tab"));
+        assert!(note.contains("only available with headphones or with echo cancellation turned on"));
+        // The plain approval note is unchanged.
+        assert_eq!(BrainStatus::NeedsApproval.as_str(), "needs_approval");
+        assert!(!BrainStatus::NeedsApproval.note().contains("headphones"));
+    }
+
+    #[test]
+    fn the_voice_is_told_each_confirmation_step() {
+        assert!(CONFIRMED_NOTE.contains("They confirmed. It is going ahead now") && CONFIRMED_NOTE.contains("The result will follow."));
+        assert!(DENIED_NOTE.contains("They said no. It was not done"));
+        assert!(FALLBACK_NOTE.contains("Not confirmed. Tell them to approve or deny it in the Hobbes tab."));
+        let again = ask_again_note("erases disk 10");
+        assert!(again.contains("You didn't get a clear yes or no. Ask again, briefly") && again.contains("This erases disk 10."));
+        let w = waiting_for_confirmation_response();
+        assert_eq!(w["status"], "waiting_for_confirmation");
+        assert!(w["note"].as_str().unwrap().contains("Don't send their answer to the brain."));
+        let s = system_instruction(chrono::Local::now(), "");
+        assert!(s.contains("When a result needs confirmation, ask them and wait; Hobbes hears their yes or no itself, so don't relay it."));
+    }
+
+    #[test]
+    fn a_confirmed_call_is_found_in_its_turn_only() {
+        let request = msg("User", &brain::framed_request("erase disk 10"));
+        let held = msg("Hobbes", "");
+        let msgs = vec![msg("User", "earlier"), request.clone(), held.clone(), msg("Hobbes", "Erased.")];
+        set_confirmed_hold(Some(("hobbes-confirm-test".into(), held.id)));
+        assert!(confirmed_in_turn("hobbes-confirm-test", &msgs, request.id));
+        assert!(!confirmed_in_turn("other", &msgs, request.id));
+        // A turn after it doesn't hold the call.
+        assert!(!confirmed_in_turn("hobbes-confirm-test", &msgs, msgs[3].id));
+        set_confirmed_hold(None);
+        assert!(!confirmed_in_turn("hobbes-confirm-test", &msgs, request.id));
+    }
+
+    #[test]
+    fn utterance_stamps_map_to_instants() {
+        let now = Instant::now();
+        let at = chrono::Utc::now() - chrono::Duration::seconds(2);
+        let i = instant_at(at, now);
+        assert!(now.duration_since(i) >= Duration::from_millis(1900) && now.duration_since(i) < Duration::from_secs(3));
+        // A stamp in the future reads as now.
+        assert_eq!(instant_at(chrono::Utc::now() + chrono::Duration::seconds(5), now), now);
     }
 
     #[test]

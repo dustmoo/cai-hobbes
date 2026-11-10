@@ -1579,7 +1579,7 @@ const DB_CLIENTS: &[&str] = &[
 ///
 /// | command | destructive when |
 /// |---|---|
-/// | `rm` | `-r`/`-R`/`-f` on anything not scratch or rebuildable; any target that is `/`, `~`, `$HOME`, `.`, `..`, a top-level or home/volume root, or `*` in one; via `xargs`. No target → Malformed; an empty target → Malformed |
+/// | `rm` | `-r`/`-R` on anything not scratch or rebuildable; a glob or a variable target outside scratch/rebuildable; any target that is `/`, `~`, `$HOME`, `.`, `..`, a top-level or home/volume root, `*` in one, or directly inside one (`~/Documents`, `/foo`); a system path; under `sudo` outside home; via `xargs`. Without `-r`, an explicit file path (`rm -f notes.txt`, `rm src/old.rs`) is Safe, `-f` or not. No target, an empty or unset target, or a placeholder in a forced/recursive rm → Malformed |
 /// | `find` | `-delete`, or `-exec`/`-execdir`/`-ok` with `rm`/`shred`/`srm`/`unlink`, unless every root is scratch/rebuildable or every `-name` is a rebuildable name or `*.pyc`/`*.pyo`/`*.o`/`.DS_Store`/`*.tmp` |
 /// | `shred`, `srm` | always (no target → Malformed) unless scratch |
 /// | `dd` | `of=` anything but `/dev/null` or scratch (a disk node named as such) |
@@ -2011,6 +2011,12 @@ fn shell_risk(_name: &str, args: &[&Word], cmd: &Cmd, upstream: &[&Cmd], env: &m
     Risk::Safe
 }
 
+/// The `rm` rule. Safe: every target is scratch or rebuildable, or (without
+/// `-r`/`-R`, with or without `-f`) an explicit file path — no glob, no
+/// variable, not whole-disk/home/top-level, not directly under `/`, `~` or a
+/// home/volume root, not a system path, and under `sudo` only inside home.
+/// Everything else is Destructive; an unset/empty target (or a placeholder
+/// in a forced or recursive rm), or no target, is Malformed.
 fn rm_risk(args: &[&Word], inv: &Invocation<'_>, env: &Env) -> Risk {
     let (flags, targets) = split_flags(args);
     let recursive = has_flag(&flags, "rR", &["recursive"]);
@@ -2023,7 +2029,15 @@ fn rm_risk(args: &[&Word], inv: &Invocation<'_>, env: &Env) -> Risk {
     }
     let mut first_bad: Option<String> = None;
     let mut bad = 0usize;
+    let mut globbed = false;
     for w in &targets {
+        let shown = w.display();
+        if recursive || force {
+            if let Some(ph) = placeholder_in(&shown) {
+                return malformed(placeholder_reason(&ph));
+            }
+        }
+        let has_var = w.text.contains(VS) || w.text.contains(DYN);
         match expand(&w.text, env) {
             Val::Unset(v) => return malformed(unset_reason(&v)),
             Val::Known(p) if p.is_empty() => return malformed("the rm target is an empty path"),
@@ -2035,23 +2049,40 @@ fn rm_risk(args: &[&Word], inv: &Invocation<'_>, env: &Env) -> Risk {
                 if let Some(desc) = wholesale(&p).or_else(|| wholesale(&j)) {
                     return destructive(format!("deletes everything in {desc}"));
                 }
-                if recursive || force {
+                let glob = p.contains(['*', '?', '[']);
+                let root_level = (j.starts_with('/') || j.starts_with('~'))
+                    && j.rsplit_once('/').is_some_and(|(parent, _)| {
+                        wholesale(if parent.is_empty() { "/" } else { parent }).is_some()
+                    });
+                if recursive || glob || has_var || root_level || is_system_path(&j) {
+                    globbed |= glob && !recursive;
                     bad += 1;
-                    first_bad.get_or_insert_with(|| w.display());
+                    first_bad.get_or_insert(shown);
                 }
             }
             Val::Unknown => {
-                if recursive || force {
-                    bad += 1;
-                    first_bad.get_or_insert_with(|| "paths computed when the command runs".into());
-                }
+                bad += 1;
+                first_bad.get_or_insert_with(|| "paths computed when the command runs".into());
             }
         }
     }
     let Some(first) = first_bad else {
+        if inv.sudo {
+            let owned: Vec<&Word> = targets.to_vec();
+            if !all_paths_in_home(&owned, env) {
+                let t = targets.first().map(|w| w.display()).unwrap_or_default();
+                return destructive(format!("deletes {} as administrator", clip(&t, 60)));
+            }
+        }
         return Risk::Safe;
     };
-    let verb = if recursive { "recursively deletes" } else { "force-deletes" };
+    let verb = if recursive {
+        "recursively deletes"
+    } else if globbed {
+        "deletes the files matching"
+    } else {
+        "deletes"
+    };
     let more = if bad > 1 { format!(" and {} other paths", bad - 1) } else { String::new() };
     destructive(format!("{verb} {}{more}", clip(&first, 60)))
 }
@@ -2296,7 +2327,27 @@ mod tests {
             ("rm *", D),
             ("rm -rf ~/Documents", D),
             ("rm -rf src", D),
-            ("rm -f notes.txt", D),
+            ("rm -f notes.txt", S),
+            ("rm -f file.txt", S),
+            ("rm src/old.rs", S),
+            ("rm -f src/a.rs src/b.rs", S),
+            ("cd ~/Projects/app && rm -f old.txt", S),
+            ("rm -f *.rs", D),
+            ("rm *.log", D),
+            ("rm -f src/?.bak", D),
+            ("rm -f \"$X\"", M),
+            ("rm -f ~/Documents", D),
+            ("rm ~/notes.txt", D),
+            ("rm -f /foo", D),
+            ("sudo rm -f /etc/hosts", D),
+            ("rm -f /etc/hosts", D),
+            ("sudo rm -f /usr/local/bin/tool", D),
+            ("sudo rm -f ~/Projects/app/lock.pid", S),
+            ("sudo rm -f notes.txt", D),
+            ("F=/tmp/x.txt; rm -f $F", S),
+            ("F=notes.txt; rm -f \"$F\"", D),
+            ("rm -f $(cat list.txt)", D),
+            ("rm -r docs", D),
             ("sudo rm -rf /Applications/Foo.app", D),
             ("rm -rf node_modules", S),
             ("rm -rf ./target/debug", S),

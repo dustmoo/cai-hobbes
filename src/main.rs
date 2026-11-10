@@ -201,7 +201,6 @@ static PENDING_PERMISSION_DECISIONS: GlobalSignal<Vec<(String, uuid::Uuid, bool)
 /// person's transcribed words against `call_risk::pending_risk_hold`),
 /// never on model output. Safe from any scope or task; takes effect on the
 /// next reactive tick.
-#[allow(dead_code)] // the voice controller's spoken confirmation calls it (next task)
 pub(crate) fn request_permission_decision(session_id: &str, message_id: uuid::Uuid, approve: bool) {
     PENDING_PERMISSION_DECISIONS.write().push((session_id.to_string(), message_id, approve));
 }
@@ -1038,10 +1037,11 @@ fn app() -> Element {
                             .unwrap_or(false);
                         // The Hobbes tab's news is spoken by the voice itself
                         // when — and only when — it will actually be spoken
-                        // (the same decision the announcement makes); an
-                        // approval it can't grant still toasts.
+                        // (by the live brain wait that owns the turn, or by
+                        // the announcement); an approval it can't grant
+                        // still toasts.
                         let voice_speaks = s.pending_gate.is_none()
-                            && voice::controller::pending_announcement(session_state, settings, id).is_some();
+                            && voice::controller::voice_will_speak(session_state, settings, id);
                         if s.asks_person() && !was && !voice_speaks {
                             flash_timer_toast(format!("🛰 {} needs your attention", s.name));
                         }

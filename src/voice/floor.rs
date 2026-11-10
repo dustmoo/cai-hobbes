@@ -18,7 +18,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::voice::controller::AnnounceKind;
+use crate::voice::controller::{AnnounceKind, BrainStatus};
 
 /// The person keeps the floor this long after their last speech: a short
 /// thinking pause mid-sentence isn't an opening.
@@ -261,9 +261,13 @@ pub enum Pending {
     /// News for the person ("Excuse me…").
     Announce { text: String, kind: AnnounceKind },
     /// A brain result whose call the model already abandoned.
-    Abandoned { text: String },
+    Abandoned { status: BrainStatus, text: String },
     /// A brain result for a call still open (its final tool response).
-    BrainResult { id: String, text: String },
+    BrainResult { id: String, status: BrainStatus, text: String },
+    /// An instruction for the voice (injected context), not news: the
+    /// spoken-confirmation steps. `ask`: it asks the person for their yes or
+    /// no (the confirmation window follows it).
+    Note { text: String, ask: bool },
 }
 
 /// What to send now.
@@ -272,10 +276,11 @@ pub enum Delivery {
     /// News; `merged` > 1 when several Heartbeat notes were folded into
     /// the newest one.
     Announce { text: String, kind: AnnounceKind, merged: usize },
-    Abandoned { text: String },
+    Abandoned { status: BrainStatus, text: String },
     /// The final tool response; `forced` = it waited [`BRAIN_RESULT_CAP`]
     /// and goes out without a free floor.
-    BrainResult { id: String, text: String, forced: bool },
+    BrainResult { id: String, status: BrainStatus, text: String, forced: bool },
+    Note { text: String, ask: bool },
 }
 
 /// Unsolicited speech, delivered one item at a time when the floor is free.
@@ -319,8 +324,8 @@ impl SpeechQueue {
             let overdue = self.items.iter().position(|(p, at)| {
                 matches!(p, Pending::BrainResult { .. }) && now.saturating_duration_since(*at) >= BRAIN_RESULT_CAP
             })?;
-            let (Pending::BrainResult { id, text }, _) = self.items.remove(overdue)? else { return None };
-            return Some(Delivery::BrainResult { id, text, forced: true });
+            let (Pending::BrainResult { id, status, text }, _) = self.items.remove(overdue)? else { return None };
+            return Some(Delivery::BrainResult { id, status, text, forced: true });
         }
         let (front, _) = self.items.pop_front()?;
         Some(match front {
@@ -338,8 +343,9 @@ impl SpeechQueue {
                 Delivery::Announce { text: newest, kind: AnnounceKind::Heartbeat, merged }
             }
             Pending::Announce { text, kind } => Delivery::Announce { text, kind, merged: 1 },
-            Pending::Abandoned { text } => Delivery::Abandoned { text },
-            Pending::BrainResult { id, text } => Delivery::BrainResult { id, text, forced: false },
+            Pending::Abandoned { status, text } => Delivery::Abandoned { status, text },
+            Pending::BrainResult { id, status, text } => Delivery::BrainResult { id, status, text, forced: false },
+            Pending::Note { text, ask } => Delivery::Note { text, ask },
         })
     }
 
@@ -349,25 +355,30 @@ impl SpeechQueue {
     pub fn abandon_brain_results(&mut self, abandoned: impl Fn(&str) -> bool) -> usize {
         let mut n = 0;
         for (p, _) in self.items.iter_mut() {
-            if let Pending::BrainResult { id, text } = p {
+            if let Pending::BrainResult { id, status, text } = p {
                 if !abandoned(id) {
                     continue;
                 }
-                *p = Pending::Abandoned { text: std::mem::take(text) };
+                *p = Pending::Abandoned { status: *status, text: std::mem::take(text) };
                 n += 1;
             }
         }
         n
     }
 
-    /// Everything still waiting, as announcements (the conversation is
-    /// ending: they're said afterwards instead). Oldest first.
+    /// Everything still waiting that is worth saying, as announcements (the
+    /// conversation is ending: they're said afterwards instead). Oldest
+    /// first. A cancelled brain result and the voice's own instructions
+    /// ([`Pending::Note`]) are dropped; a result held on approval says so.
     pub fn drain_as_announcements(&mut self) -> Vec<(String, AnnounceKind)> {
         self.items
             .drain(..)
-            .map(|(p, _)| match p {
-                Pending::Announce { text, kind } => (text, kind),
-                Pending::Abandoned { text } | Pending::BrainResult { text, .. } => (text, AnnounceKind::Result),
+            .filter_map(|(p, _)| match p {
+                Pending::Announce { text, kind } => Some((text, kind)),
+                Pending::Abandoned { status, text } | Pending::BrainResult { status, text, .. } => {
+                    status.announcement(&text).map(|t| (t, AnnounceKind::Result))
+                }
+                Pending::Note { .. } => None,
             })
             .collect()
     }
@@ -482,6 +493,256 @@ impl MicRing {
     }
 }
 
+// ── Spoken confirmation ──────────────────────────────────────────────────────
+//
+// A Destructive call a voice turn made is held on a permission bubble
+// (`call_risk`). When the model can't hear itself (headphones, or echo
+// cancellation on), Hobbes asks the person out loud and listens for their
+// yes or no in their own input transcript: never in anything the realtime
+// model says or sends. The window for the answer opens only once the model
+// has finished asking (its turn after the question ended and playback,
+// with its hangover, is over); speech that began before then never counts.
+
+/// What the person's answer to "should I go ahead?" was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Yes,
+    No,
+    Unclear,
+}
+
+/// Longer answers are never taken as a yes or a no: they carry conditions.
+pub const DECISION_MAX_WORDS: usize = 12;
+
+/// Words that are a yes on their own.
+const AFFIRM_WORDS: &[&str] = &[
+    "yes", "yeah", "yep", "yup", "yea", "confirm", "confirmed", "confirming", "proceed", "approve", "approved",
+    "affirmative",
+];
+/// Phrases that are a yes ("sure, go ahead" is covered by "go ahead").
+const AFFIRM_PHRASES: &[&[&str]] = &[
+    &["go", "ahead"],
+    &["do", "it"],
+    &["please", "do"],
+    &["go", "for", "it"],
+    &["that's", "right"],
+    &["that's", "correct"],
+    &["that", "is", "right"],
+    &["that", "is", "correct"],
+];
+/// Directly before an affirmative, these turn it into a no ("don't do it",
+/// "do not proceed", "not approved").
+const NEGATES_NEXT: &[&str] = &["don't", "not", "never", "doesn't", "didn't", "can't", "won't", "shouldn't"];
+/// A no, a stop, or a negation.
+const NEGATION_WORDS: &[&str] = &[
+    "no", "nope", "nah", "not", "don't", "never", "stop", "cancel", "wait", "abort", "negative", "deny", "denied",
+    "can't", "won't", "shouldn't", "doesn't", "didn't", "halt", "nevermind",
+];
+const NEGATION_PHRASES: &[&[&str]] = &[&["hold", "on"], &["hang", "on"], &["never", "mind"], &["hold", "off"]];
+/// Conditions, hesitation and questions: they keep a yes from counting.
+const HEDGE_WORDS: &[&str] = &[
+    "but", "first", "before", "after", "instead", "maybe", "actually", "unless", "except", "perhaps", "probably", "if",
+    "though", "although", "later", "only", "backup", "what", "what's", "which", "why", "how", "who", "where",
+];
+const HEDGE_PHRASES: &[&[&str]] = &[&["back", "up"]];
+/// Uncertainty, not a refusal: always unclear.
+const UNSURE_PHRASES: &[&[&str]] = &[&["not", "sure"], &["don't", "know"], &["no", "idea"]];
+
+/// Lowercased words, apostrophes kept (curly ones straightened), with the
+/// common apostrophe-less spellings mapped back.
+fn decision_tokens(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .chars()
+        .map(|c| match c {
+            '\u{2019}' | '\u{2018}' => '\'',
+            c if c.is_alphanumeric() || c == '\'' => c,
+            _ => ' ',
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .map(|t| t.trim_matches('\''))
+        .filter(|t| !t.is_empty())
+        .map(|t| match t {
+            "dont" => "don't",
+            "thats" => "that's",
+            "cant" => "can't",
+            "wont" => "won't",
+            "doesnt" => "doesn't",
+            "didnt" => "didn't",
+            "shouldnt" => "shouldn't",
+            "whats" => "what's",
+            t => t,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// Start indices of `phrase` in `toks`.
+fn phrase_starts(toks: &[String], phrase: &[&str]) -> Vec<usize> {
+    if phrase.is_empty() || toks.len() < phrase.len() {
+        return Vec::new();
+    }
+    (0..=toks.len() - phrase.len())
+        .filter(|&i| phrase.iter().enumerate().all(|(k, w)| toks[i + k] == *w))
+        .collect()
+}
+
+fn has_any(toks: &[String], words: &[&str], phrases: &[&[&str]]) -> bool {
+    toks.iter().any(|t| words.contains(&t.as_str())) || phrases.iter().any(|p| !phrase_starts(toks, p).is_empty())
+}
+
+/// The person's spoken answer, judged from their own transcribed words.
+/// `Yes` only for a short answer with a clear affirmative and nothing that
+/// negates, conditions or questions it; a bare "ok", "sure", "right" or
+/// "mm-hm" is too easy to mishear. `No` for a negation or stop with no
+/// affirmative. Anything else (mixed, long, empty, noise) is `Unclear`.
+pub fn spoken_decision(text: &str) -> Decision {
+    let toks = decision_tokens(text);
+    if toks.is_empty() || toks.len() > DECISION_MAX_WORDS {
+        return Decision::Unclear;
+    }
+    if UNSURE_PHRASES.iter().any(|p| !phrase_starts(&toks, p).is_empty()) {
+        return Decision::Unclear;
+    }
+    let negated = |i: usize| i > 0 && NEGATES_NEXT.contains(&toks[i - 1].as_str());
+    let affirm = toks.iter().enumerate().any(|(i, t)| AFFIRM_WORDS.contains(&t.as_str()) && !negated(i))
+        || AFFIRM_PHRASES.iter().any(|p| phrase_starts(&toks, p).into_iter().any(|i| !negated(i)));
+    let negation = has_any(&toks, NEGATION_WORDS, NEGATION_PHRASES);
+    let hedge = has_any(&toks, HEDGE_WORDS, HEDGE_PHRASES);
+    match (affirm, negation) {
+        (true, false) if !hedge => Decision::Yes,
+        (false, true) => Decision::No,
+        _ => Decision::Unclear,
+    }
+}
+
+/// How long the person has to answer once the window opens.
+pub const CONFIRM_ANSWER_WINDOW: Duration = Duration::from_secs(45);
+/// The question went out but the model never finished asking it.
+pub const CONFIRM_QUESTION_CAP: Duration = Duration::from_secs(60);
+/// Armed (or re-asked), but the question never went out (it waits for the
+/// floor).
+pub const CONFIRM_DELIVERY_CAP: Duration = Duration::from_secs(90);
+
+/// What a confirmation does next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmStep {
+    /// Nothing yet (no answer, or speech outside the window).
+    Wait,
+    /// They said yes: approve the held call.
+    Approve,
+    /// They said no: deny it.
+    Deny,
+    /// Unclear the first time: ask once more.
+    AskAgain,
+    /// No clear answer: leave it to the button in the Hobbes tab.
+    FallBack,
+}
+
+/// A spoken confirmation in progress for one held call.
+#[derive(Clone, Debug)]
+pub struct Confirm {
+    pub session_id: String,
+    pub message_id: uuid::Uuid,
+    pub reason: String,
+    /// Armed (or re-asked): the question is waiting to go out.
+    since: Instant,
+    /// The question went out to the model.
+    pub asked_at: Option<Instant>,
+    /// Unclear answers so far.
+    pub attempts: u32,
+    /// The model produced output after the question went out…
+    model_spoke: bool,
+    /// …and that turn ended.
+    question_done: bool,
+    /// The answer window opened (the question finished playing).
+    window_from: Option<Instant>,
+}
+
+impl Confirm {
+    pub fn new(session_id: String, message_id: uuid::Uuid, reason: String, now: Instant) -> Self {
+        Self {
+            session_id,
+            message_id,
+            reason,
+            since: now,
+            asked_at: None,
+            attempts: 0,
+            model_spoke: false,
+            question_done: false,
+            window_from: None,
+        }
+    }
+
+    /// The question (or the re-ask) went out to the model.
+    pub fn asked(&mut self, now: Instant) {
+        self.asked_at = Some(now);
+        self.model_spoke = false;
+        self.question_done = false;
+        self.window_from = None;
+    }
+
+    /// Model audio or transcript arrived (not the muted rest of a cut turn).
+    pub fn model_output(&mut self) {
+        if self.asked_at.is_some() && !self.question_done {
+            self.model_spoke = true;
+        }
+    }
+
+    /// The model's turn ended (`TurnComplete` / `Interrupted`).
+    pub fn model_turn_ended(&mut self) {
+        if self.model_spoke {
+            self.question_done = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn window_open(&self) -> bool {
+        self.window_from.is_some()
+    }
+
+    /// Open the window once the question has been said and played out
+    /// (`audible`: playback with its hangover), and time out.
+    pub fn poll(&mut self, audible: bool, now: Instant) -> ConfirmStep {
+        if self.window_from.is_none() && self.question_done && !audible {
+            self.window_from = Some(now);
+        }
+        let late = |t: Instant, cap: Duration| now.saturating_duration_since(t) >= cap;
+        match (self.asked_at, self.window_from) {
+            (_, Some(w)) if late(w, CONFIRM_ANSWER_WINDOW) => ConfirmStep::FallBack,
+            (Some(a), None) if late(a, CONFIRM_QUESTION_CAP) => ConfirmStep::FallBack,
+            (None, _) if late(self.since, CONFIRM_DELIVERY_CAP) => ConfirmStep::FallBack,
+            _ => ConfirmStep::Wait,
+        }
+    }
+
+    /// A finished utterance of the person's (`text`, from their input
+    /// transcript) that began at `started_at`.
+    pub fn on_heard(&mut self, text: &str, started_at: Instant, now: Instant) -> ConfirmStep {
+        let Some(w) = self.window_from else { return ConfirmStep::Wait };
+        if started_at < w {
+            return ConfirmStep::Wait;
+        }
+        if now.saturating_duration_since(w) >= CONFIRM_ANSWER_WINDOW {
+            return ConfirmStep::FallBack;
+        }
+        match spoken_decision(text) {
+            Decision::Yes => ConfirmStep::Approve,
+            Decision::No => ConfirmStep::Deny,
+            Decision::Unclear if self.attempts == 0 => {
+                self.attempts += 1;
+                self.since = now;
+                self.asked_at = None;
+                self.model_spoke = false;
+                self.question_done = false;
+                self.window_from = None;
+                ConfirmStep::AskAgain
+            }
+            Decision::Unclear => ConfirmStep::FallBack,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,14 +817,14 @@ mod tests {
         let t0 = Instant::now();
         let mut q = SpeechQueue::default();
         q.push(Pending::Announce { text: "result".into(), kind: AnnounceKind::Result }, t0);
-        q.push(Pending::Abandoned { text: "late".into() }, t0);
+        q.push(Pending::Abandoned { status: BrainStatus::Done, text: "late".into() }, t0);
         assert_eq!(q.next(false, false, t0), None);
         assert_eq!(q.len(), 2);
         assert_eq!(
             q.next(true, false, t0),
             Some(Delivery::Announce { text: "result".into(), kind: AnnounceKind::Result, merged: 1 })
         );
-        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { text: "late".into() }));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { status: BrainStatus::Done, text: "late".into() }));
         assert!(q.is_empty());
         assert_eq!(q.next(true, false, t0), None);
     }
@@ -592,20 +853,20 @@ mod tests {
         let t0 = Instant::now();
         let mut q = SpeechQueue::default();
         q.push(Pending::Announce { text: "hb".into(), kind: AnnounceKind::Heartbeat }, t0);
-        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0 + ms(100));
+        q.push(Pending::BrainResult { id: "c1".into(), status: BrainStatus::Done, text: "done".into() }, t0 + ms(100));
         // Person still talking: held.
         assert_eq!(q.next(false, false, t0 + ms(5000)), None);
         // Past the cap: the brain result goes out anyway; the announcement waits.
         assert_eq!(
             q.next(false, false, t0 + ms(100) + BRAIN_RESULT_CAP),
-            Some(Delivery::BrainResult { id: "c1".into(), text: "done".into(), forced: true })
+            Some(Delivery::BrainResult { id: "c1".into(), status: BrainStatus::Done, text: "done".into(), forced: true })
         );
         assert_eq!(q.len(), 1);
         assert_eq!(q.next(false, false, t0 + ms(60_000)), None);
         // Free floor: in order, not forced.
-        q.push(Pending::BrainResult { id: "c2".into(), text: "two".into() }, t0);
+        q.push(Pending::BrainResult { id: "c2".into(), status: BrainStatus::Done, text: "two".into() }, t0);
         assert!(matches!(q.next(true, false, t0), Some(Delivery::Announce { .. })));
-        assert_eq!(q.next(true, false, t0), Some(Delivery::BrainResult { id: "c2".into(), text: "two".into(), forced: false }));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::BrainResult { id: "c2".into(), status: BrainStatus::Done, text: "two".into(), forced: false }));
     }
 
     #[test]
@@ -680,7 +941,7 @@ mod tests {
     fn a_held_key_is_never_talked_over_by_a_forced_result() {
         let t0 = Instant::now();
         let mut q = SpeechQueue::default();
-        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0);
+        q.push(Pending::BrainResult { id: "c1".into(), status: BrainStatus::Done, text: "done".into() }, t0);
         let late = t0 + BRAIN_RESULT_CAP + ms(1);
         assert_eq!(q.next(false, true, late), None);
         assert!(matches!(q.next(false, false, late), Some(Delivery::BrainResult { forced: true, .. })));
@@ -706,15 +967,15 @@ mod tests {
         let t0 = Instant::now();
         let mut q = SpeechQueue::default();
         q.push(Pending::Announce { text: "hb".into(), kind: AnnounceKind::Heartbeat }, t0);
-        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0);
-        q.push(Pending::BrainResult { id: "c2".into(), text: "two".into() }, t0);
+        q.push(Pending::BrainResult { id: "c1".into(), status: BrainStatus::Done, text: "done".into() }, t0);
+        q.push(Pending::BrainResult { id: "c2".into(), status: BrainStatus::Done, text: "two".into() }, t0);
         // A cancelled call: only its result moves.
         assert_eq!(q.abandon_brain_results(|id| id == "c2"), 1);
         // A reconnect: all of them.
         assert_eq!(q.abandon_brain_results(|_| true), 1);
         assert!(matches!(q.next(true, false, t0), Some(Delivery::Announce { .. })));
-        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { text: "done".into() }));
-        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { text: "two".into() }));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { status: BrainStatus::Done, text: "done".into() }));
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { status: BrainStatus::Done, text: "two".into() }));
     }
 
     #[test]
@@ -722,14 +983,23 @@ mod tests {
         let t0 = Instant::now();
         let mut q = SpeechQueue::default();
         q.push(Pending::Announce { text: "hb".into(), kind: AnnounceKind::Heartbeat }, t0);
-        q.push(Pending::BrainResult { id: "c1".into(), text: "done".into() }, t0);
-        q.push(Pending::Abandoned { text: "late".into() }, t0);
+        q.push(Pending::BrainResult { id: "c1".into(), status: BrainStatus::Done, text: "done".into() }, t0);
+        q.push(Pending::Abandoned { status: BrainStatus::Done, text: "late".into() }, t0);
+        // A cancelled result and the voice's own instructions aren't news.
+        q.push(Pending::BrainResult { id: "c2".into(), status: BrainStatus::Cancelled, text: "x".into() }, t0);
+        q.push(Pending::Note { text: "[They confirmed.]".into(), ask: false }, t0);
+        // A result held on approval says where to approve it.
+        q.push(Pending::BrainResult { id: "c3".into(), status: BrainStatus::NeedsConfirmation, text: "This erases disk 10.".into() }, t0);
         assert_eq!(
             q.drain_as_announcements(),
             vec![
                 ("hb".to_string(), AnnounceKind::Heartbeat),
                 ("done".to_string(), AnnounceKind::Result),
                 ("late".to_string(), AnnounceKind::Result),
+                (
+                    "The brain needs your approval in the Hobbes tab before it can continue: this erases disk 10.".to_string(),
+                    AnnounceKind::Result
+                ),
             ]
         );
         assert!(q.is_empty());
@@ -805,5 +1075,197 @@ mod tests {
         m.ended();
         m.cut();
         assert!(!m.muting());
+    }
+    #[test]
+    fn notes_wait_for_the_floor_and_keep_their_place() {
+        let t0 = Instant::now();
+        let mut q = SpeechQueue::default();
+        q.push(Pending::Note { text: "ask".into(), ask: true }, t0);
+        q.push(Pending::BrainResult { id: "c1".into(), status: BrainStatus::Done, text: "done".into() }, t0);
+        assert_eq!(q.next(false, false, t0 + ms(100)), None);
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Note { text: "ask".into(), ask: true }));
+        assert!(matches!(q.next(true, false, t0), Some(Delivery::BrainResult { status: BrainStatus::Done, .. })));
+        // A status survives the move to injected context.
+        q.push(Pending::BrainResult { id: "c2".into(), status: BrainStatus::NeedsConfirmation, text: "t".into() }, t0);
+        q.abandon_brain_results(|_| true);
+        assert_eq!(q.next(true, false, t0), Some(Delivery::Abandoned { status: BrainStatus::NeedsConfirmation, text: "t".into() }));
+    }
+
+    #[test]
+    fn spoken_decisions() {
+        use Decision::*;
+        let cases: &[(&str, Decision)] = &[
+            // Clear yeses.
+            ("yes", Yes),
+            ("Yes.", Yes),
+            ("Yeah.", Yes),
+            ("yep", Yes),
+            ("Yup, do it.", Yes),
+            ("Yes please", Yes),
+            ("yes yes yes", Yes),
+            ("Go ahead.", Yes),
+            ("Sure, go ahead.", Yes),
+            ("OK, go ahead", Yes),
+            ("Do it.", Yes),
+            ("Just do it", Yes),
+            ("Please do.", Yes),
+            ("Confirmed.", Yes),
+            ("I confirm", Yes),
+            ("Proceed.", Yes),
+            ("I approve", Yes),
+            ("Approved", Yes),
+            ("Affirmative", Yes),
+            ("That's right", Yes),
+            ("That\u{2019}s correct.", Yes),
+            ("thats right", Yes),
+            ("Go for it", Yes),
+            ("Yes, I'm sure", Yes),
+            ("Yes, erase disk ten", Yes),
+            ("Um, yes", Yes),
+            // Clear noes.
+            ("No.", No),
+            ("Nope", No),
+            ("No, no, no", No),
+            ("Don't.", No),
+            ("Don't do it", No),
+            ("dont do it", No),
+            ("Do not proceed", No),
+            ("Not approved", No),
+            ("Stop!", No),
+            ("Cancel that", No),
+            ("Wait", No),
+            ("Hold on", No),
+            ("Hang on a second", No),
+            ("Absolutely not", No),
+            ("Never mind", No),
+            ("No thanks", No),
+            ("Not yet", No),
+            ("Please don't", No),
+            // Mixed, hedged, bare, long or noise: unclear.
+            ("durable", Unclear),
+            ("Yes but back up the music first", Unclear),
+            ("yes, but back up my music first", Unclear),
+            ("Yes, wait", Unclear),
+            ("No, go ahead", Unclear),
+            ("No problem, go ahead", Unclear),
+            ("Yes if it's disk ten", Unclear),
+            ("Yes, actually, back up first", Unclear),
+            ("Maybe", Unclear),
+            ("Maybe do it later", Unclear),
+            ("Go ahead instead with disk two", Unclear),
+            ("Yes, what's on it?", Unclear),
+            ("What will it do?", Unclear),
+            ("ok", Unclear),
+            ("Okay.", Unclear),
+            ("sure", Unclear),
+            ("Right.", Unclear),
+            ("mm-hm", Unclear),
+            ("uh huh", Unclear),
+            ("Absolutely", Unclear),
+            ("I'm not sure", Unclear),
+            ("I don't know", Unclear),
+            ("Erase it", Unclear),
+            ("", Unclear),
+            ("   ", Unclear),
+            ("...", Unclear),
+            ("<noise>", Unclear),
+            ("yes go ahead and erase the whole disk now please thank you very much", Unclear),
+            ("no I really do not want you to touch that disk at all today", Unclear),
+        ];
+        assert!(cases.len() >= 40);
+        for (text, want) in cases {
+            assert_eq!(spoken_decision(text), *want, "{text:?}");
+        }
+    }
+
+    fn confirm(t0: Instant) -> Confirm {
+        Confirm::new("h".into(), uuid::Uuid::new_v4(), "erases disk 10".into(), t0)
+    }
+
+    /// The question went out at `at`, was said, and played out by `at + 3s`.
+    fn asked_and_said(c: &mut Confirm, at: Instant) -> Instant {
+        c.asked(at);
+        assert_eq!(c.poll(false, at), ConfirmStep::Wait);
+        c.model_output();
+        assert_eq!(c.poll(true, at + ms(1000)), ConfirmStep::Wait);
+        c.model_turn_ended();
+        // Still audible (the hangover): not yet.
+        assert_eq!(c.poll(true, at + ms(2900)), ConfirmStep::Wait);
+        assert!(!c.window_open());
+        let open = at + ms(3000);
+        assert_eq!(c.poll(false, open), ConfirmStep::Wait);
+        assert!(c.window_open());
+        open
+    }
+
+    #[test]
+    fn a_yes_counts_only_once_the_question_is_said() {
+        let t0 = Instant::now();
+        let mut c = confirm(t0);
+        // Before the question went out, and while it is being said: ignored.
+        assert_eq!(c.on_heard("yes", t0, t0), ConfirmStep::Wait);
+        c.asked(t0 + ms(100));
+        c.model_output();
+        assert_eq!(c.on_heard("yes", t0 + ms(500), t0 + ms(600)), ConfirmStep::Wait);
+        // A turn end with no model output after the ask doesn't open it.
+        let mut quiet = confirm(t0);
+        quiet.asked(t0);
+        quiet.model_turn_ended();
+        assert_eq!(quiet.poll(false, t0 + ms(10)), ConfirmStep::Wait);
+        assert!(!quiet.window_open());
+        // Said and played out: an utterance that began before the window
+        // (talking over the question, or echo) still doesn't count.
+        let mut c = confirm(t0);
+        let open = asked_and_said(&mut c, t0 + ms(100));
+        assert_eq!(c.on_heard("yes", open - ms(200), open + ms(500)), ConfirmStep::Wait);
+        assert_eq!(c.on_heard("yes", open + ms(100), open + ms(900)), ConfirmStep::Approve);
+    }
+
+    #[test]
+    fn a_no_denies() {
+        let t0 = Instant::now();
+        let mut c = confirm(t0);
+        let open = asked_and_said(&mut c, t0);
+        assert_eq!(c.on_heard("No, don't.", open + ms(10), open + ms(800)), ConfirmStep::Deny);
+    }
+
+    #[test]
+    fn unclear_asks_once_more_then_falls_back() {
+        let t0 = Instant::now();
+        let mut c = confirm(t0);
+        let open = asked_and_said(&mut c, t0);
+        let t1 = open + ms(2000);
+        assert_eq!(c.on_heard("durable", open + ms(10), t1), ConfirmStep::AskAgain);
+        assert_eq!(c.attempts, 1);
+        // The window closed until the re-ask has been said.
+        assert!(!c.window_open());
+        assert_eq!(c.on_heard("yes", t1 + ms(10), t1 + ms(20)), ConfirmStep::Wait);
+        let open2 = asked_and_said(&mut c, t1 + ms(500));
+        // A clear answer the second time still counts…
+        let mut yes = c.clone();
+        assert_eq!(yes.on_heard("yes, go ahead", open2 + ms(10), open2 + ms(900)), ConfirmStep::Approve);
+        // …a second unclear one falls back to the button.
+        assert_eq!(c.on_heard("yes but back up the music first", open2 + ms(10), open2 + ms(900)), ConfirmStep::FallBack);
+    }
+
+    #[test]
+    fn confirmations_time_out() {
+        let t0 = Instant::now();
+        // No answer within the window.
+        let mut c = confirm(t0);
+        let open = asked_and_said(&mut c, t0);
+        assert_eq!(c.poll(false, open + CONFIRM_ANSWER_WINDOW - ms(1)), ConfirmStep::Wait);
+        assert_eq!(c.poll(false, open + CONFIRM_ANSWER_WINDOW), ConfirmStep::FallBack);
+        // An answer that comes too late falls back too.
+        assert_eq!(c.on_heard("yes", open + CONFIRM_ANSWER_WINDOW, open + CONFIRM_ANSWER_WINDOW), ConfirmStep::FallBack);
+        // Asked, but the model never finished saying it.
+        let mut c = confirm(t0);
+        c.asked(t0);
+        c.model_output();
+        assert_eq!(c.poll(true, t0 + CONFIRM_QUESTION_CAP), ConfirmStep::FallBack);
+        // The question never went out.
+        let mut c = confirm(t0);
+        assert_eq!(c.poll(false, t0 + CONFIRM_DELIVERY_CAP - ms(1)), ConfirmStep::Wait);
+        assert_eq!(c.poll(false, t0 + CONFIRM_DELIVERY_CAP), ConfirmStep::FallBack);
     }
 }

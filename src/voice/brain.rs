@@ -207,7 +207,7 @@ pub fn collect_reply(messages: &[Message], anchor: usize) -> String {
 /// auto-recovery prompt (those continue the turn they are in), or an
 /// incoming dispatch relay that woke a turn of its own (no user message
 /// starts that turn: `todo::relay::starts_turn`).
-fn ends_turn(m: &Message) -> bool {
+pub(crate) fn ends_turn(m: &Message) -> bool {
     (m.author == "User" && !crate::voice::transcript::is_recovery_prompt(m)) || crate::todo::relay::starts_turn(m)
 }
 
@@ -351,6 +351,11 @@ impl Owners {
                 return true;
             }
         }
+        self.owns_live(session_id, trigger_text, trigger_id)
+    }
+
+    /// As [`Owners::owns`], counting only live waits (not delivered marks).
+    fn owns_live(&self, session_id: &str, trigger_text: &str, trigger_id: Option<uuid::Uuid>) -> bool {
         let text = trigger_text.trim();
         self.live.iter().any(|o| {
             if o.session_id != session_id || o.detach.load(Ordering::SeqCst) {
@@ -394,6 +399,12 @@ impl Owners {
 /// it is known; the text alone matches requests not yet anchored.
 pub fn wait_owns(session_id: &str, trigger_text: &str, trigger_message_id: Option<uuid::Uuid>) -> bool {
     with_owners(|o| o.owns(session_id, trigger_text, trigger_message_id))
+}
+
+/// Whether a live (not detached) wait will still deliver the turn started
+/// by `trigger_message_id` (a turn it already delivered doesn't count).
+pub fn live_wait_owns(session_id: &str, trigger_text: &str, trigger_message_id: Option<uuid::Uuid>) -> bool {
+    with_owners(|o| o.owns_live(session_id, trigger_text, trigger_message_id))
 }
 
 /// A wait's hold on its request (released on drop; see the rule above).
@@ -1003,8 +1014,11 @@ mod tests {
         assert!(!owners.owns("h", &framed, Some(id)));
         // Delivered: never announced, and claimed against re-anchoring.
         owners.live.push(OwnedRequest { token: 2, session_id: "h".into(), framed: framed.clone(), anchor_id: Some(id), detach });
+        assert!(owners.owns_live("h", &framed, Some(id)));
         owners.release(2, true);
         assert!(owners.owns("h", &framed, Some(id)));
+        // A delivered turn has no live wait left to speak it.
+        assert!(!owners.owns_live("h", &framed, Some(id)));
         assert!(owners.claimed("h").contains(&id));
         assert!(owners.live.is_empty());
     }
