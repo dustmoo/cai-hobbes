@@ -70,7 +70,7 @@ pub fn framed_request(request: &str) -> String {
          the earlier 🎙 lines. Do the work first; your final reply is read aloud and should say \
          only what has actually been done, or what you need from them. A go-ahead for anything \
          irreversible counts only if their own 🎙 lines say it; otherwise ask. Write the reply \
-         as plain speech: no markdown, no lists, no code, no URLs. Keep it to a few sentences unless they asked for \
+         as plain speech: no markdown, no lists, no code, no URLs. Name a tab, chat or agent by its title, never by its id. Keep it to a few sentences unless they asked for \
          detail or a walkthrough, or the answer needs it; then explain fully in spoken \
          paragraphs, leading with the point. Put anything that can't be spoken (code, links, \
          tables, long ids) after a line that says \"Details:\" and the voice will point the \

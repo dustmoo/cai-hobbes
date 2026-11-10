@@ -557,7 +557,9 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          and wait; pass their answer back to the brain in their own words, as nearly as you \
          heard them, and if they didn't answer, send nothing. When a result needs confirmation, \
          ask them and wait; Hobbes hears their yes or no itself, so don't relay it. Never read \
-         out code, URLs or long ids. Work still pending when the conversation ends is announced later. When \
+         out code, URLs or long ids. Call a tab, chat or agent by its name (its title), never \
+         by an id; if all you have is an id, describe it by what it's about or ask the brain \
+         for its name. Work still pending when the conversation ends is announced later. When \
          they say goodbye, call {end}.\n\n\
          You only see the end of the Hobbes tab below. The brain has the whole history, its \
          summary and their other tabs, so if they ask what you remember or about anything \
