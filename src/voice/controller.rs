@@ -467,9 +467,7 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          hear the conversation), tell them briefly that you're on it, and keep talking with \
          them. Call {brain} once per request and wait: its result always arrives on that same \
          call, however long it takes. Never call it again for something you've already \
-         asked, not even reworded; only call it again when the person asks for something new. Give the brain what the person actually said. If you didn't clearly hear their answer \
-         — they were talked over, cut off, or it made no sense — never fill it in or assume a yes: \
-         ask them to say it again. As you hand something to the brain, say a short holding phrase out loud — \
+         asked, not even reworded; only call it again when the person asks for something new. As you hand something to the brain, say a short holding phrase out loud — \
          \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
          silence. When the result comes back, summarise it naturally, and give the detail if they \
          asked for it. Never read out code, URLs \
@@ -619,9 +617,6 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // and when the person's latest utterance began (input transcript).
     let mut in_flight_asks: HashMap<String, InFlightAsk> = HashMap::new();
     let mut last_speech_start: Option<Instant> = None;
-    // The person's transcribed words since the last brain request, quoted
-    // to the brain beside the model's paraphrase (`brain::grounded_request`).
-    let mut heard_since_ask = String::new();
     let (brain_tx, mut brain_rx) = mpsc::unbounded_channel::<(String, BrainOutcome)>();
     let mut ending_at: Option<Instant> = None;
     // When the voice last told them it was thinking (rate-limits the phrase).
@@ -720,7 +715,6 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                             last_speech_start = Some(Instant::now());
                         }
                         heard.push(&t);
-                        heard_since_ask.push_str(&t);
                         last_activity = Instant::now();
                         ui.heard = live_tail(heard.text());
                         ui.phase = Phase::Listening;
@@ -795,9 +789,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                                     let tx = brain_tx.clone();
                                     let sid = voice_session.clone();
                                     let st = ctx.session_state;
-                                    let heard_words = std::mem::take(&mut heard_since_ask);
                                     spawn(async move {
-                                        let outcome = brain::run(st, sid, request, heard_words, handle, crate::session_streaming).await;
+                                        let outcome = brain::run(st, sid, request, handle, crate::session_streaming).await;
                                         let _ = tx.send((id, outcome));
                                     });
                                 }
