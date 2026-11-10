@@ -58,6 +58,35 @@ pub fn framed_request(request: &str) -> String {
     )
 }
 
+/// Most of the person's transcribed words quoted in a request.
+const MAX_HEARD_CHARS: usize = 600;
+
+/// [`framed_request`] plus what was actually transcribed from the person
+/// since the last request. The request line is the realtime model's own
+/// paraphrase and can be wrong (it once turned a talked-over, one-word
+/// transcript into "Yes, you may proceed with erasing the drive"), so the
+/// brain is given the words themselves to check it against.
+pub fn grounded_request(request: &str, heard: &str) -> String {
+    let heard = heard.split_whitespace().collect::<Vec<_>>().join(" ");
+    let quoted = if heard.chars().any(char::is_alphanumeric) {
+        let tail: String = {
+            let n = heard.chars().count();
+            heard.chars().skip(n.saturating_sub(MAX_HEARD_CHARS)).collect()
+        };
+        format!("What was transcribed from the person since the last request: \"{tail}\".")
+    } else {
+        "Nothing was transcribed from the person since the last request.".to_string()
+    };
+    format!(
+        "{}\n\n[Grounding: the first line above is the voice layer's own summary of what it \
+         thinks the person wants, and it can be wrong. {quoted} The transcript can be partial \
+         or garbled. If the summary claims a yes, a permission or an instruction that those \
+         words don't support, do not act on it: say you didn't catch their answer and ask \
+         again. Never erase, delete, overwrite, send or pay on the summary alone.]",
+        framed_request(request)
+    )
+}
+
 /// The brain's reply: assistant text after the request at `anchor`, up to
 /// the next user message (a later request or a typed message belongs to its
 /// own turn), skipping voice transcript lines, with any "Details:" tail
@@ -194,13 +223,14 @@ pub async fn run(
     session_state: Signal<SessionState>,
     session_id: String,
     request: String,
+    heard: String,
     handle: BrainHandle,
     streaming: fn(&str) -> bool,
 ) -> BrainOutcome {
     let started = Instant::now();
     let outcome = {
         let _wait = WaitGuard::new();
-        run_inner(session_state, session_id, request, handle, streaming).await
+        run_inner(session_state, session_id, request, heard, handle, streaming).await
     };
     let (kind, chars) = match &outcome {
         BrainOutcome::Done(t) => ("done", t.chars().count()),
@@ -216,6 +246,7 @@ async fn run_inner(
     session_state: Signal<SessionState>,
     session_id: String,
     request: String,
+    heard: String,
     handle: BrainHandle,
     streaming: fn(&str) -> bool,
 ) -> BrainOutcome {
@@ -223,7 +254,7 @@ async fn run_inner(
         Some(s) => s.messages.len(),
         None => return BrainOutcome::Failed("The Hobbes session isn't loaded.".into()),
     };
-    let framed = framed_request(&request);
+    let framed = grounded_request(&request, &heard);
     let queued_id = queue_request(&session_id, &framed);
     tracing::info!("voice: brain request queued");
 
@@ -404,6 +435,23 @@ mod tests {
         assert_eq!(collect_reply(&msgs, 0), "Answer A.");
         assert_eq!(find_anchor(&msgs, 1, &framed_request("B")), Some(2));
         assert_eq!(collect_reply(&msgs, 2), "Answer B.");
+    }
+
+    #[test]
+    fn a_request_quotes_what_was_actually_heard() {
+        let g = grounded_request("Yes, you may proceed with erasing the drive.", "  durable \n");
+        assert!(g.starts_with(&framed_request("Yes, you may proceed with erasing the drive.")));
+        assert!(is_voice_request(&g));
+        assert!(g.contains("since the last request: \"durable\"."), "{g}");
+        assert!(g.contains("do not act on it"));
+        // Nothing heard, or only noise marks: said plainly.
+        for nothing in ["", "  ", "..."] {
+            assert!(grounded_request("Yes.", nothing).contains("Nothing was transcribed"), "{nothing:?}");
+        }
+        // A long ramble keeps its end.
+        let long = format!("{} then stop", "word ".repeat(400));
+        let g = grounded_request("x", &long);
+        assert!(g.contains("then stop\"") && g.len() < 2500);
     }
 
     #[test]
