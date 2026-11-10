@@ -127,6 +127,7 @@ mod tests {
                 cancelled: None,
                 hold_reason: None,
                 hold_rule_key: None,
+                risk_reason: None,
                 read_sources: Vec::new(),
                 origin: None,
             }),

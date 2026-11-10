@@ -19,6 +19,7 @@ mod agent_time_runtime;
 mod async_persist;
 #[cfg(target_os = "macos")]
 mod biometric_auth;
+mod call_risk;
 mod components;
 mod constants;
 mod context;
@@ -179,6 +180,39 @@ fn drain_pending_tab_reopens() -> Vec<String> {
     std::mem::take(&mut *PENDING_TAB_REOPEN.write())
         .into_iter()
         .collect()
+}
+
+/// Permission decisions asked for from outside the approval bubble:
+/// (session id, held message id, approve). Same reach problem and fix as
+/// `PENDING_TAB_REOPEN`; drained by an effect in `app()`, which resolves
+/// each through `tool_call_display::decide_held_message` — the very approve
+/// / deny path the bubble's buttons use.
+static PENDING_PERMISSION_DECISIONS: GlobalSignal<Vec<(String, uuid::Uuid, bool)>> = Signal::global(Vec::new);
+
+/// Approve (`approve = true`) or deny the held call in `message_id` (a
+/// `PermissionRequest` message) of `session_id`, exactly as the bubble's
+/// Approve / Deny buttons do: the same trust-decision log entry, then
+/// `approve_held_call` (flip to `Running`, hand the session to the
+/// approval-resume effect in chat.rs, which re-runs the scope gates with
+/// `user_approved = true` and persists) or `deny_held_call` ("Denied by
+/// user.", persisted, the model not resumed). A no-op (warned) when the
+/// message isn't a held call any more. Harness-level: call it only on the
+/// person's own decision (e.g. the voice controller after checking the
+/// person's transcribed words against `call_risk::pending_risk_hold`),
+/// never on model output. Safe from any scope or task; takes effect on the
+/// next reactive tick.
+#[allow(dead_code)] // the voice controller's spoken confirmation calls it (next task)
+pub(crate) fn request_permission_decision(session_id: &str, message_id: uuid::Uuid, approve: bool) {
+    PENDING_PERMISSION_DECISIONS.write().push((session_id.to_string(), message_id, approve));
+}
+
+/// Drain `PENDING_PERMISSION_DECISIONS`, subscribing the caller (see
+/// `drain_pending_tab_reopens`).
+fn drain_permission_decisions() -> Vec<(String, uuid::Uuid, bool)> {
+    if PENDING_PERMISSION_DECISIONS.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *PENDING_PERMISSION_DECISIONS.write())
 }
 
 /// Rotated system sessions (`session_rotation`) whose tab, if open, the
@@ -3135,6 +3169,14 @@ fn app() -> Element {
                 // (message send, session switch, app close). Serializing the entire
                 // session state here was blocking the UI thread for large states.
             });
+        }
+    });
+
+    // Permission decisions asked for outside the bubble
+    // (`request_permission_decision`): the buttons' own approve/deny path.
+    use_effect(move || {
+        for (session_id, message_id, approve) in drain_permission_decisions() {
+            crate::components::tool_call_display::decide_held_message(session_state, &session_id, message_id, approve);
         }
     });
 

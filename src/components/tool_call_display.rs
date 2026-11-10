@@ -315,6 +315,62 @@ pub fn deny_held_call(
     found
 }
 
+/// **Pure.** The still-held call in message `message_id` of `session_id`,
+/// with the session's project id (for the decision log): `None` when the
+/// session isn't hydrated or the message isn't a `PermissionRequest` any
+/// more (already answered).
+pub fn held_call_for_message(
+    state: &crate::session::SessionState,
+    session_id: &str,
+    message_id: uuid::Uuid,
+) -> Option<(ToolCall, Option<String>)> {
+    let session = state.sessions.get(session_id)?;
+    session.messages.iter().find(|m| m.id == message_id).and_then(|m| match &m.content {
+        super::shared::MessageContent::PermissionRequest(tc) => Some((tc.clone(), session.project_id.clone())),
+        _ => None,
+    })
+}
+
+/// Resolve the held call in message `message_id` the way the bubble's
+/// buttons do (`crate::request_permission_decision` lands here): the same
+/// trust-decision log entry (`Approved` / `Denied`, none for a skill load,
+/// like `SkillToolPermissionPrompt`), then [`approve_held_call`] or
+/// [`deny_held_call`] with [`DENIED_BY_USER`]. Never authors a trust rule.
+/// Returns whether a held call was found.
+pub fn decide_held_message(
+    session_state: Signal<crate::session::SessionState>,
+    session_id: &str,
+    message_id: uuid::Uuid,
+    approve: bool,
+) -> bool {
+    let held = held_call_for_message(&session_state.peek(), session_id, message_id);
+    let Some((tc, project_id)) = held else {
+        tracing::warn!("permission decision: no held call in message {message_id} of session {session_id}");
+        return false;
+    };
+    if !is_skill_invoke_request(&tc) {
+        let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+        crate::context::trust_store::log_decision(crate::context::trust_store::TrustDecision::new(
+            if approve {
+                crate::context::trust_store::DecisionKind::Approved
+            } else {
+                crate::context::trust_store::DecisionKind::Denied
+            },
+            tc.hold_rule_key.as_deref().unwrap_or(&tc.server_name),
+            &tc.tool_name,
+            crate::context::trust_store::arg_summary(&args),
+            Some(session_id.to_string()),
+            project_id,
+            None,
+        ));
+    }
+    if approve {
+        approve_held_call(session_state, session_id, &tc.execution_id)
+    } else {
+        deny_held_call(session_state, session_id, &tc.execution_id, DENIED_BY_USER)
+    }
+}
+
 /// The message carrying this execution id, within one session.
 fn message_mut_by_execution_id<'a>(
     session: &'a mut crate::session::Session,
@@ -434,6 +490,11 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
 
     // Built-ins that always ask can't be pre-approved: no trust-rule option.
     let always_asks = crate::components::builtin_tools::always_asks(&tool_call.tool_name);
+    // Held by the call risk gate (a destructive call from a voice or
+    // unattended turn): asked every time, so no trust-rule option either —
+    // a rule would bypass nothing here, yet loosen typed chat.
+    let risk_reason = tool_call.risk_reason.clone();
+    let risk_held = risk_reason.is_some();
     // HOBBES_PROJECT_MERGE states what moves. Titles and to-dos are in
     // memory; the chat count is an index lookup run off the UI thread
     // (P-017), filled in when it lands.
@@ -518,6 +579,9 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 if let Some(reason) = tool_call.hold_reason.clone() {
                     p { class: "font-medium text-yellow-100", "{reason}" }
                 }
+                if let Some(reason) = risk_reason.clone() {
+                    p { class: "font-medium text-yellow-100", "Held because this {reason}." }
+                }
                 p {
                     "The AI wants to use the tool "
                     span { class: "font-mono text-sm", "{tool_call.tool_name}" }
@@ -572,12 +636,12 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     p { class: "font-semibold text-yellow-100", "{desc}" }
                 }
                 p { "Do you want to allow this?" }
-                if always_asks {
+                if always_asks || risk_held {
                     p { class: "text-xs text-yellow-200/70", "Hobbes asks every time for this one; it can't be set to always allow." }
                 }
                 // Trust-rule authoring at the moment of decision (the skill
                 // prompt's remember-choice idiom).
-                if !always_asks {
+                if !always_asks && !risk_held {
                 div {
                     class: "flex flex-col gap-1 pt-1",
                     div {
@@ -645,7 +709,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                         let owning_session_id = owning_session_id_approve.clone();
                         // "Always" on a tab read turns the setting on (saved
                         // like any settings edit) rather than writing a rule.
-                        if *make_rule.peek() && tab_read {
+                        if *make_rule.peek() && tab_read && !risk_held {
                             crate::hobbes_tabs::allow_always(&mut settings.write());
                             let snapshot = settings.peek().clone();
                             if let Err(e) = settings_manager.read().save(&snapshot) {
@@ -655,7 +719,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                                 crate::context::trust_store::DecisionKind::ApprovedRuleCreated,
                                 None,
                             );
-                        } else if *make_rule.peek() {
+                        } else if *make_rule.peek() && !risk_held {
                             // Author the rule first (when asked), then approve.
                             let rule = crate::context::permissions::TrustRule {
                                 id: uuid::Uuid::new_v4().to_string(),
@@ -896,6 +960,22 @@ mod tests {
             MessageContent::PermissionRequest(tc) => assert_eq!(tc.execution_id, "exec-2"),
             other => panic!("expected PermissionRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn held_call_for_message_finds_only_a_still_held_request() {
+        let held = permission_request_message("exec-h");
+        let done = tool_call_message("exec-d");
+        let (mut state, id) = session_with_messages(vec![held.clone(), done.clone()]);
+        state.sessions.get_mut(&id).unwrap().project_id = Some("proj-1".into());
+        let (tc, project) = super::held_call_for_message(&state, &id, held.id).unwrap();
+        assert_eq!(tc.execution_id, "exec-h");
+        assert_eq!(project.as_deref(), Some("proj-1"));
+        assert!(super::held_call_for_message(&state, &id, done.id).is_none());
+        assert!(super::held_call_for_message(&state, "no-such-session", held.id).is_none());
+        // Resolved (as the buttons do): no longer held.
+        super::resolve_held_call(&mut state, &id, "exec-h", &super::HeldResolution::Approve).unwrap();
+        assert!(super::held_call_for_message(&state, &id, held.id).is_none());
     }
 
     #[test]

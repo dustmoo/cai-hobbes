@@ -502,7 +502,7 @@ pub fn approval_blocks_wake(messages: &[Message], now: DateTime<Utc>, stale_afte
             MessageContent::SkillPermissionRequest(sc) => sc.origin,
             _ => return false,
         };
-        i >= turn_start || (!origin.is_some_and(|o| o.is_user()) && now - m.created_at < stale_after)
+        i >= turn_start || (!origin.is_some_and(|o| o.is_person()) && now - m.created_at < stale_after)
     })
 }
 
@@ -1201,6 +1201,9 @@ mod tests {
         let mut recent_user = old_user.clone();
         recent_user[0].created_at = t - Duration::hours(3);
         recent_user[1] = held(TurnOrigin::User, t - Duration::hours(3));
+        assert!(!approval_blocks_wake(&recent_user, t, stale));
+        // A spoken request's held call (e.g. a risk hold) is the person's too.
+        recent_user[1] = held(TurnOrigin::Voice, t - Duration::hours(3));
         assert!(!approval_blocks_wake(&recent_user, t, stale));
         // An approval in the latest turn holds it, whoever raised it.
         let latest = vec![msg_at("User", text("Send it"), t - Duration::minutes(5)), held(TurnOrigin::User, t - Duration::minutes(4))];

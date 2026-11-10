@@ -185,8 +185,8 @@ async fn controller_loop(ctx: BuiltinToolCtx, mut rx: mpsc::UnboundedReceiver<Vo
 }
 
 /// What to say for a finished Hobbes-tab turn: the reply after its trigger
-/// (the last message not written by Hobbes), whether that trigger was a
-/// voice request, and whether the turn is held on an approval.
+/// (the message that started the turn, see [`starts_turn`]), whether that
+/// trigger was a voice request, and whether the turn is held on an approval.
 #[derive(Debug, PartialEq)]
 pub struct TurnNews {
     pub voice_request: bool,
@@ -197,15 +197,29 @@ pub struct TurnNews {
     /// The chat tab the full details live in, when the turn answered a
     /// report from a chat worker (its tab, not the Hobbes tab's summary).
     pub details_tab: Option<String>,
+    /// The message that started the turn, for [`brain::wait_owns`].
+    pub trigger_id: uuid::Uuid,
+    pub trigger_text: String,
+}
+
+/// Whether `m` started a turn of its own: a user-authored message that is
+/// not an auto-recovery prompt, or an incoming relay that woke a turn. The
+/// same rule as the brain wait's turn boundary (`brain::ends_turn`), so a
+/// relay the brain sent mid-turn, a non-waking relay or a recovery prompt is
+/// never taken for the trigger.
+fn starts_turn(m: &crate::components::chat::Message) -> bool {
+    (m.author == "User" && !crate::voice::transcript::is_recovery_prompt(m)) || crate::todo::relay::starts_turn(m)
 }
 
 pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNews> {
-    let trigger = messages.iter().rposition(|m| m.author != "Hobbes")?;
+    let trigger = messages.iter().rposition(starts_turn)?;
     let trigger_text = messages[trigger].content.get_text_content();
     let voice_request = trigger_text.as_deref().is_some_and(|t| brain::is_voice_request(t.trim()));
     let heartbeat_wake = trigger_text
         .as_deref()
         .is_some_and(|t| t.trim_start().starts_with(crate::heartbeat::wake::WAKE_HEADER));
+    let trigger_id = messages[trigger].id;
+    let trigger_text = trigger_text.unwrap_or_default();
     let details_tab = match &messages[trigger].content {
         crate::components::shared::MessageContent::Relay(note)
             if note.direction == crate::todo::relay::RelayDirection::FromWorker =>
@@ -218,6 +232,8 @@ pub fn turn_news(messages: &[crate::components::chat::Message]) -> Option<TurnNe
         voice_request,
         heartbeat_wake,
         details_tab,
+        trigger_id,
+        trigger_text,
         reply: brain::collect_reply(messages, trigger),
         needs_approval: crate::heartbeat::wake::has_pending_approval(&messages[trigger + 1..]),
     })
@@ -235,16 +251,18 @@ fn app_focused() -> bool {
     APP_FOCUSED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Whether a finished Hobbes-tab turn should be spoken. A voice request the
-/// live conversation is still waiting on is delivered by that wait; with no
-/// conversation, a turn the person is reading as it lands (`viewing`: the
-/// Hobbes tab active in the focused window) needs no announcement, whoever
-/// started it, unless it answers an earlier voice request.
-pub fn should_announce(news: &TurnNews, live: bool, waits_in_flight: usize, viewing: bool) -> bool {
+/// Whether a finished Hobbes-tab turn should be spoken. A turn a brain wait
+/// owns (`owned`: [`brain::wait_owns`] for its trigger) is delivered by
+/// that wait — or already was — and is never announced; a wait that was
+/// detached or gave up no longer owns it. Otherwise, with no conversation,
+/// a turn the person is reading as it lands (`viewing`: the Hobbes tab
+/// active in the focused window) needs no announcement, whoever started it,
+/// unless it answers an earlier voice request.
+pub fn should_announce(news: &TurnNews, live: bool, owned: bool, viewing: bool) -> bool {
     if news.reply.is_empty() && !news.needs_approval {
         return false;
     }
-    if live && news.voice_request && waits_in_flight > 0 {
+    if owned {
         return false;
     }
     live || !viewing || news.voice_request
@@ -292,7 +310,8 @@ pub fn pending_announcement(
         let news = turn_news(&session.messages)?;
         (news, state.active_session_id == session_id && app_focused(), session.turn_origin)
     };
-    if !should_announce(&news, is_live(), brain::waits_in_flight(), viewing) {
+    let owned = news.voice_request && brain::wait_owns(session_id, &news.trigger_text, Some(news.trigger_id));
+    if !should_announce(&news, is_live(), owned, viewing) {
         return None;
     }
     let kind = announce_kind(origin, &news, speak_heartbeat)?;
@@ -311,16 +330,13 @@ pub fn pending_announcement(
     Some((text, kind))
 }
 
-/// A reply about a chat worker's report, pointing at the worker's tab for
-/// the details rather than the Hobbes tab.
+/// A reply about a chat worker's report: when it says written details are
+/// in the Hobbes tab, point at the worker's tab instead. A reply with no
+/// written details gets no pointer at all.
 pub fn point_at_tab(reply: &str, tab: &str) -> String {
     let note = format!("(Full details are in the \"{tab}\" tab.)");
     let hobbes = "(Full details are in the Hobbes tab.)";
-    if reply.contains(hobbes) {
-        reply.replace(hobbes, &note)
-    } else {
-        format!("{} {note}", reply.trim_end())
-    }
+    reply.replace(hobbes, &note)
 }
 
 /// Called when any turn ends (stream_manager): speak Hobbes-tab news —
@@ -369,8 +385,8 @@ pub fn announce_prompt_merged(text: &str, mid_conversation: bool, kind: Announce
         String::new()
     };
     format!(
-        "[{how}{earlier} If there's more, say where: the tab the news names for its details, \
-         else the Hobbes tab.]\n\n{}",
+        "[{how}{earlier} Mention a tab only if the news below says its details are there, and \
+         then only once. Don't repeat anything you've already told them.]\n\n{}",
         text.trim()
     )
 }
@@ -461,19 +477,29 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
          paragraphs, and lead with the point. Room to explain never means answering more \
          yourself: who answers is decided below, and length only shapes how you say it. If \
          they interrupt, stop and listen.\n\n\
-         You are the voice layer. You can check their coding-agent Fleet, their planner and \
-         calendar, timers, and the Heartbeat's notes yourself with your tools. For anything \
-         else — doing or changing things, email, files, code, dispatching work, anything \
-         you'd need to look up or explain in depth, anything from before the conversation \
-         below, or questions that need careful thought — call {brain} with a complete request (the brain cannot \
-         hear the conversation), tell them briefly that you're on it, and keep talking with \
-         them. Call {brain} once per request and wait: its result always arrives on that same \
-         call, however long it takes. Never call it again for something you've already \
-         asked, not even reworded; only call it again when the person asks for something new. As you hand something to the brain, say a short holding phrase out loud — \
-         \"let me think about that\", \"one moment, I'll check\" — so they're never left in \
-         silence. When the result comes back, summarise it naturally, and give the detail if they \
-         asked for it. Never read out code, URLs \
-         or long ids; say it's in the Hobbes tab. When they say goodbye, call {end}.\n\n\
+         You are the voice layer. Answer small talk, questions about what they just said, and \
+         how work in flight is going yourself; your tools also let you check their \
+         coding-agent Fleet, planner and calendar, timers, and the Heartbeat's notes. \
+         Everything else goes to the brain with {brain}: doing or changing things, email, \
+         files, code, dispatching work, anything you'd need to look up or explain in depth, \
+         anything from before the conversation below, and questions that need careful \
+         thought. Don't guess those answers yourself.\n\n\
+         Call {brain} once per request and wait: its result always arrives on that same call, \
+         however long it takes. As you hand something over, give one short acknowledgement in \
+         your own words, varied each time, then say nothing more about it until the result \
+         arrives. Meanwhile keep talking with them normally. If they ask about that same task, \
+         answer from what you know (it's still being worked on) without calling the brain \
+         again; call it again only for a different request.\n\n\
+         You only know what they actually said. If you didn't hear them clearly, or they were \
+         talked over or cut off, say so and ask once. Never assume, infer or invent what they \
+         said or an answer for them, above all never a yes.\n\n\
+         Each result comes with a status and a note: follow the note, and never call \
+         something done unless its status is done. Mention the Hobbes tab only when the \
+         result says written details are there. When a result is a question for them, ask it \
+         and wait; pass their answer back to the brain in their own words, as nearly as you \
+         heard them, and if they didn't answer, send nothing. Never read out code, URLs or \
+         long ids. Work still pending when the conversation ends is announced later. When \
+         they say goodbye, call {end}.\n\n\
          You only see the end of the Hobbes tab below. The brain has the whole history, its \
          summary and their other tabs, so if they ask what you remember or about anything \
          earlier, ask the brain rather than saying you can't see it.\n\n\
@@ -485,7 +511,8 @@ pub fn system_instruction(now: chrono::DateTime<chrono::Local>, tail: &str) -> S
     if !tail.trim().is_empty() {
         s.push_str(
             "\n\nThe end of the Hobbes tab, where your voice conversations, typed messages and the \
-             Heartbeat's background checks share one timeline:\n",
+             Heartbeat's background checks share one timeline (\"Person\" is them, \"You (voice)\" \
+             is you, \"Hobbes (brain)\" is the brain):\n",
         );
         s.push_str(tail.trim());
     }
@@ -926,11 +953,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     in_flight_asks.remove(&id);
                     ui.brain_busy = brain_cancel.len();
                     last_activity = Instant::now();
-                    let text = match outcome {
-                        BrainOutcome::Done(t) => t,
-                        BrainOutcome::NeedsApproval(t) | BrainOutcome::Failed(t) => t,
-                        BrainOutcome::Cancelled => "Cancelled.".to_string(),
-                    };
+                    let (status, text) = BrainStatus::of(outcome);
+                    let text = queued_brain_text(status, &text);
                     // Either way it makes the voice speak: wait for the floor.
                     let item = if abandoned.remove(&id) {
                         Pending::Abandoned { text }
@@ -1068,8 +1092,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     floor_state.model_active(now);
                 }
                 Delivery::Abandoned { text } => {
+                    let (status, text) = parse_queued_brain_text(&text);
                     let _ = rt.control.send(RealtimeControl::InjectContext {
-                        text: format!("[Result of your earlier request to the brain] {text}"),
+                        text: brain_result_context(status, text),
                         respond: true,
                     });
                     floor_state.model_active(now);
@@ -1084,7 +1109,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                     } else {
                         floor_state.model_active(now);
                     }
-                    respond(&rt.control, &id, tools::ASK_BRAIN, json!({"result": text}), Some(Scheduling::WhenIdle));
+                    let (status, text) = parse_queued_brain_text(&text);
+                    respond(&rt.control, &id, tools::ASK_BRAIN, brain_result_response(status, text), Some(Scheduling::WhenIdle));
                 }
             }
         }
@@ -1123,7 +1149,7 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         // Not after an announcement that never found the floor (it would
         // only start the same one again), nor when the app is closing, nor
         // after Stop (they asked for quiet; the text is in the Hobbes tab).
-        let unspoken = queue.drain_as_announcements();
+        let unspoken = unspoken_announcements(queue.drain_as_announcements());
         if matches!(close_reason.as_str(), "announced" | "app closing" | "stopped") {
             tracing::info!("voice: {} queued item(s) not spoken before the end", unspoken.len());
         } else {
@@ -1241,14 +1267,115 @@ pub fn brain_started_quiet_response() -> Value {
     })
 }
 
+/// The interim response when nothing has been said yet: the one
+/// acknowledgement the instructions describe, if it hasn't been given.
 pub fn brain_started_response() -> Value {
     json!({
         "status": "working",
-        "note": "The brain is working on this; it can take a minute. Say a few words to let them \
-                 know you're thinking about it and will be right back (for example \"Let me \
-                 think about that, one moment.\"). Don't guess the answer. The result arrives \
-                 later on this same call.",
+        "note": "The brain is working on this; it can take a minute. If you haven't acknowledged \
+                 it yet, do so now, once and briefly; if you already have, say nothing. Don't \
+                 guess the answer. The result arrives later on this same call.",
     })
+}
+
+/// How a brain request ended, as the voice is told it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BrainStatus {
+    Done,
+    NeedsApproval,
+    Failed,
+    Cancelled,
+}
+
+impl BrainStatus {
+    const ALL: [BrainStatus; 4] = [Self::Done, Self::NeedsApproval, Self::Failed, Self::Cancelled];
+
+    /// The status and the text to relay for a finished wait.
+    pub fn of(outcome: BrainOutcome) -> (Self, String) {
+        match outcome {
+            BrainOutcome::Done(t) => (Self::Done, t),
+            BrainOutcome::NeedsApproval(t) => (Self::NeedsApproval, t),
+            BrainOutcome::Failed(t) => (Self::Failed, t),
+            BrainOutcome::Cancelled => (Self::Cancelled, "The request was cancelled.".to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::NeedsApproval => "needs_approval",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// What the voice should do with the result (one wording, used by the
+    /// tool response and the injected-context path alike).
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Done => {
+                "Finished. Say the outcome in a sentence or two, faithfully: it is already phrased \
+                 for speech; don't add claims it doesn't make, and don't repeat anything you \
+                 already said."
+            }
+            Self::NeedsApproval => {
+                "NOT done. It is waiting for the person to approve in the Hobbes tab. Tell them \
+                 that; do not say it is done."
+            }
+            Self::Failed => "It did not work. Say so plainly; don't retry unless they ask.",
+            Self::Cancelled => "Cancelled. Nothing more to say unless they ask.",
+        }
+    }
+}
+
+/// The final `VOICE_ASK_BRAIN` response for a finished wait.
+pub fn brain_result_response(status: BrainStatus, text: &str) -> Value {
+    json!({"status": status.as_str(), "result": text, "note": status.note()})
+}
+
+/// A result whose call the model already abandoned, injected as context.
+pub fn brain_result_context(status: BrainStatus, text: &str) -> String {
+    format!(
+        "[Result of your earlier request to the brain. Status: {}. {}]\n\n{}",
+        status.as_str(),
+        status.note(),
+        text.trim()
+    )
+}
+
+/// Marks a brain result's status inside the floor queue's plain text (the
+/// queue carries text only); never spoken or sent as is.
+const STATUS_TAG: char = '\u{1}';
+
+/// A brain result as queued for the floor: its status tagged in front.
+pub fn queued_brain_text(status: BrainStatus, text: &str) -> String {
+    format!("{STATUS_TAG}{}{STATUS_TAG}{text}", status.as_str())
+}
+
+/// The status and text of a queued brain result (untagged text reads as done).
+pub fn parse_queued_brain_text(text: &str) -> (BrainStatus, &str) {
+    let parsed = text.strip_prefix(STATUS_TAG).and_then(|rest| {
+        let (tag, body) = rest.split_once(STATUS_TAG)?;
+        let status = BrainStatus::ALL.into_iter().find(|s| s.as_str() == tag)?;
+        Some((status, body))
+    });
+    parsed.unwrap_or((BrainStatus::Done, text))
+}
+
+/// Queued items left at the end of a conversation, to announce afterwards:
+/// brain results lose their status tag, and a cancelled one is dropped
+/// (there is nothing to say about it).
+fn unspoken_announcements(items: Vec<(String, AnnounceKind)>) -> Vec<(String, AnnounceKind)> {
+    items
+        .into_iter()
+        .filter_map(|(text, kind)| {
+            if !text.starts_with(STATUS_TAG) {
+                return Some((text, kind));
+            }
+            let (status, body) = parse_queued_brain_text(&text);
+            (status != BrainStatus::Cancelled).then(|| (body.to_string(), kind))
+        })
+        .collect()
 }
 
 /// The answer to a repeated `VOICE_ASK_BRAIN` (see [`is_duplicate_ask`]):
@@ -1439,28 +1566,115 @@ mod tests {
         assert!(!news.voice_request);
         assert_eq!(news.reply, "The rollup is done: 14 items filed.");
         // Live conversation: say it now. Not live and not looking: announce.
-        assert!(should_announce(&news, true, 0, false));
-        assert!(should_announce(&news, false, 0, false));
+        assert!(should_announce(&news, true, false, false));
+        assert!(should_announce(&news, false, false, false));
         // Not live, reading the Hobbes tab as it lands: no need to say it.
-        assert!(!should_announce(&news, false, 0, true));
+        assert!(!should_announce(&news, false, false, true));
         // It speaks as returned work, not as the Heartbeat.
         use crate::session::TurnOrigin;
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), Some(AnnounceKind::Result));
     }
 
 
+    fn news(voice_request: bool, reply: &str, needs_approval: bool, heartbeat_wake: bool) -> TurnNews {
+        TurnNews {
+            voice_request,
+            reply: reply.into(),
+            needs_approval,
+            heartbeat_wake,
+            details_tab: None,
+            trigger_id: uuid::Uuid::new_v4(),
+            trigger_text: String::new(),
+        }
+    }
+
     #[test]
-    fn voice_requests_are_left_to_the_live_wait() {
+    fn voice_requests_are_left_to_the_wait_that_owns_them() {
         let msgs = vec![msg("User", &brain::framed_request("check CI")), msg("Hobbes", "CI is green.")];
         let news = turn_news(&msgs).unwrap();
         assert!(news.voice_request);
-        // The live conversation's wait delivers it.
-        assert!(!should_announce(&news, true, 1, false));
-        // The conversation ended first: announce it, even in the Hobbes tab.
-        assert!(should_announce(&news, false, 0, true));
+        assert_eq!(news.trigger_id, msgs[0].id);
+        assert_eq!(news.trigger_text, brain::framed_request("check CI"));
+        // Owned (a live wait delivers it, or already did): never announced,
+        // whatever else holds.
+        for live in [true, false] {
+            for viewing in [true, false] {
+                assert!(!should_announce(&news, live, true, viewing), "live {live} viewing {viewing}");
+            }
+        }
+        // Not owned (no wait, a detached one, or one that gave up early):
+        // a voice request is always announced, even in the Hobbes tab.
+        for live in [true, false] {
+            for viewing in [true, false] {
+                assert!(should_announce(&news, live, false, viewing), "live {live} viewing {viewing}");
+            }
+        }
+        // Any other turn keeps the viewing rule.
+        let other = self::news(false, "Done.", false, false);
+        assert!(should_announce(&other, true, false, true));
+        assert!(should_announce(&other, false, false, false));
+        assert!(!should_announce(&other, false, false, true));
         // Nothing to say: nothing announced.
-        let empty = TurnNews { voice_request: false, reply: String::new(), needs_approval: false, heartbeat_wake: false, details_tab: None };
-        assert!(!should_announce(&empty, true, 0, false));
+        let empty = self::news(false, "", false, false);
+        assert!(!should_announce(&empty, true, false, false));
+        // An approval with no reply is still news.
+        assert!(should_announce(&self::news(true, "", true, false), true, false, false));
+    }
+
+    /// The announcement asks the wait registry by the trigger's own id.
+    #[test]
+    fn ownership_is_read_from_the_wait_registry() {
+        let msgs = vec![msg("User", &brain::framed_request("a request nobody waits on")), msg("Hobbes", "Done.")];
+        let news = turn_news(&msgs).unwrap();
+        assert!(!brain::wait_owns("no-such-session", &news.trigger_text, Some(news.trigger_id)));
+    }
+
+    fn relay(direction: crate::todo::relay::RelayDirection, woke_turn: bool) -> crate::components::chat::Message {
+        use crate::todo::relay::{RelayKind, RelayNote};
+        let mut m = msg("Relay", "");
+        m.content = crate::components::shared::MessageContent::Relay(RelayNote {
+            direction,
+            kind: RelayKind::Result,
+            peer_session_id: "w".into(),
+            peer_title: "Worker".into(),
+            todo_id: None,
+            text: "note".into(),
+            hop: 0,
+            woke_turn,
+        });
+        m
+    }
+
+    /// The trigger is the message that started the turn: not a relay the
+    /// brain sent mid-turn, a relay that didn't wake a turn, nor a recovery
+    /// prompt.
+    #[test]
+    fn the_trigger_is_the_message_that_started_the_turn() {
+        use crate::todo::relay::RelayDirection;
+        let request = msg("User", &brain::framed_request("ask the worker"));
+        let msgs = vec![
+            request.clone(),
+            relay(RelayDirection::ToWorker, false),
+            relay(RelayDirection::FromWorker, false),
+            msg("Hobbes", "Part one."),
+            msg("User", "[System: Auto-recovery triggered, carry on]"),
+            msg("Hobbes", "Part two."),
+        ];
+        let news = turn_news(&msgs).unwrap();
+        assert!(news.voice_request);
+        assert_eq!(news.trigger_id, request.id);
+        assert_eq!(news.details_tab, None);
+        // A relay that woke a turn of its own does start one.
+        let mut msgs = msgs;
+        let woke = relay(RelayDirection::FromWorker, true);
+        msgs.push(woke.clone());
+        msgs.push(msg("Hobbes", "The worker finished."));
+        let news = turn_news(&msgs).unwrap();
+        assert!(!news.voice_request);
+        assert_eq!(news.trigger_id, woke.id);
+        assert_eq!(news.reply, "The worker finished.");
+        // No message started a turn: no news.
+        assert_eq!(turn_news(&[msg("Hobbes", "hello")]), None);
     }
 
     #[test]
@@ -1480,10 +1694,8 @@ mod tests {
         let msgs = vec![report, msg("Hobbes", "The foundation parts are raised 0.2m.")];
         let news = turn_news(&msgs).unwrap();
         assert_eq!(news.details_tab.as_deref(), Some("NMS VR: adjust elevation"));
-        assert_eq!(
-            point_at_tab(&news.reply, "NMS VR: adjust elevation"),
-            "The foundation parts are raised 0.2m. (Full details are in the \"NMS VR: adjust elevation\" tab.)"
-        );
+        // No written details: no pointer.
+        assert_eq!(point_at_tab(&news.reply, "NMS VR: adjust elevation"), "The foundation parts are raised 0.2m.");
         assert_eq!(
             point_at_tab("Two PRs. (Full details are in the Hobbes tab.)", "CI"),
             "Two PRs. (Full details are in the \"CI\" tab.)"
@@ -1499,6 +1711,9 @@ mod tests {
         assert!(announce_prompt("CI is green.", false, AnnounceKind::Result).ends_with("CI is green."));
         let hb = announce_prompt("CI is red on main.", false, AnnounceKind::Heartbeat);
         assert!(hb.contains("Excuse me") && hb.contains("Heartbeat") && hb.ends_with("CI is red on main."));
+        // A tab only when the news names one; no habitual pointer.
+        assert!(hb.contains("Mention a tab only if the news below says its details are there"));
+        assert!(!hb.contains("else the Hobbes tab"));
     }
 
     #[test]
@@ -1512,15 +1727,15 @@ mod tests {
         assert!(!news.voice_request);
         // Same rule as a returned result: live, or not looking at the tab.
         assert!(news.heartbeat_wake);
-        assert!(should_announce(&news, false, 0, false));
+        assert!(should_announce(&news, false, false, false));
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, true), Some(AnnounceKind::Heartbeat));
         // Off by the Heartbeat-specific switch.
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &news, false), None);
         // Nothing for the person: stay quiet.
-        let quiet = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: false, heartbeat_wake: true, details_tab: None };
+        let quiet = self::news(false, "Nothing to report.", false, true);
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &quiet, true), None);
         // Held on an approval: say so.
-        let held = TurnNews { voice_request: false, reply: "Nothing to report.".into(), needs_approval: true, heartbeat_wake: true, details_tab: None };
+        let held = self::news(false, "Nothing to report.", true, true);
         assert_eq!(announce_kind(TurnOrigin::Heartbeat, &held, true), Some(AnnounceKind::Heartbeat));
         // A turn the person started is a result, whatever the switch.
         assert_eq!(announce_kind(TurnOrigin::User, &news, false), Some(AnnounceKind::Result));
@@ -1638,12 +1853,81 @@ mod tests {
     }
 
     #[test]
-    fn the_brain_handoff_is_announced() {
+    fn the_brain_handoff_is_acknowledged_once() {
         let s = system_instruction(chrono::Local::now(), "");
-        assert!(s.contains("holding phrase"));
+        assert!(s.contains("give one short acknowledgement in your own words, varied each time"));
+        // One source of truth: no example phrases to parrot.
+        assert!(!s.contains("one moment") && !s.contains("let me think"));
         let r = brain_started_response();
         assert_eq!(r["status"], "working");
-        assert!(r["note"].as_str().unwrap().contains("one moment"));
+        let note = r["note"].as_str().unwrap();
+        assert!(note.contains("if you already have, say nothing"));
+        assert!(!note.to_lowercase().contains("one moment"));
+    }
+
+    #[test]
+    fn the_rules_cover_hearing_relaying_and_results() {
+        let s = system_instruction(chrono::Local::now(), "");
+        for needle in [
+            "Answer small talk",
+            "without calling the brain again",
+            "You only know what they actually said",
+            "above all never a yes",
+            "in their own words",
+            "if they didn't answer, send nothing",
+            "follow the note",
+            "Mention the Hobbes tab only when the result says written details are there",
+            "Never read out code, URLs or long ids",
+            "announced later",
+        ] {
+            assert!(s.contains(needle), "missing: {needle}");
+        }
+        // Said once.
+        assert_eq!(s.matches("call it again only for a different request").count(), 1);
+    }
+
+    #[test]
+    fn every_brain_outcome_is_labelled() {
+        let cases = [
+            (BrainOutcome::Done("CI is green.".into()), "done", "CI is green.", "Finished."),
+            (BrainOutcome::NeedsApproval("Waiting.".into()), "needs_approval", "Waiting.", "NOT done."),
+            (BrainOutcome::Failed("Broke.".into()), "failed", "Broke.", "It did not work."),
+            (BrainOutcome::Cancelled, "cancelled", "The request was cancelled.", "Cancelled."),
+        ];
+        for (outcome, status, result, note) in cases {
+            let (s, text) = BrainStatus::of(outcome);
+            let r = brain_result_response(s, &text);
+            assert_eq!(r["status"], status);
+            assert_eq!(r["result"], result);
+            assert!(r["note"].as_str().unwrap().starts_with(note), "{status}");
+            // The injected-context path says the same.
+            let c = brain_result_context(s, &text);
+            assert!(c.contains(&format!("Status: {status}.")) && c.contains(s.note()) && c.ends_with(result));
+            // Through the floor queue's text and back.
+            let q = queued_brain_text(s, &text);
+            assert_eq!(parse_queued_brain_text(&q), (s, result));
+        }
+        assert!(BrainStatus::NeedsApproval.note().contains("do not say it is done"));
+        // Untagged text reads as done.
+        assert_eq!(parse_queued_brain_text("plain"), (BrainStatus::Done, "plain"));
+    }
+
+    #[test]
+    fn unspoken_results_are_announced_without_their_tag() {
+        let items = vec![
+            ("News.".to_string(), AnnounceKind::Heartbeat),
+            (queued_brain_text(BrainStatus::Done, "CI is green."), AnnounceKind::Result),
+            (queued_brain_text(BrainStatus::Cancelled, "The request was cancelled."), AnnounceKind::Result),
+            (queued_brain_text(BrainStatus::NeedsApproval, "Waiting for approval."), AnnounceKind::Result),
+        ];
+        assert_eq!(
+            unspoken_announcements(items),
+            vec![
+                ("News.".to_string(), AnnounceKind::Heartbeat),
+                ("CI is green.".to_string(), AnnounceKind::Result),
+                ("Waiting for approval.".to_string(), AnnounceKind::Result),
+            ]
+        );
     }
 
     #[test]

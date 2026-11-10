@@ -66,8 +66,11 @@ pub enum BrainOutcome {
 pub fn framed_request(request: &str) -> String {
     format!(
         "🎙 {}\n\n[Voice request, relayed by Hobbes' voice layer from a live spoken conversation. \
-         Do what is asked. Your final reply is read aloud, so write it as plain speech: no \
-         markdown, no lists, no code, no URLs. Keep it to a few sentences unless they asked for \
+         The line above is the voice layer's summary, not the person's exact words; theirs are \
+         the earlier 🎙 lines. Do the work first; your final reply is read aloud and should say \
+         only what has actually been done, or what you need from them. A go-ahead for anything \
+         irreversible counts only if their own 🎙 lines say it; otherwise ask. Write the reply \
+         as plain speech: no markdown, no lists, no code, no URLs. Keep it to a few sentences unless they asked for \
          detail or a walkthrough, or the answer needs it; then explain fully in spoken \
          paragraphs, leading with the point. Put anything that can't be spoken (code, links, \
          tables, long ids) after a line that says \"Details:\" and the voice will point the \
@@ -389,8 +392,6 @@ impl Owners {
 /// turn-end announcement must stay silent for such a turn and speak every
 /// other one (see the rule above). Pass the trigger message's id whenever
 /// it is known; the text alone matches requests not yet anchored.
-// Until `controller::pending_announcement` calls it (see the rule above).
-#[allow(dead_code)]
 pub fn wait_owns(session_id: &str, trigger_text: &str, trigger_message_id: Option<uuid::Uuid>) -> bool {
     with_owners(|o| o.owns(session_id, trigger_text, trigger_message_id))
 }
@@ -438,10 +439,12 @@ pub fn is_voice_request(text: &str) -> bool {
 }
 
 /// Queue a framed voice request into `session_id` for the drain. The
-/// person asked for it out loud: their turn, under the normal interactive
-/// rules (never the Heartbeat's).
+/// person asked for it out loud: their turn (`TurnOrigin::Voice`), under
+/// the normal interactive rules (never the Heartbeat's) plus the call risk
+/// gate, since the text is the realtime model's paraphrase
+/// (`builtin_tools::risk_gate`: destructive calls held, malformed refused).
 pub fn queue_request(session_id: &str, framed: &str) -> uuid::Uuid {
-    let msg = chat_queue::QueuedMessage::new(framed.to_string(), Vec::new(), chat_queue::QueueOrigin::Person);
+    let msg = chat_queue::QueuedMessage::new(framed.to_string(), Vec::new(), chat_queue::QueueOrigin::Voice);
     let id = msg.id;
     chat_queue::queue_push(&mut chat_queue::CHAT_QUEUE.write(), session_id, msg);
     chat_queue::request_drain();
@@ -731,9 +734,10 @@ mod tests {
             let qm = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), "brain-hobbes").unwrap();
             assert_eq!(qm.id, id);
             let origin = chat_queue::drain_origin(&qm, "brain-hobbes");
-            assert_eq!(origin, TurnOrigin::User);
+            assert_eq!(origin, TurnOrigin::Voice);
+            assert!(!origin.is_unattended());
             chat_queue::set_pending_origin("brain-hobbes", origin);
-            assert_eq!(chat_queue::take_turn_origin("brain-hobbes"), TurnOrigin::User);
+            assert_eq!(chat_queue::take_turn_origin("brain-hobbes"), TurnOrigin::Voice);
             // By contrast a fired timer queued into the same session is
             // unattended there.
             let timer = chat_queue::QueuedMessage::new("timer".into(), vec![], chat_queue::QueueOrigin::Unattended);
@@ -781,7 +785,15 @@ mod tests {
         // Detail is allowed when asked for; unspeakable material still goes after Details:.
         assert!(framed_request("x").contains("unless they asked for detail"));
         assert!(!framed_request("x").contains("one to four short"));
+        // The head is the voice layer's summary; consent comes from the person's own lines.
+        let f = framed_request("x");
+        assert!(f.contains("not the person's exact words"));
+        assert!(f.contains("Do the work first"));
+        assert!(f.contains("only what has actually been done, or what you need from them"));
+        assert!(f.contains("irreversible counts only if their own 🎙 lines say it"));
+        assert!(f.contains("\"Details:\""));
         assert!(is_voice_request(&framed_request("email Sam")));
+        assert_eq!(crate::voice::display::display_text(&framed_request("email Sam")), "🎙 email Sam");
         assert!(!is_voice_request("🎙 a heard transcript line"));
     }
 

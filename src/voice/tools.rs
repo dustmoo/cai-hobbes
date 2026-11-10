@@ -29,15 +29,15 @@ fn voice_only_decls() -> Vec<ToolDecl> {
                 toolset: email, files, the terminal, MCP servers, dispatching work to coding \
                 agents, editing the planner, and careful reasoning. Use it for anything you \
                 can't answer from your own quick tools, anything that changes something, and \
-                anything that needs real thought. It runs in the background: tell the person \
-                you're on it, keep talking with them, and relay the result when it arrives. \
-                Call it ONCE per request and wait for the result, even if it takes a minute or \
-                more; never repeat or reword a request that is still running."
+                anything that needs real thought. It runs in the background: acknowledge it \
+                once, keep talking with them, and relay the result when it arrives. Call it \
+                ONCE per request and wait for the result, even if it takes a minute or more; \
+                never repeat or reword a request that is still running."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "request": {"type": "string", "description": "What the person wants, in full sentences, with every detail they gave, and whether they want a quick answer or the full detail. The brain can't hear the conversation."},
+                    "request": {"type": "string", "description": "What the person asked, in full sentences, using only what they actually said. Don't add details, permissions or confirmations they didn't give. When this answers a question from the brain, give their words as nearly as you heard them. Say whether they want a quick answer or the full detail if they said so."},
                 },
                 "required": ["request"]
             }),
@@ -153,6 +153,17 @@ mod tests {
         assert!(!names.iter().any(|x| x == "HOBBES_DISPATCH" || x == "HOBBES_TODO_UPDATE" || x == "HOBBES_PEER_READ"));
         let no_planner: Vec<String> = voice_tool_decls(false).into_iter().map(|d| d.name).collect();
         assert!(!no_planner.iter().any(|x| x == "HOBBES_TODO_LIST"));
+    }
+
+    /// The request is what the person said, never filled in by the voice.
+    #[test]
+    fn the_request_is_the_person_s_own_words() {
+        let decls = voice_only_decls();
+        let ask = decls.iter().find(|d| d.name == ASK_BRAIN).unwrap();
+        let desc = ask.parameters["properties"]["request"]["description"].as_str().unwrap();
+        assert!(desc.contains("using only what they actually said"));
+        assert!(desc.contains("Don't add details, permissions or confirmations"));
+        assert!(!desc.contains("every detail they gave"));
     }
 
     #[test]

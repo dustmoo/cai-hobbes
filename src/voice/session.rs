@@ -56,10 +56,36 @@ pub fn tail_text(messages: &[Message], limit: usize, max_chars: usize) -> String
     out
 }
 
+/// Who said a Hobbes-tab message, as the voice is shown it, and its text
+/// when that differs from the stored one: "Person" (heard or typed), "You
+/// (voice)" (what the voice said, and the requests it handed over, without
+/// their frame), "Hobbes (brain)" (the brain's replies and tool calls), a
+/// Heartbeat wake as one line (its briefing is long; its outcome is in the
+/// reply after it).
+fn voice_view(m: &Message) -> (String, Option<String>) {
+    let text = m.content.get_text_content();
+    let text = text.as_deref().map(str::trim);
+    let strip = |t: &str, prefix: &str| t.strip_prefix(prefix.trim_end()).unwrap_or(t).trim().to_string();
+    match (m.author.as_str(), text) {
+        ("User", Some(t)) if t.starts_with(crate::heartbeat::wake::WAKE_HEADER) => {
+            ("Heartbeat".into(), Some("(woke to check on the person's day)".into()))
+        }
+        ("User", Some(t)) if crate::voice::brain::is_voice_request(t) => (
+            "You (voice), asking the brain".into(),
+            Some(strip(crate::voice::display::display_text(t), HEARD_PREFIX)),
+        ),
+        ("User", Some(t)) if crate::voice::transcript::is_recovery_prompt(m) => ("System".into(), Some(t.to_string())),
+        ("User", Some(t)) => ("Person".into(), Some(strip(t, HEARD_PREFIX))),
+        ("Hobbes", Some(t)) if t.starts_with(SPOKE_PREFIX.trim_end()) => ("You (voice)".into(), Some(strip(t, SPOKE_PREFIX))),
+        ("User", None) => ("Person".into(), None),
+        ("Hobbes", _) => ("Hobbes (brain)".into(), None),
+        (other, _) => (other.to_string(), None),
+    }
+}
+
 /// The recent conversation in the Hobbes session (read-only) for the voice
-/// tier's instructions: the last `limit` messages as "Author: text" lines,
-/// a Heartbeat wake briefing reduced to one line (it is long, and its
-/// outcome is in the reply after it).
+/// tier's instructions: the last `limit` messages as "Speaker: text" lines
+/// (see [`voice_view`] for the speakers), capped in size.
 pub fn session_tail(session_state: Signal<SessionState>, session_id: &str, limit: usize) -> String {
     let state = session_state.peek();
     let Some(s) = state.sessions.get(session_id) else { return String::new() };
@@ -67,21 +93,18 @@ pub fn session_tail(session_state: Signal<SessionState>, session_id: &str, limit
     let tail: Vec<Message> = s.messages[start..]
         .iter()
         .map(|m| {
-            let wake = m.author == "User"
-                && m.content.get_text_content().is_some_and(|t| t.starts_with(crate::heartbeat::wake::WAKE_HEADER));
-            if wake {
-                let mut short = m.clone();
-                short.author = "Heartbeat".to_string();
-                short.content = MessageContent::Text {
-                    content: "(woke to check on the person's day)".to_string(),
+            let (author, text) = voice_view(m);
+            let mut v = m.clone();
+            v.author = author;
+            if let Some(content) = text {
+                v.content = MessageContent::Text {
+                    content,
                     thought_signature: None,
                     thought_summary: None,
                     signature_provider: None,
                 };
-                short
-            } else {
-                m.clone()
             }
+            v
         })
         .collect();
     tail_text(&tail, limit, 6000)
@@ -128,10 +151,37 @@ mod tests {
             };
             s.messages.push(wake);
             s.messages.push(transcript_message(false, "CI is red on main."));
+            let mut request = transcript_message(true, "x");
+            request.content = MessageContent::Text {
+                content: crate::voice::brain::framed_request("fix CI"),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            };
+            s.messages.push(request);
+            let mut reply = transcript_message(false, "x");
+            reply.content = MessageContent::Text {
+                content: "Dispatched a fix.".into(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            };
+            s.messages.push(reply);
             let sig = use_signal(|| state);
             let tail = session_tail(sig, &id, 6);
-            assert!(tail.contains("🎙 what's blocked?") && tail.contains("CI is red on main."));
-            assert!(tail.contains("Heartbeat: (woke"));
+            let lines: Vec<&str> = tail.lines().collect();
+            assert_eq!(
+                lines,
+                [
+                    "Person: what's blocked?",
+                    "Heartbeat: (woke to check on the person's day)",
+                    "You (voice): CI is red on main.",
+                    "You (voice), asking the brain: fix CI",
+                    "Hobbes (brain): Dispatched a fix.",
+                ]
+            );
+            // The voice request's frame is never shown to the voice.
+            assert!(!tail.contains("[Voice request") && !tail.contains("Details:"));
             assert!(!tail.contains("detail detail"));
             assert_eq!(session_tail(sig, "missing", 6), "");
             rsx! { div {} }

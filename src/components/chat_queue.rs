@@ -33,9 +33,13 @@ pub struct QueuedMessage {
 /// Who a queued message's turn belongs to, as its producer knows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueueOrigin {
-    /// The person: typed while a turn ran, a voice brain request, an answer
-    /// they gave in the planner.
+    /// The person: typed while a turn ran, an answer they gave in the
+    /// planner.
     Person,
+    /// The person by voice: a request the realtime model relayed to the
+    /// brain (`voice::brain::queue_request`). The person's turn, but the
+    /// words are a paraphrase, so the call risk gate applies.
+    Voice,
     /// A Heartbeat wake.
     HeartbeatWake,
     /// Nobody is present: a fired timer, a relay, returned work, a message
@@ -80,6 +84,7 @@ pub fn resolve_origin(stated: QueueOrigin, is_hobbes_session: bool) -> crate::se
     use crate::session::TurnOrigin;
     match stated {
         QueueOrigin::Person => TurnOrigin::User,
+        QueueOrigin::Voice => TurnOrigin::Voice,
         QueueOrigin::HeartbeatWake => TurnOrigin::Heartbeat,
         QueueOrigin::Unattended if is_hobbes_session => TurnOrigin::Heartbeat,
         QueueOrigin::Unattended => TurnOrigin::User,
@@ -343,6 +348,8 @@ mod tests {
         assert_eq!(resolve_origin(QueueOrigin::Unattended, true), TurnOrigin::Heartbeat);
         assert_eq!(resolve_origin(QueueOrigin::Unattended, false), TurnOrigin::User);
         assert_eq!(resolve_origin(QueueOrigin::Person, true), TurnOrigin::User);
+        assert_eq!(resolve_origin(QueueOrigin::Voice, true), TurnOrigin::Voice);
+        assert_eq!(resolve_origin(QueueOrigin::Voice, false), TurnOrigin::Voice);
         assert_eq!(resolve_origin(QueueOrigin::HeartbeatWake, true), TurnOrigin::Heartbeat);
         assert_eq!(resolve_origin(QueueOrigin::HeartbeatWake, false), TurnOrigin::Heartbeat);
         // The drain hands its resolution to the send; a typed send finds none.

@@ -472,16 +472,38 @@ pub enum TurnOrigin {
     /// Unattended: a Heartbeat wake, or anything else nobody is present
     /// for in the Hobbes session (a timer, a relay, returned work).
     Heartbeat,
+    /// The person, by voice: the realtime model's paraphrase handed to the
+    /// brain (`voice::brain::queue_request`). The person's turn in every
+    /// respect (not unattended, no Heartbeat scope) except the call risk
+    /// gate (`builtin_tools::risk_gate`), which holds destructive calls and
+    /// refuses malformed ones, since the words weren't typed.
+    Voice,
 }
 
 impl TurnOrigin {
+    /// Exactly a typed turn (also the serde default, so `Voice` round-trips).
     pub fn is_user(&self) -> bool {
         *self == TurnOrigin::User
+    }
+
+    /// The person's turn, typed or spoken (`User` or `Voice`).
+    pub fn is_person(self) -> bool {
+        matches!(self, TurnOrigin::User | TurnOrigin::Voice)
     }
 
     /// Whether the Heartbeat's strict, unattended rules apply.
     pub fn is_unattended(self) -> bool {
         self == TurnOrigin::Heartbeat
+    }
+
+    /// How strict this origin's rules are, for "the strictest wins" when
+    /// several origins meet (a resumed approval): typed < voice < unattended.
+    pub fn strictness(self) -> u8 {
+        match self {
+            TurnOrigin::User => 0,
+            TurnOrigin::Voice => 1,
+            TurnOrigin::Heartbeat => 2,
+        }
     }
 }
 
@@ -2253,6 +2275,44 @@ impl Default for SessionState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn turn_origin_voice_round_trips_and_old_rows_still_load() {
+        use crate::components::shared::ToolCall;
+        assert_eq!(serde_json::to_string(&TurnOrigin::Voice).unwrap(), "\"voice\"");
+        for o in [TurnOrigin::User, TurnOrigin::Heartbeat, TurnOrigin::Voice] {
+            let back: TurnOrigin = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+            assert_eq!(back, o);
+        }
+        assert!(!TurnOrigin::Voice.is_unattended() && !TurnOrigin::Voice.is_user());
+        // A session's turn origin: Voice is written (User is skipped) and read back.
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let mut session = state.sessions.get(&id).unwrap().clone();
+        session.turn_origin = TurnOrigin::Voice;
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["turn_origin"], "voice");
+        let back: Session = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.turn_origin, TurnOrigin::Voice);
+        // An old row: no turn_origin at all.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("turn_origin");
+        let back: Session = serde_json::from_value(old).unwrap();
+        assert_eq!(back.turn_origin, TurnOrigin::User);
+        // A call stamped Voice and held by the risk gate round-trips; an old
+        // call without either field still loads.
+        let mut tc = ToolCall::new("hobbes-terminal".into(), "HOBBES_TERMINAL_EXEC".into(), serde_json::json!({}), None, None);
+        tc.origin = Some(TurnOrigin::Voice);
+        tc.risk_reason = Some("erases the whole disk disk10".into());
+        let back: ToolCall = serde_json::from_str(&serde_json::to_string(&tc).unwrap()).unwrap();
+        assert_eq!(back.origin, Some(TurnOrigin::Voice));
+        assert_eq!(back.risk_reason.as_deref(), Some("erases the whole disk disk10"));
+        let mut legacy = serde_json::to_value(ToolCall::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("risk_reason");
+        legacy.as_object_mut().unwrap().remove("origin");
+        let back: ToolCall = serde_json::from_value(legacy).unwrap();
+        assert_eq!((back.origin, back.risk_reason), (None, None));
+    }
+
     use super::*;
 
     #[test]
@@ -3443,6 +3503,7 @@ mod tests {
                         cancelled: None,
                         hold_reason: None,
                         hold_rule_key: None,
+                        risk_reason: None,
                         read_sources: Vec::new(),
                         origin: None,
                     }),
@@ -3474,6 +3535,7 @@ mod tests {
                         cancelled: None,
                         hold_reason: None,
                         hold_rule_key: None,
+                        risk_reason: None,
                         read_sources: Vec::new(),
                         origin: None,
                     }),

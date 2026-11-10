@@ -999,7 +999,15 @@ impl StreamManagerContext {
                                         &tool_call_message_id,
                                     ) {
                                         if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
-                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(tc.clone());
+                                            let mut held = tc.clone();
+                                            // A destructive voice/unattended call: say why
+                                            // (the bubble shows it; no always-allow).
+                                            held.risk_reason = crate::components::builtin_tools::risk_hold_reason(
+                                                &tool_call,
+                                                &args_json,
+                                                &session_id_inner,
+                                            );
+                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(held);
                                             pending_snapshot = Some(msg.clone());
                                         }
                                     }

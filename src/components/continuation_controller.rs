@@ -124,9 +124,9 @@ pub fn take_approval_origins(session_id: &str) -> Vec<crate::session::TurnOrigin
         .unwrap_or_default()
 }
 
-/// The strictest of `origins` (unattended wins), if any.
+/// The strictest of `origins` (unattended over voice over typed), if any.
 pub fn strictest(origins: impl IntoIterator<Item = crate::session::TurnOrigin>) -> Option<crate::session::TurnOrigin> {
-    origins.into_iter().reduce(|a, b| if a.is_unattended() { a } else { b })
+    origins.into_iter().reduce(|a, b| if a.strictness() >= b.strictness() { a } else { b })
 }
 
 /// Holds a session's continuation in-flight guard for one run of the

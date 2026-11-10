@@ -207,6 +207,15 @@ pub struct ToolCall {
     /// (`profile_reach::tab_read_sources`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_sources: Vec<String>,
+    /// Why the call risk gate held this call for the person (a verb phrase,
+    /// `call_risk::Risk::Destructive`'s reason, e.g. "erases the whole disk
+    /// /dev/disk10"). Stamped by the harness when the streaming path holds a
+    /// voice or unattended call (`builtin_tools::risk_hold_reason`), cleared
+    /// at mint (`stamp_turn_origin`), never from model output. Shown on the
+    /// approval bubble, which then offers no "always allow"; the voice
+    /// controller finds it with `call_risk::pending_risk_hold`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_reason: Option<String>,
 }
 
 /// Stop reason for a call cut off by the user's Stop.
@@ -289,6 +298,7 @@ impl ToolCall {
             hold_rule_key: None,
             read_sources: Vec::new(),
             origin: None,
+            risk_reason: None,
         }
     }
 

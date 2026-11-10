@@ -267,6 +267,8 @@ pub fn stamp_turn_origin(tool_call: &mut ToolCall, origin: crate::session::TurnO
     // Like the origin, a tab read's sources are the harness's to stamp
     // (`hobbes_tabs::stamp_read_sources`), never carried in from a mint.
     tool_call.read_sources.clear();
+    // So is a risk hold's reason (`risk_hold_reason`).
+    tool_call.risk_reason = None;
 }
 
 /// **The Heartbeat scope gate**, run by BOTH tool-call sites right after
@@ -320,9 +322,88 @@ pub fn tab_read_gate(deps: BuiltinToolCtx, tool_call: &ToolCall, session_id: &st
     }
 }
 
+/// **The call risk gate** (`call_risk`): judges what a call would do —
+/// rules only, no LLM — for calls minted by a voice-relayed turn
+/// (`TurnOrigin::Voice`) or an unattended one ([`effective_origin`]); a
+/// no-op (`Proceed`) for a typed turn. Safe proceeds into the normal flow
+/// (always-allow and trust rules included); Malformed is refused with a
+/// message telling the model what to fix (the person isn't asked);
+/// Destructive is held as a `PermissionRequest` whatever always-allow or
+/// trust rules say (`ForceApproval`; the streaming path stamps the reason,
+/// [`risk_hold_reason`]) and runs once the person approves
+/// (`user_approved` on the resume path). Reads only the harness's origin
+/// stamp and `user_approved`, never model output. Logs one INFO line per
+/// non-Safe verdict: tool name, origin and verdict kind only.
+pub fn risk_gate(
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+    user_approved: bool,
+) -> AgentTimeGate {
+    use crate::call_risk::{classify, gate_applies, gate_decision, RiskGate};
+    let origin = effective_origin(tool_call, session_id);
+    if !gate_applies(origin) {
+        return AgentTimeGate::Proceed;
+    }
+    let risk = classify(&tool_call.server_name, &tool_call.tool_name, args_json);
+    let decision = gate_decision(origin, &risk, user_approved);
+    if risk != crate::call_risk::Risk::Safe {
+        let action = match &decision {
+            RiskGate::Proceed => "approved",
+            RiskGate::Hold { .. } => "held",
+            RiskGate::Refuse(_) => "refused",
+        };
+        tracing::info!(
+            tool = %tool_call.tool_name,
+            origin = ?origin,
+            verdict = risk.kind(),
+            action,
+            "Call risk gate"
+        );
+    }
+    match decision {
+        RiskGate::Proceed => AgentTimeGate::Proceed,
+        RiskGate::Hold { .. } => AgentTimeGate::ForceApproval,
+        RiskGate::Refuse(message) => AgentTimeGate::Refuse(message),
+    }
+}
+
+/// The reason to stamp on a call the streaming path is holding
+/// (`ToolCall::risk_reason`): `Some` when the risk gate applies to its
+/// origin and judges it Destructive, else `None`. Pure apart from the
+/// origin lookup; logs nothing.
+pub fn risk_hold_reason(tool_call: &ToolCall, args_json: &serde_json::Value, session_id: &str) -> Option<String> {
+    if !crate::call_risk::gate_applies(effective_origin(tool_call, session_id)) {
+        return None;
+    }
+    match crate::call_risk::classify(&tool_call.server_name, &tool_call.tool_name, args_json) {
+        crate::call_risk::Risk::Destructive { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+/// The stricter of two gate results: Refuse > ForceApproval > Proceed; on a
+/// tie the first is kept (so a Heartbeat refusal keeps its own message).
+pub fn stricter_gate(first: AgentTimeGate, second: AgentTimeGate) -> AgentTimeGate {
+    let rank = |g: &AgentTimeGate| match g {
+        AgentTimeGate::Proceed => 0,
+        AgentTimeGate::ForceApproval => 1,
+        AgentTimeGate::Refuse(_) => 2,
+    };
+    if rank(&second) > rank(&first) {
+        second
+    } else {
+        first
+    }
+}
+
 /// All scope gates in order: agent time first, then (when it proceeds) the
-/// Heartbeat's, then the tab-read gate. The one entry point the two
-/// tool-call sites use, so neither can run one gate without the others.
+/// Heartbeat's, then the call risk gate, then the tab-read gate. The one
+/// entry point the two tool-call sites use, so neither can run one gate
+/// without the others. The risk gate composes with whatever came before it
+/// (the stricter result wins, so a Heartbeat hold of a malformed call is
+/// refused, and a refusal stays a refusal); for a typed turn it is a no-op,
+/// so typed chat is exactly as before.
 pub fn scope_gates(
     deps: BuiltinToolCtx,
     tool_call: &ToolCall,
@@ -330,11 +411,15 @@ pub fn scope_gates(
     session_id: &str,
     user_approved: bool,
 ) -> AgentTimeGate {
-    match agent_time_gate(deps, tool_call, args_json, session_id, user_approved) {
-        AgentTimeGate::Proceed => match heartbeat_gate(tool_call, args_json, session_id, user_approved) {
-            AgentTimeGate::Proceed => tab_read_gate(deps, tool_call, session_id, user_approved),
-            other => other,
-        },
+    let earlier = match agent_time_gate(deps, tool_call, args_json, session_id, user_approved) {
+        AgentTimeGate::Proceed => heartbeat_gate(tool_call, args_json, session_id, user_approved),
+        other => other,
+    };
+    if matches!(earlier, AgentTimeGate::Refuse(_)) {
+        return earlier;
+    }
+    match stricter_gate(earlier, risk_gate(tool_call, args_json, session_id, user_approved)) {
+        AgentTimeGate::Proceed => tab_read_gate(deps, tool_call, session_id, user_approved),
         other => other,
     }
 }
@@ -1768,5 +1853,100 @@ mod tests {
         assert!(!is_builtin_tool("MCP_LOAD_SERVER_TOOLS"));
         assert!(!is_planner_tool("HOBBES_UPDATE_SCRATCHPAD"));
         assert!(!is_planner_tool("MCP_LOAD_SERVER_TOOLS"));
+    }
+
+    // ── The call risk gate (voice and unattended turns only) ──
+
+    #[test]
+    fn the_risk_gate_judges_voice_and_unattended_calls_only() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                crate::settings::Settings::default(),
+            );
+            crate::system_sessions::set_current("risk-hobbes");
+            let exec = |origin: TurnOrigin, cmd: &str| {
+                let args = serde_json::json!({ "command": cmd });
+                let mut tc = ToolCall::new("hobbes-terminal".into(), "HOBBES_TERMINAL_EXEC".into(), args, None, None);
+                tc.risk_reason = Some("the model's own words".into());
+                stamp_turn_origin(&mut tc, origin);
+                assert_eq!(tc.risk_reason, None, "minting clears a carried-in reason");
+                tc
+            };
+            let gate = |tc: &ToolCall, approved: bool| {
+                let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap();
+                scope_gates(ctx, tc, &args, "risk-hobbes", approved)
+            };
+            let wipe = "diskutil eraseDisk APFS Untitled /dev/disk10";
+            // Typed chat: byte-for-byte as before.
+            assert_eq!(gate(&exec(TurnOrigin::User, wipe), false), AgentTimeGate::Proceed);
+            assert_eq!(gate(&exec(TurnOrigin::User, "rm -rf <path>"), false), AgentTimeGate::Proceed);
+            // Voice: safe runs into the normal flow, destructive is held
+            // (then runs once approved), malformed is refused.
+            assert_eq!(gate(&exec(TurnOrigin::Voice, "ls -la"), false), AgentTimeGate::Proceed);
+            let held = exec(TurnOrigin::Voice, wipe);
+            assert_eq!(gate(&held, false), AgentTimeGate::ForceApproval);
+            assert_eq!(gate(&held, true), AgentTimeGate::Proceed);
+            assert!(matches!(gate(&exec(TurnOrigin::Voice, "rm -rf <path>"), false), AgentTimeGate::Refuse(m) if m.contains("placeholder")));
+            assert!(matches!(gate(&exec(TurnOrigin::Voice, "rm -rf <path>"), true), AgentTimeGate::Refuse(_)));
+            // The reason the stream path stamps on the held request.
+            let args = serde_json::json!({ "command": wipe });
+            assert_eq!(
+                risk_hold_reason(&held, &args, "risk-hobbes").as_deref(),
+                Some("erases the whole disk /dev/disk10")
+            );
+            assert_eq!(risk_hold_reason(&exec(TurnOrigin::User, wipe), &args, "risk-hobbes"), None);
+            // Unattended: composes with the Heartbeat gate, stricter wins.
+            // (The Heartbeat's own scope already refuses an erase outright.)
+            assert!(matches!(gate(&exec(TurnOrigin::Heartbeat, wipe), false), AgentTimeGate::Refuse(_)));
+            assert!(matches!(gate(&exec(TurnOrigin::Heartbeat, "rm -rf $DIR/"), false), AgentTimeGate::Refuse(_)));
+            // A Heartbeat refusal stays the Heartbeat's refusal.
+            let todo = {
+                let mut tc = call("HOBBES_TODO_CREATE");
+                stamp_turn_origin(&mut tc, TurnOrigin::Heartbeat);
+                tc
+            };
+            match scope_gates(ctx, &todo, &serde_json::json!({}), "risk-hobbes", false) {
+                AgentTimeGate::Refuse(m) => assert!(m.contains("Heartbeat"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+            // Voice is the person's turn for everything else: no Heartbeat scope.
+            let mut todo_voice = call("HOBBES_TODO_CREATE");
+            stamp_turn_origin(&mut todo_voice, TurnOrigin::Voice);
+            assert_eq!(scope_gates(ctx, &todo_voice, &serde_json::json!({}), "risk-hobbes", false), AgentTimeGate::Proceed);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
+    fn stricter_gate_ranks_refuse_over_hold_over_proceed() {
+        let r = |m: &str| AgentTimeGate::Refuse(m.into());
+        assert_eq!(stricter_gate(AgentTimeGate::Proceed, AgentTimeGate::ForceApproval), AgentTimeGate::ForceApproval);
+        assert_eq!(stricter_gate(AgentTimeGate::ForceApproval, AgentTimeGate::Proceed), AgentTimeGate::ForceApproval);
+        assert_eq!(stricter_gate(AgentTimeGate::ForceApproval, r("risk")), r("risk"));
+        assert_eq!(stricter_gate(r("heartbeat"), r("risk")), r("heartbeat"));
+        assert_eq!(stricter_gate(AgentTimeGate::Proceed, AgentTimeGate::Proceed), AgentTimeGate::Proceed);
+    }
+
+    #[test]
+    fn a_voice_resume_stays_under_the_risk_gate() {
+        use crate::session::TurnOrigin;
+        let stamped = |o: TurnOrigin| {
+            let mut tc = call("HOBBES_TERMINAL_EXEC");
+            stamp_turn_origin(&mut tc, o);
+            tc
+        };
+        let (u, v, h) = (stamped(TurnOrigin::User), stamped(TurnOrigin::Voice), stamped(TurnOrigin::Heartbeat));
+        let resumed = |calls: Vec<&ToolCall>| crate::components::chat::resumed_turn_origin(calls, "an-ordinary-chat");
+        assert_eq!(resumed(vec![&u, &v]), TurnOrigin::Voice);
+        assert_eq!(resumed(vec![&v, &h, &u]), TurnOrigin::Heartbeat);
+        assert_eq!(resumed(vec![&u]), TurnOrigin::User);
+        assert_eq!(resumed(vec![]), TurnOrigin::User);
+        use crate::components::continuation_controller::strictest;
+        assert_eq!(strictest([TurnOrigin::User, TurnOrigin::Voice]), Some(TurnOrigin::Voice));
+        assert_eq!(strictest([TurnOrigin::Voice, TurnOrigin::User]), Some(TurnOrigin::Voice));
+        assert_eq!(strictest([TurnOrigin::Voice, TurnOrigin::Heartbeat]), Some(TurnOrigin::Heartbeat));
     }
 }

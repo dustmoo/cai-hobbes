@@ -98,23 +98,21 @@ fn heartbeat_briefing_events(session_id: &str, unattended: bool) -> Vec<crate::h
         .collect()
 }
 
-/// The origin a resumed approval continues under: unattended if any of the
-/// resumed calls was minted by an unattended turn (the strict side wins),
-/// else the person's. Read from each call's own stamp
-/// (`builtin_tools::effective_origin`), never from the session's current
-/// turn, so a typed turn started while the approval waited can't loosen it.
+/// The origin a resumed approval continues under: the strictest of the
+/// resumed calls' own stamps (`builtin_tools::effective_origin`; unattended
+/// over voice over typed, `TurnOrigin::strictness`), else the person's.
+/// Never read from the session's current turn, so a typed turn started
+/// while the approval waited can't loosen it — and a voice turn's
+/// continuation stays under the call risk gate.
 pub(crate) fn resumed_turn_origin<'a>(
     calls: impl IntoIterator<Item = &'a crate::components::shared::ToolCall>,
     session_id: &str,
 ) -> crate::session::TurnOrigin {
-    if calls
+    calls
         .into_iter()
-        .any(|tc| crate::components::builtin_tools::effective_origin(tc, session_id).is_unattended())
-    {
-        crate::session::TurnOrigin::Heartbeat
-    } else {
-        crate::session::TurnOrigin::User
-    }
+        .map(|tc| crate::components::builtin_tools::effective_origin(tc, session_id))
+        .max_by_key(|o| o.strictness())
+        .unwrap_or_default()
 }
 
 /// Approvals that can resume now, and those whose chat still has a turn in
