@@ -230,27 +230,7 @@ pub fn init() -> Result<(), String> {
     }
     let opened = std::time::Instant::now();
     let path = get_db_path().ok_or("could not resolve sessions.db path")?;
-    let conn = Connection::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-
-    // Restrict to owner-only, matching the old sessions.json (0600). SQLite
-    // copies the db file's mode when it creates the -wal/-shm companions, so
-    // setting it here covers those too; chmod any that already exist.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["", "-wal", "-shm"] {
-            let mut p = path.clone().into_os_string();
-            p.push(suffix);
-            let p = std::path::PathBuf::from(p);
-            if p.exists() {
-                if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
-                    tracing::warn!("Failed to set permissions on {}: {e}", p.display());
-                }
-            }
-        }
-    }
-
-    create_schema(&conn).map_err(|e| format!("schema: {e}"))?;
+    let conn = open_store(&path, env!("CARGO_PKG_VERSION"))?;
     crate::startup_timing::record("store open", opened);
 
     let migrations = std::time::Instant::now();
@@ -280,6 +260,212 @@ pub fn init() -> Result<(), String> {
 pub fn is_available() -> bool {
     CONN.get().is_some()
 }
+
+/// Open the store at `path` for app `version`: owner-only permissions, the
+/// once-per-version backup ([`backup_before_upgrade`]) — before anything
+/// changes the file — then the schema. Everything after (imports,
+/// backfills) is `init`'s. A failed backup never fails the open.
+fn open_store(path: &std::path::Path, version: &str) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+
+    // Restrict to owner-only, matching the old sessions.json (0600). SQLite
+    // copies the db file's mode when it creates the -wal/-shm companions, so
+    // setting it here covers those too; chmod any that already exist.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.to_path_buf().into_os_string();
+            p.push(suffix);
+            let p = std::path::PathBuf::from(p);
+            if p.exists() {
+                if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!("Failed to set permissions on {}: {e}", p.display());
+                }
+            }
+        }
+    }
+
+    let backup = crate::startup_timing::time("store backup", || backup_before_upgrade(&conn, path, version));
+    create_schema(&conn).map_err(|e| format!("schema: {e}"))?;
+    if backup == BackupOutcome::FreshInstall {
+        // Nothing to back up for this version: the next launch of the same
+        // version mustn't take one either.
+        if let Err(e) = meta_set_conn(&conn, META_BACKUP_VERSION, version, 0) {
+            tracing::warn!("store backup: could not record the version: {e}");
+        }
+    }
+    Ok(conn)
+}
+
+// ── Pre-upgrade backup ──────────────────────────────────────────────────────
+
+/// The app version `sessions.db` was last backed up for (or created by).
+const META_BACKUP_VERSION: &str = "store_backed_up_for_version";
+/// Set to the version whose backup failed: its migrations ran without one,
+/// so the next launch's backup postdates them.
+const META_BACKUP_MISSED: &str = "store_backup_missed_version";
+
+/// What [`backup_before_upgrade`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BackupOutcome {
+    /// A new database: nothing to back up.
+    FreshInstall,
+    /// Already backed up for this version.
+    UpToDate,
+    Taken { path: PathBuf, bytes: u64 },
+    /// Logged and skipped; the next launch tries again.
+    Failed,
+}
+
+/// `<db file name>.pre-<version>.bak`, next to the database.
+fn backup_path(db_path: &std::path::Path, version: &str) -> PathBuf {
+    let name = db_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    db_path.with_file_name(format!("{name}.pre-{version}.bak"))
+}
+
+/// The backups (`<db>.pre-*.bak`) and stray temp files (`<db>.pre-*.bak.tmp`)
+/// next to `db_path`. A temp file is never a backup.
+fn backup_files(db_path: &std::path::Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let name = db_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let prefix = format!("{name}.pre-");
+    let (mut baks, mut tmps) = (Vec::new(), Vec::new());
+    let Some(dir) = db_path.parent() else { return (baks, tmps) };
+    let Ok(entries) = std::fs::read_dir(dir) else { return (baks, tmps) };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if !file.starts_with(&prefix) {
+            continue;
+        }
+        if file.ends_with(".bak") {
+            baks.push(entry.path());
+        } else if file.ends_with(".bak.tmp") {
+            tmps.push(entry.path());
+        }
+    }
+    (baks, tmps)
+}
+
+/// Once per app version, before any schema change, migration or backfill:
+/// a consistent copy of the database at `db_path` as
+/// `<db>.pre-<version>.bak`, keeping only the newest. Runs on the store's
+/// only connection, before it is shared.
+///
+/// Consistent: a `TRUNCATE` checkpoint moves the WAL into the main file,
+/// then a write transaction (`BEGIN IMMEDIATE`) keeps any other writer out
+/// while the main file is copied, and the copy is rejected if the WAL grew
+/// in between. The copy is `std::fs::copy`: a clone on APFS (near-instant,
+/// no extra disk until the files diverge), a full copy on Windows. It goes
+/// to a `.tmp` name, is synced, then renamed, so a crash never leaves a
+/// partial file named like a backup.
+///
+/// Never blocks startup: on failure it logs a WARN (no paths or content),
+/// records the version as missed and leaves the done marker alone, so the
+/// next launch tries again. That retry runs after this version's
+/// migrations, so it keeps the older backups too (they predate them) and
+/// says so; the next version's backup prunes them.
+pub(crate) fn backup_before_upgrade(conn: &Connection, db_path: &std::path::Path, version: &str) -> BackupOutcome {
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if tables == 0 {
+        return BackupOutcome::FreshInstall;
+    }
+    let has_meta = conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'", [], |_| Ok(()))
+            .is_ok();
+    let (done, missed) = if has_meta {
+        (
+            meta_get_conn(conn, META_BACKUP_VERSION).ok().flatten(),
+            meta_get_conn(conn, META_BACKUP_MISSED).ok().flatten(),
+        )
+    } else {
+        (None, None)
+    };
+    if done.as_deref() == Some(version) {
+        return BackupOutcome::UpToDate;
+    }
+    let started = std::time::Instant::now();
+    let after_migrations = missed.as_deref() == Some(version);
+    match take_backup(conn, db_path, version) {
+        Ok((path, bytes)) => {
+            let (baks, _) = backup_files(db_path);
+            if after_migrations {
+                tracing::warn!(
+                    version,
+                    "store backup: taken after this version's migrations (last launch's backup failed); older backups kept"
+                );
+            } else {
+                for old in baks.iter().filter(|b| **b != path) {
+                    if let Err(e) = std::fs::remove_file(old) {
+                        tracing::warn!(kind = ?e.kind(), "store backup: could not remove an older backup");
+                    }
+                }
+            }
+            if has_meta {
+                let recorded = meta_set_conn(conn, META_BACKUP_VERSION, version, 0)
+                    .and_then(|_| conn.execute("DELETE FROM meta WHERE key = ?1", params![META_BACKUP_MISSED]).map(|_| ()));
+                if let Err(e) = recorded {
+                    tracing::warn!("store backup: taken, but the version wasn't recorded: {e}");
+                }
+            }
+            tracing::info!(
+                version,
+                bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "store backup: sessions.db backed up before this version's migrations"
+            );
+            BackupOutcome::Taken { path, bytes }
+        }
+        Err(e) => {
+            tracing::warn!(version, "store backup skipped (will retry next launch): {e}");
+            if has_meta {
+                let _ = meta_set_conn(conn, META_BACKUP_MISSED, version, 0);
+            }
+            BackupOutcome::Failed
+        }
+    }
+}
+
+/// The copy itself (see [`backup_before_upgrade`]): the final path and its
+/// size. Errors carry no paths or content.
+fn take_backup(conn: &Connection, db_path: &std::path::Path, version: &str) -> Result<(PathBuf, u64), String> {
+    let (_, stale) = backup_files(db_path);
+    for tmp in stale {
+        let _ = std::fs::remove_file(tmp);
+    }
+    let (busy, wal_frames, checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| format!("checkpoint: {e}"))?;
+    if busy != 0 || wal_frames != checkpointed {
+        return Err("checkpoint incomplete: another connection is using the database".into());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| format!("lock: {e}"))?;
+    let copied = (|| {
+        let mut wal = db_path.to_path_buf().into_os_string();
+        wal.push("-wal");
+        if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0 {
+            return Err("the WAL grew after the checkpoint".to_string());
+        }
+        let final_path = backup_path(db_path, version);
+        let mut tmp = final_path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let result = std::fs::copy(db_path, &tmp)
+            .and_then(|bytes| std::fs::File::open(&tmp)?.sync_all().map(|_| bytes))
+            .and_then(|bytes| std::fs::rename(&tmp, &final_path).map(|_| bytes));
+        match result {
+            Ok(bytes) => Ok((final_path, bytes)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(format!("copy failed ({:?})", e.kind()))
+            }
+        }
+    })();
+    let _ = conn.execute_batch("ROLLBACK");
+    copied
+}
+
 
 /// Borrow the shared connection. `pub(crate)` so sibling domains (the planner,
 /// `todo::store`) persist through this one connection rather than opening a
@@ -3166,5 +3352,135 @@ mod event_tests {
                 "fingerprint must be forgotten after delete"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    const V1: &str = "0.13.0";
+    const V2: &str = "0.14.0";
+
+    /// A store at `dir/sessions.db` with one session row, closed.
+    fn existing_store(dir: &std::path::Path, version: &str) -> PathBuf {
+        let path = dir.join("sessions.db");
+        let conn = open_store(&path, version).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, name, last_updated, message_count, total_cost, total_tokens, has_timers, summary, search_text, seq, data)
+             VALUES ('a', 'first', '2026-11-11T00:00:00Z', 0, 0, 0, 0, '', '', 1, '{}')",
+            [],
+        )
+        .unwrap();
+        path
+    }
+
+    fn backups(dir: &std::path::Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".pre-"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn ids_in(path: &std::path::Path) -> Vec<String> {
+        let c = Connection::open(path).unwrap();
+        let mut stmt = c.prepare("SELECT id FROM sessions ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn a_fresh_install_takes_none_and_its_next_launch_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        assert!(backups(dir.path()).is_empty());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(backup_before_upgrade(&conn, &path, V1), BackupOutcome::UpToDate);
+        assert!(backups(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn taken_on_a_version_change_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        let conn = open_store(&path, V2).unwrap();
+        assert_eq!(backups(dir.path()), ["sessions.db.pre-0.14.0.bak"]);
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_VERSION).unwrap().as_deref(), Some(V2));
+        assert_eq!(ids_in(&dir.path().join("sessions.db.pre-0.14.0.bak")), ["a"]);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(backup_before_upgrade(&conn, &path, V2), BackupOutcome::UpToDate);
+    }
+
+    /// Rows still in the WAL (another connection holds it open, so nothing
+    /// was checkpointed on close) are in the backup.
+    #[test]
+    fn the_backup_includes_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        writer
+            .execute(
+                "INSERT INTO sessions (id, name, last_updated, message_count, total_cost, total_tokens, has_timers, summary, search_text, seq, data)
+                 VALUES ('b', 'in the wal', '2026-11-11T00:00:00Z', 0, 0, 0, 0, '', '', 2, '{}')",
+                [],
+            )
+            .unwrap();
+        let wal = dir.path().join("sessions.db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0, "the row is in the WAL");
+        let conn = Connection::open(&path).unwrap();
+        let BackupOutcome::Taken { path: bak, bytes } = backup_before_upgrade(&conn, &path, V2) else { panic!("no backup") };
+        assert!(bytes > 0);
+        assert_eq!(ids_in(&bak), ["a", "b"]);
+        drop(writer);
+    }
+
+    #[test]
+    fn only_the_newest_backup_is_kept_and_a_temp_file_is_never_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        drop(open_store(&path, V2).unwrap());
+        // A crash mid-copy left a partial temp file of a later version.
+        std::fs::write(dir.path().join("sessions.db.pre-0.15.0.bak.tmp"), b"partial").unwrap();
+        let (baks, tmps) = backup_files(&path);
+        assert_eq!(baks.len(), 1, "the temp file isn't a backup");
+        assert_eq!(tmps.len(), 1);
+        drop(open_store(&path, "0.15.0").unwrap());
+        assert_eq!(backups(dir.path()), ["sessions.db.pre-0.15.0.bak"], "older pruned, temp gone");
+        assert_eq!(ids_in(&dir.path().join("sessions.db.pre-0.15.0.bak")), ["a"]);
+    }
+
+    /// A backup that can't be written doesn't stop the open, isn't recorded
+    /// (so the next launch retries), and the retry, which postdates this
+    /// version's migrations, keeps the older backup.
+    #[test]
+    fn a_failed_backup_never_stops_the_open_and_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        drop(open_store(&path, V2).unwrap());
+        // The temp path is taken by a directory: the copy fails.
+        let blocker = dir.path().join("sessions.db.pre-0.15.0.bak.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"x").unwrap();
+        let conn = open_store(&path, "0.15.0").expect("the open goes on");
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_VERSION).unwrap().as_deref(), Some(V2), "not recorded");
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_MISSED).unwrap().as_deref(), Some("0.15.0"));
+        assert_eq!(ids_in(&path), ["a"], "the store works");
+        assert_eq!(backups(dir.path()), ["sessions.db.pre-0.14.0.bak", "sessions.db.pre-0.15.0.bak.tmp"]);
+        drop(conn);
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let conn = open_store(&path, "0.15.0").unwrap();
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_VERSION).unwrap().as_deref(), Some("0.15.0"));
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_MISSED).unwrap(), None);
+        assert_eq!(
+            backups(dir.path()),
+            ["sessions.db.pre-0.14.0.bak", "sessions.db.pre-0.15.0.bak"],
+            "the older, pre-migration backup is kept"
+        );
     }
 }
