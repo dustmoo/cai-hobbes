@@ -121,6 +121,9 @@ fi
 /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Hobbes Pro switches to the terminal tab where a Claude Code session is running." "$PLIST"
 
 # Set the app name to "Hobbes Pro" for direct download builds
+/usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription Hobbes listens while you talk to it in a voice conversation." "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string Hobbes listens while you talk to it in a voice conversation." "$PLIST"
+
 /usr/libexec/PlistBuddy -c "Set :CFBundleName Hobbes Pro" "$PLIST" 2>/dev/null || \
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string Hobbes Pro" "$PLIST"
 

@@ -4,7 +4,7 @@ use crate::components::stream_manager::StreamManagerContext;
 use crate::session::SessionState;
 use crate::settings::UiState;
 use dioxus::prelude::*;
-use crate::components::metal_heart::{use_heartbeat_session_id, MetalHeart};
+use crate::components::hobbes_icon::{is_system_tab, use_hobbes_session_id, SystemTabIcon};
 use dioxus_free_icons::{icons::fi_icons, Icon};
 
 /// How far (in negative px) the hover marquee should slide a tab's date +
@@ -67,7 +67,7 @@ pub struct TabBarProps {
 }
 
 pub fn TabBar(props: TabBarProps) -> Element {
-    let heartbeat_id = use_heartbeat_session_id();
+    let hobbes_id = use_hobbes_session_id();
     // Write-only: used only for update_session_name in editing handlers
     let mut session_state = use_context::<Signal<SessionState>>();
     let stream_manager = consume_context::<StreamManagerContext>();
@@ -145,7 +145,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                     let topic = props.tab_topic.get(idx).cloned().flatten();
                     let profile = props.tab_profile.get(idx).cloned().flatten();
                     let has_summary = emoji.is_some() || topic.is_some();
-                    let show_emoji = emoji.is_some();
+                    // System tabs always show their metal icon, emoji or not.
+                    let show_emoji = emoji.is_some() || is_system_tab(hobbes_id, session_id);
                     // Collapsed tabs keep the full identity in the tooltip,
                     // regardless of what the collapsed layers show.
                     let tooltip = {
@@ -289,8 +290,8 @@ pub fn TabBar(props: TabBarProps) -> Element {
                                         }
                                     },
                                     if show_emoji {
-                                        if heartbeat_id.read().as_deref() == Some(session_id.as_str()) {
-                                            MetalHeart {}
+                                        if is_system_tab(hobbes_id, session_id) {
+                                            SystemTabIcon { session_id: session_id.to_string(), emoji: emoji.clone() }
                                         } else {
                                             span {
                                                 class: "text-[13px] leading-none shrink-0",

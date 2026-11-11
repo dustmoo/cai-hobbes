@@ -329,6 +329,35 @@ fn default_prev_tab_group() -> String {
     "CmdOrCtrl+Alt+Shift+[".to_string()
 }
 
+/// What happens to a dispatched agent's to-do when its run finishes with
+/// nothing open (`todo::lanes::apply_finish_policy`; Settings → Planner).
+/// A run that leaves an open item always waits for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentFinishAction {
+    /// Complete the to-do.
+    #[default]
+    Close,
+    /// Leave it open, marked for review.
+    Review,
+}
+
+impl AgentFinishAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentFinishAction::Close => "close",
+            AgentFinishAction::Review => "review",
+        }
+    }
+
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "review" => AgentFinishAction::Review,
+            _ => AgentFinishAction::Close,
+        }
+    }
+}
+
 /// How a chat and the chat workers it dispatched may message each other
 /// (`todo::relay`; Settings → Planner).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -443,6 +472,11 @@ pub struct Settings {
     #[serde(default)]
     pub composio_profiles: Vec<ComposioProfile>,
     pub active_composio_profile: Option<String>,
+    /// Hobbes' own home profile: the Hobbes tab (Heartbeat and voice) acts here by
+    /// default and reach the other profiles from it (profile_reach). `None`
+    /// = each keeps the profile it was created with.
+    #[serde(default)]
+    pub home_composio_profile: Option<String>,
     // Legacy fields for migration (will be removed in future)
     #[serde(skip_serializing)]
     pub composio_base_url: Option<String>,
@@ -569,6 +603,14 @@ pub struct Settings {
     /// (`todo::relay`): off, worker → parent reports (default), or two-way.
     #[serde(default)]
     pub dispatch_relay_mode: DispatchRelayMode,
+    /// A dispatched agent's to-do when its run finishes with nothing open:
+    /// close it (default) or leave it marked for review.
+    #[serde(default)]
+    pub agent_finish_action: AgentFinishAction,
+    /// A chat dispatch switches to the worker's new tab. Off: the tab opens
+    /// in the background and you stay where you are.
+    #[serde(default = "default_true")]
+    pub dispatch_focus_tab: bool,
 
     // ── Terminal ────────────────────────────────────────────────────────────
     /// Register the native `hobbes-terminal` MCP server (persistent per-chat
@@ -585,6 +627,29 @@ pub struct Settings {
     /// also applies the availability gate.
     #[serde(default)]
     pub heartbeat_enabled: bool,
+    /// The Hobbes tab may list and read the person's other conversations
+    /// (`HOBBES_TAB_LIST` / `HOBBES_TAB_READ`, `hobbes_tabs`). Off by
+    /// default: the tools are still offered there, but every call is held
+    /// for the person's approval ("always" on that prompt turns this on).
+    /// Read live at every call, so turning it off revokes at once.
+    #[serde(default)]
+    pub hobbes_read_tabs: bool,
+    /// Also rotate the Hobbes chat once a day at [`Self::hobbes_rotate_at`],
+    /// not only when it grows past the size caps (`session_rotation`). Off
+    /// by default.
+    /// Gemini 4 Carbon has been offered a quick-switch slot on this install
+    /// (`seed_gemini_4_carbon_slot`). One-time, so removing it later sticks.
+    #[serde(default)]
+    pub gemini_4_carbon_slot_seeded: bool,
+    #[serde(default)]
+    pub hobbes_rotate_daily: bool,
+    /// The local time of day ("HH:MM") the daily rotation is due. It runs at
+    /// the first quiet moment after this time.
+    #[serde(default = "default_hobbes_rotate_at")]
+    pub hobbes_rotate_at: String,
+    /// Voice: a realtime speech layer that orchestrates through the harness.
+    #[serde(default)]
+    pub voice: VoiceSettings,
     /// Wake cap: at most this many wakes in any rolling 60 minutes. Over the
     /// cap a wake is deferred and its events stay queued.
     #[serde(default = "default_heartbeat_wakes_per_hour")]
@@ -592,6 +657,21 @@ pub struct Settings {
     /// Daily wake spend cap in USD (local day).
     #[serde(default = "default_heartbeat_daily_usd")]
     pub heartbeat_daily_usd: f64,
+    /// ISO weekday numbers (1 = Mon … 7 = Sun) the Heartbeat treats as
+    /// workdays. Empty means no workdays.
+    #[serde(default = "default_heartbeat_workdays")]
+    pub heartbeat_workdays: Vec<u8>,
+    /// Briefing switches: start of the workday (and the over-capacity note
+    /// that rides it), 45 minutes before meetings, end of the workday.
+    #[serde(default = "default_true")]
+    pub heartbeat_brief_start: bool,
+    #[serde(default = "default_true")]
+    pub heartbeat_brief_meetings: bool,
+    #[serde(default = "default_true")]
+    pub heartbeat_brief_end: bool,
+    /// What the Heartbeat does on a day that is not a workday.
+    #[serde(default)]
+    pub heartbeat_days_off: HeartbeatDaysOff,
     /// Per-source watcher switches.
     #[serde(default = "default_true")]
     pub heartbeat_source_planner: bool,
@@ -637,10 +717,67 @@ impl Settings {
         self.permission_settings.trust_rules.retain(|r| r.id != id);
         self.permission_settings.trust_rules.len() != before
     }
+
+    /// Always allow content from profile `from` into profile `to` (ids).
+    /// Returns false when the pair was already listed.
+    pub fn add_profile_flow(&mut self, from: &str, to: &str) -> bool {
+        let flow = crate::context::permissions::ProfileFlow { from: from.to_string(), to: to.to_string() };
+        if from == to || self.permission_settings.profile_flows.contains(&flow) {
+            return false;
+        }
+        self.permission_settings.profile_flows.push(flow);
+        true
+    }
+
+    /// Stop always allowing `from` → `to`. Returns whether it was listed.
+    pub fn remove_profile_flow(&mut self, from: &str, to: &str) -> bool {
+        let before = self.permission_settings.profile_flows.len();
+        self.permission_settings.profile_flows.retain(|f| !(f.from == from && f.to == to));
+        self.permission_settings.profile_flows.len() != before
+    }
+
+    /// Load-time migration: drop the trust rules the old cross-company
+    /// guard authored (server `profile-flow:…`); flow holds are remembered
+    /// by profile pair now. Idempotent; other rules are untouched. Returns
+    /// whether anything was dropped (the caller persists).
+    pub fn drop_legacy_flow_trust_rules(&mut self) -> bool {
+        let before = self.permission_settings.trust_rules.len();
+        self.permission_settings
+            .trust_rules
+            .retain(|r| !r.server.starts_with(crate::mcp::manager::profile_flow::FLOW_KEY_PREFIX));
+        self.permission_settings.trust_rules.len() != before
+    }
 }
 
 fn default_fleet_retire_minutes() -> u32 {
     360
+}
+
+fn default_heartbeat_workdays() -> Vec<u8> {
+    vec![1, 2, 3, 4, 5]
+}
+
+/// What the Heartbeat's own wakes do on a day that is not a workday. The
+/// person can always still talk to Hobbes directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeartbeatDaysOff {
+    /// Meeting anchors and event wakes still run.
+    #[default]
+    MeetingsAndUrgent,
+    /// Meeting anchors run; events wait (queued) for the next wake.
+    MeetingsOnly,
+    /// Nothing wakes; events wait for the next workday.
+    Off,
+}
+
+impl Settings {
+    /// Is `day` one of the Heartbeat's workdays?
+    pub fn is_heartbeat_workday(&self, day: chrono::NaiveDate) -> bool {
+        use chrono::Datelike;
+        let n = day.weekday().number_from_monday() as u8;
+        self.heartbeat_workdays.contains(&n)
+    }
 }
 
 fn default_heartbeat_wakes_per_hour() -> u32 {
@@ -653,6 +790,10 @@ fn default_heartbeat_daily_usd() -> f64 {
 
 fn default_planner_block_minutes() -> u32 {
     30
+}
+
+fn default_hobbes_rotate_at() -> String {
+    "04:00".to_string()
 }
 
 fn default_workday_start() -> String {
@@ -908,7 +1049,163 @@ pub struct ProviderInstance {
     /// Unique display name shown in the chat-bar selector and settings list.
     pub name: String,
     pub config: ProviderInstanceConfig,
+    /// What this profile is used for. Existing profiles load as chat-only.
+    #[serde(default)]
+    pub roles: ConnectorRoles,
+    /// Realtime voice settings, used when `roles.voice` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceProfile>,
 }
+
+/// The jobs a connector profile does. Chat profiles are the brain (the
+/// chat-bar picker); voice profiles are offered in the voice picker. One
+/// profile may do both, sharing its credentials.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConnectorRoles {
+    #[serde(default = "default_true")]
+    pub chat: bool,
+    #[serde(default)]
+    pub voice: bool,
+}
+
+impl Default for ConnectorRoles {
+    fn default() -> Self {
+        Self { chat: true, voice: false }
+    }
+}
+
+/// A profile's realtime voice settings.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct VoiceProfile {
+    /// Realtime model id (Gemini: `gemini-3.8-live`). Empty = provider default.
+    #[serde(default)]
+    pub model: String,
+    /// Provider voice name (Gemini: "Kore", "Puck", ...). `None` = default.
+    #[serde(default)]
+    pub voice_name: Option<String>,
+    /// BCP-47 language hint. `None` = automatic.
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+/// Global voice settings (Settings → Voice).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct VoiceSettings {
+    /// Master switch. Off by default; read through `voice::voice_active`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The voice profile in use — independent of `active_connector_id`
+    /// (the brain). Must name a profile with `roles.voice`.
+    #[serde(default)]
+    pub connector_id: Option<String>,
+    /// Global hotkey: tap toggles a conversation, hold is push-to-talk.
+    #[serde(default = "default_voice_hotkey")]
+    pub hotkey: String,
+    /// A press shorter than this is a tap; longer is a hold.
+    #[serde(default = "default_voice_hold_threshold_ms")]
+    pub hold_threshold_ms: u64,
+    /// A conversation ends after this long with nobody speaking.
+    #[serde(default = "default_voice_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+    /// What a Heartbeat wake finds for the person is spoken through the
+    /// announce path (with [`Self::announce_results`]): "Excuse me…".
+    #[serde(default = "default_true")]
+    pub speak_heartbeat: bool,
+    /// Microphone to listen on (a CoreAudio device UID on macOS, the device
+    /// name elsewhere). `None`, or a device that is gone, = system default.
+    #[serde(default)]
+    pub input_device_uid: Option<String>,
+    /// Speaker-echo handling (macOS). Apple's voice processing cancels the
+    /// speaker's echo but only works on the system default mic and puts
+    /// Bluetooth headsets into call mode; see [`VoiceEcho`].
+    #[serde(default)]
+    pub echo: VoiceEcho,
+    /// Results that reach the Hobbes tab later (dispatched work finishing, a
+    /// brain answer after the conversation ended) are spoken: "Excuse me…"
+    /// mid-conversation, or a short announcement with the mic off.
+    #[serde(default = "default_true")]
+    pub announce_results: bool,
+    /// How long a silence ends the person's turn (ms): longer lets them
+    /// pause to think without Hobbes answering half a sentence. Read
+    /// through [`VoiceSettings::end_of_turn`].
+    #[serde(default = "default_voice_end_of_turn_ms")]
+    pub end_of_turn_ms: u64,
+}
+
+/// Bounds for [`VoiceSettings::end_of_turn_ms`].
+pub const VOICE_END_OF_TURN_MIN_MS: u64 = 300;
+pub const VOICE_END_OF_TURN_MAX_MS: u64 = 3000;
+
+impl VoiceSettings {
+    /// The end-of-turn silence, clamped to its bounds.
+    pub fn end_of_turn(&self) -> u32 {
+        self.end_of_turn_ms.clamp(VOICE_END_OF_TURN_MIN_MS, VOICE_END_OF_TURN_MAX_MS) as u32
+    }
+}
+
+/// How voice keeps the model from hearing itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceEcho {
+    /// Apple voice processing only when it can help: the system default mic
+    /// is in use and the output isn't headphones. Otherwise the chosen mic
+    /// is used directly (full duplex on headphones, mic muted while Hobbes
+    /// speaks on speakers).
+    #[default]
+    Auto,
+    /// Always Apple voice processing (uses the system default mic).
+    On,
+    /// Never; the chosen mic is used directly.
+    Off,
+}
+
+fn default_voice_hotkey() -> String {
+    "Alt+Space".to_string()
+}
+fn default_voice_hold_threshold_ms() -> u64 {
+    300
+}
+fn default_voice_idle_timeout_secs() -> u64 {
+    120
+}
+fn default_voice_end_of_turn_ms() -> u64 {
+    900
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            connector_id: None,
+            hotkey: default_voice_hotkey(),
+            hold_threshold_ms: default_voice_hold_threshold_ms(),
+            idle_timeout_secs: default_voice_idle_timeout_secs(),
+            speak_heartbeat: true,
+            input_device_uid: None,
+            echo: VoiceEcho::Auto,
+            announce_results: true,
+            end_of_turn_ms: default_voice_end_of_turn_ms(),
+        }
+    }
+}
+
+/// Whether a profile's provider has a realtime speech API Hobbes supports.
+/// Gemini only for now; Claude has no realtime API.
+pub fn realtime_capable(instance: &ProviderInstance) -> bool {
+    matches!(instance.provider(), LlmProvider::Gemini)
+}
+
+/// The realtime model a voice profile uses when none is set.
+pub fn default_realtime_model(provider: LlmProvider) -> Option<&'static str> {
+    match provider {
+        LlmProvider::Gemini => Some("gemini-3.8-live"),
+        _ => None,
+    }
+}
+
+/// Shown wherever a non-realtime profile is picked for voice.
+pub const VOICE_NEEDS_REALTIME: &str =
+    "Voice needs a realtime model for the best experience. Gemini Live is supported today.";
 
 impl ProviderInstance {
     /// The provider kind of this connector.
@@ -993,6 +1290,10 @@ pub struct ComposioProfile {
     /// reauth dance and must not lose curation).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub retained_curation: HashMap<String, Vec<String>>,
+    /// A personal profile: content moves freely between it and every other
+    /// profile (`mcp::manager::profile_flow::FlowPolicy`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub personal: bool,
 }
 
 fn default_profile_color() -> String {
@@ -1016,6 +1317,7 @@ impl Default for ComposioProfile {
             color: default_profile_color(),
             chrome_profile_directory: None,
             retained_curation: HashMap::new(),
+            personal: false,
         }
     }
 }
@@ -1079,6 +1381,7 @@ impl Default for Settings {
                 mcp_server_permissions: HashMap::new(),
                 skill_permissions: HashMap::new(),
                 trust_rules: Vec::new(),
+                profile_flows: Vec::new(),
                 max_ai_turns: 25,
             },
             confirm_on_delete: true,
@@ -1099,6 +1402,7 @@ impl Default for Settings {
             composio_profiles: Vec::new(),
             hotkeys: HotkeySettings::default(),
             active_composio_profile: None,
+            home_composio_profile: None,
             // Legacy fields for migration
             composio_base_url: None,
             composio_entity_id: None,
@@ -1129,10 +1433,23 @@ impl Default for Settings {
             fleet_retire_minutes: default_fleet_retire_minutes(),
             dispatch_auto_continue: true,
             dispatch_relay_mode: DispatchRelayMode::default(),
+            agent_finish_action: AgentFinishAction::default(),
+            dispatch_focus_tab: true,
             terminal_enabled: false,
             heartbeat_enabled: false,
+            hobbes_read_tabs: false,
+            // Fresh installs get it from `default_model_slots`.
+            gemini_4_carbon_slot_seeded: true,
+            hobbes_rotate_daily: false,
+            hobbes_rotate_at: default_hobbes_rotate_at(),
+            voice: VoiceSettings::default(),
             heartbeat_wakes_per_hour: default_heartbeat_wakes_per_hour(),
             heartbeat_daily_usd: default_heartbeat_daily_usd(),
+            heartbeat_workdays: default_heartbeat_workdays(),
+            heartbeat_brief_start: true,
+            heartbeat_brief_meetings: true,
+            heartbeat_brief_end: true,
+            heartbeat_days_off: HeartbeatDaysOff::default(),
             heartbeat_source_planner: true,
             heartbeat_source_fleet: true,
             heartbeat_source_ci: true,
@@ -1424,6 +1741,22 @@ impl Settings {
 
     /// The globally active connector: `active_connector_id` when it resolves,
     /// else the first connector (stale-id fallback, mirrors get_active_profile_mut).
+    /// The voice profile in use, if it names an existing voice-role profile.
+    pub fn voice_connector(&self) -> Option<&ProviderInstance> {
+        let id = self.voice.connector_id.as_deref()?;
+        self.connector_by_id(id).filter(|c| c.roles.voice)
+    }
+
+    /// Profiles offered in the chat-bar picker (`roles.chat`).
+    pub fn chat_connectors(&self) -> impl Iterator<Item = &ProviderInstance> {
+        self.llm_connectors.iter().filter(|c| c.roles.chat)
+    }
+
+    /// Profiles offered in the voice picker (`roles.voice`).
+    pub fn voice_connectors(&self) -> impl Iterator<Item = &ProviderInstance> {
+        self.llm_connectors.iter().filter(|c| c.roles.voice)
+    }
+
     pub fn active_connector(&self) -> Option<&ProviderInstance> {
         self.active_connector_id
             .as_deref()
@@ -1467,6 +1800,8 @@ impl Settings {
             id: Uuid::new_v4().to_string(),
             name: unique_name,
             config,
+            roles: ConnectorRoles::default(),
+            voice: None,
         };
         let id = instance.id.clone();
         self.llm_connectors.push(instance);
@@ -1605,6 +1940,33 @@ impl Settings {
         if let Some(s) = self.calendar_subscription_by_id_mut(id) {
             s.name = trimmed.to_string();
         }
+    }
+
+    /// One-time, for installs whose settings predate Gemini 4 Carbon: put it
+    /// in the first empty quick-switch slot of every Gemini connector (and
+    /// the legacy Gemini buffer) that doesn't list it. A full slot list is
+    /// left alone. Returns true when it changed anything (caller persists).
+    pub fn seed_gemini_4_carbon_slot(&mut self) -> bool {
+        if self.gemini_4_carbon_slot_seeded {
+            return false;
+        }
+        self.gemini_4_carbon_slot_seeded = true;
+        let carbon = crate::llm::gemini::GeminiModel::Gemini4Carbon.canonical_slug();
+        let seed = |slots: &mut Vec<String>| {
+            if slots.iter().any(|m| m.trim().trim_start_matches("models/") == carbon) {
+                return;
+            }
+            if let Some(empty) = slots.iter_mut().find(|m| m.trim().is_empty()) {
+                *empty = carbon.to_string();
+            }
+        };
+        seed(&mut self.gemini_config.model_slots);
+        for connector in &mut self.llm_connectors {
+            if let crate::llm::config::ProviderInstanceConfig::Gemini(c) = &mut connector.config {
+                seed(&mut c.model_slots);
+            }
+        }
+        true
     }
 
     /// One-time migration: convert the legacy `planner_calendar_profile` stub
@@ -1895,6 +2257,8 @@ impl Settings {
                 id: Uuid::new_v4().to_string(),
                 name,
                 config,
+                roles: ConnectorRoles::default(),
+                voice: None,
             });
         };
 
@@ -1994,6 +2358,13 @@ impl Settings {
         }
     }
 
+    /// Hobbes' home profile, if it still names a configured profile.
+    pub fn home_profile_id(&self) -> Option<&str> {
+        self.home_composio_profile
+            .as_deref()
+            .filter(|id| self.composio_profiles.iter().any(|p| p.id == *id))
+    }
+
     /// Resolve a profile ID to its human-readable name.
     /// Returns None if the ID doesn't match any profile.
     pub fn profile_name_for_id(&self, id: &str) -> Option<&str> {
@@ -2085,6 +2456,7 @@ impl Settings {
                 color: default_profile_color(),
                 chrome_profile_directory: None,
                 retained_curation: HashMap::new(),
+                personal: false,
             };
             let profile_id = profile.id.clone();
             self.add_profile(profile);
@@ -2324,7 +2696,10 @@ impl SettingsManager {
             settings.seed_default_claude_slots_if_empty();
             let migrated_llm = settings.migrate_legacy_llm_config();
             let migrated_calendar = settings.migrate_legacy_calendar_profile();
-            if (migrated_llm || migrated_calendar) && self.save(&settings).is_err() {
+            // After the connector migration, so every Gemini connector exists.
+            let seeded_carbon = settings.seed_gemini_4_carbon_slot();
+            let dropped_flow_rules = settings.drop_legacy_flow_trust_rules();
+            if (migrated_llm || migrated_calendar || seeded_carbon || dropped_flow_rules) && self.save(&settings).is_err() {
                 tracing::error!("Failed to persist migrated settings.");
             }
             return settings;
@@ -2449,6 +2824,7 @@ impl SettingsManager {
         settings.migrate_active_profile_name_to_id();
         settings.migrate_legacy_llm_config();
         settings.migrate_legacy_calendar_profile();
+        settings.drop_legacy_flow_trust_rules();
 
         // After migrating, save the repaired settings file for the next run.
         if self.save(&settings).is_err() {
@@ -2498,6 +2874,7 @@ impl SettingsManager {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub enum SettingsTab {
     General,
+    Hobbes,
     Mcp,
     Behavior,
     Planner,
@@ -2907,6 +3284,128 @@ pub fn discover_chrome_profiles() -> Vec<ChromeProfileInfo> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn heartbeat_workdays_helper() {
+        let d = |day| chrono::NaiveDate::from_ymd_opt(2026, 10, day).unwrap(); // 22 Thu, 24 Sat, 25 Sun
+        let mut s = Settings::default();
+        assert!(s.is_heartbeat_workday(d(22)));
+        assert!(!s.is_heartbeat_workday(d(24)) && !s.is_heartbeat_workday(d(25)));
+        s.heartbeat_workdays = vec![1, 6, 7];
+        assert!(s.is_heartbeat_workday(d(24)) && s.is_heartbeat_workday(d(25)));
+        assert!(!s.is_heartbeat_workday(d(22)));
+        s.heartbeat_workdays.clear();
+        assert!(!s.is_heartbeat_workday(d(22)));
+    }
+
+    #[test]
+    fn heartbeat_schedule_defaults_when_missing() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        let o = v.as_object_mut().unwrap();
+        for k in [
+            "heartbeat_workdays",
+            "heartbeat_brief_start",
+            "heartbeat_brief_meetings",
+            "heartbeat_brief_end",
+            "heartbeat_days_off",
+        ] {
+            assert!(o.remove(k).is_some(), "{k}");
+        }
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.heartbeat_workdays, vec![1, 2, 3, 4, 5]);
+        assert!(s.heartbeat_brief_start && s.heartbeat_brief_meetings && s.heartbeat_brief_end);
+        assert_eq!(s.heartbeat_days_off, HeartbeatDaysOff::MeetingsAndUrgent);
+        let j = serde_json::to_string(&HeartbeatDaysOff::MeetingsOnly).unwrap();
+        assert_eq!(j, "\"meetings_only\"");
+    }
+
+    fn settings_with_connector() -> Settings {
+        let mut s = Settings::default();
+        if s.llm_connectors.is_empty() {
+            s.add_connector("Gemini", ProviderInstanceConfig::default_for(LlmProvider::Gemini))
+                .unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn voice_roles_legacy_json_is_chat_only() {
+        let s0 = settings_with_connector();
+        let mut v = serde_json::to_value(&s0.llm_connectors[0]).unwrap();
+        let o = v.as_object_mut().unwrap();
+        o.remove("roles");
+        o.remove("voice");
+        let inst: ProviderInstance = serde_json::from_value(v).unwrap();
+        assert!(inst.roles.chat && !inst.roles.voice);
+        assert!(inst.voice.is_none());
+
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("voice");
+        let s: Settings = serde_json::from_value(v).unwrap();
+        assert_eq!(s.voice, VoiceSettings::default());
+    }
+
+    #[test]
+    fn voice_end_of_turn_defaults_and_clamps() {
+        // Settings saved before the field existed load with the default.
+        let mut v = serde_json::to_value(VoiceSettings::default()).unwrap();
+        v.as_object_mut().unwrap().remove("end_of_turn_ms");
+        let mut vs: VoiceSettings = serde_json::from_value(v).unwrap();
+        assert_eq!(vs.end_of_turn_ms, 900);
+        assert_eq!(vs.end_of_turn(), 900);
+        vs.end_of_turn_ms = 50;
+        assert_eq!(vs.end_of_turn(), 300);
+        vs.end_of_turn_ms = 10_000;
+        assert_eq!(vs.end_of_turn(), 3000);
+    }
+
+    #[test]
+    fn voice_connector_ignores_non_voice_role() {
+        let mut s = settings_with_connector();
+        let id = s.llm_connectors[0].id.clone();
+        s.voice.connector_id = Some(id.clone());
+        assert!(s.voice_connector().is_none());
+        s.connector_by_id_mut(&id).unwrap().roles.voice = true;
+        assert_eq!(s.voice_connector().map(|c| c.id.clone()), Some(id));
+        s.voice.connector_id = Some("missing".into());
+        assert!(s.voice_connector().is_none());
+    }
+
+    #[test]
+    fn chat_and_voice_connectors_filter_by_role() {
+        let mut s = settings_with_connector();
+        let id = s.llm_connectors[0].id.clone();
+        assert_eq!(s.chat_connectors().count(), s.llm_connectors.len());
+        assert_eq!(s.voice_connectors().count(), 0);
+        {
+            let c = s.connector_by_id_mut(&id).unwrap();
+            c.roles.chat = false;
+            c.roles.voice = true;
+        }
+        assert!(s.chat_connectors().all(|c| c.id != id));
+        assert_eq!(s.voice_connectors().count(), 1);
+    }
+
+    #[test]
+    fn voice_settings_round_trip() {
+        let mut s = settings_with_connector();
+        s.voice.enabled = true;
+        s.voice.hotkey = "Ctrl+Space".into();
+        s.voice.connector_id = Some("x".into());
+        {
+            let c = &mut s.llm_connectors[0];
+            c.roles.voice = true;
+            c.voice = Some(VoiceProfile {
+                model: "m".into(),
+                voice_name: Some("Puck".into()),
+                language: Some("en-US".into()),
+            });
+        }
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(back.voice, s.voice);
+        assert_eq!(back.llm_connectors[0].roles, s.llm_connectors[0].roles);
+        assert_eq!(back.llm_connectors[0].voice, s.llm_connectors[0].voice);
+    }
+
     use super::*;
 
     #[test]
@@ -3146,6 +3645,52 @@ mod tests {
         assert_eq!(count, 1, "only settings.json should remain");
     }
 
+    /// The old cross-company guard's trust rules (`profile-flow:…`) are
+    /// dropped at load, once; every other rule, the pair list and the
+    /// personal flag survive, and a second load changes nothing.
+    #[test]
+    fn load_drops_legacy_flow_trust_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SettingsManager::new(dir.path().join("settings.json"));
+        let rule = |id: &str, server: &str| crate::context::permissions::TrustRule {
+            id: id.into(),
+            server: server.into(),
+            tool: Some("GMAIL_SEND_EMAIL".into()),
+            command_prefix: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+        };
+        let mut settings = Settings::default();
+        settings.permission_settings.trust_rules = vec![
+            rule("keep-1", "composio-native:Puget"),
+            rule("flow-1", "profile-flow:pg>cm"),
+            rule("flow-2", "profile-flow:act>pg"),
+            rule("flow-3", "profile-flow:ac+pg>local"),
+            rule("keep-2", "hobbes-terminal"),
+        ];
+        settings.composio_profiles = vec![ComposioProfile { id: "pg".into(), personal: true, ..Default::default() }];
+        assert!(settings.add_profile_flow("pg", "cm"));
+        assert!(!settings.add_profile_flow("pg", "cm"), "deduplicated");
+        assert!(!settings.add_profile_flow("cm", "cm"), "a profile never flows into itself");
+        mgr.save(&settings).unwrap();
+
+        let loaded = mgr.load();
+        let ids: Vec<&str> = loaded.permission_settings.trust_rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["keep-1", "keep-2"]);
+        assert_eq!(
+            loaded.permission_settings.profile_flows,
+            vec![crate::context::permissions::ProfileFlow { from: "pg".into(), to: "cm".into() }]
+        );
+        assert!(loaded.composio_profiles[0].personal);
+        // Persisted, and idempotent.
+        let again = mgr.load();
+        assert_eq!(again.permission_settings.trust_rules, loaded.permission_settings.trust_rules);
+        let mut twice = again.clone();
+        assert!(!twice.drop_legacy_flow_trust_rules());
+        assert!(twice.remove_profile_flow("pg", "cm"));
+        assert!(!twice.remove_profile_flow("pg", "cm"));
+    }
+
     #[test]
     fn settings_manager_save_load_roundtrip_repeats() {
         let dir = tempfile::tempdir().unwrap();
@@ -3290,6 +3835,12 @@ mod tests {
         context_ledger: Vec::new(),
         dispatch_link: None,
         dispatched_workers: Vec::new(),
+        carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
+        profile_locked: false,
+        allowed_flows: Vec::new(),
+        summary_sources: Vec::new(),
+        turn_origin: Default::default(),
         }
     }
 
@@ -3327,6 +3878,58 @@ mod tests {
             }
             _ => panic!("wrong config variant"),
         }
+    }
+
+    #[test]
+    fn gemini_4_carbon_is_offered_a_slot_once_on_existing_installs() {
+        use crate::llm::config::ProviderInstanceConfig;
+        // An install from before Carbon: slots without it, flag absent.
+        let mut settings = Settings { gemini_4_carbon_slot_seeded: false, ..Settings::default() };
+        let old_slots = |n_empty: usize| {
+            let mut v = vec!["gemini-3.7-flash".to_string(), "gemini-2.5-flash".to_string()];
+            v.extend(std::iter::repeat_n(String::new(), n_empty));
+            v
+        };
+        settings.gemini_config.model_slots = old_slots(2);
+        settings.migrate_legacy_llm_config();
+        for c in &mut settings.llm_connectors {
+            if let ProviderInstanceConfig::Gemini(g) = &mut c.config {
+                g.model_slots = old_slots(2);
+            }
+        }
+        assert!(settings.seed_gemini_4_carbon_slot());
+        assert_eq!(settings.gemini_config.model_slots[2], "gemini-4-carbon");
+        assert_eq!(settings.gemini_config.model_slots[3], "");
+        let gemini: Vec<_> = settings
+            .llm_connectors
+            .iter()
+            .filter_map(|c| match &c.config {
+                ProviderInstanceConfig::Gemini(g) => Some(g.model_slots.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!gemini.is_empty());
+        assert!(gemini.iter().all(|s| s[2] == "gemini-4-carbon" && s[..2] == old_slots(0)[..]));
+
+        // Once only: removing it afterwards sticks.
+        settings.gemini_config.model_slots[2].clear();
+        assert!(!settings.seed_gemini_4_carbon_slot());
+        assert_eq!(settings.gemini_config.model_slots[2], "");
+
+        // Already listed, or no empty slot: nothing is added or replaced.
+        let mut listed = Settings { gemini_4_carbon_slot_seeded: false, ..Settings::default() };
+        let before = listed.gemini_config.model_slots.clone();
+        listed.seed_gemini_4_carbon_slot();
+        assert_eq!(listed.gemini_config.model_slots, before);
+        let mut full = Settings { gemini_4_carbon_slot_seeded: false, ..Settings::default() };
+        full.gemini_config.model_slots = vec!["a".to_string(), "b".to_string()];
+        full.seed_gemini_4_carbon_slot();
+        assert_eq!(full.gemini_config.model_slots, vec!["a".to_string(), "b".to_string()]);
+
+        // A fresh install never needs it; an old settings file does.
+        assert!(Settings::default().gemini_4_carbon_slot_seeded);
+        let old: Settings = serde_json::from_str("{}").unwrap_or_default();
+        let _ = old;
     }
 
     #[test]

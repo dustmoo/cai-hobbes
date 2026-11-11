@@ -75,10 +75,44 @@ pub struct WorkerSignal {
     pub idle_settled: bool,
 }
 
-/// An idle, live worker counts as finished once it has been quiet this long
-/// (short enough to catch a run that stopped, long enough that the pause
-/// between a turn ending and the next prompt never flaps the state).
+/// An idle, live terminal worker counts as finished once it has been quiet
+/// this long (short enough to catch a run that stopped, long enough that the
+/// pause between a turn ending and the next prompt never flaps the state).
+/// A Hobbes chat worker settles at its turn end instead: Hobbes ran the turn,
+/// so it knows when the work stopped (`handlers::worker_signal_from_fleet`).
 pub const IDLE_SETTLE_MINUTES: i64 = 15;
+
+/// Mirror of `settings.agent_finish_action` for the derivation, which runs
+/// from paths with no Settings access (same pattern as
+/// `fleet::set_dispatch_auto_continue`). True = close a clean finish.
+static FINISH_CLOSES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_finish_action(action: crate::settings::AgentFinishAction) {
+    FINISH_CLOSES.store(
+        action == crate::settings::AgentFinishAction::Close,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn finish_closes() -> bool {
+    FINISH_CLOSES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A run that just finished cleanly (`Done` on a still-open to-do): close
+/// the to-do, or leave it open as `Review` for the person to look at. An
+/// in-progress to-do (someone is focused on it) is never closed under them.
+/// Pure apart from `now`; returns whether anything changed.
+pub fn apply_finish_policy(todo: &mut Todo, close: bool, now: DateTime<Utc>) -> bool {
+    if todo.agent_state != Some(AgentState::Done) || todo.status.is_closed() {
+        return false;
+    }
+    if close && todo.status != TodoStatus::InProgress {
+        todo.mark_completed(now);
+    } else {
+        todo.agent_state = Some(AgentState::Review);
+    }
+    true
+}
 
 /// The explicit agent state a signal implies, or `None` to leave the state
 /// as it is. First match wins:
@@ -91,9 +125,12 @@ pub const IDLE_SETTLE_MINUTES: i64 = 15;
 /// 6. the session ended with a `blocked` open item → `Review` (finished, but
 ///    there is something for the person to look at)
 /// 7. the session ended cleanly → `Done`
-/// 8. the worker has sat idle past [`IDLE_SETTLE_MINUTES`] → `Review` (its
-///    turn finished and it's waiting on the person to look, not working)
+/// 8. the worker's run settled (idle past [`IDLE_SETTLE_MINUTES`], or a
+///    chat worker's turn ended) → `Done`, like a clean end
 /// 9. otherwise → `None`
+///
+/// A clean `Done` on an open to-do then goes through
+/// [`apply_finish_policy`]: closed, or left for review.
 pub fn derive_agent_state(todo: &Todo, signal: Option<&WorkerSignal>) -> Option<AgentState> {
     if todo.status == TodoStatus::Completed {
         return Some(AgentState::Done);
@@ -122,7 +159,7 @@ pub fn derive_agent_state(todo: &Todo, signal: Option<&WorkerSignal>) -> Option<
         return Some(AgentState::Stuck);
     }
     if s.idle_settled {
-        return Some(AgentState::Review);
+        return Some(AgentState::Done);
     }
     None
 }
@@ -171,8 +208,19 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
         }
     }
 
-    if let Some(state) = derive_agent_state(todo, Some(signal)) {
-        todo.agent_state = Some(state);
+    let derived = derive_agent_state(todo, Some(signal));
+    // The finish policy judges a run once, as it finishes: only a move INTO
+    // `Done` from a live state (working, waiting, stuck, unknown). A to-do
+    // already `Done` or `Review` was judged before — by this policy, by an
+    // older build, or the person reopened it since — so a settled worker
+    // must not close it again or flip it out of review on every sync.
+    let already_judged = matches!(before.0, Some(AgentState::Done) | Some(AgentState::Review));
+    let finish_now = derived == Some(AgentState::Done) && !already_judged;
+    match derived {
+        // A run left for review stays there while it stays finished.
+        Some(AgentState::Done) if before.0 == Some(AgentState::Review) => {}
+        Some(state) => todo.agent_state = Some(state),
+        None => {}
     }
     todo.open_item = signal
         .brief
@@ -181,7 +229,9 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
         .map(str::trim)
         .filter(|b| !b.is_empty())
         .map(str::to_string);
-    let changed = before != (todo.agent_state, todo.decision.clone(), todo.open_item.clone());
+    // Only a finish that happened now (see `already_judged` above).
+    let finished = finish_now && apply_finish_policy(todo, finish_closes(), now);
+    let changed = finished || before != (todo.agent_state, todo.decision.clone(), todo.open_item.clone());
     if changed {
         todo.updated_at = now;
     }
@@ -522,6 +572,87 @@ mod tests {
     }
 
     #[test]
+    fn the_finish_policy_judges_a_run_once_as_it_finishes() {
+        let now = Utc::now();
+        let mut settled = signal(WorkerStatus::Idle);
+        settled.idle_settled = true;
+        let mut ended = signal(WorkerStatus::Idle);
+        ended.ended = true;
+
+        // A run finishing now (it was working): closed (default policy).
+        let mut t = agent_todo();
+        t.agent_state = Some(AgentState::Working);
+        assert!(apply_worker_signal(&mut t, &settled, now));
+        assert_eq!(t.status, TodoStatus::Completed);
+
+        // Upgrade: open to-dos an older build already settled — Done (a
+        // clean end) or Review (a long idle) — are left exactly as they are.
+        for state in [AgentState::Done, AgentState::Review] {
+            for sig in [&settled, &ended] {
+                let mut old = agent_todo();
+                old.agent_state = Some(state);
+                let stamp = old.updated_at;
+                assert!(!apply_worker_signal(&mut old, sig, now), "{state:?}: no change");
+                assert!(!old.status.is_closed(), "{state:?}: not completed on upgrade");
+                assert_eq!(old.agent_state, Some(state));
+                assert_eq!(old.updated_at, stamp, "no re-save");
+            }
+        }
+
+        // The person reopens a closed one: the next Fleet event leaves it open.
+        t.reopen(now);
+        for _ in 0..3 {
+            assert!(!apply_worker_signal(&mut t, &settled, now));
+            assert_eq!(t.status, TodoStatus::Open, "reopened stays open");
+        }
+        // ...until its worker runs again and finishes: that run closes it.
+        assert!(apply_worker_signal(&mut t, &signal(WorkerStatus::Working), now));
+        assert!(apply_worker_signal(&mut t, &settled, now));
+        assert_eq!(t.status, TodoStatus::Completed);
+
+        // Focused (in progress): left for review once, then not re-judged.
+        let mut f = agent_todo();
+        f.status = TodoStatus::InProgress;
+        f.agent_state = Some(AgentState::Working);
+        assert!(apply_worker_signal(&mut f, &settled, now));
+        assert_eq!(f.agent_state, Some(AgentState::Review));
+        let later = now + chrono::Duration::minutes(5);
+        for _ in 0..3 {
+            assert!(!apply_worker_signal(&mut f, &settled, later), "no churn");
+            assert_eq!(f.agent_state, Some(AgentState::Review));
+            assert_eq!(f.updated_at, now);
+        }
+    }
+
+    #[test]
+    fn a_clean_finish_closes_or_waits_for_review() {
+        let now = Utc::now();
+        let mut t = agent_todo();
+        t.agent_state = Some(AgentState::Done);
+        assert!(apply_finish_policy(&mut t, true, now));
+        assert_eq!(t.status, TodoStatus::Completed);
+        assert_eq!(t.agent_state, Some(AgentState::Done));
+        assert!(!apply_finish_policy(&mut t, true, now), "closed is final");
+
+        let mut r = agent_todo();
+        r.agent_state = Some(AgentState::Done);
+        assert!(apply_finish_policy(&mut r, false, now));
+        assert!(!r.status.is_closed());
+        assert_eq!(r.agent_state, Some(AgentState::Review), "left open, marked for review");
+
+        let mut focused = agent_todo();
+        focused.status = TodoStatus::InProgress;
+        focused.agent_state = Some(AgentState::Done);
+        assert!(apply_finish_policy(&mut focused, true, now));
+        assert_eq!(focused.status, TodoStatus::InProgress, "never closed under someone focused on it");
+        assert_eq!(focused.agent_state, Some(AgentState::Review));
+
+        let mut working = agent_todo();
+        working.agent_state = Some(AgentState::Working);
+        assert!(!apply_finish_policy(&mut working, true, now));
+    }
+
+    #[test]
     fn set_lane_keeps_fields_coherent() {
         let mut t = Todo::new("x", 0.0);
         t.kind = Some(super::super::model::HumanKind::Chore);
@@ -539,7 +670,7 @@ mod tests {
         assert_eq!(derive_agent_state(&t, Some(&signal(WorkerStatus::Idle))), None, "a fresh idle is not judged");
         let mut settled = signal(WorkerStatus::Idle);
         settled.idle_settled = true;
-        assert_eq!(derive_agent_state(&t, Some(&settled)), Some(AgentState::Review), "a long idle has finished");
+        assert_eq!(derive_agent_state(&t, Some(&settled)), Some(AgentState::Done), "a settled idle has finished");
         assert_eq!(
             derive_agent_state(&t, Some(&signal(WorkerStatus::Working))),
             Some(AgentState::Working)

@@ -2591,14 +2591,22 @@ pub fn worker_signal_from_fleet(row: &crate::fleet::FleetSession, now: DateTime<
         attention_at: row.attention_at,
         brief: row.brief.as_ref().map(|b| model::Brief {
             did: b.headline.clone(),
-            blocked: b.blocked_on.clone().filter(|x| !x.trim().is_empty()),
+            blocked: row.blocked_on().map(str::to_string),
             next: None,
         }),
         worker_name: row.display_name().to_string(),
-        idle_settled: status == WorkerStatus::Idle
-            && row.ended_at.is_none()
-            && now - row.attention_at.unwrap_or(row.last_event_at)
-                >= chrono::Duration::minutes(super::lanes::IDLE_SETTLE_MINUTES),
+        idle_settled: status == WorkerStatus::Idle && row.ended_at.is_none() && {
+            // A Hobbes chat worker's turn end is the finish: Hobbes ran the
+            // turn (a timer wait reads as Working, an ask as WaitingOnUser).
+            // `brief_dirty_at` / a brief proves a turn actually ended — a
+            // freshly opened tab is Idle too. A terminal worker can't say,
+            // so it waits out the quiet period.
+            let chat_turn_ended = row.origin == crate::fleet::FleetOrigin::Hobbes
+                && (row.brief_dirty_at.is_some() || row.brief.is_some());
+            chat_turn_ended
+                || now - row.attention_at.unwrap_or(row.last_event_at)
+                    >= chrono::Duration::minutes(super::lanes::IDLE_SETTLE_MINUTES)
+        },
     }
 }
 
@@ -6004,7 +6012,7 @@ mod tests {
     }
 
     #[test]
-    fn a_long_idle_worker_moves_from_working_to_review() {
+    fn a_long_idle_terminal_worker_finishes() {
         let mut state = PlannerState::default();
         let id = agent_todo(&mut state, "SLA check");
         state.todo_mut(&id).unwrap().linked_fleet_session = Some("chat-1".into());
@@ -6019,7 +6027,9 @@ mod tests {
 
         let settled = idle_at + chrono::Duration::minutes(super::super::lanes::IDLE_SETTLE_MINUTES);
         assert_eq!(sync_agent_states(&mut state, &live, &[], settled), vec![id.clone()]);
-        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Review));
+        // A clean finish goes through the finish policy (default: close).
+        assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Done));
+        assert_eq!(state.todo(&id).unwrap().status, TodoStatus::Completed);
 
         // A Claude Code worker at a bare idle prompt is parked the same way,
         // with no "waiting for your input" decision made up for it.
@@ -6032,14 +6042,35 @@ mod tests {
         );
         sync_agent_states(&mut state, &live, &[], settled);
         let t = state.todo(&cc).unwrap();
-        assert_eq!(t.agent_state, Some(model::AgentState::Review));
+        assert_eq!(t.agent_state, Some(model::AgentState::Done));
         assert!(t.decision.is_none(), "a finished turn is not a question");
 
         // The scratch helper hands back only the changed to-do.
+        state.todo_mut(&id).unwrap().reopen(settled);
         state.todo_mut(&id).unwrap().agent_state = Some(model::AgentState::Working);
         let changed = sync_linked_agent_todos(&state, &live, |_| None, settled);
         assert_eq!(changed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), vec![id.as_str()]);
         assert_eq!(state.todo(&id).unwrap().agent_state, Some(model::AgentState::Working), "the input is untouched");
+    }
+
+    #[test]
+    fn a_hobbes_chat_worker_finishes_at_its_turn_end() {
+        let mut state = PlannerState::default();
+        let id = agent_todo(&mut state, "NMS VR elevation");
+        state.todo_mut(&id).unwrap().linked_fleet_session = Some("chat-2".into());
+        state.todo_mut(&id).unwrap().agent_state = Some(model::AgentState::Working);
+        let ended_at: DateTime<Utc> = "2026-11-07T20:17:00Z".parse().unwrap();
+        let mut live = crate::fleet::FleetState::default();
+        // A freshly opened Hobbes tab: Idle, no turn ended yet — not judged.
+        live.sessions.insert(
+            "chat-2".into(),
+            fleet_row("chat-2", json!("Idle"), json!({"origin": "Hobbes", "last_event_at": "2026-11-07T20:17:00Z"})),
+        );
+        assert!(sync_agent_states(&mut state, &live, &[], ended_at).is_empty());
+        // Its turn ended (Stop marks the brief dirty): finished at once.
+        live.sessions.get_mut("chat-2").unwrap().brief_dirty_at = Some(ended_at);
+        assert_eq!(sync_agent_states(&mut state, &live, &[], ended_at), vec![id.clone()]);
+        assert_eq!(state.todo(&id).unwrap().status, TodoStatus::Completed);
     }
 
     #[test]
@@ -6087,6 +6118,10 @@ mod tests {
         }));
         let signal = worker_signal_from_fleet(&ended, now);
         assert_eq!(signal.brief.as_ref().unwrap().did, "Built 4 of 5 images");
+        // A brief overtaken by a later turn carries no blocker into the lane.
+        let mut overtaken = ended.clone();
+        overtaken.brief_dirty_at = Some("2026-08-12T17:30:00Z".parse().unwrap());
+        assert!(worker_signal_from_fleet(&overtaken, now).brief.unwrap().blocked.is_none());
         sync_agent_states(&mut state, &live, &[ended], now);
         let t = state.todo(&id).unwrap();
         assert_eq!(t.agent_state, Some(model::AgentState::Review));

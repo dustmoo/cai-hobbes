@@ -85,6 +85,27 @@ pub(super) fn flush_draft_into_instance(draft: &mut Settings, connector_id: &str
 /// `active_llm` are editing mirrors of the selected connector (their edits are
 /// flushed into `llm_connectors` reactively), so they're excluded to avoid
 /// phantom "unsaved changes" when a connector is merely selected for editing.
+/// A change saved from outside the panel that touches only fields the app
+/// writes on its own — `hobbes_read_tabs` (the Read other tabs toggle's
+/// immediate save, the approval prompt's "always"), trust rules and
+/// always-allowed profile flows (made at an approval) — patched into the panel's `draft` so its other unsaved
+/// edits survive. `None` when `new` differs from `prev` in anything else:
+/// the caller then replaces the draft as before.
+pub(super) fn patch_draft(prev: &Settings, new: &Settings, draft: &Settings) -> Option<Settings> {
+    let mut probe = comparable(new);
+    probe.hobbes_read_tabs = prev.hobbes_read_tabs;
+    probe.permission_settings.trust_rules = prev.permission_settings.trust_rules.clone();
+    probe.permission_settings.profile_flows = prev.permission_settings.profile_flows.clone();
+    if probe != comparable(prev) {
+        return None;
+    }
+    let mut out = draft.clone();
+    out.hobbes_read_tabs = new.hobbes_read_tabs;
+    out.permission_settings.trust_rules = new.permission_settings.trust_rules.clone();
+    out.permission_settings.profile_flows = new.permission_settings.profile_flows.clone();
+    Some(out)
+}
+
 pub(super) fn comparable(s: &Settings) -> Settings {
     let mut c = s.clone();
     c.active_llm = Default::default();
@@ -92,4 +113,47 @@ pub(super) fn comparable(s: &Settings) -> Settings {
     c.openai_compat_config = Default::default();
     c.claude_config = Default::default();
     c
+}
+
+#[cfg(test)]
+mod draft_patch_tests {
+    use super::*;
+
+    /// A change saved from outside the panel (Read other tabs, "always",
+    /// a trust rule from an approval) is patched into the draft, keeping
+    /// the panel's other unsaved edits; any other change still replaces it.
+    #[test]
+    fn an_outside_toggle_keeps_the_draft_s_other_edits() {
+        let prev = Settings::default();
+        let mut draft = prev.clone();
+        draft.user_name = Some("unsaved edit".into());
+        let mut saved = prev.clone();
+        saved.hobbes_read_tabs = true;
+        let patched = patch_draft(&prev, &saved, &draft).expect("patched, not replaced");
+        assert!(patched.hobbes_read_tabs);
+        assert_eq!(patched.user_name.as_deref(), Some("unsaved edit"));
+        // A trust rule authored at an approval rides the same way.
+        let mut ruled = prev.clone();
+        ruled.permission_settings.trust_rules.push(crate::context::permissions::TrustRule {
+            id: "r".into(),
+            server: "s".into(),
+            tool: None,
+            command_prefix: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+        });
+        let patched = patch_draft(&prev, &ruled, &draft).unwrap();
+        assert_eq!(patched.permission_settings.trust_rules.len(), 1);
+        assert_eq!(patched.user_name.as_deref(), Some("unsaved edit"));
+        // So does a profile flow allowed "always" at an approval.
+        let mut flowed = prev.clone();
+        flowed.add_profile_flow("pg", "cm");
+        let patched = patch_draft(&prev, &flowed, &draft).unwrap();
+        assert_eq!(patched.permission_settings.profile_flows.len(), 1);
+        assert_eq!(patched.user_name.as_deref(), Some("unsaved edit"));
+        // Anything else: not patchable (the caller replaces the draft).
+        let mut other = prev.clone();
+        other.heartbeat_enabled = true;
+        assert!(patch_draft(&prev, &other, &draft).is_none());
+    }
 }

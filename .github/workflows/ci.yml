@@ -33,19 +33,9 @@ jobs:
         # --locked: build cargo-audit from its own lockfile — a fresh
         # resolution has broken the install before (tinyvec, 2026-09).
         cargo install cargo-audit --locked
-        # Ignore policy: an ignore is allowed ONLY when no upstream fix exists
-        # (or the vulnerable code is provably not compiled), with the reason
-        # recorded here. Audited 2026-07-13 — all previously stale ignores removed.
-        #
-        # RUSTSEC-2026-0194 / 0195: quick-xml 0.39 pulled ONLY by
-        #   wayland-scanner (Linux build-time codegen of trusted wayland
-        #   protocol XML; not attacker-reachable). Its latest release still
-        #   pins ^0.39 — drop these when wayland-scanner moves to >=0.41.
-        # RUSTSEC-2026-0257: webbrowser BROWSER-env argument injection. Fix
-        #   is webbrowser >=1.2.2 but dioxus-desktop 0.6 pins ^0.8; exploit
-        #   requires an attacker-controlled BROWSER env var on the user's
-        #   own machine (local desktop app). Drop on the Dioxus 0.7 upgrade.
-        cargo audit --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2026-0257
+        # The ignore list and its policy live in .cargo/audit.toml (also used
+        # by the weekly audit workflow), so there is one list to maintain.
+        cargo audit
 
   # Cross-platform build check (fast, no tests or full build)
   build-check:
@@ -63,7 +53,9 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libglib2.0-dev libsecret-1-dev pkg-config libwebkit2gtk-4.1-dev
+        # libasound2-dev: cpal (voice audio fallback) links ALSA through
+        # alsa-sys, whose build script finds it with pkg-config.
+        sudo apt-get install -y libglib2.0-dev libsecret-1-dev pkg-config libwebkit2gtk-4.1-dev libasound2-dev
 
     - name: Setup Node.js
       uses: actions/setup-node@v4

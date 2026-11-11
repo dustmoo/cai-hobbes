@@ -152,6 +152,20 @@ pub enum SessionEvent {
     DispatchLinked { link: Option<crate::todo::relay::DispatchLink> },
     /// A chat worker was dispatched from this chat.
     WorkerAdded { worker_session_id: String },
+    /// A rotated system session took over its predecessor's recent Composio
+    /// reads (`session_rotation`), so the cross-company hold still sees them.
+    ReadsCarried { reads: Vec<crate::session::CarriedRead> },
+    /// Retired: the profiles once ticked on an ordinary tab's profile chip
+    /// as its reach (`Session::profile_reach`). Still replayed so old
+    /// journals rebuild, but no longer written and no longer affects reach.
+    ProfileReachSet { profiles: Vec<String> },
+    /// An ordinary tab was locked to its home profile, or opened again
+    /// (`Session::profile_locked`, the chip's "Keep this tab to … only").
+    ProfileLockSet { locked: bool },
+    /// The profile pairs allowed in this chat changed (a flow hold's "Allow
+    /// in this chat"): the whole list, so the last event wins
+    /// (`Session::allowed_flows`).
+    FlowsAllowed { flows: Vec<crate::context::permissions::ProfileFlow> },
 }
 
 impl SessionEvent {
@@ -187,6 +201,10 @@ impl SessionEvent {
             SessionEvent::Relay { .. } => "Relay",
             SessionEvent::DispatchLinked { .. } => "DispatchLinked",
             SessionEvent::WorkerAdded { .. } => "WorkerAdded",
+            SessionEvent::ReadsCarried { .. } => "ReadsCarried",
+            SessionEvent::ProfileReachSet { .. } => "ProfileReachSet",
+            SessionEvent::ProfileLockSet { .. } => "ProfileLockSet",
+            SessionEvent::FlowsAllowed { .. } => "FlowsAllowed",
         }
     }
 }
@@ -218,7 +236,7 @@ pub fn log_event_sync(session_id: &str, event: SessionEvent) {
 /// A deterministic, empty session shell for `project(None, …)`. No clocks,
 /// no settings: `last_updated` starts at the epoch and is advanced to each
 /// applied event's row timestamp.
-fn blank_session() -> Session {
+pub(crate) fn blank_session() -> Session {
     Session {
         id: String::new(),
         name: String::new(),
@@ -250,6 +268,12 @@ fn blank_session() -> Session {
         context_ledger: Vec::new(),
         dispatch_link: None,
         dispatched_workers: Vec::new(),
+        carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
+        profile_locked: false,
+        allowed_flows: Vec::new(),
+        summary_sources: Vec::new(),
+        turn_origin: crate::session::TurnOrigin::User,
     }
 }
 
@@ -296,6 +320,12 @@ pub fn project(base: Option<Session>, events: &[LoadedSessionEvent]) -> Session 
     session
 }
 
+/// [`apply_event`] for other modules' tests.
+#[cfg(test)]
+pub(crate) fn apply_for_test(session: &mut Session, event: &SessionEvent) {
+    apply_event(session, event)
+}
+
 fn apply_event(session: &mut Session, event: &SessionEvent) {
     use SessionEvent as E;
     match event {
@@ -314,6 +344,10 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
                 session.dispatched_workers.push(worker_session_id.clone());
             }
         }
+        E::ReadsCarried { reads } => session.carried_reads = reads.clone(),
+        E::ProfileReachSet { profiles } => session.profile_reach = profiles.clone(),
+        E::ProfileLockSet { locked } => session.profile_locked = *locked,
+        E::FlowsAllowed { flows } => session.allowed_flows = flows.clone(),
         E::ScratchpadSet { content } => session.scratchpad = content.clone(),
         E::HandoffWritten { note } => session.handoff = Some(note.clone()),
         E::SkillLoaded { name, payload } => {
@@ -324,7 +358,13 @@ fn apply_event(session: &mut Session, event: &SessionEvent) {
         }
         E::SummaryComputed { summary } => {
             match serde_json::from_value(summary.clone()) {
-                Ok(parsed) => session.active_context.conversation_summary = parsed,
+                Ok(parsed) => {
+                    session.active_context.conversation_summary = parsed;
+                    session.summary_sources = summary
+                        .get(crate::session::SUMMARY_SOURCES_KEY)
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                }
                 Err(e) => tracing::warn!("project: unparseable SummaryComputed payload: {e}"),
             }
         }
@@ -782,9 +822,23 @@ mod tests {
             // Auto-tag, then a manual clear: the clear wins and locks.
             SessionEvent::ProjectTagged { project_id: Some("proj-1".into()), user_set: false },
             SessionEvent::ProjectTagged { project_id: None, user_set: true },
+            // Retired reach ticks from an old journal still replay…
+            SessionEvent::ProfileReachSet { profiles: vec!["profile-2".into(), "profile-3".into()] },
+            SessionEvent::ProfileReachSet { profiles: vec!["profile-3".into()] },
+            // …and the tab is locked, opened, then locked again: the last wins.
+            SessionEvent::ProfileLockSet { locked: true },
+            SessionEvent::ProfileLockSet { locked: false },
+            SessionEvent::ProfileLockSet { locked: true },
+            // A pair allowed in this chat.
+            SessionEvent::FlowsAllowed {
+                flows: vec![crate::context::permissions::ProfileFlow { from: "pg".into(), to: "cm".into() }],
+            },
         ]);
 
         let s = project(None, &events);
+        assert_eq!(s.profile_reach, ["profile-3"], "old reach journals still replay");
+        assert!(s.profile_locked, "a replay rebuild keeps the tab's lock");
+        assert_eq!(s.allowed_flows.len(), 1, "a replay rebuild keeps the chat's allowed pairs");
         assert_eq!(s.id, "s1");
         assert_eq!(s.name, "Renamed");
         assert_eq!(s.composio_profile.as_deref(), Some("profile-1"));
@@ -1361,6 +1415,21 @@ mod tests {
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v.get("kind").and_then(|k| k.as_str()), Some(ev.kind()));
+    }
+
+    #[test]
+    fn profile_lock_round_trips_and_old_reach_rows_still_parse() {
+        let ev = SessionEvent::ProfileLockSet { locked: true };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v.get("kind").and_then(|k| k.as_str()), Some(ev.kind()));
+        assert_eq!(serde_json::from_value::<SessionEvent>(v).unwrap(), ev);
+        // A journal row written before reach ticks were retired.
+        let old: SessionEvent =
+            serde_json::from_str(r#"{"kind":"ProfileReachSet","profiles":["p2"]}"#).unwrap();
+        assert_eq!(old, SessionEvent::ProfileReachSet { profiles: vec!["p2".into()] });
+        let mut s = blank_session();
+        apply_event(&mut s, &old);
+        assert!(!s.profile_locked, "old reach rows never lock a tab");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Wakes: when to wake the Heartbeat session, the message a wake delivers,
+//! Wakes: when to wake the Hobbes session, the message a wake delivers,
 //! and how a finished wake's cost, outcome and actions are read back. All
 //! pure; the runtime (`runtime.rs`) feeds them live state.
 //!
@@ -129,11 +129,35 @@ pub fn next_check_in(state: &HeartbeatState, wakes_per_hour: u32) -> Option<Date
     check_in_due(state, wakes_per_hour)
 }
 
+/// What a day off allows the Heartbeat's own wakes (see
+/// [`days_off_gate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DayGate {
+    /// Day anchors may fire.
+    pub anchors_allowed: bool,
+    /// Queued events are held (they stay queued for the next wake).
+    pub events_held: bool,
+}
+
+/// The days-off rule. On a workday everything runs. On a day off:
+/// `MeetingsAndUrgent` changes nothing (day anchors are already only the
+/// meeting ones), `MeetingsOnly` holds events but lets meeting anchors
+/// fire, `Off` holds events and anchors alike.
+pub fn days_off_gate(mode: crate::settings::HeartbeatDaysOff, workday: bool) -> DayGate {
+    use crate::settings::HeartbeatDaysOff::*;
+    match (workday, mode) {
+        (true, _) | (false, MeetingsAndUrgent) => DayGate { anchors_allowed: true, events_held: false },
+        (false, MeetingsOnly) => DayGate { anchors_allowed: true, events_held: true },
+        (false, Off) => DayGate { anchors_allowed: false, events_held: true },
+    }
+}
+
 /// The wake decision. Urgent events wake at once; then due day anchors
 /// (`anchors` is `anchors::due_anchors`); otherwise actionable queued events
 /// wake for a check-in per [`check_in_due`]. Nothing else wakes. A busy
 /// session holds any wake; the budget then defers it (a deferred anchor
 /// retries on later polls until it lapses).
+#[cfg(test)]
 pub fn decide_wake(
     state: &HeartbeatState,
     budget: &Budget,
@@ -142,11 +166,29 @@ pub fn decide_wake(
     session_busy: bool,
     anchors: &[Anchor],
 ) -> WakeVerdict {
-    let urgent = urgent_queued(state);
+    decide_wake_gated(state, budget, spent_today_usd, now, session_busy, anchors, DayGate { anchors_allowed: true, events_held: false })
+}
+
+/// [`decide_wake`] under a [`DayGate`]. Held events never trigger a wake
+/// (Idle, not Defer, so the trail isn't spammed every poll) but stay queued
+/// and ride whichever wake does fire; blocked anchors are ignored.
+pub fn decide_wake_gated(
+    state: &HeartbeatState,
+    budget: &Budget,
+    spent_today_usd: f64,
+    now: DateTime<Utc>,
+    session_busy: bool,
+    anchors: &[Anchor],
+    gate: DayGate,
+) -> WakeVerdict {
+    let urgent = if gate.events_held { Vec::new() } else { urgent_queued(state) };
+    let anchors: &[Anchor] = if gate.anchors_allowed { anchors } else { &[] };
     let trigger = if !urgent.is_empty() {
         WakeTrigger::Urgent(urgent)
     } else if !anchors.is_empty() {
         WakeTrigger::Anchors(anchors.to_vec())
+    } else if gate.events_held {
+        return WakeVerdict::Idle;
     } else {
         match check_in_due(state, budget.wakes_per_hour) {
             Some(due) if now >= due => WakeTrigger::CheckIn,
@@ -192,7 +234,7 @@ pub fn rule_label(trigger: &WakeTrigger, state: &HeartbeatState) -> String {
             return format!("actionable items have been queued for {QUEUE_BATCH_MINUTES}+ minutes and the hourly pace allows a wake, so this is a check-in")
         }
         WakeTrigger::Anchors(_) => {
-            return "a day anchor is due (start of the workday, 45 minutes before a meeting, over capacity, or 30 minutes before the workday ends; each at most once a day)".to_string()
+            return "a day anchor is due (start of the workday, 45 minutes before a meeting, over capacity, or 30 minutes before the workday ends, on your configured workdays; each at most once a day)".to_string()
         }
         WakeTrigger::Urgent(ids) => ids
             .iter()
@@ -354,7 +396,8 @@ fn event_section(events: &[&HeartbeatEvent], todos: &HashMap<String, TodoInfo>, 
     lines
 }
 
-/// The wake message: a queued user message in the Heartbeat session. Leads
+/// The wake message: a queued message (an unattended turn) in the Hobbes
+/// session. Leads
 /// with the look-ahead, then why it woke, what changed, the workers to
 /// diagnose, the rules, the budget and goal-directed standing instructions.
 /// No line starts with "/" (the chat input would read it as a skill
@@ -426,7 +469,7 @@ pub fn build_wake_message(b: &WakeBrief<'_>) -> String {
         "Act only within the rules above; prefer dispatching a worker or raising a decision over doing outside effects yourself.",
         "Don't repeat what the Fleet already shows the person.",
         "Write a handoff note (HOBBES_WRITE_HANDOFF) before you finish.",
-        "If nothing is worth doing, say so in one line.",
+        "If nothing is worth the person's attention, reply with just \"Nothing to report.\" (anything else is spoken to them when they use voice).",
     ]);
     out.extend(rules.iter().map(|s| format!("- {s}")));
     out.join("\n")
@@ -441,6 +484,25 @@ pub fn has_pending_approval(messages: &[Message]) -> bool {
             m.content,
             MessageContent::PermissionRequest(_) | MessageContent::SkillPermissionRequest(_)
         )
+    })
+}
+
+/// Whether a call waiting on approval holds a new wake back. The Hobbes
+/// session shares its history with typed and voice turns, so an approval
+/// anywhere in it can't count — a stale one the person never answered
+/// would silence the Heartbeat for good. It holds the wake when it is in
+/// the latest turn (the wake would interleave with that turn's resume), or
+/// it is a wake's own held call (Heartbeat-stamped, or unstamped legacy)
+/// newer than `stale_after` (one wake at a time waits on the person).
+pub fn approval_blocks_wake(messages: &[Message], now: DateTime<Utc>, stale_after: Duration) -> bool {
+    let turn_start = messages.iter().rposition(crate::voice::transcript::starts_turn).unwrap_or(0);
+    messages.iter().enumerate().any(|(i, m)| {
+        let origin = match &m.content {
+            MessageContent::PermissionRequest(tc) => tc.origin,
+            MessageContent::SkillPermissionRequest(sc) => sc.origin,
+            _ => return false,
+        };
+        i >= turn_start || (!origin.is_some_and(|o| o.is_person()) && now - m.created_at < stale_after)
     })
 }
 
@@ -471,13 +533,19 @@ pub fn wake_completion(
     if session_busy {
         return None;
     }
-    let after: Vec<&Message> = messages.iter().filter(|m| m.created_at >= wake.at).collect();
+    // The wake shares the Hobbes session with typed and voice turns: only
+    // its own turn counts.
+    let until = wake_window_end(messages, wake.at, until);
+    let after: Vec<&Message> =
+        messages.iter().filter(|m| m.created_at >= wake.at && until.is_none_or(|t| m.created_at < t)).collect();
     let delivered = after.iter().any(|m| m.author == "User");
     let age = now - wake.at;
     if !delivered && age < Duration::minutes(DELIVERY_TIMEOUT_MINUTES) {
         return None;
     }
-    let waiting = has_pending_approval(messages);
+    let waiting = after.iter().any(|m| {
+        matches!(m.content, MessageContent::PermissionRequest(_) | MessageContent::SkillPermissionRequest(_))
+    });
     if delivered && waiting && age < Duration::hours(APPROVAL_WAIT_HOURS) {
         return None;
     }
@@ -503,13 +571,57 @@ pub fn wake_completion(
     Some((cost, outcome))
 }
 
-/// To-dos the Heartbeat dispatched: Fleet runs launched from its session,
-/// and to-dos named by a `HOBBES_DISPATCH` call that completed in it.
-pub fn heartbeat_todo_ids(fleet: &crate::fleet::FleetState, session_id: &str, messages: &[Message]) -> HashSet<String> {
+/// The reply a wake gives when nothing needs the person (the standing
+/// instruction in [`build_wake_message`]).
+pub const QUIET_REPLY: &str = "Nothing to report.";
+
+/// Whether a wake's reply says it found nothing for the person: empty, or
+/// [`QUIET_REPLY`] (case, trailing punctuation and quotes aside). Such a
+/// reply isn't spoken (`voice::controller::announce_kind`).
+pub fn is_quiet_reply(reply: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim()
+            .trim_matches(|c: char| c == '"' || c == '\'' || c == '*')
+            .trim_end_matches(['.', '!'])
+            .trim()
+            .to_lowercase()
+    };
+    let r = norm(reply);
+    r.is_empty() || r == norm(QUIET_REPLY)
+}
+
+/// When the wake at `since` stopped owning the session: the first message
+/// after its wake message that starts another turn (a typed message, a
+/// voice request, a relay — not a voice transcript line or an auto-recovery
+/// prompt inside the turn), or the next wake (`until`), whichever is first.
+/// The Hobbes session hosts typed and voice turns between wakes; their
+/// cost, actions and replies aren't the wake's.
+pub fn wake_window_end(
+    messages: &[Message],
+    since: DateTime<Utc>,
+    until: Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    let mut after = messages.iter().filter(|m| m.created_at >= since);
+    let turn_end = after
+        .find(|m| m.author == "User")
+        .and_then(|_| after.find(|m| crate::voice::transcript::starts_turn(m)))
+        .map(|m| m.created_at);
+    match (until, turn_end) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// To-dos the Heartbeat dispatched: Fleet runs launched from any of its
+/// sessions (`lineage`: the current one and those it rotated out of), and
+/// to-dos named by a `HOBBES_DISPATCH` call that completed in the current
+/// one (`messages`). Chat workers dispatched before a rotation are found by
+/// the caller through the carried-over worker list.
+pub fn heartbeat_todo_ids(fleet: &crate::fleet::FleetState, lineage: &[String], messages: &[Message]) -> HashSet<String> {
     let mut out: HashSet<String> = fleet
         .sessions
         .values()
-        .filter(|s| s.dispatched_from.as_deref() == Some(session_id))
+        .filter(|s| s.dispatched_from.as_ref().is_some_and(|f| lineage.contains(f)))
         .filter_map(|s| s.dispatched_todo.clone())
         .collect();
     for m in messages {
@@ -762,6 +874,39 @@ mod tests {
     }
 
     #[test]
+    fn days_off_modes_gate_events_and_anchors() {
+        use crate::settings::HeartbeatDaysOff::*;
+        let day = crate::heartbeat::anchors::tests::day();
+        let at = day.meetings[0].start - Duration::minutes(40);
+        let s0 = HeartbeatState::default();
+        let due = crate::heartbeat::anchors::due_anchors(&s0, &day, at);
+        let meeting: Vec<Anchor> = due.iter().filter(|a| a.key.starts_with("meeting:")).cloned().collect();
+        assert_eq!(meeting.len(), 1);
+        let mut urgent = HeartbeatState::default();
+        let u = ev(KIND_WORKER_STUCK, 0);
+        queue(&mut urgent, &u, Choice::WakeNow);
+        let run = |mode, workday, st: &HeartbeatState, anchors: &[Anchor]| {
+            decide_wake_gated(st, &B, 0.0, at, false, anchors, days_off_gate(mode, workday))
+        };
+        let fire_urgent = WakeVerdict::Fire(WakeTrigger::Urgent(vec![u.id.clone()]));
+        // Workdays and MeetingsAndUrgent behave as before.
+        for (mode, workday) in [(Off, true), (MeetingsOnly, true), (MeetingsAndUrgent, true), (MeetingsAndUrgent, false)] {
+            assert_eq!(run(mode, workday, &urgent, &[]), fire_urgent, "{mode:?} {workday}");
+        }
+        // MeetingsOnly on a day off: events held as Idle, nothing recorded.
+        assert_eq!(run(MeetingsOnly, false, &urgent, &[]), WakeVerdict::Idle);
+        assert_eq!(urgent.queue.len(), 1, "the event stays queued");
+        // ...but a meeting anchor fires, and the held event rides it.
+        assert_eq!(run(MeetingsOnly, false, &urgent, &meeting), WakeVerdict::Fire(WakeTrigger::Anchors(meeting.clone())));
+        // Off: nothing wakes, anchors included.
+        assert_eq!(run(Off, false, &urgent, &[]), WakeVerdict::Idle);
+        assert_eq!(run(Off, false, &urgent, &meeting), WakeVerdict::Idle);
+        assert_eq!(run(Off, false, &s0, &meeting), WakeVerdict::Idle);
+        // On the next workday the held event wakes normally.
+        assert_eq!(run(Off, true, &urgent, &[]), fire_urgent);
+    }
+
+    #[test]
     fn due_anchors_wake_respecting_busy_and_budget() {
         let day = crate::heartbeat::anchors::tests::day();
         let at = day.meetings[0].start - Duration::minutes(40);
@@ -932,7 +1077,7 @@ mod tests {
              - Act only within the rules above; prefer dispatching a worker or raising a decision over doing outside effects yourself.\n\
              - Don't repeat what the Fleet already shows the person.\n\
              - Write a handoff note (HOBBES_WRITE_HANDOFF) before you finish.\n\
-             - If nothing is worth doing, say so in one line.",
+             - If nothing is worth the person's attention, reply with just \"Nothing to report.\" (anything else is spoken to them when they use voice).",
             hm(&stuck), hm(&earlier), hm(&overdue), hm(&ci), hm(&old),
             m_start = local(14, 30), m_end = local(15, 0),
         );
@@ -1033,6 +1178,91 @@ mod tests {
     }
 
     #[test]
+    fn only_a_live_approval_holds_a_wake_back() {
+        use crate::session::TurnOrigin;
+        let t = now();
+        let stale = Duration::hours(24);
+        let held = |origin: TurnOrigin, at| {
+            let mut tc = tool("gmail_send_email", "{}", crate::components::shared::ToolCallStatus::Running);
+            tc.origin = Some(origin);
+            msg_at("Hobbes", MessageContent::PermissionRequest(tc), at)
+        };
+        // The person's approval from an earlier turn, two days old, never
+        // answered; they have moved on since. It must not silence the
+        // Heartbeat (it did: any approval anywhere held every wake).
+        let old_user = vec![
+            msg_at("User", text("Draft the Acme reply"), t - Duration::days(2)),
+            held(TurnOrigin::User, t - Duration::days(2) + Duration::minutes(1)),
+            msg_at("User", text("What's on today?"), t - Duration::hours(1)),
+            msg_at("Hobbes", text("Two meetings."), t - Duration::minutes(59)),
+        ];
+        assert!(!approval_blocks_wake(&old_user, t, stale));
+        // Even a recent one from an earlier turn of the person's.
+        let mut recent_user = old_user.clone();
+        recent_user[0].created_at = t - Duration::hours(3);
+        recent_user[1] = held(TurnOrigin::User, t - Duration::hours(3));
+        assert!(!approval_blocks_wake(&recent_user, t, stale));
+        // A spoken request's held call (e.g. a risk hold) is the person's too.
+        recent_user[1] = held(TurnOrigin::Voice, t - Duration::hours(3));
+        assert!(!approval_blocks_wake(&recent_user, t, stale));
+        // An approval in the latest turn holds it, whoever raised it.
+        let latest = vec![msg_at("User", text("Send it"), t - Duration::minutes(5)), held(TurnOrigin::User, t - Duration::minutes(4))];
+        assert!(approval_blocks_wake(&latest, t, stale));
+        // A previous wake's held call holds the next wake for a day, even
+        // after a typed turn, then lets go.
+        let wake_held = vec![
+            msg_at("User", text("[Heartbeat wake]"), t - Duration::hours(2)),
+            held(TurnOrigin::Heartbeat, t - Duration::hours(2)),
+            msg_at("User", text("hi"), t - Duration::hours(1)),
+        ];
+        assert!(approval_blocks_wake(&wake_held, t, stale));
+        assert!(!approval_blocks_wake(&wake_held, t + Duration::hours(23), stale));
+        // A voice transcript line after a held turn doesn't end that turn.
+        let mut spoken = latest.clone();
+        spoken.push(msg_at("User", text("🎙 hang on"), t - Duration::minutes(3)));
+        assert!(approval_blocks_wake(&spoken, t, stale));
+    }
+
+    #[test]
+    fn quiet_replies_are_recognised() {
+        assert!(is_quiet_reply(""));
+        assert!(is_quiet_reply("Nothing to report."));
+        assert!(is_quiet_reply("  \"nothing to report\"  "));
+        assert!(is_quiet_reply("**Nothing to report!**"));
+        assert!(!is_quiet_reply("Nothing to report, except CI is red."));
+        assert!(!is_quiet_reply("CI is red on main."));
+    }
+
+    #[test]
+    fn a_wake_owns_only_its_own_turn_in_the_shared_session() {
+        let wake = fired(10);
+        let t = wake.at;
+        let held = tool("gmail_send_email", "{}", crate::components::shared::ToolCallStatus::Running);
+        let msgs = vec![
+            msg_at("User", text("[Heartbeat wake]"), t),
+            msg_at("Hobbes", text("CI is red on main; dispatched a fix."), t + Duration::minutes(1)),
+            // A voice line said during the wake, written after it: still
+            // the wake's window.
+            msg_at("User", text("🎙 hello"), t + Duration::minutes(1) + Duration::seconds(30)),
+            // The person's own turn afterwards: not the wake's.
+            msg_at("User", text("Draft the reply to Acme"), t + Duration::minutes(3)),
+            msg_at("Hobbes", MessageContent::PermissionRequest(held), t + Duration::minutes(4)),
+            msg_at("Hobbes", text("Drafted; it needs your approval."), t + Duration::minutes(5)),
+        ];
+        assert_eq!(wake_window_end(&msgs, t, None), Some(t + Duration::minutes(3)));
+        assert_eq!(wake_window_end(&msgs, t, Some(t + Duration::minutes(2))), Some(t + Duration::minutes(2)));
+        let spend = [
+            Spend { session_id: "hb", at: t + Duration::minutes(1), cost: Some(0.5) },
+            Spend { session_id: "hb", at: t + Duration::minutes(5), cost: Some(2.0) },
+        ];
+        // The user's held call and later reply don't hold or label the wake,
+        // and their spend isn't charged to it.
+        let (cost, outcome) = wake_completion(&wake, None, "hb", &msgs, &spend, false, now()).unwrap();
+        assert!((cost - 0.5).abs() < 1e-9, "{cost}");
+        assert_eq!(outcome, "CI is red on main; dispatched a fix.");
+    }
+
+    #[test]
     fn completion_waits_for_delivery_and_approvals() {
         let wake = fired(10);
         let t = wake.at;
@@ -1053,6 +1283,29 @@ mod tests {
         assert_eq!(wake_completion(&wake, None, "hb", &msgs, &[], false, now()), None);
         let (_, outcome) = wake_completion(&wake, None, "hb", &msgs, &[], false, now() + Duration::hours(24)).unwrap();
         assert_eq!(outcome, "waiting on your approval");
+    }
+
+    /// A relay into the Hobbes tab uses this rule too: an approval nobody
+    /// answered in an earlier turn must not hold every later turn back.
+    #[test]
+    fn an_old_unanswered_approval_does_not_block_a_new_turn() {
+        use crate::components::shared::ToolCallStatus as S;
+        let t = now();
+        let mut held = tool("write_to_terminal", "{}", S::Running);
+        held.origin = Some(crate::session::TurnOrigin::User);
+        let stale = Duration::hours(crate::session_rotation::APPROVAL_STALE_HOURS);
+        let msgs = vec![
+            msg_at("User", text("run it"), t - Duration::hours(24)),
+            msg_at("Hobbes", MessageContent::PermissionRequest(held.clone()), t - Duration::hours(24)),
+            msg_at("User", text("something else"), t - Duration::hours(1)),
+            msg_at("Hobbes", text("done"), t - Duration::hours(1)),
+        ];
+        assert!(has_pending_approval(&msgs), "the old bubble is still there");
+        assert!(!approval_blocks_wake(&msgs, t, stale), "but it no longer holds a turn");
+        // One in the latest turn still holds it.
+        let mut latest = msgs.clone();
+        latest.push(msg_at("Hobbes", MessageContent::PermissionRequest(held), t));
+        assert!(approval_blocks_wake(&latest, t, stale));
     }
 
     #[test]
@@ -1124,15 +1377,20 @@ mod tests {
         };
         let run = row("run-1", "t-fleet", "hb");
         let other = row("run-2", "t-other", "chat");
+        // Launched from the session the Heartbeat rotated out of.
+        let before = row("run-3", "t-before", "hb-old");
         fleet.sessions.insert("run-1".into(), run);
         fleet.sessions.insert("run-2".into(), other);
+        fleet.sessions.insert("run-3".into(), before);
         use crate::components::shared::ToolCallStatus as S;
         let msgs = vec![
             msg_at("Hobbes", MessageContent::ToolCall(tool("HOBBES_DISPATCH", r#"{"todo_id":"t-chat"}"#, S::Completed)), now()),
             msg_at("Hobbes", MessageContent::ToolCall(tool("HOBBES_DISPATCH", r#"{"todo_id":"t-err"}"#, S::Error)), now()),
             msg_at("Hobbes", MessageContent::PermissionRequest(tool("HOBBES_DISPATCH", r#"{"todo_id":"t-held"}"#, S::Running)), now()),
         ];
-        let ids = heartbeat_todo_ids(&fleet, "hb", &msgs);
+        let ids = heartbeat_todo_ids(&fleet, &["hb".to_string()], &msgs);
         assert_eq!(ids, HashSet::from(["t-fleet".to_string(), "t-chat".to_string()]));
+        let ids = heartbeat_todo_ids(&fleet, &["hb-old".to_string(), "hb".to_string()], &msgs);
+        assert_eq!(ids, HashSet::from(["t-fleet".to_string(), "t-chat".to_string(), "t-before".to_string()]));
     }
 }

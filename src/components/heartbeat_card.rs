@@ -42,7 +42,7 @@ impl Status {
     }
 }
 
-/// Off, waking (the Heartbeat session is streaming), deferred (the newest
+/// Off, waking (a wake's turn is streaming in the Hobbes session), deferred (the newest
 /// wake record was deferred, so nothing has fired since), else asleep.
 pub fn status_of(state: &HeartbeatState, enabled: bool, streaming: bool) -> Status {
     if !enabled {
@@ -281,12 +281,19 @@ pub fn HeartbeatCard(now: DateTime<Utc>) -> Element {
         (s.heartbeat_enabled, budget::Budget::from_settings(&s))
     };
     let hb = HEARTBEAT.read();
-    let session_id = hb.session_id.clone();
+    let session_id = crate::system_sessions::current_reactive();
+    // The Hobbes session also runs typed and voice turns: only an
+    // unattended (wake) turn is the Heartbeat working.
+    let wake_turn = |id: &str| {
+        try_consume_context::<Signal<crate::session::SessionState>>().is_some_and(|st| {
+            st.peek().sessions.get(id).is_some_and(|s| s.turn_origin.is_unattended())
+        })
+    };
     let streaming = match (
         &session_id,
         try_consume_context::<crate::components::stream_manager::StreamManagerContext>(),
     ) {
-        (Some(id), Some(sm)) => sm.streaming_sessions.read().contains(id),
+        (Some(id), Some(sm)) => sm.streaming_sessions.read().contains(id) && wake_turn(id),
         _ => false,
     };
     let status = status_of(&hb, enabled, streaming);

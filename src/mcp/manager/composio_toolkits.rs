@@ -587,8 +587,7 @@ impl McpManager {
                         .filter(|c| settings_snapshot.is_connector_configured(c))
                         .or_else(|| {
                             settings_snapshot
-                                .llm_connectors
-                                .iter()
+                                .chat_connectors()
                                 .find(|c| settings_snapshot.is_connector_configured(c))
                         })
                         .cloned();

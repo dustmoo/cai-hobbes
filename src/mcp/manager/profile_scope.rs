@@ -14,30 +14,32 @@ use crate::session::SessionState;
 use crate::settings::Settings;
 use dioxus_signals::Readable;
 
-/// The Composio profile id an MCP context should be built for.
-///
-/// A session's own pin wins; otherwise the global active profile (validated
+/// The Composio profile id a context with no session behind it is built
+/// for: the pin when given, else the global active profile (validated
 /// against the configured profiles, as `get_active_profile` does). `None`
-/// only when neither exists. Same rule the send path uses
-/// (`fetch_fresh_mcp_context` in `components/chat.rs`).
+/// only when neither exists. A session's context goes through
+/// [`context_profile_for_session`], which follows its `ProfileScope`.
 pub fn resolve_context_profile(session_pin: Option<&str>, settings: &Settings) -> Option<String> {
     session_pin
         .map(str::to_string)
         .or_else(|| settings.get_active_profile().map(|p| p.id.clone()))
 }
 
-/// `resolve_context_profile` for a session looked up by id. An unknown or
-/// non-hydrated session falls back to the global active profile.
+/// The home profile of a session looked up by id — its
+/// [`super::profile_reach::ProfileScope`], the same resolution the send path
+/// uses (`fetch_fresh_mcp_context` in `components/chat.rs`). A pin to a
+/// removed profile gives `None` (nothing to act in), never the stale id. An
+/// unknown or non-hydrated session falls back to the global active profile.
 pub fn context_profile_for_session(
     state: &SessionState,
     session_id: &str,
     settings: &Settings,
 ) -> Option<String> {
-    let pin = state
-        .sessions
-        .get(session_id)
-        .and_then(|s| s.composio_profile.as_deref());
-    resolve_context_profile(pin, settings)
+    let scope = match state.sessions.get(session_id) {
+        Some(s) => super::profile_reach::ProfileScope::for_session(settings, s),
+        None => super::profile_reach::ProfileScope::resolve(settings, session_id, None, true),
+    };
+    scope.home_id().map(str::to_string)
 }
 
 impl McpManager {
@@ -53,6 +55,20 @@ impl McpManager {
     pub async fn get_active_profile_mcp_context(&self) -> McpContext {
         let profile_id = self.background_context_profile();
         self.get_mcp_context(profile_id).await
+    }
+
+    /// The context for a session whose home is `profile_id`
+    /// ([`context_profile_for_session`]). With no home to act in it carries
+    /// no Composio tools at all, as the send path offers such a tab —
+    /// `get_mcp_context(None)` would list every profile's.
+    pub async fn get_session_mcp_context(&self, profile_id: Option<String>) -> McpContext {
+        let has_home = profile_id.is_some();
+        let ctx = self.get_mcp_context(profile_id).await;
+        if has_home {
+            ctx
+        } else {
+            super::profile_reach::without_composio(ctx)
+        }
     }
 }
 
@@ -209,6 +225,10 @@ mod tests {
             context_profile_for_session(&state, "no-such-session", &s),
             Some("a".to_string())
         );
+        // A pin to a removed profile: nothing to act in, never the stale id
+        // (nor the focus-driven global one).
+        let gone = state.create_session_raw(Some("removed".to_string()));
+        assert_eq!(context_profile_for_session(&state, &gone, &s), None);
     }
 
     #[test]

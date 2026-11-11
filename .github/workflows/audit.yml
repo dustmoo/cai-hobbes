@@ -1,0 +1,26 @@
+name: Weekly Security Audit
+
+# Advisories are published against dependencies we already ship, so a clean
+# audit at merge time goes stale. This run catches new ones between merges
+# instead of at the next push to main. Ignores: .cargo/audit.toml.
+on:
+  schedule:
+    - cron: '0 14 * * 1'   # Mondays 14:00 UTC
+  workflow_dispatch:
+
+jobs:
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: stable
+
+    - name: Security Audit
+      run: |
+        cargo install cargo-audit --locked
+        cargo audit

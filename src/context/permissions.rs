@@ -51,7 +51,56 @@ pub struct PermissionSettings {
     pub skill_permissions: HashMap<String, bool>,
     #[serde(default)]
     pub trust_rules: Vec<TrustRule>,
+    /// Profile pairs content may always move along (from → to, profile
+    /// ids), authored from a flow hold's "Always allow" and listed in
+    /// Settings (`mcp::manager::profile_flow`). Direction matters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_flows: Vec<ProfileFlow>,
     pub max_ai_turns: u32,
+}
+
+/// One allowed direction of content between two Composio profiles (ids):
+/// content read from `from` may be carried into `to` without asking.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProfileFlow {
+    pub from: String,
+    pub to: String,
+}
+
+impl PermissionSettings {
+    /// The global and per-server MCP permission for `server_name` (no
+    /// trust rules, no per-tool always-allow): what
+    /// `PermissionManager::check_mcp_permission` answers. Pure.
+    pub fn mcp_permission(&self, server_name: &str) -> PermissionStatus {
+        // 1. Global Auto-Approval Check
+        if !self.auto_approval_enabled {
+            return PermissionStatus::RequiresPrompt;
+        }
+
+        // 2. ToolCategory::Mcp Global Toggle
+        if !self
+            .granular_permissions
+            .get(&ToolCategory::Mcp)
+            .copied()
+            .unwrap_or(false)
+        {
+            // If global MCP tools are disabled, we return RequiresPrompt instead of Denied
+            // to allow manual overrides for individual tool calls.
+            return PermissionStatus::RequiresPrompt;
+        }
+
+        // 3. Per-Server Toggle
+        if let Some(&allowed) = self.mcp_server_permissions.get(server_name) {
+            if allowed {
+                PermissionStatus::Allowed
+            } else {
+                PermissionStatus::RequiresPrompt
+            }
+        } else {
+            // Default to Allowed if no specific server setting exists (but global is on)
+            PermissionStatus::Allowed
+        }
+    }
 }
 
 impl Default for PermissionSettings {
@@ -62,6 +111,7 @@ impl Default for PermissionSettings {
             mcp_server_permissions: HashMap::new(),
             skill_permissions: HashMap::new(),
             trust_rules: Vec::new(),
+            profile_flows: Vec::new(),
             max_ai_turns: 25,
         }
     }
@@ -78,41 +128,7 @@ impl PermissionManager {
     }
 
     pub fn check_mcp_permission(&self, server_name: &str) -> PermissionStatus {
-        let settings = self.settings.read();
-
-        // 1. Global Auto-Approval Check
-        if !settings.permission_settings.auto_approval_enabled {
-            return PermissionStatus::RequiresPrompt;
-        }
-
-        // 2. ToolCategory::Mcp Global Toggle
-        if !settings
-            .permission_settings
-            .granular_permissions
-            .get(&ToolCategory::Mcp)
-            .copied()
-            .unwrap_or(false)
-        {
-            // If global MCP tools are disabled, we return RequiresPrompt instead of Denied
-            // to allow manual overrides for individual tool calls.
-            return PermissionStatus::RequiresPrompt;
-        }
-
-        // 3. Per-Server Toggle
-        if let Some(&allowed) = settings
-            .permission_settings
-            .mcp_server_permissions
-            .get(server_name)
-        {
-            if allowed {
-                PermissionStatus::Allowed
-            } else {
-                PermissionStatus::RequiresPrompt
-            }
-        } else {
-            // Default to Allowed if no specific server setting exists (but global is on)
-            PermissionStatus::Allowed
-        }
+        self.settings.read().permission_settings.mcp_permission(server_name)
     }
 
     pub fn is_turn_limit_reached_for(&self, turn_count: u32) -> bool {

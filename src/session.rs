@@ -183,11 +183,53 @@ pub const TAB_TITLE_MATURE_USER_MESSAGES: usize = 3;
 /// caller to journal as `SessionEvent::TabTitled`; `None` when the summary
 /// carried no proposal, the tab's identity is locked (user-set or a final AI
 /// title), the tab is still too short to retitle, or it has no user message.
+/// A tab emoji and title to journal as `TabTitled`.
+pub type TabIdentity = (Option<String>, Option<String>);
+
+/// The key under which a `SummaryComputed` journal entry carries
+/// `Session::summary_sources` beside the summary's own fields.
+pub const SUMMARY_SOURCES_KEY: &str = "source_profiles";
+
+/// Adopt a freshly computed summary into `session`: record which
+/// companies' data it may hold (`Session::summary_sources`, harness-set —
+/// the model has no say), apply its tab identity, and store it. Returns the
+/// payload to journal as `SummaryComputed` (the summary plus its sources)
+/// and the tab identity to journal as `TabTitled`. Every site that computes
+/// a summary goes through here.
+///
+/// `generated_from` is `profile_reach::durable_summary_sources` of the snapshot the
+/// summary was written from, taken before the LLM call: an undo while it
+/// was in flight removes reads from the live session, but not from the
+/// summary that comes back, so the sources are the union of both.
+pub fn adopt_summary(
+    session: &mut Session,
+    summary: ConversationSummary,
+    generated_from: &[String],
+) -> (Value, Option<TabIdentity>) {
+    let mut sources: std::collections::BTreeSet<String> =
+        crate::mcp::manager::profile_reach::durable_summary_sources(session).into_iter().collect();
+    sources.extend(generated_from.iter().cloned());
+    session.summary_sources = sources.into_iter().collect();
+    let titled = apply_tab_identity_from_summary(session, &summary);
+    let value = summary_payload(&summary, &session.summary_sources);
+    session.active_context.conversation_summary = summary;
+    (value, titled)
+}
+
+/// The `SummaryComputed` payload: the summary plus its sources.
+pub fn summary_payload(summary: &ConversationSummary, sources: &[String]) -> Value {
+    let mut value = serde_json::to_value(summary).unwrap_or(Value::Null);
+    if let (Some(map), false) = (value.as_object_mut(), sources.is_empty()) {
+        map.insert(SUMMARY_SOURCES_KEY.into(), serde_json::json!(sources));
+    }
+    value
+}
+
 pub fn apply_tab_identity_from_summary(
     session: &mut Session,
     summary: &ConversationSummary,
 ) -> Option<(Option<String>, Option<String>)> {
-    if session.name_user_set {
+    if session.name_user_set || crate::system_sessions::is_system(&session.id) {
         return None;
     }
     let user_messages = session.user_message_count();
@@ -381,6 +423,102 @@ pub struct Session {
     /// Dispatch relay, parent side: worker tabs dispatched from this chat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dispatched_workers: Vec<String>,
+    /// Composio reads a rotated system session carried over from the
+    /// session it replaced (`session_rotation`): the cross-company hold
+    /// (`profile_reach::session_read_profiles`) counts them like reads in
+    /// this session's own messages until they age out of the read window.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub carried_reads: Vec<CarriedRead>,
+    /// Retired: the profiles once ticked on the tab's chip as its reach.
+    /// Ordinary tabs now reach every set-up profile unless locked
+    /// (`profile_locked`), so this no longer affects resolution. Kept so old
+    /// rows and `ProfileReachSet` journals still load and replay.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub profile_reach: Vec<String>,
+    /// The chip's "Keep this tab to {home} only" switch: when set, this
+    /// ordinary tab acts only in its home profile instead of reaching every
+    /// set-up profile (`profile_reach::session_reach`). Per tab; new tabs
+    /// start open. Ignored for system sessions. Journaled as `ProfileLockSet`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub profile_locked: bool,
+    /// Profile pairs content may move along in this chat without asking
+    /// (from → to, profile ids), from a flow hold's "Allow in this chat"
+    /// (`mcp::manager::profile_flow::FlowPolicy`). Journaled as
+    /// `FlowsAllowed`. Not carried through a rotation: the successor asks
+    /// again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_flows: Vec<crate::context::permissions::ProfileFlow>,
+    /// The Composio profiles whose data the conversation summary may hold
+    /// (profile ids, or a `composio-native:{name}` server name for an
+    /// unstamped call). Set only by `adopt_summary`, never from model
+    /// output, and kept off the summary itself so it never reaches the
+    /// prompt. The cross-company hold counts these in an ordinary tab after
+    /// the messages they came from are gone. Journaled inside
+    /// `SummaryComputed`; cleared with the summary on rewind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub summary_sources: Vec<String>,
+    /// Who started the turn now running (or last run) in this session —
+    /// set only by the harness when a turn starts (`chat.rs` send path, the
+    /// queue drain), never from model output. Every tool call the turn
+    /// mints is stamped with it (`ToolCall::origin`), and the scope gates
+    /// read the call's stamp, so a resumed approval keeps its turn's rules.
+    #[serde(default, skip_serializing_if = "TurnOrigin::is_user")]
+    pub turn_origin: TurnOrigin,
+}
+
+/// Who started a turn. Trust follows the turn, not the session: the Hobbes
+/// session hosts typed turns, voice hand-offs and Heartbeat wakes alike, and
+/// only the unattended ones get the Heartbeat's strict scope rules
+/// (`builtin_tools::heartbeat_gate`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    /// The person: a typed message, a voice request, anything they did.
+    #[default]
+    User,
+    /// Unattended: a Heartbeat wake, or anything else nobody is present
+    /// for in the Hobbes session (a timer, a relay, returned work).
+    Heartbeat,
+    /// The person, by voice: the realtime model's paraphrase handed to the
+    /// brain (`voice::brain::queue_request`). The person's turn in every
+    /// respect (not unattended, no Heartbeat scope) except the call risk
+    /// gate (`builtin_tools::risk_gate`), which holds destructive calls and
+    /// refuses malformed ones, since the words weren't typed.
+    Voice,
+}
+
+impl TurnOrigin {
+    /// Exactly a typed turn (also the serde default, so `Voice` round-trips).
+    pub fn is_user(&self) -> bool {
+        *self == TurnOrigin::User
+    }
+
+    /// The person's turn, typed or spoken (`User` or `Voice`).
+    pub fn is_person(self) -> bool {
+        matches!(self, TurnOrigin::User | TurnOrigin::Voice)
+    }
+
+    /// Whether the Heartbeat's strict, unattended rules apply.
+    pub fn is_unattended(self) -> bool {
+        self == TurnOrigin::Heartbeat
+    }
+
+    /// How strict this origin's rules are, for "the strictest wins" when
+    /// several origins meet (a resumed approval): typed < voice < unattended.
+    pub fn strictness(self) -> u8 {
+        match self {
+            TurnOrigin::User => 0,
+            TurnOrigin::Voice => 1,
+            TurnOrigin::Heartbeat => 2,
+        }
+    }
+}
+
+/// One Composio read carried into a rotated system session's successor.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CarriedRead {
+    pub profile_id: String,
+    pub read_at: DateTime<Utc>,
 }
 
 /// What a [`LedgerEntry`] records.
@@ -624,6 +762,7 @@ impl Session {
 
         if count > 0 {
             self.active_context.conversation_summary = Default::default();
+            self.summary_sources.clear();
             tracing::debug!(
                 "Reset conversation_summary after undo ({} messages removed)",
                 count
@@ -1140,6 +1279,7 @@ impl SessionState {
             };
             session.scheduled_timers.push(timer.clone());
         }
+        crate::timers::request_check();
         crate::session_events::log_event(
             session_id,
             crate::session_events::SessionEvent::TimerCreated { timer },
@@ -1753,6 +1893,12 @@ impl SessionState {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            profile_locked: false,
+            allowed_flows: Vec::new(),
+            summary_sources: Vec::new(),
+            turn_origin: TurnOrigin::User,
         };
         // Birth event: a journal that starts with SessionCreated is
         // "journal-complete" and can be rebuilt from nothing via project().
@@ -1796,7 +1942,23 @@ impl SessionState {
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_name = format!("Fork of {source_name}");
         let events = crate::session_store::fork_events(source_id, at_seq, &new_id, &new_name)?;
-        let session = crate::session_events::project(None, &events);
+        let mut session = crate::session_events::project(None, &events);
+        // A fork from before the source's pin was journaled (the pin
+        // migration journals it at the end) keeps the source's current pin,
+        // so it never starts unpinned.
+        if session.composio_profile.is_none() {
+            let source_pin = match self.sessions.get(source_id) {
+                Some(s) => s.composio_profile.clone(),
+                None => crate::session_store::stored_pin(source_id),
+            };
+            if let Some(pin) = source_pin {
+                session.composio_profile = Some(pin.clone());
+                crate::session_events::log_event(
+                    &new_id,
+                    crate::session_events::SessionEvent::ComposioProfileSet { profile: Some(pin) },
+                );
+            }
+        }
         self.sessions.insert(new_id.clone(), session);
         self.active_session_id = new_id.clone();
         Ok(new_id)
@@ -1974,6 +2136,23 @@ impl SessionState {
         Self::save_async(&signal.read(), error_signal);
     }
 
+    /// Make sure session `id` is in memory, hydrating it from the store
+    /// (one indexed row) when it is only on disk — a closed tab a dispatch
+    /// result, relay or review needs. False when there is no such session.
+    pub fn ensure_hydrated(mut signal: dioxus::prelude::Signal<SessionState>, id: &str) -> bool {
+        use dioxus::prelude::{Readable, Writable};
+        if signal.peek().sessions.contains_key(id) {
+            return true;
+        }
+        match crate::session_store::load_session(id) {
+            Some(session) => {
+                signal.write().sessions.insert(id.to_string(), session);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// A rename from the tab bar or History — a user act. Wins forever: sets
     /// `name_user_set` so the summarizer never overwrites `name`/`tab_title`
     /// for this session again.
@@ -2031,6 +2210,30 @@ impl SessionState {
             .and_then(|session| session.messages.iter_mut().find(|m| m.id == *message_id))
     }
 
+    /// Fix the pin of every hydrated ordinary tab by the per-tab rule
+    /// (`profile_reach::pin_fix`: a tab without a pin gets its own Composio
+    /// calls' profile, else Hobbes' home, else stays unpinned; a legacy name
+    /// pin becomes its id), journaling each. System sessions keep their own
+    /// rules. Returns the changed ids; the caller saves. Runs before the
+    /// stored-row backfill starts, which then skips these ids.
+    pub fn pin_unpinned(&mut self, settings: &crate::settings::Settings) -> Vec<String> {
+        let mut pinned = Vec::new();
+        for (id, session) in self.sessions.iter_mut() {
+            if crate::system_sessions::is_system(id) {
+                continue;
+            }
+            if let Some(pin) = crate::mcp::manager::profile_reach::pin_fix(settings, session) {
+                session.composio_profile = Some(pin.clone());
+                pinned.push(id.clone());
+                crate::session_events::log_event(
+                    id,
+                    crate::session_events::SessionEvent::ComposioProfileSet { profile: Some(pin) },
+                );
+            }
+        }
+        pinned
+    }
+
     /// Migrate session composio_profile from name-based to ID-based.
     /// Any session whose composio_profile matches a profile name (but not an ID)
     /// gets updated to the corresponding profile ID.
@@ -2080,6 +2283,44 @@ impl Default for SessionState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn turn_origin_voice_round_trips_and_old_rows_still_load() {
+        use crate::components::shared::ToolCall;
+        assert_eq!(serde_json::to_string(&TurnOrigin::Voice).unwrap(), "\"voice\"");
+        for o in [TurnOrigin::User, TurnOrigin::Heartbeat, TurnOrigin::Voice] {
+            let back: TurnOrigin = serde_json::from_str(&serde_json::to_string(&o).unwrap()).unwrap();
+            assert_eq!(back, o);
+        }
+        assert!(!TurnOrigin::Voice.is_unattended() && !TurnOrigin::Voice.is_user());
+        // A session's turn origin: Voice is written (User is skipped) and read back.
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let mut session = state.sessions.get(&id).unwrap().clone();
+        session.turn_origin = TurnOrigin::Voice;
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["turn_origin"], "voice");
+        let back: Session = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back.turn_origin, TurnOrigin::Voice);
+        // An old row: no turn_origin at all.
+        let mut old = json;
+        old.as_object_mut().unwrap().remove("turn_origin");
+        let back: Session = serde_json::from_value(old).unwrap();
+        assert_eq!(back.turn_origin, TurnOrigin::User);
+        // A call stamped Voice and held by the risk gate round-trips; an old
+        // call without either field still loads.
+        let mut tc = ToolCall::new("hobbes-terminal".into(), "HOBBES_TERMINAL_EXEC".into(), serde_json::json!({}), None, None);
+        tc.origin = Some(TurnOrigin::Voice);
+        tc.risk_reason = Some("erases the whole disk disk10".into());
+        let back: ToolCall = serde_json::from_str(&serde_json::to_string(&tc).unwrap()).unwrap();
+        assert_eq!(back.origin, Some(TurnOrigin::Voice));
+        assert_eq!(back.risk_reason.as_deref(), Some("erases the whole disk disk10"));
+        let mut legacy = serde_json::to_value(ToolCall::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("risk_reason");
+        legacy.as_object_mut().unwrap().remove("origin");
+        let back: ToolCall = serde_json::from_value(legacy).unwrap();
+        assert_eq!((back.origin, back.risk_reason), (None, None));
+    }
+
     use super::*;
 
     #[test]
@@ -2358,6 +2599,12 @@ mod tests {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            profile_locked: false,
+            allowed_flows: Vec::new(),
+            summary_sources: Vec::new(),
+            turn_origin: TurnOrigin::User,
             }
         }
 
@@ -3208,6 +3455,12 @@ mod tests {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            profile_locked: false,
+            allowed_flows: Vec::new(),
+            summary_sources: Vec::new(),
+            turn_origin: TurnOrigin::User,
             messages: vec![
                 Message {
                     id: msg1_id,
@@ -3258,6 +3511,11 @@ mod tests {
                         model: None,
                         round_id: None,
                         cancelled: None,
+                        hold_reason: None,
+                        hold_rule_key: None,
+                        risk_reason: None,
+                        read_sources: Vec::new(),
+                        origin: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -3285,6 +3543,11 @@ mod tests {
                         model: None,
                         round_id: None,
                         cancelled: None,
+                        hold_reason: None,
+                        hold_rule_key: None,
+                        risk_reason: None,
+                        read_sources: Vec::new(),
+                        origin: None,
                     }),
                     attachments: vec![],
                     comments: vec![],
@@ -3569,5 +3832,37 @@ mod tests {
         let state = SessionState::migrate_from_raw_json(&old_format).unwrap();
         let session = state.sessions.get("test-session-1").unwrap();
         assert_eq!(session.messages.len(), 1);
+    }
+
+    #[test]
+    fn pin_unpinned_pins_open_tabs_but_not_system_sessions() {
+        let mut settings = crate::settings::Settings::default();
+        for (id, name) in [("cm", "Clearmirror"), ("pg", "Puget")] {
+            settings.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        // The global profile follows focus: never the target.
+        settings.active_composio_profile = Some("pg".into());
+        let mut state = SessionState::default();
+        let plain = state.create_session_raw(None);
+        let pinned = state.create_session_raw(Some("pg".into()));
+        let named = state.create_session_raw(Some("Puget".into()));
+        let hobbes = state.create_session_raw(None);
+        crate::system_sessions::set_current(&hobbes);
+        // No calls and no Hobbes home: left unpinned.
+        let done = state.pin_unpinned(&settings);
+        assert_eq!(done, vec![named.clone()], "only the name pin, normalised");
+        assert_eq!(state.sessions[&named].composio_profile.as_deref(), Some("pg"));
+        assert_eq!(state.sessions[&plain].composio_profile, None);
+        // With Hobbes' home set, the tab takes it.
+        settings.home_composio_profile = Some("cm".into());
+        assert_eq!(state.pin_unpinned(&settings), vec![plain.clone()]);
+        assert_eq!(state.sessions[&plain].composio_profile.as_deref(), Some("cm"));
+        assert_eq!(state.sessions[&pinned].composio_profile.as_deref(), Some("pg"));
+        assert_eq!(state.sessions[&hobbes].composio_profile, None);
+        assert!(state.pin_unpinned(&settings).is_empty(), "idempotent");
     }
 }

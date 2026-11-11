@@ -70,6 +70,9 @@ pub enum ChatCommand {
     OpenTabInBackground(String),
     /// Switch the current session's profile to the profile at this index.
     SwitchProfile(usize),
+    /// Keep the current tab to its home Composio profile, or open it to
+    /// every set-up profile again (`Session::profile_locked`).
+    ToggleProfileLock,
     /// Switch the current session's model to the model at this index in the available models list.
     SwitchModel(usize),
     /// Switch the current session's LLM connector to the instance with this
@@ -405,6 +408,7 @@ pub fn ChatInput(
                 | ChatCommand::NewChat
                 | ChatCommand::DeleteSession(_)
                 | ChatCommand::SwitchProfile(_)
+                | ChatCommand::ToggleProfileLock
                 | ChatCommand::SwitchModel(_)
                 | ChatCommand::SwitchConnector(_)
                 | ChatCommand::CloseTab
@@ -501,6 +505,12 @@ pub fn ChatInput(
                     // DO NOT also call on_send / has_new_comments here — that would
                     // create a second parallel LLM stream (double-turn regression).
                     let sid = current_session_id.read().clone();
+                    // The person asked for it: their turn.
+                    crate::components::continuation_controller::record_approval_origin(
+                        &sid,
+                        crate::components::continuation_controller::ApprovalKey::AnalyseNow,
+                        crate::session::TurnOrigin::User,
+                    );
                     has_pending_approvals.write().insert(sid);
                 }
             }
@@ -516,6 +526,11 @@ pub fn ChatInput(
     // draft may hold unrelated live text; clearing it is the caller's job.
     let submit = use_callback(
         move |(user_message, atts, target_sid): (String, Vec<Attachment>, String)| {
+        // Who this submission's turn belongs to: what the drain resolved for
+        // a queued message, else the person. Taken once, here, so no branch
+        // (a /skill, /unload) can leave it for a later send to pick up.
+        let turn_origin = chat_queue::take_turn_origin(&target_sid);
+        let turn_absent = chat_queue::take_pending_absent(&target_sid);
         // Skill Command Detection
         {
             // /unload command — remove a loaded skill from session context.
@@ -639,6 +654,7 @@ pub fn ChatInput(
                         path: skill.path.clone(),
                         has_scripts: !skill.scripts.is_empty(),
                         raw_output: None,
+                        origin: Some(turn_origin),
                         profile_color: {
                             let settings_read = settings.read();
                             let profile_name =
@@ -757,6 +773,13 @@ pub fn ChatInput(
                                     // Auto-trigger the LLM to respond with the
                                     // injected skill context, on the invoking
                                     // session (not the active tab).
+                                    if let Some(origin) = sc_clone.origin {
+                                        crate::components::continuation_controller::record_approval_origin(
+                                            &skill_sid,
+                                            crate::components::continuation_controller::ApprovalKey::Message(msg_id),
+                                            origin,
+                                        );
+                                    }
                                     has_pending_approvals.write().insert(skill_sid.clone());
                                 }
                                 Err(e) => {
@@ -838,6 +861,9 @@ pub fn ChatInput(
             user_message
         };
 
+        // The send path takes it back (`chat.rs` send_message).
+        chat_queue::set_pending_origin(&target_sid, turn_origin);
+        chat_queue::set_pending_absent(&target_sid, turn_absent);
         on_send.call((user_message, atts, target_sid));
     },
     );
@@ -860,6 +886,10 @@ pub fn ChatInput(
         let user_message = draft.read().clone();
         let atts = attachments.read().clone();
         let session_id = current_session_id.read().clone();
+        if crate::system_sessions::is_archive(&session_id) {
+            tracing::debug!("'send_message' blocked: archived system session is read-only.");
+            return;
+        }
         if user_message.is_empty()
             && atts.is_empty()
             && !has_new_comments.read().contains(&session_id)
@@ -872,14 +902,16 @@ pub fn ChatInput(
             prompt_history::save(prompt_log.peek().clone());
         }
 
-        // If this session's turn is still in flight, queue the message instead of
-        // sending. The turn drains it on completion (see the drain effect below).
-        if stream_manager.is_session_streaming(&session_id) {
+        // If this session's turn is still in flight — streaming, or between
+        // rounds while a continuation builds its next prompt — queue the
+        // message instead of sending, so two turns never interleave. The
+        // turn drains it on completion (see the drain effect below).
+        if stream_manager.turn_in_flight(&session_id) {
             if !user_message.is_empty() || !atts.is_empty() {
                 chat_queue::queue_push(
                     &mut CHAT_QUEUE.write(),
                     &session_id,
-                    QueuedMessage::new(user_message, atts),
+                    QueuedMessage::new(user_message, atts, chat_queue::QueueOrigin::Person),
                 );
                 crate::components::shared::set_chat_draft(draft, String::new(), None, false);
                 attachments.set(Vec::new());
@@ -897,9 +929,9 @@ pub fn ChatInput(
     };
 
     // Drain one queued message per idle session — the active tab AND any
-    // background tab whose turn has finished. `dispatching` is keyed by session
-    // so one tab's async gap can't block another's drain.
-    let mut dispatching = use_signal(HashSet::<String>::new);
+    // background tab whose turn has finished. `chat_queue::DISPATCHING` is
+    // keyed by session so one tab's async gap can't block another's drain
+    // (global so session rotation can see a popped message still in flight).
     use_effect(move || {
         // Re-run on any stream state change, active-session switch, or explicit
         // drain request (e.g. a fired timer enqueuing for a session).
@@ -917,13 +949,23 @@ pub fn ChatInput(
         for session_id in backlog {
             if stream_manager.is_session_streaming(&session_id) {
                 // The message we dispatched has started streaming — release
-                // this session's guard.
-                if dispatching.peek().contains(&session_id) {
-                    dispatching.write().remove(&session_id);
-                }
+                // this session's guard (start_stream also does, for a
+                // session whose queue emptied with this pop).
+                chat_queue::release_dispatch(&session_id);
                 continue;
             }
-            if dispatching.peek().contains(&session_id) {
+            if chat_queue::DISPATCHING.peek().contains(&session_id) {
+                continue;
+            }
+            // An approval waiting to resume in this chat goes first: the
+            // resume and a queued message must not start on the same tick.
+            if has_pending_approvals.peek().contains(&session_id) {
+                continue;
+            }
+            // Between a tool round and its continuation's stream nothing is
+            // streaming, but the turn isn't over: popping now would start a
+            // second turn inside it.
+            if stream_manager.turn_in_flight(&session_id) {
                 continue;
             }
             // Don't pop for a session that isn't in state: deleted, or not yet
@@ -942,7 +984,18 @@ pub fn ChatInput(
             // borrowed.
             let popped = chat_queue::queue_pop_next(&mut CHAT_QUEUE.write(), &session_id);
             if let Some(qm) = popped {
-                dispatching.write().insert(session_id.clone());
+                let popped_id = qm.id;
+                chat_queue::begin_dispatch(&session_id, popped_id);
+                // A new turn starts here: a voice cancel aimed at the
+                // previous one must not stop it (stream_manager::request_turn_abort).
+                crate::components::stream_manager::clear_turn_abort(&session_id);
+                // Who this turn belongs to (trust follows the turn: an
+                // unattended one in the Hobbes session gets the Heartbeat's
+                // rules). Harness-decided here, never by the model.
+                let origin = chat_queue::drain_origin(&qm, &session_id);
+                // Nobody present (a timer, relay, returned work): the flow
+                // guard treats the turn as unattended in any chat.
+                let absent = chat_queue::nobody_present(qm.origin);
                 match qm.relay {
                     // A waking dispatch relay: append it and start a turn
                     // with no user message (todo::relay). Never resets the
@@ -954,25 +1007,45 @@ pub fn ChatInput(
                             &session_id,
                             relay,
                         );
+                        // Only a relay that starts a turn gives it an origin
+                        // (the continuation records it on the session).
                         if start {
+                            chat_queue::set_turn_absent(&session_id, absent);
                             continuation_controller
                                 .write()
-                                .trigger_continuation(session_id.clone());
+                                .trigger_continuation(session_id.clone(), origin);
                         }
                     }
-                    None => submit.call((qm.text, qm.attachments, session_id.clone())),
+                    None => {
+                        chat_queue::set_pending_origin(&session_id, origin);
+                        chat_queue::set_pending_absent(&session_id, absent);
+                        submit.call((qm.text, qm.attachments, session_id.clone()));
+                    }
                 }
                 // Failsafe: a queued no-op (e.g. a command that starts no stream)
                 // must not wedge the queue. Real turns clear the guard sooner via
                 // the is_streaming branch above; this only fires if nothing ever
-                // streams.
+                // streams. Tied to this pop: a later pop in the same session
+                // owns the guard from then on, and this timer must not
+                // release it (that would let a third message pop into the
+                // later pop's turn).
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                    dispatching.write().remove(&session_id);
+                    chat_queue::end_dispatch(&session_id, popped_id);
                 });
             }
         }
     });
+
+    // A rotated-out Hobbes session (or a pre-merge Heartbeat / Voice one)
+    // is a read-only archive: its
+    // successor carries on the conversation (session_rotation).
+    let archived = crate::system_sessions::is_archive(&current_session_id.read());
+    let placeholder = if archived {
+        "Archived — read-only. The conversation continues in the current tab."
+    } else {
+        "Type your message..."
+    };
 
     rsx! {
         if !attachments.read().is_empty() {
@@ -1113,7 +1186,8 @@ pub fn ChatInput(
                         class: "w-full min-h-[44px] px-4 pt-3 pb-1.5 bg-transparent border-0 text-fg placeholder-gray-500 focus:outline-none focus:ring-0 resize-none overflow-y-auto",
                         style: "max-height: 50vh;",
                         rows: "1",
-                        placeholder: "Type your message...",
+                        placeholder: "{placeholder}",
+                        disabled: archived,
                         // UNCONTROLLED on purpose: a controlled `value` binding races
                         // the IPC round-trip and snaps the caret to the end mid-typing.
                         // Programmatic writes go through shared::set_chat_draft, which
@@ -1632,7 +1706,7 @@ pub fn ChatInput(
                 // Row 2 — the identity footer: who is answering, with what,
                 // about what, then the actions.
                 div {
-                    class: "flex items-center gap-2 px-2.5 pb-2.5 pl-3",
+                    class: "flex flex-wrap items-center gap-2 px-2.5 pb-2.5 pl-3",
 
                     // 1. PROFILE PILL — this tab's Composio identity.
                     { if ui_state.read().show_profile_selector {
@@ -1643,30 +1717,73 @@ pub fn ChatInput(
                             if profiles.is_empty() {
                                 rsx!({})
                             } else {
-                                // session.composio_profile stores ID (matching settings.active_composio_profile)
-                                let active_profile = session_state.read().get_active_session()
-                                    .and_then(|s| s.composio_profile.as_ref())
-                                    .and_then(|id| profiles.iter().find(|p| &p.id == id))  // Match by ID
-                                    .or_else(|| settings_read.get_active_profile())
-                                    .cloned()
-                                    .unwrap_or_else(|| profiles[0].clone());
-
-                                let active_initial = active_profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
-                                let active_name = active_profile.name.clone();
-                                let active_color = active_profile.color.clone();
+                                // Home and reach come from the same resolution dispatch
+                                // uses (`profile_reach::reach_of`: the pin, else the
+                                // global active profile), so the chip never shows a
+                                // home the tab's calls don't run in. With no home
+                                // (no profile resolves) the first profile is shown
+                                // and there is no lock to set. System sessions keep
+                                // their own reach, so they get no lock switch.
+                                let (home, lock_editable, locked, reach_extra, pin_removed) = {
+                                    let state = session_state.read();
+                                    match state.get_active_session() {
+                                        Some(s) => {
+                                            let chip = crate::mcp::manager::profile_reach::chip_reach(&settings_read, s);
+                                            (
+                                                chip.home.and_then(|id| profiles.iter().find(|p| p.id == id)).cloned(),
+                                                chip.editable,
+                                                chip.locked,
+                                                chip.extra,
+                                                chip.pin_removed,
+                                            )
+                                        }
+                                        None => (None, false, false, Vec::new(), false),
+                                    }
+                                };
+                                // No home (the pin points at a removed profile, or
+                                // there is no pin and no global profile): say so —
+                                // a removed pin as a warning, since this tab's
+                                // Composio calls are refused until one is picked —
+                                // and list every profile so one can be picked.
+                                let active_id: Option<String> = home.as_ref().map(|h| h.id.clone());
+                                let (active_name, active_color) = match &home {
+                                    Some(h) => (h.name.clone(), h.color.clone()),
+                                    None if pin_removed => ("Profile removed".to_string(), "bg-yellow-900/40".to_string()),
+                                    None => ("No profile".to_string(), "bg-input".to_string()),
+                                };
+                                // Every tab reaches the other set-up profiles unless
+                                // it is locked to home; the tooltip says which.
+                                let reach_title = if locked {
+                                    " · kept to this profile only".to_string()
+                                } else if reach_extra.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · can also use {}", reach_extra.join(", "))
+                                };
+                                let active_initial = home
+                                    .as_ref()
+                                    .and_then(|h| h.name.chars().next())
+                                    .unwrap_or('?')
+                                    .to_uppercase()
+                                    .to_string();
                                 // The pill borrows the profile's colour for its border so the
                                 // tab's identity is legible without opening anything.
                                 let pill_class = format!(
                                     "h-7 rounded-full border {} text-xs flex items-center gap-1.5 pl-1 pr-2.5 select-none shrink-0",
-                                    profile_border_class(&active_color),
+                                    if pin_removed { "border-yellow-600".to_string() } else { profile_border_class(&active_color) },
                                 );
+                                let pill_title = if pin_removed {
+                                    "This tab's Composio profile was removed, so its Composio tools won't run. Pick a profile.".to_string()
+                                } else {
+                                    format!("Profile: {active_name}{reach_title}")
+                                };
                                 let avatar_class = format!(
                                     "w-5 h-5 rounded-full {} flex items-center justify-center text-[10px] font-bold text-fg shrink-0",
                                     active_color,
                                 );
                                 // A single profile is still shown — it is identity, not a
                                 // control — but there is nothing to pick, so no chevron.
-                                let interactive = profiles.len() > 1;
+                                let interactive = profiles.len() > 1 || home.is_none();
 
                                 rsx! {
                                     div {
@@ -1674,10 +1791,21 @@ pub fn ChatInput(
                                         if interactive {
                                             button {
                                                 class: "{pill_class} cursor-pointer hover:brightness-110 transition-all focus:outline-none focus:ring-2 focus:ring-primary-600",
-                                                title: "Profile: {active_name}",
+                                                title: "{pill_title}",
                                                 onclick: move |_| show_profile_selector.set(!show_profile_selector()),
-                                                span { class: "{avatar_class}", "{active_initial}" }
-                                                span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                                if pin_removed {
+                                                    span {
+                                                        class: "{avatar_class} text-yellow-300",
+                                                        Icon { width: 12, height: 12, icon: fi_icons::FiAlertTriangle }
+                                                    }
+                                                    span { class: "text-yellow-300 truncate max-w-28", "{active_name}" }
+                                                } else {
+                                                    span { class: "{avatar_class}", "{active_initial}" }
+                                                    span { class: "text-fg truncate max-w-28", "{active_name}" }
+                                                }
+                                                if locked {
+                                                    Icon { width: 12, height: 12, icon: fi_icons::FiLock, class: "text-fg-muted shrink-0" }
+                                                }
                                                 Icon { width: 12, height: 12, icon: fi_icons::FiChevronDown, class: "text-fg-muted shrink-0" }
                                             }
                                         } else {
@@ -1691,17 +1819,33 @@ pub fn ChatInput(
 
                                         if show_profile_selector() {
                                             div {
-                                                class: "absolute bottom-10 left-0 w-56 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                                class: "absolute bottom-10 left-0 w-64 bg-card border border-subtle rounded-lg shadow-xl z-50 overflow-hidden py-1",
+                                                // Home: the tab's pinned profile.
+                                                if home.is_some() {
+                                                    div {
+                                                        class: "w-full px-4 py-2 text-sm text-fg flex items-center justify-between border-b border-faint",
+                                                        div {
+                                                            class: "flex items-center space-x-2 min-w-0",
+                                                            span {
+                                                                class: format!("w-6 h-6 rounded-full {} border border-faint flex items-center justify-center text-[10px] text-fg font-bold shadow-sm shrink-0", active_color),
+                                                                "{active_initial}"
+                                                            }
+                                                            span { class: "truncate", "{active_name}" }
+                                                        }
+                                                        span { class: "text-xs text-fg-muted", "home" }
+                                                    }
+                                                }
                                                 for (index, profile) in profiles.iter().enumerate() {
                                                     {
                                                         let profile_name = profile.name.clone();
                                                         let profile_color = profile.color.clone();
                                                         let profile_initial = profile.name.chars().next().unwrap_or('?').to_uppercase().to_string();
 
-                                                        if profile.name != active_profile.name {
+                                                        if active_id.as_deref() != Some(profile.id.as_str()) {
                                                             rsx! {
                                                                 button {
-                                                                    class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:bg-primary-900/50 hover:text-fg transition-colors flex items-center justify-between",
+                                                                    class: "w-full text-left px-4 py-2 text-sm text-fg-muted hover:text-fg hover:bg-primary-900/50 transition-colors flex items-center justify-between",
+                                                                    title: "Make {profile_name} this tab's home profile",
                                                                     onclick: move |_| {
                                                                         // Route through the global command so the session
                                                                         // pin is PERSISTED (save_async) and the profile
@@ -1739,11 +1883,54 @@ pub fn ChatInput(
                                                         }
                                                     }
                                                 }
+                                                // Keep this tab to its home profile (per tab; new
+                                                // tabs start open). Only for an ordinary tab with a
+                                                // home, and only when there is another profile.
+                                                if lock_editable && profiles.len() > 1 {
+                                                    div {
+                                                        class: "mt-1 px-4 pt-2 pb-1 flex items-center justify-between gap-2.5 border-t border-faint text-xs text-fg",
+                                                        span { class: "min-w-0 truncate", "Keep this tab to {active_name} only" }
+                                                        button {
+                                                            r#type: "button",
+                                                            role: "switch",
+                                                            "aria-checked": if locked { "true" } else { "false" },
+                                                            "aria-label": "Keep this tab to {active_name} only",
+                                                            title: if locked { "Let this tab use your other profiles" } else { "Use only {active_name} in this tab" },
+                                                            class: if locked {
+                                                                "relative w-7 h-4 rounded-full bg-primary-500 shrink-0 cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
+                                                            } else {
+                                                                "relative w-7 h-4 rounded-full bg-input shrink-0 cursor-pointer transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary-600"
+                                                            },
+                                                            onclick: move |_| {
+                                                                // Journaled and saved by the ToggleProfileLock
+                                                                // handler in main.rs.
+                                                                chat_command.set(Some(ChatCommand::ToggleProfileLock));
+                                                            },
+                                                            span {
+                                                                class: if locked {
+                                                                    "absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform translate-x-3"
+                                                                } else {
+                                                                    "absolute top-0.5 left-0.5 w-3 h-3 rounded-full bg-white transition-transform"
+                                                                },
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 // The profile owns which Composio toolkits are live, so a
                                                 // switch is not free — say so before it is taken.
                                                 p {
-                                                    class: "mt-1 px-4 pt-1.5 pb-1 text-[11px] text-fg-muted border-t border-faint",
-                                                    "Tools in this tab reload for the chosen profile."
+                                                    class: if lock_editable && profiles.len() > 1 {
+                                                        "px-4 pt-1.5 pb-1 text-[11px] text-fg-muted"
+                                                    } else {
+                                                        "mt-1 px-4 pt-1.5 pb-1 text-[11px] text-fg-muted border-t border-faint"
+                                                    },
+                                                    if locked {
+                                                        "Only {active_name} tools run in this tab."
+                                                    } else if lock_editable {
+                                                        "Pick a profile to make it home. Hobbes asks before moving anything between profiles."
+                                                    } else {
+                                                        "Tools in this tab reload for the chosen profile."
+                                                    }
                                                 }
                                             }
                                         }
@@ -1777,13 +1964,12 @@ pub fn ChatInput(
                                     .or_else(|| settings_read.active_connector().cloned())
                             };
                             let active_id = active_instance.as_ref().map(|c| c.id.clone());
-                            // Every connector, in canonical order — the index drives the
+                            // Every chat-role connector, in canonical order — the index drives the
                             // ⇧⌥⌘{n} hotkey hint. The session's current connector is shown
                             // highlighted rather than hidden.
                             let all_connectors: Vec<(usize, crate::settings::ProviderInstance)> = settings
                                 .read()
-                                .llm_connectors
-                                .iter()
+                                .chat_connectors()
                                 .cloned()
                                 .enumerate()
                                 .collect();
@@ -2048,8 +2234,9 @@ pub fn ChatInput(
                         }
                     }
 
-                    // 5. spacer — everything after this hugs the right edge.
-                    div { class: "flex-1" }
+                    // 5. Everything after this hugs the right edge as one group,
+                    // which wraps to its own line together on a narrow window.
+                    div { class: "ml-auto flex items-center gap-2 shrink-0",
 
                     // 6. COST
                     SessionCostIcon {}
@@ -2235,6 +2422,7 @@ pub fn ChatInput(
                             onclick: move |_| on_cancel.call(()),
                             "Stop"
                         }
+                    }
                     }
                 }
             }

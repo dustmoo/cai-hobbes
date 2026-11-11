@@ -155,29 +155,10 @@ pub async fn start(shared: Arc<FleetShared>, cfg: FleetServerConfig) -> Result<F
                         }
 
                         // Dispatched runs that finished: hand their result
-                        // back to the chat that launched them. Ended rows
-                        // have left the live map, so today's store rows come
-                        // along — a run that finished before the last local
-                        // midnight is stale news and deliberately drops.
-                        let now = chrono::Utc::now();
-                        let ended = store::sessions_active_on(chrono::Local::now().date_naive());
-                        let sweep = {
-                            let mut state = shared.state.lock().expect("fleet state lock poisoned");
-                            crate::fleet::sweep_dispatch_continuations(
-                                &mut state,
-                                &ended,
-                                now,
-                                crate::fleet::dispatch_auto_continue(),
-                            )
-                        };
-                        if !sweep.is_empty() {
-                            store::persist_sessions(&sweep.live_rows);
-                            for id in &sweep.ended_ids {
-                                store::merge_session(id, |row| row.continuation_sent = true);
-                            }
-                            shared.push_continuations(sweep.continuations);
-                            shared.poke();
-                        }
+                        // back to the chat that launched them. Normally a
+                        // landed brief or the post-finish grace timer got
+                        // there first; this tick is the backstop.
+                        shared.run_dispatch_continuations();
                         // Truth-on-disk reconciliation: catches events lost
                         // while Hobbes wasn't running (file IO off the lock).
                         let shared_for_reconcile = shared.clone();
@@ -351,7 +332,7 @@ async fn handle(
     let now = chrono::Utc::now();
     let transcript_path = crate::fleet::events::transcript_path_from_body(&body);
     let prompt_id = crate::fleet::events::prompt_id_from_body(&body);
-    let held = {
+    let (held, handback) = {
         let mut state = shared.state.lock().expect("fleet state lock poisoned");
         // Revival: an event for a session that retired (or resumed after
         // SessionEnd) rejoins with its stored row, keeping banked time.
@@ -376,11 +357,23 @@ async fn handle(
         }
         store::persist_sessions(&changed);
         store::save_coverage(&crate::fleet::sync_coverage(&mut state, now));
+        // A dispatched run that just finished owes its parent chat a
+        // continuation: note when the no-brief fallback is due. SessionEnd
+        // has already moved the row out of the live map, into `changed`.
+        let handback = match &event {
+            FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } => state
+                .sessions
+                .get(event.session_id())
+                .or_else(|| changed.iter().find(|r| r.id == event.session_id()))
+                .and_then(crate::fleet::dispatch_continue_deadline)
+                .map(|deadline| (deadline, matches!(event, FleetEvent::SessionEnd { .. }))),
+            _ => None,
+        };
         // A headless dispatched run's permission request is held for the
         // in-app Approve / Deny. Register the responder BEFORE the state
         // becomes visible (the poke), so a UI click racing the snapshot can
         // never miss it.
-        match &event {
+        let held = match &event {
             FleetEvent::PermissionRequest { request_id, .. }
                 if state
                     .sessions
@@ -390,9 +383,14 @@ async fn handle(
                 Some((request_id.clone(), shared.register_gate(request_id)))
             }
             _ => None,
-        }
+        };
+        (held, handback)
     };
     shared.poke();
+
+    if let Some((deadline, ended)) = handback {
+        arm_dispatch_handback(&shared, deadline, ended);
+    }
 
     // Title refresh at ingest: the card should match the Claude Code session
     // title (terminal tab name) without waiting for the brief debounce — a
@@ -448,6 +446,40 @@ async fn handle(
     };
     finish_gate(&shared, event.session_id(), &request_id, outcome);
     Ok(respond(StatusCode::OK, &decision_body(outcome)))
+}
+
+/// Event-driven hand-back for a dispatched run that just finished (Stop /
+/// SessionEnd). Wakes the brief supervisor for its closing brief — at once
+/// on SessionEnd, after the short settle window on a Stop (a headless run's
+/// SessionEnd usually follows within a second, and its final brief is the
+/// one worth generating) — then sweeps at `deadline`, the no-brief fallback.
+/// A brief that lands first triggers the sweep itself
+/// ([`FleetShared::set_brief`]); the latch makes the later timer a no-op.
+fn arm_dispatch_handback(shared: &Arc<FleetShared>, deadline: chrono::DateTime<chrono::Utc>, ended: bool) {
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let settle = if ended {
+            Duration::ZERO
+        } else {
+            Duration::from_secs(crate::fleet::briefs::DISPATCH_BRIEF_QUIET_SECS as u64)
+        };
+        if !settle.is_zero() {
+            tokio::time::sleep(settle).await;
+        }
+        shared.wake_briefs();
+        tokio::time::sleep(handback_delay(deadline, chrono::Utc::now())).await;
+        shared.run_dispatch_continuations();
+    });
+}
+
+/// How long to sleep until the grace deadline. One extra second clears the
+/// sweep's whole-second `< DISPATCH_CONTINUE_GRACE_SECS` comparison; a
+/// deadline already past sleeps just that second.
+fn handback_delay(
+    deadline: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    (deadline - now).to_std().unwrap_or(Duration::ZERO) + Duration::from_secs(1)
 }
 
 /// Post-decision bookkeeping for a held gate: state transition,
@@ -714,6 +746,18 @@ mod tests {
         // A late UI click on the dead gate is a no-op.
         assert!(!shared.resolve_gate("whatever", true));
         server.shutdown();
+    }
+
+    #[test]
+    fn handback_delay_clears_the_grace_deadline() {
+        let now: chrono::DateTime<chrono::Utc> = "2026-09-01T10:00:00Z".parse().unwrap();
+        let deadline = now + chrono::Duration::seconds(30);
+        assert_eq!(handback_delay(deadline, now), Duration::from_secs(31));
+        // A deadline already past still waits the rounding second only.
+        assert_eq!(
+            handback_delay(now - chrono::Duration::seconds(5), now),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]

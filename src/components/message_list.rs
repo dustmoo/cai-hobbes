@@ -15,6 +15,18 @@ use super::shared::{
     SessionIdContext,
 };
 
+/// The message as the bubble shows it: a voice request without its
+/// bracketed frame (the stored message is untouched; copy then yields the
+/// request line, and edits restore the frame via `restore_frame`).
+fn display_message(message: &crate::components::chat::Message) -> crate::components::chat::Message {
+    let mut shown = message.clone();
+    if let MessageContent::Text { content, .. } = &mut shown.content {
+        let visible = crate::voice::display::display_text(content).len();
+        content.truncate(visible);
+    }
+    shown
+}
+
 const INITIAL_MESSAGES_TO_SHOW: usize = 20;
 
 /// What occupies one slot in the rendered list: either a plain message, or a
@@ -388,11 +400,30 @@ pub fn MessageList(
                                                     // is absorbed into the adjacent ToolCall card, so an empty text message
                                                     // with only thinking metadata should be hidden.
                                                     let should_render = !text.trim().is_empty() || is_generating || !message.attachments.is_empty();
+                                                    // A voice request that repeats the heard line
+                                                    // just above it shows as a hand-off marker under
+                                                    // that bubble, not as a second copy of it — only
+                                                    // while that bubble is rendered (not above the
+                                                    // Load More cut-off).
+                                                    let echo = crate::voice::display::echoes_heard_line(&sorted_messages, *idx)
+                                                        .is_some_and(|heard| crate::voice::display::marker_shown(heard, skip));
 
-                                                    if should_render {
+                                                    if echo {
+                                                        let request = crate::voice::display::display_text(text).to_string();
+                                                        rsx! {
+                                                            div {
+                                                                class: "flex justify-end",
+                                                                span {
+                                                                    class: "text-xs text-fg-muted px-2 cursor-default",
+                                                                    title: "{request}",
+                                                                    "↳ Asked Hobbes"
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if should_render {
                                                         rsx! {
                                                             MessageBubble {
-                                                                message: message.clone(),
+                                                                message: display_message(message),
                                                                 on_content_update: move |_| stream_update_trigger += 1,
                                                                 on_selection: move |data| tracing::debug!("Selection event: {:?}", data),
                                                                 on_delete: {
@@ -405,11 +436,13 @@ pub fn MessageList(
                                                                 },
                                                                 on_edit_save: {
                                                                     let msg_id = message.id;
-                                                                    move |text: String| on_edit_save.call((msg_id, text))
+                                                                    let original = text.clone();
+                                                                    move |t: String| on_edit_save.call((msg_id, crate::voice::display::restore_frame(&original, t)))
                                                                 },
                                                                 on_edit_resend: {
                                                                     let msg_id = message.id;
-                                                                    move |text: String| on_edit_resend.call((msg_id, text))
+                                                                    let original = text.clone();
+                                                                    move |t: String| on_edit_resend.call((msg_id, crate::voice::display::restore_frame(&original, t)))
                                                                 },
                                                                 on_comment: move |_| on_comment.call(()),
                                                                 show_time: stamp.show_time,
@@ -562,6 +595,10 @@ pub fn MessageList(
                                                                             move |_exec_id: String| {
                                                                                 let msg_id = message_id;
                                                                                 let session_id = session_id.clone();
+                                                                                // An archived system session is read-only.
+                                                                                if crate::system_sessions::is_archive(&session_id) {
+                                                                                    return;
+                                                                                }
                                                                                 spawn(async move {
                                                                                     // Get session's profile for profile-scoped MCP context
                                                                                     let (skill_call_clone, profile_id) = {
@@ -625,6 +662,16 @@ pub fn MessageList(
                                                                                                 // Trigger continuation on the session that actually ran the
                                                                                                 // skill, not whichever tab is active right now (see the
                                                                                                 // has_pending_approvals doc comment above).
+                                                                                                // The continuation runs under the approved
+                                                                                                // skill's own origin (unstamped legacy: the
+                                                                                                // resume path's fallback scan decides).
+                                                                                                if let Some(origin) = sc.origin {
+                                                                                                    crate::components::continuation_controller::record_approval_origin(
+                                                                                                        &session_id,
+                                                                                                        crate::components::continuation_controller::ApprovalKey::Message(msg_id),
+                                                                                                        origin,
+                                                                                                    );
+                                                                                                }
                                                                                                 has_pending_approvals.write().insert(session_id.clone());
                                                                                             }
                                                                                             Err(e) => {
@@ -654,6 +701,9 @@ pub fn MessageList(
                                                                             move |_exec_id: String| {
                                                                                 let msg_id = message_id;
                                                                                 let session_id = session_id.clone();
+                                                                                if crate::system_sessions::is_archive(&session_id) {
+                                                                                    return;
+                                                                                }
                                                                                 // Mark skill as denied
                                                                                 let mut state = session_state.write();
                                                                                 let mut denied_snapshot: Option<crate::components::chat::Message> = None;

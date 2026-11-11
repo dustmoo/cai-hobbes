@@ -66,6 +66,8 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "HOBBES_DECISIONS",
     "HOBBES_TIME_GOALS",
     "HOBBES_AGENT_TIME",
+    "HOBBES_TAB_LIST",
+    "HOBBES_TAB_READ",
 ];
 
 #[allow(dead_code)]
@@ -241,21 +243,55 @@ pub fn agent_time_gate(
     }
 }
 
+/// The origin of the turn that minted `tool_call`: its stamp
+/// (`ToolCall::origin`, written by `stream_manager` from the session's
+/// harness-set `turn_origin`, never by the model). An unstamped call — a
+/// legacy row — counts as unattended in a system session (the safe side:
+/// the pre-merge Heartbeat session's calls were all unattended) and as the
+/// person's elsewhere.
+pub fn effective_origin(tool_call: &ToolCall, session_id: &str) -> crate::session::TurnOrigin {
+    tool_call.origin.unwrap_or_else(|| {
+        if crate::system_sessions::is_system(session_id) {
+            crate::session::TurnOrigin::Heartbeat
+        } else {
+            crate::session::TurnOrigin::User
+        }
+    })
+}
+
+/// Stamp a freshly minted call with the origin of the turn minting it
+/// (`stream_manager`, for every call the model emits). Overwrites whatever
+/// the call carried: the origin is the harness's to say, never the model's.
+pub fn stamp_turn_origin(tool_call: &mut ToolCall, origin: crate::session::TurnOrigin) {
+    tool_call.origin = Some(origin);
+    // Like the origin, a tab read's sources are the harness's to stamp
+    // (`hobbes_tabs::stamp_read_sources`), never carried in from a mint.
+    tool_call.read_sources.clear();
+    // So is a risk hold's reason (`risk_hold_reason`), and a flow hold's
+    // reason and pairs (`profile_flow::flow_hold`, stamped after this).
+    tool_call.risk_reason = None;
+    tool_call.hold_reason = None;
+    tool_call.hold_rule_key = None;
+}
+
 /// **The Heartbeat scope gate**, run by BOTH tool-call sites right after
 /// [`agent_time_gate`] (when that says `Proceed`) and before built-in
-/// dispatch and `use_mcp_tool`'s permission check. A no-op for every
-/// session but the dedicated Heartbeat session; there, the agent-time scope
-/// rules apply (`heartbeat::trust`): Allow proceeds, NeedsApproval is held
-/// as a `PermissionRequest` without consulting trust rules or always-allow
-/// (`ForceApproval`; runs once the user approves), Deny is refused.
+/// dispatch and `use_mcp_tool`'s permission check. Trust follows the turn,
+/// not the session: a no-op for every call but one minted by an unattended
+/// turn (a Heartbeat wake, [`effective_origin`]); there, the agent-time
+/// scope rules apply (`heartbeat::trust`): Allow proceeds, NeedsApproval is
+/// held as a `PermissionRequest` without consulting trust rules or
+/// always-allow (`ForceApproval`; runs once the user approves), Deny is
+/// refused. On the resume path the call's own stamp is read, so an approval
+/// keeps the rules of the turn that raised it.
 pub fn heartbeat_gate(
     tool_call: &ToolCall,
     args_json: &serde_json::Value,
     session_id: &str,
     user_approved: bool,
 ) -> AgentTimeGate {
-    let is_heartbeat = crate::heartbeat::HEARTBEAT.peek().session_id.as_deref() == Some(session_id);
-    match crate::heartbeat::trust::gate_verdict(is_heartbeat, &tool_call.tool_name, args_json, user_approved) {
+    let unattended = effective_origin(tool_call, session_id).is_unattended();
+    match crate::heartbeat::trust::gate_verdict(unattended, &tool_call.tool_name, args_json, user_approved) {
         crate::heartbeat::trust::HeartbeatVerdict::Proceed => AgentTimeGate::Proceed,
         crate::heartbeat::trust::HeartbeatVerdict::ForceApproval => AgentTimeGate::ForceApproval,
         crate::heartbeat::trust::HeartbeatVerdict::Refuse(message) => {
@@ -265,9 +301,127 @@ pub fn heartbeat_gate(
     }
 }
 
-/// Both scope gates in order: agent time first, then (when it proceeds) the
-/// Heartbeat's. The one entry point the two tool-call sites use, so neither
-/// can run one gate without the other.
+/// **The tab-read gate** (`hobbes_tabs`): `HOBBES_TAB_LIST` / `_READ` run
+/// only in the live Hobbes session (refused anywhere else), freely while
+/// `Settings::hobbes_read_tabs` is on, and are held for the person's
+/// approval (`ForceApproval`) while it is off — a Heartbeat wake's call
+/// too, so an unattended turn never reads silently. Everything it reads is
+/// harness state (the setting, the session id, `user_approved` from the
+/// resume path), never the model's output. A no-op for every other tool.
+pub fn tab_read_gate(deps: BuiltinToolCtx, tool_call: &ToolCall, session_id: &str, user_approved: bool) -> AgentTimeGate {
+    let read_tabs = deps.settings.peek().hobbes_read_tabs;
+    match crate::hobbes_tabs::tab_gate(
+        &tool_call.tool_name,
+        crate::hobbes_tabs::tab_tools_offered(session_id),
+        read_tabs,
+        user_approved,
+    ) {
+        crate::hobbes_tabs::TabGate::Proceed => AgentTimeGate::Proceed,
+        crate::hobbes_tabs::TabGate::Ask => AgentTimeGate::ForceApproval,
+        crate::hobbes_tabs::TabGate::Refuse(message) => {
+            tracing::info!(session_id, tool = %tool_call.tool_name, "Tab-read gate refused a tool call");
+            AgentTimeGate::Refuse(message)
+        }
+    }
+}
+
+/// **The call risk gate** (`call_risk`): judges what a call would do —
+/// rules only, no LLM — for calls minted by a voice-relayed turn
+/// (`TurnOrigin::Voice`), an unattended one ([`effective_origin`]), or a
+/// turn nobody is present for in an ordinary chat (a fired timer, a relay or
+/// returned work: `chat_queue::turn_absent`, [`risk_gate_applies`]); a
+/// no-op (`Proceed`) for a turn the person typed. Safe proceeds into the normal flow
+/// (always-allow and trust rules included); Malformed is refused with a
+/// message telling the model what to fix (the person isn't asked);
+/// Destructive is held as a `PermissionRequest` whatever always-allow or
+/// trust rules say (`ForceApproval`; the streaming path stamps the reason,
+/// [`risk_hold_reason`]) and runs once the person approves
+/// (`user_approved` on the resume path). Reads only the harness's origin
+/// stamp and `user_approved`, never model output. Logs one INFO line per
+/// non-Safe verdict: tool name, origin and verdict kind only.
+pub fn risk_gate(
+    tool_call: &ToolCall,
+    args_json: &serde_json::Value,
+    session_id: &str,
+    user_approved: bool,
+) -> AgentTimeGate {
+    use crate::call_risk::{classify, decide, RiskGate};
+    let origin = effective_origin(tool_call, session_id);
+    if !risk_gate_applies(tool_call, session_id) {
+        return AgentTimeGate::Proceed;
+    }
+    let risk = classify(&tool_call.server_name, &tool_call.tool_name, args_json);
+    let decision = decide(&risk, user_approved);
+    if risk != crate::call_risk::Risk::Safe {
+        let action = match &decision {
+            RiskGate::Proceed => "approved",
+            RiskGate::Hold { .. } => "held",
+            RiskGate::Refuse(_) => "refused",
+        };
+        tracing::info!(
+            tool = %tool_call.tool_name,
+            origin = ?origin,
+            verdict = risk.kind(),
+            action,
+            "Call risk gate"
+        );
+    }
+    match decision {
+        RiskGate::Proceed => AgentTimeGate::Proceed,
+        RiskGate::Hold { .. } => AgentTimeGate::ForceApproval,
+        RiskGate::Refuse(message) => AgentTimeGate::Refuse(message),
+    }
+}
+
+/// The reason to stamp on a call the streaming path is holding
+/// (`ToolCall::risk_reason`): `Some` when the risk gate applies to its
+/// origin and judges it Destructive, else `None`. Pure apart from the
+/// origin lookup; logs nothing.
+pub fn risk_hold_reason(tool_call: &ToolCall, args_json: &serde_json::Value, session_id: &str) -> Option<String> {
+    if !risk_gate_applies(tool_call, session_id) {
+        return None;
+    }
+    match crate::call_risk::classify(&tool_call.server_name, &tool_call.tool_name, args_json) {
+        crate::call_risk::Risk::Destructive { reason } => Some(reason),
+        _ => None,
+    }
+}
+
+/// Whether the call risk gate judges `tool_call`: its turn's origin is a
+/// voice or unattended one, or nobody is present for the turn running in
+/// `session_id` (`chat_queue::turn_absent`: a timer, relay or returned work
+/// in an ordinary chat — the person's origin, but nobody watching). Both are
+/// harness state, never model output. The Heartbeat gate's reach is
+/// unchanged: it reads the origin alone.
+pub fn risk_gate_applies(tool_call: &ToolCall, session_id: &str) -> bool {
+    crate::call_risk::gate_applies_to(
+        effective_origin(tool_call, session_id),
+        crate::components::chat_queue::turn_absent(session_id),
+    )
+}
+
+/// The stricter of two gate results: Refuse > ForceApproval > Proceed; on a
+/// tie the first is kept (so a Heartbeat refusal keeps its own message).
+pub fn stricter_gate(first: AgentTimeGate, second: AgentTimeGate) -> AgentTimeGate {
+    let rank = |g: &AgentTimeGate| match g {
+        AgentTimeGate::Proceed => 0,
+        AgentTimeGate::ForceApproval => 1,
+        AgentTimeGate::Refuse(_) => 2,
+    };
+    if rank(&second) > rank(&first) {
+        second
+    } else {
+        first
+    }
+}
+
+/// All scope gates in order: agent time first, then (when it proceeds) the
+/// Heartbeat's, then the call risk gate, then the tab-read gate. The one
+/// entry point the two tool-call sites use, so neither can run one gate
+/// without the others. The risk gate composes with whatever came before it
+/// (the stricter result wins, so a Heartbeat hold of a malformed call is
+/// refused, and a refusal stays a refusal); for a typed turn it is a no-op,
+/// so typed chat is exactly as before.
 pub fn scope_gates(
     deps: BuiltinToolCtx,
     tool_call: &ToolCall,
@@ -275,8 +429,15 @@ pub fn scope_gates(
     session_id: &str,
     user_approved: bool,
 ) -> AgentTimeGate {
-    match agent_time_gate(deps, tool_call, args_json, session_id, user_approved) {
+    let earlier = match agent_time_gate(deps, tool_call, args_json, session_id, user_approved) {
         AgentTimeGate::Proceed => heartbeat_gate(tool_call, args_json, session_id, user_approved),
+        other => other,
+    };
+    if matches!(earlier, AgentTimeGate::Refuse(_)) {
+        return earlier;
+    }
+    match stricter_gate(earlier, risk_gate(tool_call, args_json, session_id, user_approved)) {
+        AgentTimeGate::Proceed => tab_read_gate(deps, tool_call, session_id, user_approved),
         other => other,
     }
 }
@@ -617,7 +778,7 @@ pub async fn dispatch_builtin_tool(
 
         "HOBBES_INVOKE_SKILL" => {
             let (status, response) =
-                invoke_skill(deps, args_json, session_id, profile_id, user_approved).await;
+                invoke_skill(deps, args_json, session_id, profile_id, user_approved, tool_call.origin).await;
             Some(BuiltinOutcome {
                 status,
                 response,
@@ -645,6 +806,23 @@ pub async fn dispatch_builtin_tool(
         "HOBBES_MESSAGE_WORKER" => {
             let (status, response) =
                 crate::todo::relay::handle_message_worker(deps, args_json, session_id);
+            Some(BuiltinOutcome { status, response, persist: true })
+        }
+
+        // The Hobbes tab reading other conversations (hobbes_tabs):
+        // read-only; the gate is re-checked inside. Persisted: a read
+        // carries the tab's company sources into this session.
+        "HOBBES_TAB_LIST" | "HOBBES_TAB_READ" => {
+            let (status, response) =
+                crate::hobbes_tabs::dispatch(
+                deps,
+                &tool_call.tool_name,
+                args_json,
+                session_id,
+                &tool_call.execution_id,
+                user_approved,
+            )
+            .await;
             Some(BuiltinOutcome { status, response, persist: true })
         }
 
@@ -884,6 +1062,7 @@ fn deliver_decision(
                 crate::components::chat_queue::QueuedMessage::new(
                     crate::todo::lanes::answer_message(entry),
                     vec![],
+                    crate::components::chat_queue::QueueOrigin::Unattended,
                 ),
             );
             crate::components::chat_queue::request_drain();
@@ -942,6 +1121,7 @@ async fn invoke_skill(
     session_id: &str,
     profile_id: Option<&String>,
     user_approved: bool,
+    origin: Option<crate::session::TurnOrigin>,
 ) -> (ToolCallStatus, String) {
     let mut session_state = deps.session_state;
 
@@ -1028,6 +1208,7 @@ async fn invoke_skill(
             let settings_read = deps.settings.read();
             crate::components::shared::resolve_profile_color(profile_id, &settings_read)
         },
+        origin,
     };
 
     // Use the reactively-synced McpContext signal
@@ -1130,6 +1311,340 @@ fn unload_skill(
 mod tests {
     use super::*;
 
+    // ── Trust follows the turn (the Hobbes session hosts both kinds) ──
+
+    fn call(tool: &str) -> ToolCall {
+        // As a connector builds it from the model's output: no origin.
+        ToolCall::new("hobbes-core".into(), tool.into(), serde_json::json!({}), None, None)
+    }
+
+    #[test]
+    fn the_stream_path_gates_by_the_turn_s_stamped_origin() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                crate::settings::Settings::default(),
+            );
+            crate::system_sessions::set_current("gate-hobbes");
+            let gate = |origin: TurnOrigin, tool: &str| {
+                let mut tc = call(tool);
+                assert_eq!(tc.origin, None, "the connector never sets an origin");
+                // Whatever the call claims, the stream stamps the turn's.
+                tc.origin = Some(if origin == TurnOrigin::User { TurnOrigin::Heartbeat } else { TurnOrigin::User });
+                stamp_turn_origin(&mut tc, origin);
+                assert_eq!(tc.origin, Some(origin));
+                scope_gates(ctx, &tc, &serde_json::json!({}), "gate-hobbes", false)
+            };
+            // A Heartbeat wake's turn: the strict, unattended rules.
+            assert!(matches!(gate(TurnOrigin::Heartbeat, "HOBBES_TODO_CREATE"), AgentTimeGate::Refuse(_)));
+            assert_eq!(gate(TurnOrigin::Heartbeat, "gmail_send_email"), AgentTimeGate::ForceApproval);
+            assert_eq!(gate(TurnOrigin::Heartbeat, "HOBBES_TODO_LIST"), AgentTimeGate::Proceed);
+            // The person's turn in the same session: the normal flow (the
+            // permission system and the cross-company hold still apply).
+            assert_eq!(gate(TurnOrigin::User, "HOBBES_TODO_CREATE"), AgentTimeGate::Proceed);
+            assert_eq!(gate(TurnOrigin::User, "gmail_send_email"), AgentTimeGate::Proceed);
+            // An unstamped legacy call: strict in a system session, normal
+            // in an ordinary chat.
+            assert!(matches!(
+                scope_gates(ctx, &call("HOBBES_TODO_CREATE"), &serde_json::json!({}), "gate-hobbes", false),
+                AgentTimeGate::Refuse(_)
+            ));
+            assert_eq!(
+                scope_gates(ctx, &call("HOBBES_TODO_CREATE"), &serde_json::json!({}), "an-ordinary-chat", false),
+                AgentTimeGate::Proceed
+            );
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
+    fn a_skill_continuation_keeps_the_raising_turn_s_origin() {
+        use crate::components::shared::{MessageContent, SkillCall};
+        use crate::session::TurnOrigin;
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        // A wake's turn raised a skill held for approval ...
+        let held = SkillCall { origin: Some(TurnOrigin::Heartbeat), ..Default::default() };
+        let mut m = crate::voice::session::transcript_message(false, "x");
+        m.content = MessageContent::SkillPermissionRequest(held);
+        s.messages.push(m);
+        // ... and something else set the session's turn to the person's
+        // since (a /unload, a leaked origin): the continuation after the
+        // approval still runs under the wake's rules.
+        s.turn_origin = TurnOrigin::User;
+        assert_eq!(crate::components::chat::raising_turn_origin(s), TurnOrigin::Heartbeat);
+        // Nothing stamped: the session's recorded turn.
+        s.messages.clear();
+        assert_eq!(crate::components::chat::raising_turn_origin(s), TurnOrigin::User);
+    }
+
+    #[test]
+    fn a_no_tools_continuation_runs_under_the_approved_skill_s_origin() {
+        use crate::components::chat::no_tools_continuation_origin;
+        use crate::components::shared::{MessageContent, SkillCall};
+        use crate::session::TurnOrigin;
+        let mut state = SessionState::default();
+        let id = state.create_session_raw(None);
+        let s = state.sessions.get_mut(&id).unwrap();
+        let mut skill = crate::voice::session::transcript_message(false, "x");
+        skill.content = MessageContent::SkillCall(SkillCall { origin: Some(TurnOrigin::Heartbeat), ..Default::default() });
+        s.messages.push(skill);
+        // A newer turn of the person's, stamped User.
+        let mut mine = call("HOBBES_TODO_LIST");
+        stamp_turn_origin(&mut mine, TurnOrigin::User);
+        let mut m = crate::voice::session::transcript_message(false, "x");
+        m.content = MessageContent::ToolCall(mine);
+        s.messages.push(m);
+        use crate::components::continuation_controller::{record_approval_origin, ApprovalKey};
+        // The wake's skill, approved now: its own origin, not the newest turn's.
+        record_approval_origin(&id, ApprovalKey::Message(uuid::Uuid::new_v4()), TurnOrigin::Heartbeat);
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
+        // ... and an "analyse now" while it waited doesn't loosen it.
+        record_approval_origin(&id, ApprovalKey::Message(uuid::Uuid::new_v4()), TurnOrigin::Heartbeat);
+        record_approval_origin(&id, ApprovalKey::AnalyseNow, TurnOrigin::User);
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
+        // Taken once: an "analyse now" from the person after a wake is theirs.
+        s.messages.reverse(); // newest stamp is now the wake's
+        record_approval_origin(&id, ApprovalKey::AnalyseNow, TurnOrigin::User);
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::User);
+        // Nothing handed over (legacy, unstamped skill): the scan decides.
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::Heartbeat);
+        s.messages.reverse();
+        assert_eq!(no_tools_continuation_origin(&id, Some(s)), TurnOrigin::User);
+    }
+
+    #[test]
+    fn a_tools_resume_consumes_recorded_approval_origins() {
+        use crate::components::continuation_controller::{record_approval_origin, ApprovalKey};
+        use crate::session::TurnOrigin;
+        let id = "tools-resume-consumes";
+        // A skill approval recorded, but the resume found tool calls to run.
+        record_approval_origin(id, ApprovalKey::Message(uuid::Uuid::new_v4()), TurnOrigin::Heartbeat);
+        let mut mine = call("HOBBES_TODO_LIST");
+        stamp_turn_origin(&mut mine, TurnOrigin::User);
+        // The strict side wins for this continuation ...
+        assert_eq!(crate::components::chat::tools_resume_origin([&mine], id), TurnOrigin::Heartbeat);
+        // ... and nothing is left for a later, unstamped legacy skill to pick up.
+        let mut legacy = SessionState::default();
+        let sid = legacy.create_session_raw(None);
+        assert_eq!(crate::components::chat::no_tools_continuation_origin(id, legacy.sessions.get(&sid)), TurnOrigin::User);
+    }
+
+    #[test]
+    fn a_resumed_approval_keeps_its_turn_s_origin() {
+        use crate::components::shared::MessageContent;
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                crate::settings::Settings::default(),
+            );
+            crate::system_sessions::set_current("resume-hobbes");
+            // A wake's call held for approval, as the stream path stored it.
+            let mut held = call("gmail_send_email");
+            stamp_turn_origin(&mut held, TurnOrigin::Heartbeat);
+            let stored = MessageContent::PermissionRequest(held);
+            // It survives the save / journal round trip ...
+            let stored: MessageContent = serde_json::from_value(serde_json::to_value(&stored).unwrap()).unwrap();
+            // ... and Approve flips it back to a running call, stamp intact.
+            let MessageContent::PermissionRequest(tc) = stored else { panic!("a held call") };
+            let approved = MessageContent::ToolCall(tc);
+            let MessageContent::ToolCall(resumed) = &approved else { unreachable!() };
+            assert_eq!(resumed.origin, Some(TurnOrigin::Heartbeat));
+            // The person typed in the tab while it waited: the session's
+            // current turn is theirs, but the resume reads the call's stamp.
+            assert_eq!(
+                crate::components::chat::resumed_turn_origin([resumed], "resume-hobbes"),
+                TurnOrigin::Heartbeat
+            );
+            // The approval lets the held outside effect run ...
+            assert_eq!(
+                scope_gates(ctx, resumed, &serde_json::json!({}), "resume-hobbes", true),
+                AgentTimeGate::Proceed
+            );
+            // ... but a call the Heartbeat may never make stays refused,
+            // approved or not.
+            let mut denied = call("HOBBES_TODO_CREATE");
+            stamp_turn_origin(&mut denied, TurnOrigin::Heartbeat);
+            assert!(matches!(
+                scope_gates(ctx, &denied, &serde_json::json!({}), "resume-hobbes", true),
+                AgentTimeGate::Refuse(_)
+            ));
+            // The person's own held call resumes under the normal rules.
+            let mut mine = call("HOBBES_TODO_CREATE");
+            stamp_turn_origin(&mut mine, TurnOrigin::User);
+            assert_eq!(crate::components::chat::resumed_turn_origin([&mine], "resume-hobbes"), TurnOrigin::User);
+            assert_eq!(scope_gates(ctx, &mine, &serde_json::json!({}), "resume-hobbes", true), AgentTimeGate::Proceed);
+            // Mixed: the strict side wins for the continuation.
+            assert_eq!(
+                crate::components::chat::resumed_turn_origin([&mine, resumed], "resume-hobbes"),
+                TurnOrigin::Heartbeat
+            );
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    // ── The Hobbes tab reading other tabs (hobbes_tabs) ──
+
+    fn read_tabs_settings(on: bool) -> Settings {
+        let mut settings = Settings { hobbes_read_tabs: on, ..Default::default() };
+        for (id, name) in [("cm", "Clearmirror"), ("pg", "Puget")] {
+            settings.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        settings.active_composio_profile = Some("cm".into());
+        settings
+    }
+
+    /// The setting gate on both tool-call paths (stream: `user_approved`
+    /// false; approval resume: true), for typed and unattended turns, the
+    /// "always" switch, revoking, and refusal outside the Hobbes tab; then
+    /// dispatch end to end, which re-checks the gate and carries the read
+    /// tab's companies into the Hobbes session.
+    #[test]
+    fn tab_reads_follow_the_setting_on_both_paths_and_only_in_hobbes() {
+        use crate::session::TurnOrigin;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut dom = VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                read_tabs_settings(false),
+            );
+            let (hobbes, puget, other) = {
+                let mut state = ctx.session_state.clone();
+                let mut state = state.write();
+                let hobbes = state.create_session_raw(Some("cm".into()));
+                let puget = state.create_session_raw(Some("pg".into()));
+                let other = state.create_session_raw(None);
+                let mut m = crate::voice::session::transcript_message(true, "PUGET-SECRET plan");
+                m.author = "User".into();
+                state.sessions.get_mut(&puget).unwrap().messages.push(m);
+                (hobbes, puget, other)
+            };
+            crate::system_sessions::set_current(&hobbes);
+            let args = serde_json::json!({ "session_id": puget });
+            let stamped = |tool: &str, origin: TurnOrigin| {
+                let mut tc = ToolCall::new("hobbes-core".into(), tool.into(), args.clone(), None, None);
+                stamp_turn_origin(&mut tc, origin);
+                tc
+            };
+            let gate = |tool: &str, origin: TurnOrigin, sid: &str, approved: bool| {
+                scope_gates(ctx, &stamped(tool, origin), &args, sid, approved)
+            };
+            for tool in [crate::hobbes_tabs::TAB_LIST, crate::hobbes_tabs::TAB_READ] {
+                for origin in [TurnOrigin::User, TurnOrigin::Heartbeat] {
+                    // Off: held for the person on the stream path (an
+                    // unattended turn too: never a silent read) ...
+                    assert_eq!(gate(tool, origin, &hobbes, false), AgentTimeGate::ForceApproval, "{tool} {origin:?}");
+                    // ... and runs once approved (allow once, resume path).
+                    assert_eq!(gate(tool, origin, &hobbes, true), AgentTimeGate::Proceed, "{tool} {origin:?}");
+                    // Never outside the Hobbes tab, approved or not.
+                    assert!(matches!(gate(tool, origin, &other, false), AgentTimeGate::Refuse(_)));
+                    assert!(matches!(gate(tool, origin, &other, true), AgentTimeGate::Refuse(_)));
+                }
+            }
+            // Not held by anything else: no always-ask, no skill approval.
+            assert!(!builtin_needs_approval(ctx, &stamped(crate::hobbes_tabs::TAB_READ, TurnOrigin::User), &args, &hobbes));
+
+            let handle = tokio::runtime::Handle::current();
+            let run = |tc: &ToolCall, sid: &str, approved: bool| {
+                handle.block_on(dispatch_builtin_tool(ctx, tc, &args, sid, None, approved)).expect("a built-in")
+            };
+            let read = stamped(crate::hobbes_tabs::TAB_READ, TurnOrigin::User);
+            // The call's message, as the stream path stores it.
+            {
+                let mut m = crate::voice::session::transcript_message(false, "x");
+                m.content = crate::components::shared::MessageContent::ToolCall(read.clone());
+                ctx.session_state.clone().write().sessions.get_mut(&hobbes).unwrap().messages.push(m);
+            }
+            let stamped_sources = || {
+                ctx.session_state.peek().sessions[&hobbes]
+                    .messages
+                    .iter()
+                    .find_map(|m| match &m.content {
+                        crate::components::shared::MessageContent::ToolCall(tc) if tc.execution_id == read.execution_id => {
+                            Some(tc.read_sources.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            // Dispatch re-checks: unapproved with the setting off reads nothing.
+            let out = run(&read, &hobbes, false);
+            assert_eq!(out.status, ToolCallStatus::Error);
+            assert!(!out.response.contains("PUGET-SECRET"));
+            assert!(stamped_sources().is_empty());
+            // Outside the Hobbes tab: refused even "approved".
+            let out = run(&read, &other, true);
+            assert_eq!(out.status, ToolCallStatus::Error);
+            assert_eq!(out.response, crate::hobbes_tabs::NOT_HOBBES_REFUSAL);
+            // Allow once: reads, and the Puget tab's company is now in play.
+            let out = run(&read, &hobbes, true);
+            assert_eq!(out.status, ToolCallStatus::Completed, "{}", out.response);
+            assert!(out.response.contains("PUGET-SECRET"));
+            assert!(out.persist);
+            // Stamped on the read's own call; once the call site marks it
+            // done, the hold counts it for as long as the message stays.
+            assert_eq!(stamped_sources(), ["pg"]);
+            {
+                let mut state = ctx.session_state.clone();
+                let mut state = state.write();
+                for m in &mut state.sessions.get_mut(&hobbes).unwrap().messages {
+                    if let crate::components::shared::MessageContent::ToolCall(tc) = &mut m.content {
+                        tc.status = ToolCallStatus::Completed;
+                    }
+                }
+            }
+            let later = chrono::Utc::now() + chrono::Duration::days(1);
+            let settings = ctx.settings.peek().clone();
+            assert!(crate::mcp::manager::profile_reach::session_read_profiles(
+                &settings,
+                &ctx.session_state.peek().sessions[&hobbes],
+                later
+            )
+            .contains("pg"));
+            assert!(ctx.session_state.peek().sessions[&hobbes].carried_reads.is_empty());
+            // Reading the Hobbes tab itself is refused.
+            let own = serde_json::json!({ "session_id": hobbes });
+            let out = handle.block_on(dispatch_builtin_tool(ctx, &read, &own, &hobbes, None, true)).unwrap();
+            assert_eq!(out.status, ToolCallStatus::Error);
+            // The listing never includes the Hobbes tab or message text; its
+            // titles carry the other company's home for the read window.
+            let list = stamped(crate::hobbes_tabs::TAB_LIST, TurnOrigin::User);
+            let out = handle.block_on(dispatch_builtin_tool(ctx, &list, &serde_json::json!({}), &hobbes, None, true)).unwrap();
+            assert_eq!(out.status, ToolCallStatus::Completed, "{}", out.response);
+            assert!(out.response.contains(&puget) && out.response.contains(&other));
+            assert!(!out.response.contains(&hobbes));
+            assert!(!out.response.contains("PUGET-SECRET"));
+            let carried: Vec<String> =
+                ctx.session_state.peek().sessions[&hobbes].carried_reads.iter().map(|r| r.profile_id.clone()).collect();
+            assert_eq!(carried, ["pg"]);
+
+            // "Always" turns the setting on: both paths and both origins run.
+            assert!(crate::hobbes_tabs::allow_always(&mut ctx.settings.clone().write()));
+            for origin in [TurnOrigin::User, TurnOrigin::Heartbeat] {
+                assert_eq!(gate(crate::hobbes_tabs::TAB_READ, origin, &hobbes, false), AgentTimeGate::Proceed);
+                assert_eq!(gate(crate::hobbes_tabs::TAB_READ, origin, &hobbes, true), AgentTimeGate::Proceed);
+                assert!(matches!(gate(crate::hobbes_tabs::TAB_READ, origin, &other, false), AgentTimeGate::Refuse(_)));
+            }
+            assert_eq!(run(&read, &hobbes, false).status, ToolCallStatus::Completed);
+            // Revoked in Settings: the next call asks again.
+            ctx.settings.clone().write().hobbes_read_tabs = false;
+            assert_eq!(gate(crate::hobbes_tabs::TAB_READ, TurnOrigin::Heartbeat, &hobbes, false), AgentTimeGate::ForceApproval);
+            assert_eq!(run(&read, &hobbes, false).status, ToolCallStatus::Error);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
     #[test]
     fn unload_removes_only_the_named_skill() {
         let mut state = SessionState::default();
@@ -1167,7 +1682,8 @@ mod tests {
     #[test]
     fn every_core_client_tool_is_dispatchable() {
         let relay = crate::mcp::core_client::CoreClient::relay_tools();
-        for tool in crate::mcp::core_client::CoreClient::new().list_tools().into_iter().chain(relay) {
+        let tabs = crate::mcp::core_client::CoreClient::tab_tools();
+        for tool in crate::mcp::core_client::CoreClient::new().list_tools().into_iter().chain(relay).chain(tabs) {
             assert!(
                 is_builtin_tool(&tool.name),
                 "CoreClient advertises '{}' but BUILTIN_TOOLS does not list it — \
@@ -1355,5 +1871,125 @@ mod tests {
         assert!(!is_builtin_tool("MCP_LOAD_SERVER_TOOLS"));
         assert!(!is_planner_tool("HOBBES_UPDATE_SCRATCHPAD"));
         assert!(!is_planner_tool("MCP_LOAD_SERVER_TOOLS"));
+    }
+
+    // ── The call risk gate (voice and unattended turns only) ──
+
+    #[test]
+    fn the_risk_gate_judges_voice_and_unattended_calls_only() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let ctx = crate::todo::dispatch::tests::test_ctx_with(
+                crate::todo::PlannerState::default(),
+                crate::settings::Settings::default(),
+            );
+            crate::system_sessions::set_current("risk-hobbes");
+            let exec = |origin: TurnOrigin, cmd: &str| {
+                let args = serde_json::json!({ "command": cmd });
+                let mut tc = ToolCall::new("hobbes-terminal".into(), "HOBBES_TERMINAL_EXEC".into(), args, None, None);
+                tc.risk_reason = Some("the model's own words".into());
+                stamp_turn_origin(&mut tc, origin);
+                assert_eq!(tc.risk_reason, None, "minting clears a carried-in reason");
+                tc
+            };
+            let gate = |tc: &ToolCall, approved: bool| {
+                let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap();
+                scope_gates(ctx, tc, &args, "risk-hobbes", approved)
+            };
+            let wipe = "diskutil eraseDisk APFS Untitled /dev/disk10";
+            // Typed chat: byte-for-byte as before.
+            assert_eq!(gate(&exec(TurnOrigin::User, wipe), false), AgentTimeGate::Proceed);
+            assert_eq!(gate(&exec(TurnOrigin::User, "rm -rf <path>"), false), AgentTimeGate::Proceed);
+            // Voice: safe runs into the normal flow, destructive is held
+            // (then runs once approved), malformed is refused.
+            assert_eq!(gate(&exec(TurnOrigin::Voice, "ls -la"), false), AgentTimeGate::Proceed);
+            let held = exec(TurnOrigin::Voice, wipe);
+            assert_eq!(gate(&held, false), AgentTimeGate::ForceApproval);
+            assert_eq!(gate(&held, true), AgentTimeGate::Proceed);
+            assert!(matches!(gate(&exec(TurnOrigin::Voice, "rm -rf <path>"), false), AgentTimeGate::Refuse(m) if m.contains("placeholder")));
+            assert!(matches!(gate(&exec(TurnOrigin::Voice, "rm -rf <path>"), true), AgentTimeGate::Refuse(_)));
+            // The reason the stream path stamps on the held request.
+            let args = serde_json::json!({ "command": wipe });
+            assert_eq!(
+                risk_hold_reason(&held, &args, "risk-hobbes").as_deref(),
+                Some("erases the whole disk /dev/disk10")
+            );
+            assert_eq!(risk_hold_reason(&exec(TurnOrigin::User, wipe), &args, "risk-hobbes"), None);
+            // Unattended: composes with the Heartbeat gate, stricter wins.
+            // (The Heartbeat's own scope already refuses an erase outright.)
+            assert!(matches!(gate(&exec(TurnOrigin::Heartbeat, wipe), false), AgentTimeGate::Refuse(_)));
+            assert!(matches!(gate(&exec(TurnOrigin::Heartbeat, "rm -rf $DIR/"), false), AgentTimeGate::Refuse(_)));
+            // A Heartbeat refusal stays the Heartbeat's refusal.
+            let todo = {
+                let mut tc = call("HOBBES_TODO_CREATE");
+                stamp_turn_origin(&mut tc, TurnOrigin::Heartbeat);
+                tc
+            };
+            match scope_gates(ctx, &todo, &serde_json::json!({}), "risk-hobbes", false) {
+                AgentTimeGate::Refuse(m) => assert!(m.contains("Heartbeat"), "{m}"),
+                other => panic!("{other:?}"),
+            }
+            // Voice is the person's turn for everything else: no Heartbeat scope.
+            let mut todo_voice = call("HOBBES_TODO_CREATE");
+            stamp_turn_origin(&mut todo_voice, TurnOrigin::Voice);
+            assert_eq!(scope_gates(ctx, &todo_voice, &serde_json::json!({}), "risk-hobbes", false), AgentTimeGate::Proceed);
+
+            // A timer, relay or returned work in an ordinary chat: the
+            // person's origin, but nobody present — the risk gate judges it.
+            let ordinary = "risk-ordinary-tab";
+            let gate_in = |tc: &ToolCall, approved: bool| {
+                let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap();
+                scope_gates(ctx, tc, &args, ordinary, approved)
+            };
+            crate::components::chat_queue::set_turn_absent(ordinary, true);
+            let absent_wipe = exec(TurnOrigin::User, wipe);
+            assert_eq!(gate_in(&absent_wipe, false), AgentTimeGate::ForceApproval);
+            assert_eq!(gate_in(&absent_wipe, true), AgentTimeGate::Proceed);
+            assert!(matches!(gate_in(&exec(TurnOrigin::User, "rm -rf <path>"), false), AgentTimeGate::Refuse(_)));
+            assert_eq!(gate_in(&exec(TurnOrigin::User, "ls -la"), false), AgentTimeGate::Proceed);
+            assert_eq!(
+                risk_hold_reason(&absent_wipe, &args, ordinary).as_deref(),
+                Some("erases the whole disk /dev/disk10")
+            );
+            // The Heartbeat gate's reach is unchanged: a planner write on such
+            // a turn is still the person's (no Heartbeat refusal).
+            assert_eq!(scope_gates(ctx, &call("HOBBES_TODO_CREATE"), &serde_json::json!({}), ordinary, false), AgentTimeGate::Proceed);
+            // The person typing again: untouched, as before.
+            crate::components::chat_queue::set_turn_absent(ordinary, false);
+            assert_eq!(gate_in(&exec(TurnOrigin::User, wipe), false), AgentTimeGate::Proceed);
+            assert_eq!(risk_hold_reason(&exec(TurnOrigin::User, wipe), &args, ordinary), None);
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
+    fn stricter_gate_ranks_refuse_over_hold_over_proceed() {
+        let r = |m: &str| AgentTimeGate::Refuse(m.into());
+        assert_eq!(stricter_gate(AgentTimeGate::Proceed, AgentTimeGate::ForceApproval), AgentTimeGate::ForceApproval);
+        assert_eq!(stricter_gate(AgentTimeGate::ForceApproval, AgentTimeGate::Proceed), AgentTimeGate::ForceApproval);
+        assert_eq!(stricter_gate(AgentTimeGate::ForceApproval, r("risk")), r("risk"));
+        assert_eq!(stricter_gate(r("heartbeat"), r("risk")), r("heartbeat"));
+        assert_eq!(stricter_gate(AgentTimeGate::Proceed, AgentTimeGate::Proceed), AgentTimeGate::Proceed);
+    }
+
+    #[test]
+    fn a_voice_resume_stays_under_the_risk_gate() {
+        use crate::session::TurnOrigin;
+        let stamped = |o: TurnOrigin| {
+            let mut tc = call("HOBBES_TERMINAL_EXEC");
+            stamp_turn_origin(&mut tc, o);
+            tc
+        };
+        let (u, v, h) = (stamped(TurnOrigin::User), stamped(TurnOrigin::Voice), stamped(TurnOrigin::Heartbeat));
+        let resumed = |calls: Vec<&ToolCall>| crate::components::chat::resumed_turn_origin(calls, "an-ordinary-chat");
+        assert_eq!(resumed(vec![&u, &v]), TurnOrigin::Voice);
+        assert_eq!(resumed(vec![&v, &h, &u]), TurnOrigin::Heartbeat);
+        assert_eq!(resumed(vec![&u]), TurnOrigin::User);
+        assert_eq!(resumed(vec![]), TurnOrigin::User);
+        use crate::components::continuation_controller::strictest;
+        assert_eq!(strictest([TurnOrigin::User, TurnOrigin::Voice]), Some(TurnOrigin::Voice));
+        assert_eq!(strictest([TurnOrigin::Voice, TurnOrigin::User]), Some(TurnOrigin::Voice));
+        assert_eq!(strictest([TurnOrigin::Voice, TurnOrigin::Heartbeat]), Some(TurnOrigin::Heartbeat));
     }
 }

@@ -19,6 +19,7 @@ mod agent_time_runtime;
 mod async_persist;
 #[cfg(target_os = "macos")]
 mod biometric_auth;
+mod call_risk;
 mod components;
 mod constants;
 mod context;
@@ -52,7 +53,12 @@ mod services;
 mod session;
 mod session_events;
 mod session_store;
+mod startup_timing;
 mod str_utils;
+mod session_rotation;
+mod system_sessions;
+mod hobbes_session;
+mod hobbes_tabs;
 mod tab_list;
 mod tab_tidy;
 #[cfg(test)]
@@ -62,6 +68,7 @@ mod handoff;
 mod heartbeat;
 mod todo;
 mod usage_log;
+mod voice;
 mod settings;
 mod skills;
 mod theme;
@@ -98,6 +105,35 @@ static CANCEL_STREAM_REQUEST: GlobalSignal<std::collections::HashSet<String>> =
 /// Pause / Stop / budget stop). No-op when nothing is streaming there.
 pub(crate) fn request_stream_cancel(session_id: &str) {
     CANCEL_STREAM_REQUEST.write().insert(session_id.to_string());
+}
+
+/// Whether `session_id` is mid-turn (no subscription: a peek), for code
+/// outside the component tree (the voice brain bridge).
+pub(crate) fn session_streaming(session_id: &str) -> bool {
+    STREAMING_SESSIONS.peek().contains(session_id)
+}
+
+/// Mirror of `StreamManagerContext::turn_in_flight_sessions` (streaming, a
+/// stream mapped to the session, or a continuation between tool rounds;
+/// never proactive summarization), kept in sync by `StreamBridge`. Unlike
+/// `STREAMING_SESSIONS` it stays set through the gap between rounds.
+static TURN_IN_FLIGHT: GlobalSignal<std::collections::HashSet<String>> =
+    Signal::global(std::collections::HashSet::new);
+
+/// Whether a turn is under way in `session_id` (no subscription: a peek),
+/// for code outside the component tree (the voice brain wait): a turn in
+/// flight, or a queued message popped and handed to the send but not yet
+/// streaming (`chat_queue::DISPATCHING`). Lags the stream manager by one
+/// reactive tick (it is a mirror), so callers should see it idle twice
+/// before treating a turn as over.
+pub(crate) fn session_turn_in_flight(session_id: &str) -> bool {
+    session_turn_started(session_id) || crate::components::chat_queue::DISPATCHING.peek().contains(session_id)
+}
+
+/// As [`session_turn_in_flight`], without the drain's hand-over: the turn
+/// itself has started (a stream registered) and is still running.
+pub(crate) fn session_turn_started(session_id: &str) -> bool {
+    TURN_IN_FLIGHT.peek().contains(session_id)
 }
 
 /// Drain `CANCEL_STREAM_REQUEST`, subscribing the caller to it.
@@ -144,6 +180,76 @@ fn drain_pending_tab_reopens() -> Vec<String> {
     std::mem::take(&mut *PENDING_TAB_REOPEN.write())
         .into_iter()
         .collect()
+}
+
+/// Permission decisions asked for from outside the approval bubble:
+/// (session id, held message id, approve). Same reach problem and fix as
+/// `PENDING_TAB_REOPEN`; drained by an effect in `app()`, which resolves
+/// each through `tool_call_display::decide_held_message` — the very approve
+/// / deny path the bubble's buttons use.
+static PENDING_PERMISSION_DECISIONS: GlobalSignal<Vec<(String, uuid::Uuid, bool)>> = Signal::global(Vec::new);
+
+/// Approve (`approve = true`) or deny the held call in `message_id` (a
+/// `PermissionRequest` message) of `session_id`, exactly as the bubble's
+/// Approve / Deny buttons do: the same trust-decision log entry, then
+/// `approve_held_call` (flip to `Running`, hand the session to the
+/// approval-resume effect in chat.rs, which re-runs the scope gates with
+/// `user_approved = true` and persists) or `deny_held_call` ("Denied by
+/// user.", persisted, the model not resumed). A no-op (warned) when the
+/// message isn't a held call any more. Harness-level: call it only on the
+/// person's own decision (e.g. the voice controller after checking the
+/// person's transcribed words against `call_risk::pending_risk_hold`),
+/// never on model output. Safe from any scope or task; takes effect on the
+/// next reactive tick.
+pub(crate) fn request_permission_decision(session_id: &str, message_id: uuid::Uuid, approve: bool) {
+    PENDING_PERMISSION_DECISIONS.write().push((session_id.to_string(), message_id, approve));
+}
+
+/// Drain `PENDING_PERMISSION_DECISIONS`, subscribing the caller (see
+/// `drain_pending_tab_reopens`).
+fn drain_permission_decisions() -> Vec<(String, uuid::Uuid, bool)> {
+    if PENDING_PERMISSION_DECISIONS.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *PENDING_PERMISSION_DECISIONS.write())
+}
+
+/// Rotated system sessions (`session_rotation`) whose tab, if open, the
+/// successor takes over: (archived id, new id). Same reach problem and fix
+/// as `PENDING_TAB_REOPEN`: the rotation runs in the Heartbeat runtime's
+/// tick, which can't see `open_tabs`.
+static PENDING_TAB_REPLACE: GlobalSignal<Vec<(String, String)>> = Signal::global(Vec::new);
+
+/// Ask the `ChatCommand` handler to put `new` in `old`'s tab (same position,
+/// active if `old` was) and close `old`'s.
+pub(crate) fn request_tab_replace(old: &str, new: &str) {
+    PENDING_TAB_REPLACE.write().push((old.to_string(), new.to_string()));
+}
+
+/// Drain `PENDING_TAB_REPLACE`, subscribing the caller (see
+/// `drain_pending_tab_reopens`).
+fn drain_pending_tab_replacements() -> Vec<(String, String)> {
+    if PENDING_TAB_REPLACE.read().is_empty() {
+        return Vec::new();
+    }
+    std::mem::take(&mut *PENDING_TAB_REPLACE.write())
+}
+
+/// `tabs` with `old` replaced by `new` in place (`old` dropped if `new` is
+/// already open), and where the active tab is now: the tab that was active
+/// keeps focus, `new` taking it when `old` had it. `None` when `old` isn't
+/// open.
+fn replace_tab(tabs: &[String], active: usize, old: &str, new: &str) -> Option<(Vec<String>, usize)> {
+    let pos = tabs.iter().position(|t| t == old)?;
+    let active_id = tabs.get(active).map(|id| if id == old { new } else { id.as_str() }).unwrap_or(new).to_string();
+    let mut out = tabs.to_vec();
+    if out.iter().any(|t| t == new) {
+        out.remove(pos);
+    } else {
+        out[pos] = new.to_string();
+    }
+    let idx = out.iter().position(|t| *t == active_id).unwrap_or(0).min(out.len().saturating_sub(1));
+    Some((out, idx))
 }
 
 /// One entry in the visible tab strip, in `tab_bar.rs`'s left-to-right render
@@ -243,6 +349,8 @@ fn tidy_inputs(
     use tab_tidy::TidyTodoStatus;
     let tabs = open_tabs
         .iter()
+        // The Hobbes tab is permanent: never closed or filed, so not tidied.
+        .filter(|id| !crate::system_sessions::is_system(id))
         .filter_map(|id| {
             let s = state.sessions.get(id)?;
             Some(tab_tidy::TidyTab {
@@ -293,6 +401,25 @@ fn tidy_inputs(
 #[cfg(test)]
 mod tab_cycle_tests {
     use super::*;
+
+    #[test]
+    fn a_rotated_session_s_tab_is_replaced_in_place() {
+        let v = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let tabs = v(&["a", "hb-old", "c"]);
+        // In place; the active tab (old or not) keeps its position.
+        assert_eq!(replace_tab(&tabs, 1, "hb-old", "hb-new").unwrap(), (v(&["a", "hb-new", "c"]), 1));
+        assert_eq!(replace_tab(&tabs, 2, "hb-old", "hb-new").unwrap(), (v(&["a", "hb-new", "c"]), 2));
+        // Not open: nothing to do.
+        assert_eq!(replace_tab(&tabs, 0, "elsewhere", "hb-new"), None);
+        // The successor already open: the archive's tab goes and focus
+        // follows the tab that had it.
+        let both = v(&["hb-new", "x", "hb-old", "y"]);
+        // The archive was active: focus moves to the successor.
+        assert_eq!(replace_tab(&both, 2, "hb-old", "hb-new").unwrap(), (v(&["hb-new", "x", "y"]), 0));
+        // Another tab to its right was active: it stays active, one left.
+        assert_eq!(replace_tab(&both, 3, "hb-old", "hb-new").unwrap(), (v(&["hb-new", "x", "y"]), 2));
+        assert_eq!(replace_tab(&both, 1, "hb-old", "hb-new").unwrap(), (v(&["hb-new", "x", "y"]), 1));
+    }
 
     #[test]
     fn cycle_index_wraps_forward() {
@@ -547,6 +674,7 @@ fn init_logger() {
 }
 
 fn main() {
+    startup_timing::begin();
     // Try to load .env file for developer convenience.
     dotenv().ok();
     tracing::debug!("Attempted to load .env file from the environment.");
@@ -563,13 +691,17 @@ fn main() {
     if let Err(e) = session_store::init() {
         tracing::error!("Failed to initialize session store: {e}");
     }
+    // One-time: system sessions' summaries stop carrying the Composio
+    // reads they recorded before tab reads (profile_reach counts a system
+    // session's summary sources now). Before any hydration.
+    startup_timing::time("system sessions", system_sessions::clear_legacy_summary_sources);
 
     // Read persisted window size (meta only — no session hydration)
     let (initial_width, initial_height) = session::SessionState::load_window_dims();
 
     // Load settings for menu
     let settings_manager = settings::SettingsManager::new(get_settings_path());
-    let initial_settings = settings_manager.load();
+    let initial_settings = startup_timing::time("settings", || settings_manager.load());
 
     let menu = menu::build_menu(&initial_settings);
     LaunchBuilder::new()
@@ -758,7 +890,7 @@ fn app() -> Element {
     let mut ui_state = use_context_provider(|| Signal::new(ui_state_manager.read().load()));
     let mut session_state = use_context_provider(|| {
         let open_tabs = ui_state.peek().open_tabs.clone();
-        let mut state = SessionState::load(&open_tabs).unwrap_or_else(|e| {
+        let mut state = startup_timing::time("hydrate", || SessionState::load(&open_tabs)).unwrap_or_else(|e| {
             tracing::error!("Failed to load session state during startup: {}", e);
             // Create default state with save DISABLED to protect stored data
             SessionState {
@@ -800,11 +932,45 @@ fn app() -> Element {
         }
     });
 
+    // The pin rule's view of the settings (profiles, Hobbes' home), kept
+    // current for the loader and the background backfill.
+    use_effect(move || {
+        crate::session_store::set_pin_rules(&settings.read());
+    });
+
+    // Pin tabs without a Composio profile (profile_reach::pin_fix): an
+    // unpinned tab followed the global profile, which follows focus, so its
+    // tools moved between companies as other tabs were opened. Per tab: its
+    // own Composio calls' profile, else Hobbes' home, else left unpinned —
+    // never the focus-driven global. Hydrated tabs here; stored rows by a
+    // background backfill that starts only after this pass and skips these
+    // ids; rows hydrated later as they load (session_store::pin_on_load).
+    use_effect(move || {
+        if session_state.peek().save_disabled {
+            return;
+        }
+        let settings_snapshot = settings.peek().clone();
+        if settings_snapshot.composio_profiles.is_empty() {
+            // Nothing to pin to yet; the migration waits for a profile.
+            return;
+        }
+        crate::session_store::set_pin_rules(&settings_snapshot);
+        let pinned = session_state.write().pin_unpinned(&settings_snapshot);
+        if !pinned.is_empty() {
+            tracing::info!(count = pinned.len(), "pinned open tabs without a Composio profile");
+            SessionState::save_signal(&session_state, None);
+        }
+        let mut skip: std::collections::HashSet<String> = session_state.peek().sessions.keys().cloned().collect();
+        skip.extend(crate::system_sessions::lineage());
+        crate::session_store::spawn_pin_backfill(skip);
+    });
+
     // Global focus context for keyboard event coordination
     use_context_provider(|| Signal::new(components::focus_context::FocusContext::default()));
 
     // Usage log for cost tracking that survives session deletion
-    let mut usage_log_sig = use_context_provider(|| Signal::new(usage_log::UsageLog::load()));
+    let mut usage_log_sig =
+        use_context_provider(|| Signal::new(startup_timing::time("usage log", usage_log::UsageLog::load)));
     // Cache keep-alive pings run on background tasks; their usage entries
     // come back over a channel because a Signal can't be written from there.
     use_hook(move || {
@@ -829,7 +995,8 @@ fn app() -> Element {
     // The planner is hydrated in full at startup — its rows are small and
     // bounded by human effort, so there is no lazy-loading path to justify.
     // Safe here: session_store::init() ran in main() before the app launched.
-    let mut planner_state = use_context_provider(|| Signal::new(todo::PlannerState::load()));
+    let mut planner_state =
+        use_context_provider(|| Signal::new(startup_timing::time("planner", todo::PlannerState::load)));
     // Which list the Planner is showing, for surfaces mounted outside it
     // (the ⌘K palette pre-seeds its project from this).
     use_context_provider(|| {
@@ -853,6 +1020,8 @@ fn app() -> Element {
         spawn(async move {
             let shared = fleet::shared().clone();
             let mut rx = shared.subscribe();
+            // Ended Fleet rows read for the agent-state sync below.
+            let mut ended_rows = crate::components::planner_view::agent_lane::EndedRowCache::new();
             loop {
                 if rx.changed().await.is_err() {
                     break;
@@ -866,9 +1035,39 @@ fn app() -> Element {
                             .get(id)
                             .map(|p| p.asks_person())
                             .unwrap_or(false);
-                        if s.asks_person() && !was {
+                        // The Hobbes tab's news is spoken by the voice itself
+                        // when — and only when — it will actually be spoken
+                        // (by the live brain wait that owns the turn, or by
+                        // the announcement); an approval it can't grant
+                        // still toasts.
+                        let voice_speaks = s.pending_gate.is_none()
+                            && voice::controller::voice_will_speak(session_state, settings, id);
+                        if s.asks_person() && !was && !voice_speaks {
                             flash_timer_toast(format!("🛰 {} needs your attention", s.name));
                         }
+                    }
+                }
+                // Agent to-dos follow their workers on every Fleet change,
+                // whether or not the Planner is open or the Heartbeat is on;
+                // a worker that just finished reports to its parent chat now
+                // rather than at the next sweep.
+                {
+                    let mut planner = planner_state;
+                    let changed = crate::components::planner_view::agent_lane::sync_agent_states_cached(
+                        &mut planner,
+                        &snapshot,
+                        &mut ended_rows,
+                        chrono::Utc::now(),
+                    );
+                    if changed > 0 {
+                        crate::todo::relay::sweep_completion_reports(
+                            crate::todo::relay::RelaySignals {
+                                session_state,
+                                planner: planner_state,
+                                settings,
+                            },
+                            &STREAMING_SESSIONS.peek().clone(),
+                        );
                     }
                 }
                 fleet_state.set(snapshot);
@@ -878,7 +1077,10 @@ fn app() -> Element {
                 // task) can't touch Signals, so it parks the continuations on
                 // FleetShared and pokes us; this is the only side that writes
                 // the chat queue.
-                for c in shared.take_continuations() {
+                for mut c in shared.take_continuations() {
+                    // A run dispatched from a system session that has since
+                    // rotated reports to its successor.
+                    c.parent_session_id = crate::system_sessions::current_for(&c.parent_session_id);
                     let todo_title = c
                         .todo_id
                         .as_deref()
@@ -897,27 +1099,17 @@ fn app() -> Element {
                     // was closed is hydrated back into memory first. Focus is
                     // never stolen — the turn runs in the background and the
                     // toast is the only interruption.
-                    if !session_state.peek().sessions.contains_key(&c.parent_session_id) {
-                        match crate::session_store::load_session(&c.parent_session_id) {
-                            Some(session) => {
-                                session_state
-                                    .write()
-                                    .sessions
-                                    .insert(c.parent_session_id.clone(), session);
-                            }
-                            None => {
-                                tracing::warn!(
-                                    "dispatch continuation: parent session {} is gone; dropping",
-                                    c.parent_session_id
-                                );
-                                continue;
-                            }
-                        }
+                    if !SessionState::ensure_hydrated(session_state, &c.parent_session_id) {
+                        tracing::warn!(
+                            "dispatch continuation: parent session {} is gone; dropping",
+                            c.parent_session_id
+                        );
+                        continue;
                     }
                     crate::components::chat_queue::queue_push(
                         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
                         &c.parent_session_id,
-                        crate::components::chat_queue::QueuedMessage::new(text, Vec::new()),
+                        crate::components::chat_queue::QueuedMessage::new(text, Vec::new(), crate::components::chat_queue::QueueOrigin::Unattended),
                     );
                     crate::components::chat_queue::request_drain();
                     // The parent's tab may have been closed while the run was
@@ -926,11 +1118,9 @@ fn app() -> Element {
                     // visible tab to show its activity in. `open_tabs` isn't
                     // reachable from this task (see `PENDING_TAB_REOPEN`), so
                     // park the id for the ChatCommand handler to reopen.
-                    // The Heartbeat's own session stays out of the tab
-                    // strip: its turn runs in the background like a wake.
-                    if heartbeat::HEARTBEAT.peek().session_id.as_deref()
-                        != Some(c.parent_session_id.as_str())
-                    {
+                    // The Hobbes session stays out of the tab strip: its
+                    // turn runs in the background like a wake.
+                    if !crate::system_sessions::is_current(&c.parent_session_id) {
                         PENDING_TAB_REOPEN
                             .write()
                             .insert(c.parent_session_id.clone());
@@ -965,6 +1155,7 @@ fn app() -> Element {
                 fleet::bridge::set_enabled(want);
                 fleet::set_retire_minutes(settings.peek().fleet_retire_minutes);
                 fleet::set_dispatch_auto_continue(settings.peek().dispatch_auto_continue);
+                crate::todo::lanes::set_finish_action(settings.peek().agent_finish_action);
                 if want && server.is_none() {
                     if !hydrated {
                         // Sessions left live by a previous process re-enter
@@ -1022,9 +1213,15 @@ fn app() -> Element {
         // process holds hydrated API keys (fleet tokio tasks never see
         // Settings). One task per 15s tick — with the 45s quiet period this
         // is the debounce — keeps cost and concurrency trivially bounded.
+        // A finished dispatched run wakes the loop early (fleet ingest →
+        // `wake_briefs`): its parent chat is waiting on the closing brief.
         spawn(async move {
+            let mut backoff = fleet::briefs::BriefBackoff::default();
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    _ = fleet::shared().briefs_woken() => {}
+                }
                 let s = settings.peek().clone();
                 if !(s.fleet_enabled
                     && s.fleet_briefs_enabled
@@ -1036,8 +1233,7 @@ fn app() -> Element {
                     .active_connector()
                     .filter(|i| s.is_connector_configured(i))
                     .or_else(|| {
-                        s.llm_connectors
-                            .iter()
+                        s.chat_connectors()
                             .find(|i| s.is_connector_configured(i))
                     })
                     .cloned()
@@ -1050,17 +1246,18 @@ fn app() -> Element {
                 let ended = fleet::store::sessions_active_on(today);
                 let links = crate::todo::handlers::linked_session_pairs(&planner_state.peek());
                 let due = fleet::briefs::collect_due(&live, &ended, &links, chrono::Utc::now());
-                let Some(task) = due.into_iter().next() else {
+                // Oldest dirty first, past any session backing off after a
+                // failure — one failing task must not starve the rest.
+                let Some(task) = backoff.pick(due, chrono::Utc::now()) else {
                     continue;
                 };
 
                 let started_at = chrono::Utc::now();
+                // No new brief: clear the mark and the old blocker with it.
                 let clear_dirty = |task: &fleet::briefs::BriefTask| {
                     if !fleet::shared().clear_brief_dirty(&task.session_id, started_at) {
                         fleet::store::merge_session(&task.session_id, |row| {
-                            if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
-                                row.brief_dirty_at = None;
-                            }
+                            fleet::clear_dirty_without_brief(row, started_at);
                         });
                     }
                 };
@@ -1099,6 +1296,7 @@ fn app() -> Element {
                 .await
                 {
                     Ok(Ok(value)) => {
+                        backoff.succeeded(&task.session_id);
                         let Some(brief) = fleet::briefs::brief_from_summary_value(
                             &value,
                             chrono::Utc::now(),
@@ -1108,14 +1306,22 @@ fn app() -> Element {
                             continue;
                         };
                         let shared = fleet::shared();
-                        if !shared.set_brief(
+                        // The blocker as the row now shows it: hidden when a
+                        // turn raced in while the brief was generating.
+                        let blocked = if shared.set_brief(
                             &task.session_id,
                             brief.clone(),
                             started_at,
                             session_title.clone(),
                         ) {
+                            shared.blocked_on_of(&task.session_id)
+                        } else {
                             // Ended (or just-ended) row: merge into the store.
                             let brief_for_merge = brief.clone();
+                            let blocked = std::cell::RefCell::new(None);
+                            let blocked_ref = &blocked;
+                            let owes_handback = std::cell::Cell::new(false);
+                            let owes_ref = &owes_handback;
                             let merged =
                                 fleet::store::merge_session(&task.session_id, move |row| {
                                     row.brief = Some(brief_for_merge);
@@ -1125,14 +1331,24 @@ fn app() -> Element {
                                     if row.brief_dirty_at.is_none_or(|d| d <= started_at) {
                                         row.brief_dirty_at = None;
                                     }
+                                    *blocked_ref.borrow_mut() = row.blocked_on().map(str::to_string);
+                                    owes_ref.set(fleet::awaiting_dispatch_handback(row));
                                 });
                             if merged {
                                 shared.poke();
+                                // A dispatched run's closing brief: hand it
+                                // back to the parent chat now, not at the
+                                // next sweep tick (live rows do this inside
+                                // `set_brief`).
+                                if owes_handback.get() {
+                                    shared.run_dispatch_continuations();
+                                }
                             }
-                        }
+                            blocked.into_inner()
+                        };
                         // Progress flows onto linked todos (display-only —
                         // never status; progress is reported, not judged).
-                        let line = fleet::briefs::progress_line(&brief);
+                        let line = fleet::briefs::progress_line(&brief, blocked.as_deref());
                         let changed = crate::todo::handlers::apply_brief_progress(
                             &mut planner_state.write(),
                             &task.session_id,
@@ -1150,14 +1366,20 @@ fn app() -> Element {
                             }
                         }
                     }
-                    Ok(Err(e)) => tracing::warn!(
-                        "fleet briefs: generation failed for {}: {e}",
-                        task.session_id
-                    ),
-                    Err(_) => tracing::warn!(
-                        "fleet briefs: generation timed out for {}",
-                        task.session_id
-                    ),
+                    Ok(Err(e)) => {
+                        backoff.failed(&task.session_id, chrono::Utc::now());
+                        tracing::warn!(
+                            "fleet briefs: generation failed for {}: {e}",
+                            task.session_id
+                        )
+                    }
+                    Err(_) => {
+                        backoff.failed(&task.session_id, chrono::Utc::now());
+                        tracing::warn!(
+                            "fleet briefs: generation timed out for {}",
+                            task.session_id
+                        )
+                    }
                 }
             }
         });
@@ -1168,6 +1390,7 @@ fn app() -> Element {
     let mut is_app_initialized = use_signal(|| false);
     use_effect(move || {
         is_app_initialized.set(true);
+        startup_timing::report();
     });
 
     // Sync theme to DOM (class on <html> element)
@@ -2055,13 +2278,15 @@ fn app() -> Element {
     // Dispatch relay: a chat worker's to-do can finish after its last turn
     // (a brief lands later and marks it Done / Review). This sweep hands
     // those completion reports to the parent chat; the worker's turn end
-    // covers the rest. Latched per worker, so a report goes out once.
+    // covers the rest. Latched per worker, so a report goes out once. A
+    // backstop: the worker's turn end and the Fleet drain's agent-state sync
+    // send reports as they happen.
     {
         let planner_state = planner_state;
         let session_state = session_state;
         use_future(move || async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 let streaming = STREAMING_SESSIONS.peek().clone();
                 crate::todo::relay::sweep_completion_reports(
                     crate::todo::relay::RelaySignals {
@@ -2076,7 +2301,7 @@ fn app() -> Element {
     }
 
     // ── AI-settable timer scheduler ──────────────────────────────────────────
-    // Polls every 5s for due timers (HOBBES_SET_TIMER) and fires them: focus the
+    // Wakes at each due timer (HOBBES_SET_TIMER) and fires it: focus the
     // window + toast, and for `prompt` mode enqueue the prompt and switch to its
     // session so ChatInput's drain runs it. A timer with a wake condition
     // (`until`) also fires as soon as the planner shows it met
@@ -2139,13 +2364,19 @@ fn app() -> Element {
                     ));
                 }
 
-                // Poll loop.
+                // Check loop: sleep until the next pending deadline, waking
+                // early when a to-do is saved or a timer is created
+                // (`timers::request_check`); capped as a backstop.
                 loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    let nap = crate::timers::next_check_in(
+                        session_state.peek().sessions.values().flat_map(|s| s.scheduled_timers.iter()),
+                        chrono::Utc::now(),
+                    );
+                    crate::timers::wait_for_check(nap).await;
                     let now = chrono::Utc::now();
 
                     // Cheap read-only pass first so we don't mark the signal
-                    // dirty (and re-render) every 5s when nothing is due. It
+                    // dirty (and re-render) on every check when nothing is due. It
                     // collects (session, timer, cause) for the write pass.
                     let wakes: Vec<(String, String, String)> = {
                         let planner = planner_state.peek();
@@ -2220,6 +2451,7 @@ fn app() -> Element {
                                         crate::components::chat_queue::QueuedMessage::new(
                                             prompt,
                                             Vec::new(),
+                                            crate::components::chat_queue::QueueOrigin::Unattended,
                                         ),
                                     );
                                     chat_command.set(Some(ChatCommand::SwitchToSession(
@@ -2254,6 +2486,32 @@ fn app() -> Element {
         });
     }
 
+    // ── Voice ────────────────────────────────────────────────────────────────
+    // The realtime voice layer (voice::controller) and its global tap / hold
+    // hotkey. Both idle until voice is on and a conversation is started.
+    {
+        let voice_ctx = crate::components::builtin_tools::BuiltinToolCtx {
+            session_state,
+            settings,
+            skill_registry,
+            permission_manager,
+            mcp_context,
+            planner: planner_state,
+            chat_command,
+        };
+        voice::controller::use_voice(voice_ctx);
+        voice::hotkey::use_voice_hotkey();
+        // The Hobbes tab at launch: the one-time merge of the pre-merge
+        // Heartbeat and Voice sessions, or a repair of its icon / project
+        // tag / home profile. On the next tick, not during this render.
+        use_hook(|| {
+            spawn(async move {
+                let settings_now = settings.peek().clone();
+                crate::hobbes_session::startup(session_state, &settings_now);
+            })
+        });
+    }
+
     // Persist tab state to UiState (Pattern 12 & 13)
     use_effect(move || {
         let mut ui = ui_state.write();
@@ -2274,11 +2532,18 @@ fn app() -> Element {
     let active_profile_id = move || settings.peek().get_active_profile().map(|p| p.id.clone());
 
     let mut sync_profile_from_session = move |session_id: &str| {
-        let profile_id = session_state
-            .read()
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.composio_profile.clone());
+        // Only a pin that names a profile that exists (by id, or a legacy
+        // name, as its id): a removed pin never becomes the global profile.
+        let profile_id = {
+            let state = session_state.read();
+            let settings_read = settings.peek();
+            state.sessions.get(session_id).and_then(|s| {
+                let scope = crate::mcp::manager::profile_reach::ProfileScope::for_session(&settings_read, s);
+                (scope.source == crate::mcp::manager::profile_reach::ScopeSource::Pinned)
+                    .then(|| scope.home_id().map(str::to_string))
+                    .flatten()
+            })
+        };
         if let Some(pid) = profile_id {
             if settings.peek().active_composio_profile.as_deref() != Some(&pid) {
                 settings.write().active_composio_profile = Some(pid);
@@ -2494,14 +2759,14 @@ fn app() -> Element {
             }
 
             // Delete the session if it has no messages (empty tab).
-            // Sessions with messages are preserved in History. The
-            // Heartbeat's own session is kept even while empty: it is
-            // waiting for its first wake, not an abandoned tab.
+            // Sessions with messages are preserved in History. The Hobbes
+            // session is kept even while empty: it is waiting for its first
+            // wake or conversation (or was just rotated in, carrying the old
+            // one's summary), not an abandoned tab.
             {
                 let state = session_state.read();
-                let is_heartbeat = heartbeat::HEARTBEAT.peek().session_id.as_deref()
-                    == Some(closing_session_id.as_str());
-                let is_empty = !is_heartbeat
+                let is_system = crate::system_sessions::is_current(&closing_session_id);
+                let is_empty = !is_system
                     && state.sessions.get(&closing_session_id)
                         .map(|s| s.messages.is_empty())
                         .unwrap_or(true);
@@ -2557,6 +2822,9 @@ fn app() -> Element {
     let apply_tidy_fn = move |apply: components::tab_tidy::TidyApply| {
         if !apply.tag.is_empty() {
             for (sid, pid) in &apply.tag {
+                if crate::system_sessions::is_system(sid) {
+                    continue;
+                }
                 {
                     let mut state = session_state.write();
                     if let Some(s) = state.sessions.get_mut(sid) {
@@ -2614,6 +2882,11 @@ fn app() -> Element {
     let window_for_resize = window.clone();
     use_wry_event_handler(move |event, _| {
         if let Event::WindowEvent { event, .. } = event {
+            // The voice only announces a Hobbes-tab turn the person isn't
+            // already reading: the tab active in the focused window.
+            if let WindowEvent::Focused(focused) = event {
+                crate::voice::controller::set_app_focused(*focused);
+            }
             if let WindowEvent::Resized(new_size) = event {
                 last_known_size.set(*new_size);
                 let logical = new_size
@@ -2899,6 +3172,14 @@ fn app() -> Element {
         }
     });
 
+    // Permission decisions asked for outside the bubble
+    // (`request_permission_decision`): the buttons' own approve/deny path.
+    use_effect(move || {
+        for (session_id, message_id, approve) in drain_permission_decisions() {
+            crate::components::tool_call_display::decide_held_message(session_state, &session_id, message_id, approve);
+        }
+    });
+
     // Single Authority for Command Handling (Pattern 126.1)
     // Listens for global commands from hotkeys, menu, or child components
     use_effect(move || {
@@ -2924,10 +3205,35 @@ fn app() -> Element {
             }
         }
 
+        // A rotated system session's tab now shows its successor, in the
+        // same position (see `PENDING_TAB_REPLACE`).
+        for (old, new) in drain_pending_tab_replacements() {
+            let tabs = open_tabs.peek().clone();
+            let active = *active_tab_index.peek();
+            if let Some((next, idx)) = replace_tab(&tabs, active, &old, &new) {
+                open_tabs.set(next);
+                if idx != active {
+                    active_tab_index.set(idx);
+                }
+            }
+            if *current_session_id.peek() == old {
+                current_session_id.set(new.clone());
+                session_state.write().active_session_id = new;
+            }
+        }
+
         if let Some(cmd) = cmd_opt {
             tracing::debug!("App handling global ChatCommand: {:?}", cmd);
+            // An archived system session is read-only (session_rotation):
+            // its profile, model and connector stay as they were.
+            let archived_tab = crate::system_sessions::is_archive(&current_session_id.peek());
 
             match cmd {
+                ChatCommand::SwitchProfile(_) | ChatCommand::SwitchModel(_) | ChatCommand::SwitchConnector(_)
+                    if archived_tab =>
+                {
+                    tracing::debug!("ignored a profile/model switch on an archived system session");
+                }
                 ChatCommand::SwitchToSettingsTab(tab, slug) => {
                     tracing::info!(
                         "App: Switching to Settings Tab: {:?}, slug: {:?}",
@@ -3010,6 +3316,32 @@ fn app() -> Element {
                             SessionState::save_async(&session_state.read(), Some(save_error));
                             mcp_manager.read().invalidate_status_cache();
                         }
+                    }
+                }
+                ChatCommand::ToggleProfileLock => {
+                    // Keep this tab to its home profile, or open it to every
+                    // set-up profile again (profile_reach::session_reach).
+                    // Per tab; system sessions keep their own reach.
+                    // Journaled so a replay rebuild keeps it.
+                    let sid = current_session_id.peek().clone();
+                    let changed = if crate::system_sessions::is_system(&sid) {
+                        None
+                    } else {
+                        let mut state = session_state.write();
+                        state.sessions.get_mut(&sid).map(|session| {
+                            session.profile_locked = !session.profile_locked;
+                            // The next send re-fetches the tool set for the new reach.
+                            session.active_context.mcp_tools = None;
+                            session.profile_locked
+                        })
+                    };
+                    if let Some(locked) = changed {
+                        crate::session_events::log_event(
+                            &sid,
+                            crate::session_events::SessionEvent::ProfileLockSet { locked },
+                        );
+                        SessionState::save_async(&session_state.read(), Some(save_error));
+                        mcp_manager.read().invalidate_status_cache();
                     }
                 }
                 ChatCommand::SwitchModel(idx) => {
@@ -3573,6 +3905,8 @@ fn app() -> Element {
                                     }
                                 }
                             }
+                            // Live voice conversation / voice problems
+                            crate::components::voice_indicator::VoiceIndicator {}
                             // Main content area
                             div {
                                 class: "flex flex-row flex-1 min-h-0 overflow-hidden", // This will contain the sidebars and chat
@@ -3850,6 +4184,28 @@ fn StreamBridge() -> Element {
         // machinery) for nothing.
         if *STREAMING_SESSIONS.peek() != sessions {
             *STREAMING_SESSIONS.write() = sessions;
+        }
+    });
+    // Wider than streaming: everything that means a turn is under way, for
+    // session rotation's quiet-moment check (which runs outside the tree).
+    use_effect(move || {
+        let busy = stream_manager.turn_activity();
+        if *crate::session_rotation::TURN_ACTIVITY.peek() != busy {
+            *crate::session_rotation::TURN_ACTIVITY.write() = busy;
+        }
+    });
+    // Narrower: a turn in flight (no summarization), for the voice brain's
+    // wait. When a session leaves the set its turn is over (or held on an
+    // approval), so the waits wake now — after the mirror has updated —
+    // rather than on their next fallback tick.
+    use_effect(move || {
+        let in_flight = stream_manager.turn_in_flight_sessions();
+        if *TURN_IN_FLIGHT.peek() != in_flight {
+            let dropped = TURN_IN_FLIGHT.peek().iter().any(|s| !in_flight.contains(s));
+            *TURN_IN_FLIGHT.write() = in_flight;
+            if dropped {
+                crate::voice::brain::wake();
+            }
         }
     });
     // Reverse direction: root-scope code (delete_session_fn) can't call

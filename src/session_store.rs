@@ -17,7 +17,7 @@ use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::session::Session;
@@ -47,6 +47,58 @@ const META_JSON_MIGRATED: &str = "migrated_from_json";
 const META_SEARCH_TAB_TITLE: &str = "search_text_has_tab_title";
 /// Set once the `project_id` column carries each row's `data.project_id`.
 const META_PROJECT_ID_COLUMN: &str = "project_id_column_backfilled";
+/// Set once the background `tab_title` backfill (`spawn_tab_title_backfill`) has filled the column.
+const META_TAB_TITLE_COLUMN: &str = "tab_title_column_backfilled";
+/// The one-time pin backfill over stored rows has finished.
+const META_PIN_BACKFILLED: &str = "unpinned_tabs_pinned";
+/// The last rowid the pin backfill finished, so a restart resumes there.
+const META_PIN_CURSOR: &str = "unpinned_tabs_pin_cursor";
+
+/// Bumped whenever a write changes what the History listing shows (a row
+/// added, deleted or renamed, or its title, emoji, summary, message count or
+/// timestamp changed), so the History drawer re-queries on that and not on
+/// every save of a streaming reply. See [`list_version`].
+static LIST_VERSION: AtomicU64 = AtomicU64::new(0);
+/// Per row: the hash of its listed fields as last written ([`SessionRow::list_hash`]).
+static LIST_KEYS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+
+/// A counter that changes whenever the History listing may have changed.
+/// Compare against a previously read value; the number itself means nothing.
+pub fn list_version() -> u64 {
+    LIST_VERSION.load(Ordering::Acquire)
+}
+
+fn list_watch() -> &'static tokio::sync::watch::Sender<u64> {
+    static TX: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
+    TX.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+/// A receiver that wakes whenever [`list_version`] is bumped. Await
+/// `changed()`, then re-read [`list_version`] for the value.
+pub fn subscribe_list_version() -> tokio::sync::watch::Receiver<u64> {
+    list_watch().subscribe()
+}
+
+fn bump_list_version() {
+    let v = LIST_VERSION.fetch_add(1, Ordering::AcqRel) + 1;
+    list_watch().send_replace(v);
+}
+
+/// Bump [`list_version`] if `id`'s listed fields differ from its last write.
+fn note_listing(id: &str, list_hash: u64) {
+    let mut keys = LIST_KEYS.get_or_init(|| Mutex::new(HashMap::new())).lock().unwrap();
+    if keys.insert(id.to_string(), list_hash) != Some(list_hash) {
+        bump_list_version();
+    }
+}
+
+/// `id`'s row was deleted or changed outside `upsert_row`: always re-list.
+fn forget_listing(id: &str) {
+    if let Some(keys) = LIST_KEYS.get() {
+        keys.lock().unwrap().remove(id);
+    }
+    bump_list_version();
+}
 
 fn fingerprints() -> &'static Mutex<HashMap<String, u64>> {
     FINGERPRINTS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -121,6 +173,10 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
+         -- A WAL file keeps its high-water size after a checkpoint unless
+         -- this is set; one large write (a backfill, an import) otherwise
+         -- leaves hundreds of MB on disk for good.
+         PRAGMA journal_size_limit=33554432;
          CREATE TABLE IF NOT EXISTS sessions (
              id            TEXT PRIMARY KEY,
              name          TEXT NOT NULL,
@@ -136,6 +192,11 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
              project_id    TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_sessions_last_updated ON sessions(last_updated DESC);
+         -- `seed_seq_from_db` reads MAX(seq) at every launch. Without this
+         -- it walks every row, through each row's search_text overflow
+         -- pages to reach the column: ~0.5 s cold on a 1.5 GB store, before
+         -- the window shows. Built once (one such walk) on first open.
+         CREATE INDEX IF NOT EXISTS idx_sessions_seq ON sessions(seq);
          CREATE TABLE IF NOT EXISTS meta (
              key   TEXT PRIMARY KEY,
              value TEXT NOT NULL,
@@ -151,6 +212,7 @@ pub fn create_schema(conn: &Connection) -> rusqlite::Result<()> {
          );",
     )?;
     ensure_project_id_column(conn)?;
+    ensure_tab_title_column(conn)?;
 
     // The planner and the fleet share this database and connection. Creating
     // their schemas here means test databases get their tables too.
@@ -166,29 +228,12 @@ pub fn init() -> Result<(), String> {
     if CONN.get().is_some() {
         return Ok(());
     }
+    let opened = std::time::Instant::now();
     let path = get_db_path().ok_or("could not resolve sessions.db path")?;
-    let conn = Connection::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let conn = open_store(&path, env!("CARGO_PKG_VERSION"))?;
+    crate::startup_timing::record("store open", opened);
 
-    // Restrict to owner-only, matching the old sessions.json (0600). SQLite
-    // copies the db file's mode when it creates the -wal/-shm companions, so
-    // setting it here covers those too; chmod any that already exist.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        for suffix in ["", "-wal", "-shm"] {
-            let mut p = path.clone().into_os_string();
-            p.push(suffix);
-            let p = std::path::PathBuf::from(p);
-            if p.exists() {
-                if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
-                    tracing::warn!("Failed to set permissions on {}: {e}", p.display());
-                }
-            }
-        }
-    }
-
-    create_schema(&conn).map_err(|e| format!("schema: {e}"))?;
-
+    let migrations = std::time::Instant::now();
     if let Err(e) = migrate_from_json_files(&conn) {
         // Import failure must not brick the app, but log loudly — the JSON
         // files are left untouched so the import retries next launch.
@@ -203,9 +248,12 @@ pub fn init() -> Result<(), String> {
         tracing::warn!("project_id column backfill failed (will retry next launch): {e}");
     }
 
-    seed_seq_from_db(&conn);
+    crate::startup_timing::record("store migrations", migrations);
+
+    crate::startup_timing::time("store seq", || seed_seq_from_db(&conn));
 
     let _ = CONN.set(Mutex::new(conn));
+    spawn_tab_title_backfill();
     Ok(())
 }
 
@@ -213,9 +261,220 @@ pub fn is_available() -> bool {
     CONN.get().is_some()
 }
 
+/// Open the store at `path` for app `version`: owner-only permissions, the
+/// once-per-version backup ([`backup_before_upgrade`]) — before anything
+/// changes the file — then the schema. Everything after (imports,
+/// backfills) is `init`'s. A failed backup never fails the open.
+fn open_store(path: &std::path::Path, version: &str) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+
+    // Restrict to owner-only, matching the old sessions.json (0600). SQLite
+    // copies the db file's mode when it creates the -wal/-shm companions, so
+    // setting it here covers those too; chmod any that already exist.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm"] {
+            let mut p = path.to_path_buf().into_os_string();
+            p.push(suffix);
+            let p = std::path::PathBuf::from(p);
+            if p.exists() {
+                if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!("Failed to set permissions on {}: {e}", p.display());
+                }
+            }
+        }
+    }
+
+    let backup = crate::startup_timing::time("store backup", || backup_before_upgrade(&conn, path, version));
+    create_schema(&conn).map_err(|e| format!("schema: {e}"))?;
+    if backup == BackupOutcome::FreshInstall {
+        // Nothing to back up for this version: the next launch of the same
+        // version mustn't take one either.
+        if let Err(e) = meta_set_conn(&conn, META_BACKUP_VERSION, version, 0) {
+            tracing::warn!("store backup: could not record the version: {e}");
+        }
+    }
+    Ok(conn)
+}
+
+// ── Pre-upgrade backup ──────────────────────────────────────────────────────
+
+/// The app version `sessions.db` was last backed up for (or created by).
+const META_BACKUP_VERSION: &str = "store_backed_up_for_version";
+/// Set to the version whose backup failed: its migrations ran without one,
+/// so the next launch's backup postdates them.
+const META_BACKUP_MISSED: &str = "store_backup_missed_version";
+
+/// What [`backup_before_upgrade`] did.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum BackupOutcome {
+    /// A new database: nothing to back up.
+    FreshInstall,
+    /// Already backed up for this version.
+    UpToDate,
+    Taken { path: PathBuf, bytes: u64 },
+    /// Logged and skipped; the next launch tries again.
+    Failed,
+}
+
+/// `<db file name>.pre-<version>.bak`, next to the database.
+fn backup_path(db_path: &std::path::Path, version: &str) -> PathBuf {
+    let name = db_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    db_path.with_file_name(format!("{name}.pre-{version}.bak"))
+}
+
+/// The backups (`<db>.pre-*.bak`) and stray temp files (`<db>.pre-*.bak.tmp`)
+/// next to `db_path`. A temp file is never a backup.
+fn backup_files(db_path: &std::path::Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let name = db_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let prefix = format!("{name}.pre-");
+    let (mut baks, mut tmps) = (Vec::new(), Vec::new());
+    let Some(dir) = db_path.parent() else { return (baks, tmps) };
+    let Ok(entries) = std::fs::read_dir(dir) else { return (baks, tmps) };
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if !file.starts_with(&prefix) {
+            continue;
+        }
+        if file.ends_with(".bak") {
+            baks.push(entry.path());
+        } else if file.ends_with(".bak.tmp") {
+            tmps.push(entry.path());
+        }
+    }
+    (baks, tmps)
+}
+
+/// Once per app version, before any schema change, migration or backfill:
+/// a consistent copy of the database at `db_path` as
+/// `<db>.pre-<version>.bak`, keeping only the newest. Runs on the store's
+/// only connection, before it is shared.
+///
+/// Consistent: a `TRUNCATE` checkpoint moves the WAL into the main file,
+/// then a write transaction (`BEGIN IMMEDIATE`) keeps any other writer out
+/// while the main file is copied, and the copy is rejected if the WAL grew
+/// in between. The copy is `std::fs::copy`: a clone on APFS (near-instant,
+/// no extra disk until the files diverge), a full copy on Windows. It goes
+/// to a `.tmp` name, is synced, then renamed, so a crash never leaves a
+/// partial file named like a backup.
+///
+/// Never blocks startup: on failure it logs a WARN (no paths or content),
+/// records the version as missed and leaves the done marker alone, so the
+/// next launch tries again. That retry runs after this version's
+/// migrations, so it keeps the older backups too (they predate them) and
+/// says so; the next version's backup prunes them.
+pub(crate) fn backup_before_upgrade(conn: &Connection, db_path: &std::path::Path, version: &str) -> BackupOutcome {
+    let tables: i64 = conn
+        .query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table'", [], |r| r.get(0))
+        .unwrap_or(0);
+    if tables == 0 {
+        return BackupOutcome::FreshInstall;
+    }
+    let has_meta = conn
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'", [], |_| Ok(()))
+            .is_ok();
+    let (done, missed) = if has_meta {
+        (
+            meta_get_conn(conn, META_BACKUP_VERSION).ok().flatten(),
+            meta_get_conn(conn, META_BACKUP_MISSED).ok().flatten(),
+        )
+    } else {
+        (None, None)
+    };
+    if done.as_deref() == Some(version) {
+        return BackupOutcome::UpToDate;
+    }
+    let started = std::time::Instant::now();
+    let after_migrations = missed.as_deref() == Some(version);
+    match take_backup(conn, db_path, version) {
+        Ok((path, bytes)) => {
+            let (baks, _) = backup_files(db_path);
+            if after_migrations {
+                tracing::warn!(
+                    version,
+                    "store backup: taken after this version's migrations (last launch's backup failed); older backups kept"
+                );
+            } else {
+                for old in baks.iter().filter(|b| **b != path) {
+                    if let Err(e) = std::fs::remove_file(old) {
+                        tracing::warn!(kind = ?e.kind(), "store backup: could not remove an older backup");
+                    }
+                }
+            }
+            if has_meta {
+                let recorded = meta_set_conn(conn, META_BACKUP_VERSION, version, 0)
+                    .and_then(|_| conn.execute("DELETE FROM meta WHERE key = ?1", params![META_BACKUP_MISSED]).map(|_| ()));
+                if let Err(e) = recorded {
+                    tracing::warn!("store backup: taken, but the version wasn't recorded: {e}");
+                }
+            }
+            tracing::info!(
+                version,
+                bytes,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "store backup: sessions.db backed up before this version's migrations"
+            );
+            BackupOutcome::Taken { path, bytes }
+        }
+        Err(e) => {
+            tracing::warn!(version, "store backup skipped (will retry next launch): {e}");
+            if has_meta {
+                let _ = meta_set_conn(conn, META_BACKUP_MISSED, version, 0);
+            }
+            BackupOutcome::Failed
+        }
+    }
+}
+
+/// The copy itself (see [`backup_before_upgrade`]): the final path and its
+/// size. Errors carry no paths or content.
+fn take_backup(conn: &Connection, db_path: &std::path::Path, version: &str) -> Result<(PathBuf, u64), String> {
+    let (_, stale) = backup_files(db_path);
+    for tmp in stale {
+        let _ = std::fs::remove_file(tmp);
+    }
+    let (busy, wal_frames, checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| format!("checkpoint: {e}"))?;
+    if busy != 0 || wal_frames != checkpointed {
+        return Err("checkpoint incomplete: another connection is using the database".into());
+    }
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|e| format!("lock: {e}"))?;
+    let copied = (|| {
+        let mut wal = db_path.to_path_buf().into_os_string();
+        wal.push("-wal");
+        if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0 {
+            return Err("the WAL grew after the checkpoint".to_string());
+        }
+        let final_path = backup_path(db_path, version);
+        let mut tmp = final_path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let result = std::fs::copy(db_path, &tmp)
+            .and_then(|bytes| std::fs::File::open(&tmp)?.sync_all().map(|_| bytes))
+            .and_then(|bytes| std::fs::rename(&tmp, &final_path).map(|_| bytes));
+        match result {
+            Ok(bytes) => Ok((final_path, bytes)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(format!("copy failed ({:?})", e.kind()))
+            }
+        }
+    })();
+    let _ = conn.execute_batch("ROLLBACK");
+    copied
+}
+
+
 /// Borrow the shared connection. `pub(crate)` so sibling domains (the planner,
 /// `todo::store`) persist through this one connection rather than opening a
 /// second writer on the same file.
+/// Whether the store has been opened (`init`).
+pub(crate) fn is_ready() -> bool {
+    CONN.get().is_some()
+}
+
 pub(crate) fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
     let conn = CONN.get().ok_or("session store not initialized")?;
     let guard = conn.lock().map_err(|_| "session store lock poisoned")?;
@@ -223,6 +482,280 @@ pub(crate) fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -
 }
 
 // ── One-time migration ──────────────────────────────────────────────────────
+
+/// What the pin rule (`profile_reach::pin_fix`) needs from the settings —
+/// the profiles and Hobbes' home — kept current by the app
+/// ([`set_pin_rules`]) so the loader and the backfill validate against the
+/// profiles as they are now. Process-wide; per thread in tests.
+#[cfg(not(test))]
+fn pin_rules_cell() -> &'static std::sync::RwLock<Option<crate::settings::Settings>> {
+    static CELL: OnceLock<std::sync::RwLock<Option<crate::settings::Settings>>> = OnceLock::new();
+    CELL.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+#[cfg(test)]
+fn pin_rules_cell() -> &'static std::sync::RwLock<Option<crate::settings::Settings>> {
+    thread_local! {
+        static CELL: &'static std::sync::RwLock<Option<crate::settings::Settings>> =
+            Box::leak(Box::new(std::sync::RwLock::new(None)));
+    }
+    CELL.with(|c| *c)
+}
+
+/// Keep the pin rules current: call with the settings whenever they change.
+pub fn set_pin_rules(settings: &crate::settings::Settings) {
+    let slim = crate::settings::Settings {
+        composio_profiles: settings.composio_profiles.clone(),
+        home_composio_profile: settings.home_composio_profile.clone(),
+        ..Default::default()
+    };
+    if let Ok(mut r) = pin_rules_cell().write() {
+        *r = Some(slim);
+    }
+}
+
+#[cfg(test)]
+fn clear_pin_rules() {
+    if let Ok(mut r) = pin_rules_cell().write() {
+        *r = None;
+    }
+}
+
+fn pin_rules() -> Option<crate::settings::Settings> {
+    pin_rules_cell().read().ok().and_then(|r| r.clone())
+}
+
+/// Ids whose load-time pin was journaled this run: a tab reloaded before
+/// its first save isn't journaled twice.
+fn load_pins_logged() -> &'static Mutex<std::collections::HashSet<String>> {
+    static LOGGED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    LOGGED.get_or_init(Default::default)
+}
+
+/// A hydrating ordinary tab gets its pin fixed by the same rule as the
+/// backfill (`profile_reach::pin_fix`: its own calls' profile, else
+/// Hobbes' home; a legacy name pin becomes its id), so an in-memory copy
+/// can never write a missing pin back over a row the backfill pinned.
+/// System sessions keep their own rules. Returns whether it changed; the
+/// session's fingerprint still matches the old bytes, so its next save
+/// writes the pin.
+fn pin_on_load(id: &str, session: &mut Session) -> bool {
+    if crate::system_sessions::is_system(id) {
+        return false;
+    }
+    let Some(rules) = pin_rules() else { return false };
+    match crate::mcp::manager::profile_reach::pin_fix(&rules, session) {
+        Some(pin) => {
+            session.composio_profile = Some(pin);
+            true
+        }
+        None => false,
+    }
+}
+
+/// A fork's source pin when the source isn't hydrated: its stored row's,
+/// as an id when the rules know it. One indexed row.
+pub fn stored_pin(id: &str) -> Option<String> {
+    let pin: Option<String> = with_conn(|c| {
+        use rusqlite::OptionalExtension;
+        c.query_row(
+            "SELECT json_extract(data, '$.composio_profile') FROM sessions WHERE id = ?1 AND json_valid(data)",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map(Option::flatten)
+    })
+    .ok()
+    .flatten();
+    let pin = pin.filter(|p| !p.is_empty())?;
+    Some(
+        pin_rules()
+            .and_then(|r| crate::mcp::manager::profile_reach::find_profile(&r, &pin).map(|p| p.id.clone()))
+            .unwrap_or(pin),
+    )
+}
+
+/// Bytes of row data read per pin-backfill batch (at least one row): the
+/// connection lock is held only to read a batch and to write its fixes;
+/// parsing happens between, without it.
+const PIN_BACKFILL_BATCH_BYTES: i64 = 8 * 1024 * 1024;
+
+/// One-time: fix the pin of every stored ordinary tab by the per-tab rule
+/// (`profile_reach::pin_fix`) — tabs without a pin get their own calls'
+/// profile, else Hobbes' home, else stay unpinned; legacy name pins become
+/// ids. A background thread over rowid batches by size; the cursor is kept
+/// in meta, so a restart resumes where it stopped.
+///
+/// Never touches a row that has (or had) an in-memory copy, which is
+/// pinned in `SessionState` (startup pass, [`pin_on_load`]) and saved by
+/// its own copy: it skips `skip` (the hydrated and system ids at spawn),
+/// any system session, any row with a fingerprint (loaded or saved by this
+/// process; loads record it under the connection lock), any row written
+/// since the spawn (`seq` at or above the high-water mark), and any row
+/// whose `seq` changed between the read and the write. A fixed row is
+/// rewritten whole (`build_row`) with a fresh `seq`, and its
+/// `ComposioProfileSet` is journaled in the same transaction.
+pub fn spawn_pin_backfill(skip: std::collections::HashSet<String>) {
+    let (done, cursor) = with_conn(|c| Ok((meta_get_conn(c, META_PIN_BACKFILLED)?, meta_get_conn(c, META_PIN_CURSOR)?)))
+        .unwrap_or((Some(String::new()), None));
+    if done.is_some() {
+        return;
+    }
+    let high_water = SEQ.load(Ordering::SeqCst);
+    let mut cursor: i64 = cursor.and_then(|c| c.parse().ok()).unwrap_or(0);
+    let spawned = std::thread::Builder::new().name("pin-backfill".into()).spawn(move || {
+        let started = std::time::Instant::now();
+        let mut pinned = 0usize;
+        loop {
+            let Some(rules) = pin_rules() else {
+                tracing::warn!("pin backfill: no profile rules; will retry next launch");
+                return;
+            };
+            let step = with_conn(|c| read_pin_batch(c, cursor, PIN_BACKFILL_BATCH_BYTES)).and_then(|batch| match batch {
+                None => with_conn(|c| meta_set_conn(c, META_PIN_BACKFILLED, "1", next_seq())).map(|_| None),
+                Some((last, rows)) => {
+                    let fixes = pin_fixes(&rules, rows, high_water, &skip);
+                    with_conn(|c| write_pin_fixes(c, &fixes, last)).map(|n| Some((last, n)))
+                }
+            });
+            match step {
+                Ok(Some((last, n))) => {
+                    cursor = last;
+                    pinned += n;
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        pinned,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "pin backfill: stored tabs done"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("pin backfill failed (will resume next launch): {e}");
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("pin backfill not started: {e}");
+    }
+}
+
+/// A stored row as the pin backfill reads it: id, seq, data.
+type PinRow = (String, i64, String);
+
+/// The next batch after rowid `after`: rows up to `max_bytes` of data (at
+/// least one), and the batch's last rowid. `None` when no rows are left.
+fn read_pin_batch(conn: &Connection, after: i64, max_bytes: i64) -> rusqlite::Result<Option<(i64, Vec<PinRow>)>> {
+    let mut last = None;
+    {
+        // `octet_length` reads the size from the record, not the value.
+        let mut stmt =
+            conn.prepare("SELECT rowid, octet_length(data) FROM sessions WHERE rowid > ?1 ORDER BY rowid LIMIT 256")?;
+        let mut rows = stmt.query(params![after])?;
+        let mut total = 0i64;
+        while let Some(r) = rows.next()? {
+            let (rowid, len): (i64, i64) = (r.get(0)?, r.get(1)?);
+            if last.is_some() && total + len > max_bytes {
+                break;
+            }
+            total += len;
+            last = Some(rowid);
+        }
+    }
+    let Some(last) = last else { return Ok(None) };
+    let mut stmt = conn.prepare("SELECT id, seq, data FROM sessions WHERE rowid > ?1 AND rowid <= ?2")?;
+    let rows = stmt
+        .query_map(params![after, last], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<PinRow>>>()?;
+    Ok(Some((last, rows)))
+}
+
+/// A fixed row, ready to write: the seq it was read at, the rewritten row
+/// and its journal event — all built without the connection lock.
+struct PinFix {
+    read_seq: i64,
+    row: SessionRow,
+    events: Vec<SessionEventRow>,
+}
+
+/// The rows of a batch whose pin the rule changes, built into the rows to
+/// write. Pure apart from the system-session registry; runs without the
+/// connection lock. Each row is parsed once for its pin and, only when it
+/// is unpinned or holds a profile name, once in full.
+fn pin_fixes(
+    rules: &crate::settings::Settings,
+    rows: Vec<PinRow>,
+    high_water: i64,
+    skip: &std::collections::HashSet<String>,
+) -> Vec<PinFix> {
+    #[derive(serde::Deserialize)]
+    struct PinProbe {
+        #[serde(default)]
+        composio_profile: Option<String>,
+    }
+    rows.into_iter()
+        .filter(|(id, seq, _)| *seq < high_water && !skip.contains(id) && !crate::system_sessions::is_system(id))
+        .filter_map(|(id, seq, data)| {
+            let pin = serde_json::from_str::<PinProbe>(&data).ok()?.composio_profile;
+            let candidate = match pin.as_deref() {
+                None | Some("") => true,
+                Some(p) => crate::mcp::manager::profile_reach::find_profile(rules, p).is_some_and(|f| f.id != p),
+            };
+            if !candidate {
+                return None;
+            }
+            let mut session = parse_session(&id, &data)?;
+            let fixed = crate::mcp::manager::profile_reach::pin_fix(rules, &session)?;
+            session.composio_profile = Some(fixed.clone());
+            let row = match build_row(&session, next_seq()) {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(session_id = %id, "pin backfill: row skipped: {e}");
+                    return None;
+                }
+            };
+            let events = prepare_event_rows(&id, &[SessionEvent::ComposioProfileSet { profile: Some(fixed) }]);
+            Some(PinFix { read_seq: seq, row, events })
+        })
+        .collect()
+}
+
+/// Write a batch's fixes and advance the cursor to `last`, in one
+/// transaction with their journal events. Under the lock only the checks
+/// and the writes: a row is written only if it still has the seq it was
+/// read at and no in-memory copy (no fingerprint). Returns how many rows
+/// were pinned.
+fn write_pin_fixes(conn: &Connection, fixes: &[PinFix], last: i64) -> rusqlite::Result<usize> {
+    use rusqlite::OptionalExtension;
+    let tx = conn.unchecked_transaction()?;
+    let mut writes: Vec<&PinFix> = Vec::new();
+    for fix in fixes {
+        let now: Option<i64> =
+            tx.query_row("SELECT seq FROM sessions WHERE id = ?1", params![fix.row.id], |r| r.get(0)).optional()?;
+        if now == Some(fix.read_seq) {
+            writes.push(fix);
+        }
+    }
+    // Checked under the connection lock (loads record fingerprints under
+    // it); the guard is dropped before the journal takes the tombstone
+    // lock (`mark_rows_saved` takes tombstones, then fingerprints).
+    {
+        let fps = fingerprints().lock().unwrap();
+        writes.retain(|f| !fps.contains_key(&f.row.id));
+    }
+    for fix in &writes {
+        upsert_row(&tx, &fix.row)?;
+        insert_event_rows_in(&tx, &fix.events)?;
+    }
+    meta_set_conn(&tx, META_PIN_CURSOR, &last.to_string(), next_seq())?;
+    tx.commit()?;
+    Ok(writes.len())
+}
 
 /// One-time: prepend each row's AI topic title to `search_text`, matching what
 /// `build_row` now writes, so History search finds chats by the title the
@@ -234,8 +767,8 @@ fn backfill_search_tab_titles(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute(
         "UPDATE sessions
-         SET search_text = lower(json_extract(data, '$.tab_title')) || char(10) || search_text
-         WHERE trim(coalesce(json_extract(data, '$.tab_title'), '')) <> ''",
+         SET search_text = lower(CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END) || char(10) || search_text
+         WHERE trim(coalesce(CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END, '')) <> ''",
         [],
     )?;
     meta_set_conn(conn, META_SEARCH_TAB_TITLE, "1", 0)
@@ -271,8 +804,8 @@ fn backfill_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
     let started = std::time::Instant::now();
     let updated = conn.execute(
         "UPDATE sessions
-         SET project_id = json_extract(data, '$.project_id')
-         WHERE project_id IS NOT json_extract(data, '$.project_id')",
+         SET project_id = CASE WHEN json_valid(data) THEN json_extract(data, '$.project_id') END
+         WHERE project_id IS NOT CASE WHEN json_valid(data) THEN json_extract(data, '$.project_id') END",
         [],
     )?;
     meta_set_conn(conn, META_PROJECT_ID_COLUMN, "1", 0)?;
@@ -281,6 +814,100 @@ fn backfill_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
         elapsed_ms = started.elapsed().as_millis() as u64,
         "backfilled the sessions.project_id column"
     );
+    Ok(())
+}
+
+/// The `tab_title` column (a copy of `data.tab_title`, written by
+/// `upsert_row`), so the Hobbes tab's list query (`tab_rows`) matches titles
+/// without parsing every row's JSON under the connection lock. Added to
+/// databases created before it (`ADD COLUMN` is schema-only); filled once by
+/// `spawn_tab_title_backfill` in the background.
+fn ensure_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
+    let has_column = conn
+        .prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'tab_title'")?
+        .exists([])?;
+    if !has_column {
+        conn.execute("ALTER TABLE sessions ADD COLUMN tab_title TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Rows per `tab_title` backfill batch: the connection lock is held for one
+/// batch at a time, so saves and History queries interleave with it.
+const TAB_TITLE_BACKFILL_BATCH: i64 = 100;
+
+/// One-time: copy each row's `data.tab_title` into the `tab_title` column.
+/// Runs on a background thread after `init`, in rowid batches, so a large
+/// store (every row's JSON is parsed) never holds the window back: until it
+/// finishes, older rows just don't match a title search in `tab_rows`.
+/// Interrupted runs resume from the start next launch (each batch is
+/// idempotent). Leaves `data`, `seq` and fingerprints untouched.
+fn spawn_tab_title_backfill() {
+    let done = with_conn(|c| meta_get_conn(c, META_TAB_TITLE_COLUMN)).ok().flatten().is_some();
+    if done {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("tab-title-backfill".into()).spawn(|| {
+        let started = std::time::Instant::now();
+        let mut cursor = 0i64;
+        loop {
+            match with_conn(|c| backfill_tab_title_batch(c, cursor, TAB_TITLE_BACKFILL_BATCH)) {
+                Ok(Some(next)) => cursor = next,
+                Ok(None) => {
+                    tracing::info!(
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "backfilled the sessions.tab_title column"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("tab_title column backfill failed (will retry next launch): {e}");
+                    return;
+                }
+            }
+            // Let the UI's saves and queries take the lock between batches.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    });
+    if let Err(e) = spawned {
+        tracing::warn!("tab_title column backfill not started: {e}");
+    }
+}
+
+/// One batch of the `tab_title` backfill: the next `batch` rows after rowid
+/// `after`. Returns the cursor for the next batch, or `None` once every row
+/// is done (and marks the backfill complete).
+fn backfill_tab_title_batch(conn: &Connection, after: i64, batch: i64) -> rusqlite::Result<Option<i64>> {
+    let last: Option<i64> = conn.query_row(
+        "SELECT max(rowid) FROM (SELECT rowid FROM sessions WHERE rowid > ?1 ORDER BY rowid LIMIT ?2)",
+        params![after, batch],
+        |r| r.get(0),
+    )?;
+    let Some(last) = last else {
+        meta_set_conn(conn, META_TAB_TITLE_COLUMN, "1", 0)?;
+        return Ok(None);
+    };
+    conn.execute(
+        "UPDATE sessions
+         SET tab_title = CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END
+         WHERE rowid > ?1 AND rowid <= ?2
+           AND tab_title IS NOT CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END",
+        params![after, last],
+    )?;
+    Ok(Some(last))
+}
+
+/// The whole `tab_title` backfill on one connection (tests).
+#[cfg(test)]
+fn backfill_tab_title_column(conn: &Connection) -> rusqlite::Result<()> {
+    if meta_get_conn(conn, META_TAB_TITLE_COLUMN)?.is_some() {
+        return Ok(());
+    }
+    let mut cursor = 0;
+    // A small batch so the tests cross batch boundaries.
+    while let Some(next) = backfill_tab_title_batch(conn, cursor, 2)? {
+        cursor = next;
+    }
     Ok(())
 }
 
@@ -411,9 +1038,13 @@ pub struct SessionRow {
     pub search_text: String,
     /// `session.project_id`, mirrored into an indexed column.
     pub project_id: Option<String>,
+    /// `session.tab_title`, mirrored into its own column (`tab_rows`).
+    pub tab_title: Option<String>,
     pub seq: i64,
     pub data: String,
     pub data_hash: u64,
+    /// Hash of the fields the History drawer lists ([`list_version`]).
+    pub list_hash: u64,
 }
 
 /// Fixed-width UTC timestamp so lexicographic string order == time order.
@@ -445,17 +1076,35 @@ pub fn build_row(session: &Session, seq: i64) -> Result<SessionRow, serde_json::
             search_text.push_str(&t.to_lowercase());
         }
     }
+    let list_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (
+            &session.name,
+            &session.last_updated,
+            session.messages.len(),
+            &summary,
+            &session.tab_title,
+            &session.tab_emoji,
+            session.name_user_set,
+        )
+            .hash(&mut h);
+        h.finish()
+    };
     Ok(SessionRow {
+        list_hash,
         id: session.id.clone(),
         name: session.name.clone(),
         last_updated: fmt_ts(&session.last_updated),
         message_count: session.messages.len() as i64,
         total_cost: session.total_cost(),
         total_tokens: session.total_tokens() as i64,
-        has_timers: !session.scheduled_timers.is_empty(),
+        // Pending only: startup hydrates these rows, and a session whose
+        // timers all fired (a rotated-out system session, say) needn't load.
+        has_timers: session.next_pending_timer().is_some(),
         summary,
         search_text,
         project_id: session.project_id.clone(),
+        tab_title: session.tab_title.clone(),
         seq,
         data,
         data_hash,
@@ -466,8 +1115,8 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO sessions
             (id, name, last_updated, message_count, total_cost, total_tokens,
-             has_timers, summary, search_text, seq, data, project_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             has_timers, summary, search_text, seq, data, project_id, tab_title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              last_updated = excluded.last_updated,
@@ -479,7 +1128,8 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
              search_text = excluded.search_text,
              seq = excluded.seq,
              data = excluded.data,
-             project_id = excluded.project_id
+             project_id = excluded.project_id,
+             tab_title = excluded.tab_title
          WHERE excluded.seq >= sessions.seq",
         params![
             row.id,
@@ -494,8 +1144,10 @@ fn upsert_row(conn: &Connection, row: &SessionRow) -> rusqlite::Result<()> {
             row.seq,
             row.data,
             row.project_id,
+            row.tab_title,
         ],
     )?;
+    note_listing(&row.id, row.list_hash);
     Ok(())
 }
 
@@ -546,28 +1198,36 @@ pub fn forget_fingerprint(id: &str) {
 /// seq predates a delete tombstone are dropped — they were collected before
 /// the session was deleted and must not resurrect it.
 pub fn write_rows_and_meta(rows: &[SessionRow], meta: &[(String, String, i64)]) -> Result<(), String> {
-    with_conn(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut tombs = tombstones().lock().unwrap();
-            for row in rows {
-                match tombs.get(&row.id) {
-                    Some(del_seq) if row.seq < *del_seq => continue,
-                    Some(_) => {
-                        // Row collected after the delete — the id was
-                        // re-created, so the tombstone no longer applies.
-                        tombs.remove(&row.id);
-                    }
-                    None => {}
+    with_conn(|conn| write_rows_and_meta_conn(conn, rows, meta))
+}
+
+/// [`write_rows_and_meta`] against a connection: one transaction, so on an
+/// error nothing of it lands.
+pub(crate) fn write_rows_and_meta_conn(
+    conn: &Connection,
+    rows: &[SessionRow],
+    meta: &[(String, String, i64)],
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut tombs = tombstones().lock().unwrap();
+        for row in rows {
+            match tombs.get(&row.id) {
+                Some(del_seq) if row.seq < *del_seq => continue,
+                Some(_) => {
+                    // Row collected after the delete — the id was
+                    // re-created, so the tombstone no longer applies.
+                    tombs.remove(&row.id);
                 }
-                upsert_row(&tx, row)?;
+                None => {}
             }
+            upsert_row(&tx, row)?;
         }
-        for (key, value, seq) in meta {
-            meta_set_conn(&tx, key, value, *seq)?;
-        }
-        tx.commit()
-    })
+    }
+    for (key, value, seq) in meta {
+        meta_set_conn(&tx, key, value, *seq)?;
+    }
+    tx.commit()
 }
 
 // ── Meta ────────────────────────────────────────────────────────────────────
@@ -656,6 +1316,16 @@ pub fn load_sessions(ids: &[String]) -> HashMap<String, Session> {
     if let Err(e) = result {
         tracing::error!("load_sessions failed: {e}");
     }
+    // Outside `with_conn`: the system-session check may read meta. A tab
+    // the pin migration hasn't reached yet is pinned as it hydrates.
+    for (id, session) in out.iter_mut() {
+        if pin_on_load(id, session) && load_pins_logged().lock().unwrap().insert(id.clone()) {
+            crate::session_events::log_event(
+                id,
+                SessionEvent::ComposioProfileSet { profile: session.composio_profile.clone() },
+            );
+        }
+    }
     // Journal outside `with_conn`: appending takes the same connection lock.
     for (id, messages) in cancelled {
         tracing::info!(session_id = %id, calls = messages.len(), "Ended tool calls cut off by a restart");
@@ -682,6 +1352,25 @@ pub fn contains(id: &str) -> bool {
             .map(|o| o.is_some())
     })
     .unwrap_or(false)
+}
+
+/// The stored size of a session's `data` blob in bytes (what every save of
+/// that session rewrites), without reading it. `None` when there is no row.
+pub fn row_bytes(id: &str) -> Option<u64> {
+    with_conn(|conn| {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            // `octet_length` reads the size from the record header; a
+            // `CAST` would load the whole value (overflow pages and all).
+            "SELECT octet_length(data) FROM sessions WHERE id = ?1",
+            params![id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+    })
+    .ok()
+    .flatten()
+    .map(|n| n.max(0) as u64)
 }
 
 pub fn session_ids_with_timers() -> Vec<String> {
@@ -727,13 +1416,20 @@ fn delete_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<(
         .optional()?;
     conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
     conn.execute("DELETE FROM session_events WHERE session_id = ?1", params![id])?;
+    forget_listing(id);
     Ok(harvest)
 }
 
 /// Rename a session directly in the DB (for sessions not hydrated in memory).
 /// Rewrites the `name` field inside the data blob to keep them consistent.
 pub fn rename_session(id: &str, new_name: &str) {
-    let result = with_conn(|conn| {
+    if let Err(e) = with_conn(|conn| rename_session_conn(conn, id, new_name)) {
+        tracing::error!("rename_session({id}) failed: {e}");
+    }
+}
+
+fn rename_session_conn(conn: &Connection, id: &str, new_name: &str) -> rusqlite::Result<()> {
+    {
         use rusqlite::OptionalExtension;
         let data: Option<String> = conn
             .query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0))
@@ -748,10 +1444,8 @@ pub fn rename_session(id: &str, new_name: &str) {
             "UPDATE sessions SET name = ?2, data = ?3, seq = ?4 WHERE id = ?1",
             params![id, new_name, new_data, next_seq()],
         )?;
+        forget_listing(id);
         Ok(())
-    });
-    if let Err(e) = result {
-        tracing::error!("rename_session({id}) failed: {e}");
     }
 }
 
@@ -865,16 +1559,16 @@ pub fn sum_cost_tokens() -> (f64, i64) {
     .unwrap_or((0.0, 0))
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SessionMeta {
     pub id: String,
     pub name: String,
     pub last_updated: String,
     pub message_count: i64,
     pub summary: String,
-    /// Tab identity, read out of the row's `data` JSON blob (least invasive:
-    /// no new columns/migration — `name`/`tab_title`/`tab_emoji`/
-    /// `name_user_set` already live in every session's serialized JSON).
+    /// Tab identity: `tab_title` from its column (or the row's JSON while
+    /// the column backfill hasn't reached it), `tab_emoji`/`name_user_set`
+    /// via `json_extract` ([`META_SELECT`]).
     pub tab_title: Option<String>,
     pub tab_emoji: Option<String>,
     pub name_user_set: bool,
@@ -897,21 +1591,30 @@ impl SessionMeta {
         self.tab_emoji.as_deref().map(str::trim).filter(|e| !e.is_empty())
     }
 
-    fn from_row(id: String, name: String, last_updated: String, message_count: i64, summary: String, data: Option<String>) -> Self {
-        let (tab_title, tab_emoji, name_user_set) = data
-            .as_deref()
-            .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-            .map(|v| {
-                (
-                    v.get("tab_title").and_then(|x| x.as_str()).map(str::to_string),
-                    v.get("tab_emoji").and_then(|x| x.as_str()).map(str::to_string),
-                    v.get("name_user_set").and_then(|x| x.as_bool()).unwrap_or(false),
-                )
-            })
-            .unwrap_or((None, None, false));
-        Self { id, name, last_updated, message_count, summary, tab_title, tab_emoji, name_user_set }
+    fn from_row(r: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            last_updated: r.get(2)?,
+            message_count: r.get(3)?,
+            summary: r.get(4)?,
+            tab_title: r.get(5)?,
+            tab_emoji: r.get(6)?,
+            name_user_set: r.get::<_, Option<i64>>(7)?.unwrap_or(0) != 0,
+        })
     }
 }
+
+/// The [`SessionMeta`] columns. Only the listed fields are read: no row's
+/// `data` is deserialized. `tab_title` comes from its column, falling back
+/// to the JSON while `spawn_tab_title_backfill` hasn't filled it; the two
+/// JSON-only fields use `json_extract` (SQLite parses each row's JSON once
+/// and shares it between the calls). `json_valid` keeps one malformed row
+/// from failing the whole listing.
+const META_SELECT: &str = "id, name, last_updated, message_count, summary, \
+     coalesce(tab_title, CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END), \
+     CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_emoji') END, \
+     CASE WHEN json_valid(data) THEN json_extract(data, '$.name_user_set') END";
 
 /// Paginated, newest-first metadata listing. `query` (lowercased substring)
 /// matches name, summary, or message text. Returns (page, total_matches).
@@ -927,11 +1630,9 @@ pub fn list_metadata(query: Option<&str>, offset: i64, limit: i64) -> (Vec<Sessi
 }
 
 /// `list_metadata` against an explicit connection (so tests can use an
-/// in-memory DB). Besides name/summary/message text, the query also matches
-/// the AI topic (`tab_title`), read straight from the row's `data` JSON so it
-/// works for rows saved before `tab_title` was part of anything else and
-/// needs no migration or backfill. `OR` short-circuits, so the JSON is only
-/// parsed for rows the cheaper columns did not already match.
+/// in-memory DB). The query matches name, summary and `search_text` (which
+/// carries the AI topic title and message text, `build_row`); all columns,
+/// so filtering parses no JSON.
 fn list_metadata_conn(
     conn: &Connection,
     query: Option<&str>,
@@ -954,20 +1655,11 @@ fn list_metadata_conn(
 
         let count_sql = format!("SELECT COUNT(*) FROM sessions {where_clause}");
         let list_sql = format!(
-            "SELECT id, name, last_updated, message_count, summary, data FROM sessions {where_clause} \
+            "SELECT {META_SELECT} FROM sessions {where_clause} \
              ORDER BY last_updated DESC LIMIT {limit} OFFSET {offset}"
         );
 
-        let map_row = |r: &rusqlite::Row| -> rusqlite::Result<SessionMeta> {
-            Ok(SessionMeta::from_row(
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-            ))
-        };
+        let map_row = SessionMeta::from_row;
 
         if pattern.is_empty() {
             let total: i64 = conn.query_row(&count_sql, [], |r| r.get(0))?;
@@ -995,33 +1687,225 @@ pub fn all_name_summaries() -> Vec<(String, String, String)> {
     .unwrap_or_default()
 }
 
+/// [`SessionMeta`] for `ids`, in that order (missing ids skipped).
 pub fn metadata_by_ids(ids: &[String]) -> Vec<SessionMeta> {
-    with_conn(|conn| {
-        let mut stmt = conn.prepare(
-            "SELECT id, name, last_updated, message_count, summary, data FROM sessions WHERE id = ?1",
-        )?;
-        let mut out = Vec::new();
-        for id in ids {
-            use rusqlite::OptionalExtension;
-            if let Some(m) = stmt
-                .query_row(params![id], |r| {
-                    Ok(SessionMeta::from_row(
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ))
-                })
-                .optional()?
-            {
-                out.push(m);
+    with_conn(|conn| metadata_by_ids_conn(conn, ids)).unwrap_or_else(|e| {
+        tracing::error!("metadata_by_ids failed: {e}");
+        Vec::new()
+    })
+}
+
+fn metadata_by_ids_conn(conn: &Connection, ids: &[String]) -> rusqlite::Result<Vec<SessionMeta>> {
+    use rusqlite::OptionalExtension;
+    let mut stmt = conn.prepare(&format!("SELECT {META_SELECT} FROM sessions WHERE id = ?1"))?;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(m) = stmt.query_row(params![id], SessionMeta::from_row).optional()? {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// A conversation row for the Hobbes tab's `HOBBES_TAB_LIST` (`hobbes_tabs`):
+/// metadata only, read with `json_extract` so no message blob is parsed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TabRow {
+    pub id: String,
+    pub name: String,
+    pub tab_title: Option<String>,
+    pub tab_emoji: Option<String>,
+    pub name_user_set: bool,
+    pub project_id: Option<String>,
+    pub composio_profile: Option<String>,
+    /// RFC 3339 (the `last_updated` column).
+    pub last_updated: String,
+    pub message_count: i64,
+}
+
+impl TabRow {
+    /// Mirrors `Session::display_title` for a non-hydrated row.
+    pub fn display_title(&self) -> String {
+        match (&self.tab_title, self.name_user_set) {
+            (Some(t), false) => t.clone(),
+            _ => self.name.clone(),
+        }
+    }
+}
+
+/// Whether a conversation's name or AI title contains `query_lower` (already
+/// lowercased), folding case with Unicode rules (`str::to_lowercase`). The
+/// one matcher for the Hobbes tab's listing, in memory
+/// (`hobbes_tabs::session_matches`) and from the store ([`tab_rows`]), so a
+/// hydrated tab and a stored one match the same queries.
+pub fn title_matches(name: &str, tab_title: Option<&str>, query_lower: &str) -> bool {
+    let has = |t: &str| t.to_lowercase().contains(query_lower);
+    has(name) || tab_title.is_some_and(has)
+}
+
+/// Newest-first conversation rows, skipping `exclude` (the Hobbes lineage
+/// and the hydrated sessions the caller lists from memory). `query`
+/// matches the name and the AI title only ([`title_matches`]); `project_id`
+/// filters on the indexed column.
+///
+/// Two steps, so no row's JSON is parsed to filter: the `last_updated`
+/// index walk reads only the `id`, `name` and `tab_title` columns and
+/// matches the query in Rust (SQLite's `LIKE` folds ASCII case only), and
+/// stops once `limit` rows are kept; each match's JSON-only fields are then
+/// read by id. A row whose `data` isn't valid JSON is skipped (it couldn't
+/// be read with `HOBBES_TAB_READ` either) and doesn't fail the listing.
+pub fn tab_rows(query: Option<&str>, project_id: Option<&str>, exclude: &[String], limit: i64) -> Vec<TabRow> {
+    with_conn(|conn| tab_rows_conn(conn, query, project_id, exclude, limit)).unwrap_or_else(|e| {
+        tracing::error!("tab_rows failed: {e}");
+        Vec::new()
+    })
+}
+
+pub(crate) fn tab_rows_conn(
+    conn: &Connection,
+    query: Option<&str>,
+    project_id: Option<&str>,
+    exclude: &[String],
+    limit: i64,
+) -> rusqlite::Result<Vec<TabRow>> {
+    use rusqlite::OptionalExtension;
+    let limit = limit.max(0) as usize;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query = query.map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
+    let mut clauses: Vec<String> = Vec::new();
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(p) = project_id {
+        values.push(p.to_string().into());
+        clauses.push(format!("project_id = ?{}", values.len()));
+    }
+    if !exclude.is_empty() {
+        let start = values.len();
+        let marks: Vec<String> = (0..exclude.len()).map(|i| format!("?{}", start + i + 1)).collect();
+        values.extend(exclude.iter().map(|id| rusqlite::types::Value::from(id.clone())));
+        clauses.push(format!("id NOT IN ({})", marks.join(", ")));
+    }
+    let where_clause = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
+    // Step 1: columns only. No SQL LIMIT: the walk stops in Rust once
+    // `limit` rows are kept, which a skipped (malformed) row doesn't count
+    // towards.
+    let mut walk = conn.prepare(&format!(
+        "SELECT id, name, tab_title, project_id, last_updated, message_count          FROM sessions {where_clause} ORDER BY last_updated DESC"
+    ))?;
+    // Step 2: the JSON-only fields of one kept row; `json_valid` first, so
+    // a malformed row reads as NULL instead of failing the statement.
+    let mut fields = conn.prepare(
+        "SELECT json_valid(data),          CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_emoji') END,          CASE WHEN json_valid(data) THEN coalesce(json_extract(data, '$.name_user_set'), 0) END,          CASE WHEN json_valid(data) THEN json_extract(data, '$.composio_profile') END          FROM sessions WHERE id = ?1",
+    )?;
+    let mut rows = walk.query(rusqlite::params_from_iter(values))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let (id, name, tab_title): (String, String, Option<String>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+        if query.as_deref().is_some_and(|q| !title_matches(&name, tab_title.as_deref(), q)) {
+            continue;
+        }
+        type Fields = (bool, Option<String>, Option<i64>, Option<String>);
+        let Some((valid, tab_emoji, name_user_set, composio_profile)) = fields
+            .query_row(params![id], |f| Ok::<Fields, _>((f.get(0)?, f.get(1)?, f.get(2)?, f.get(3)?)))
+            .optional()?
+        else {
+            continue;
+        };
+        if !valid {
+            tracing::warn!(session_id = %id, "tab_rows: skipped a row whose data isn't valid JSON");
+            continue;
+        }
+        out.push(TabRow {
+            id,
+            name,
+            tab_title,
+            tab_emoji,
+            name_user_set: name_user_set.unwrap_or(0) != 0,
+            project_id: r.get(3)?,
+            composio_profile,
+            last_updated: r.get(4)?,
+            message_count: r.get(5)?,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// Read one session for viewing only (`HOBBES_TAB_READ`, the Heartbeat's
+/// worker diagnoses): parsed from its row, with none of [`load_sessions`]'
+/// hydration side effects — no fingerprint recorded, no cut-off call ended
+/// or journalled. The result must never be put into `SessionState`.
+pub fn peek_session(id: &str) -> Option<Session> {
+    // Only the fetch holds the connection lock; the parse runs after.
+    let data = with_conn(|conn| peek_data_conn(conn, id)).ok().flatten()?;
+    parse_session(id, &data)
+}
+
+fn peek_data_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<String>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row("SELECT data FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).optional()
+}
+
+#[cfg(test)]
+pub(crate) fn peek_session_conn(conn: &Connection, id: &str) -> rusqlite::Result<Option<Session>> {
+    Ok(peek_data_conn(conn, id)?.and_then(|d| parse_session(id, &d)))
+}
+
+/// `meta` key set once system sessions' legacy summary sources are cleared
+/// ([`clear_system_summary_sources_once`]).
+pub const SYSTEM_SUMMARY_SOURCES_CLEARED_KEY: &str = "system_summary_sources_cleared";
+
+/// One-time, at startup before any hydration: clear `summary_sources` on
+/// the system sessions `ids` (the Hobbes lineage). Before tab reads, a
+/// system session's summary recorded every Composio read, which the
+/// cross-company hold ignored there; it now counts a system session's
+/// `summary_sources` with no clock (they hold only tab-read sources from
+/// here on, `profile_reach::durable_summary_sources`), so the old entries
+/// must go rather than hold writes for good. Guarded by
+/// [`SYSTEM_SUMMARY_SOURCES_CLEARED_KEY`], written in the same transaction
+/// as the rows; each clear is journaled as a `SummaryComputed` without
+/// sources, so a replay matches.
+pub fn clear_system_summary_sources_once(ids: &[String]) {
+    match with_conn(|conn| clear_summary_sources_conn(conn, ids)) {
+        Ok(cleared) => {
+            if !cleared.is_empty() {
+                tracing::info!(sessions = cleared.len(), "Cleared legacy summary sources on system sessions");
+            }
+            for (id, summary) in cleared {
+                crate::session_events::log_event(&id, crate::session_events::SessionEvent::SummaryComputed { summary });
             }
         }
-        Ok(out)
-    })
-    .unwrap_or_default()
+        Err(e) => tracing::error!("clearing system summary sources failed (will retry next launch): {e}"),
+    }
+}
+
+/// [`clear_system_summary_sources_once`] against a connection: the cleared
+/// sessions with the `SummaryComputed` payload to journal for each.
+pub(crate) fn clear_summary_sources_conn(
+    conn: &Connection,
+    ids: &[String],
+) -> rusqlite::Result<Vec<(String, serde_json::Value)>> {
+    if meta_get_conn(conn, SYSTEM_SUMMARY_SOURCES_CLEARED_KEY)?.is_some() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(mut session) = peek_data_conn(&tx, id)?.and_then(|d| parse_session(id, &d)) else { continue };
+        if session.summary_sources.is_empty() {
+            continue;
+        }
+        session.summary_sources.clear();
+        let row = build_row(&session, next_seq()).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        upsert_row(&tx, &row)?;
+        out.push((id.clone(), crate::session::summary_payload(&session.active_context.conversation_summary, &[])));
+    }
+    meta_set_conn(&tx, SYSTEM_SUMMARY_SOURCES_CLEARED_KEY, "1", next_seq())?;
+    tx.commit()?;
+    Ok(out)
 }
 
 pub fn session_count() -> i64 {
@@ -1100,6 +1984,12 @@ pub fn prepare_event_rows(session_id: &str, events: &[SessionEvent]) -> Vec<Sess
 
 fn insert_event_rows_conn(conn: &Connection, rows: &[SessionEventRow]) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    insert_event_rows_in(&tx, rows)?;
+    tx.commit()
+}
+
+/// [`insert_event_rows_conn`] inside a transaction the caller holds.
+fn insert_event_rows_in(tx: &Connection, rows: &[SessionEventRow]) -> rusqlite::Result<()> {
     {
         // A tombstoned session's journal must not grow again: a stream that
         // is still running when its tab is deleted keeps producing events
@@ -1129,7 +2019,7 @@ fn insert_event_rows_conn(conn: &Connection, rows: &[SessionEventRow]) -> rusqli
             stmt.execute(params![row.session_id, row.seq, row.ts, row.kind, row.payload])?;
         }
     }
-    tx.commit()
+    Ok(())
 }
 
 /// Write prepared event rows. Called on a blocking thread by `append_events`,
@@ -1512,6 +2402,11 @@ pub mod test_support {
         backfill_project_id_column(conn).unwrap();
     }
 
+    pub fn backfill_tab_titles(conn: &Connection) {
+        conn.execute("DELETE FROM meta WHERE key = ?1", params![META_TAB_TITLE_COLUMN]).unwrap();
+        backfill_tab_title_column(conn).unwrap();
+    }
+
     pub fn ensure_project_id_column_for_test(conn: &Connection) {
         ensure_project_id_column(conn).unwrap();
     }
@@ -1707,6 +2602,219 @@ mod list_metadata_tests {
         assert!(plan.contains("idx_sessions_project_id"), "{plan}");
     }
 
+    /// `seed_seq_from_db` runs before the window shows: its `MAX(seq)`
+    /// reads must be index lookups, never a walk of every session's row.
+    #[test]
+    fn seq_high_water_reads_use_an_index() {
+        with_test_db(|conn| {
+            // session_events' MAX(seq) scans its (session_id, seq) key
+            // index, a few MB: cheaper than a one-time index build over
+            // the journal's hundreds of MB.
+            for (table, index) in [("sessions", "idx_sessions_seq"), ("fleet_events", "idx_fleet_events_seq")] {
+                let plan: String = conn
+                    .query_row(&format!("EXPLAIN QUERY PLAN SELECT MAX(seq) FROM {table}"), [], |r| r.get(3))
+                    .unwrap();
+                assert!(plan.contains(index), "{table}: {plan}");
+            }
+        });
+    }
+
+    /// The listing reads only the listed fields: a row whose `data` is huge
+    /// and isn't even a `Session` still lists with the right values.
+    #[test]
+    fn listing_reads_fields_without_deserializing_data() {
+        with_test_db(|conn| {
+            let s = session("Sep 18 - 10:00 AM", true, Some("Trip Planning"), Some("🧳"));
+            upsert(conn, &s);
+            let blob = "x".repeat(4 * 1024 * 1024);
+            let data = serde_json::json!({
+                "tab_title": "Trip Planning",
+                "tab_emoji": "🧳",
+                "name_user_set": true,
+                "messages": [{ "huge": blob }],
+            })
+            .to_string();
+            conn.execute("UPDATE sessions SET data = ?2 WHERE id = ?1", params![s.id, data]).unwrap();
+            assert!(parse_session(&s.id, &data).is_none(), "data must not be a Session for this test");
+
+            let (metas, total) = list_metadata_conn(conn, None, 0, 10).unwrap();
+            assert_eq!(total, 1);
+            let m = &metas[0];
+            assert_eq!(m.id, s.id);
+            assert_eq!(m.name, "Sep 18 - 10:00 AM");
+            assert_eq!(m.tab_title.as_deref(), Some("Trip Planning"));
+            assert_eq!(m.display_emoji(), Some("🧳"));
+            assert!(m.name_user_set);
+            assert_eq!(m.display_title(), "Sep 18 - 10:00 AM");
+            assert_eq!(metadata_by_ids_conn(conn, std::slice::from_ref(&s.id)).unwrap()[0], *m);
+        });
+    }
+
+    #[test]
+    fn listing_survives_malformed_data() {
+        with_test_db(|conn| {
+            let s = session("Sep 19 - 08:00 AM", false, Some("Garden"), Some("🌱"));
+            upsert(conn, &s);
+            conn.execute("UPDATE sessions SET data = '{not json' WHERE id = ?1", params![s.id]).unwrap();
+            let (metas, _) = list_metadata_conn(conn, None, 0, 10).unwrap();
+            // The column still carries the title; the JSON-only fields are blank.
+            assert_eq!(metas[0].display_title(), "Garden");
+            assert_eq!(metas[0].tab_emoji, None);
+            assert!(!metas[0].name_user_set);
+        });
+    }
+
+    /// Until `spawn_tab_title_backfill` reaches a row, its `tab_title`
+    /// column is NULL: the title comes from the JSON instead.
+    #[test]
+    fn null_tab_title_column_falls_back_to_json() {
+        with_test_db(|conn| {
+            let titled = session("Sep 20 - 09:00 AM", false, Some("Quarterly Budget Review"), Some("💰"));
+            let untitled = session("Sep 21 - 09:00 AM", false, None, None);
+            upsert(conn, &titled);
+            upsert(conn, &untitled);
+            conn.execute("UPDATE sessions SET tab_title = NULL", []).unwrap();
+            let metas = metadata_by_ids_conn(conn, &[titled.id.clone(), untitled.id.clone()]).unwrap();
+            assert_eq!(metas[0].display_title(), "Quarterly Budget Review");
+            assert_eq!(metas[1].tab_title, None);
+            assert_eq!(metas[1].display_title(), "Sep 21 - 09:00 AM");
+        });
+    }
+
+    /// One row whose `data` isn't JSON: the column backfills skip it and
+    /// still finish (their done flags set), instead of failing every launch.
+    #[test]
+    fn a_malformed_row_never_stops_the_column_backfills() {
+        with_test_db(|conn| {
+            let a = session("Sep 25 - 09:00 AM", false, Some("Garden"), None);
+            let bad = session("Sep 25 - 10:00 AM", false, Some("Broken"), None);
+            let c = session("Sep 25 - 11:00 AM", false, Some("Taxes"), None);
+            for s in [&a, &bad, &c] {
+                upsert(conn, s);
+            }
+            conn.execute("UPDATE sessions SET data = '{not json' WHERE id = ?1", params![bad.id]).unwrap();
+            conn.execute("UPDATE sessions SET tab_title = NULL, project_id = 'stale'", []).unwrap();
+
+            test_support::backfill_tab_titles(conn);
+            assert!(meta(conn, META_TAB_TITLE_COLUMN).is_some(), "the backfill finished");
+            let title = |id: &str| -> Option<String> {
+                conn.query_row("SELECT tab_title FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+            };
+            assert_eq!(title(&a.id).as_deref(), Some("Garden"));
+            assert_eq!(title(&bad.id), None, "skipped");
+            assert_eq!(title(&c.id).as_deref(), Some("Taxes"), "rows after it are still filled");
+
+            conn.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![META_PROJECT_ID_COLUMN, META_SEARCH_TAB_TITLE])
+                .unwrap();
+            backfill_project_id_column(conn).unwrap();
+            backfill_search_tab_titles(conn).unwrap();
+            assert!(meta(conn, META_PROJECT_ID_COLUMN).is_some() && meta(conn, META_SEARCH_TAB_TITLE).is_some());
+        });
+    }
+
+    /// `HOBBES_TAB_LIST`'s store rows: a malformed row is skipped, not the
+    /// whole listing, and doesn't count towards the limit.
+    #[test]
+    fn tab_rows_skip_a_malformed_row() {
+        with_test_db(|conn| {
+            let now = chrono::Utc::now();
+            let mut rows = Vec::new();
+            for (i, title) in ["Oldest", "Middle", "Broken newest"].into_iter().enumerate() {
+                let mut s = session(&format!("Sep 26 - 0{i}:00 AM"), false, Some(title), Some("🧾"));
+                s.last_updated = now - chrono::Duration::minutes(10 - i as i64);
+                upsert(conn, &s);
+                rows.push(s);
+            }
+            conn.execute("UPDATE sessions SET data = '{not json' WHERE id = ?1", params![rows[2].id]).unwrap();
+            let listed = tab_rows_conn(conn, None, None, &[], 2).unwrap();
+            let titles: Vec<String> = listed.iter().map(TabRow::display_title).collect();
+            assert_eq!(titles, ["Middle", "Oldest"]);
+            assert_eq!(listed[0].tab_emoji.as_deref(), Some("🧾"));
+            assert!(tab_rows_conn(conn, Some("broken"), None, &[], 10).unwrap().is_empty());
+        });
+    }
+
+    /// The store's title search folds case like the in-memory one
+    /// (`str::to_lowercase`), not just ASCII the way SQLite's `LIKE` does.
+    #[test]
+    fn tab_rows_fold_non_ascii_case_like_memory() {
+        with_test_db(|conn| {
+            let titled = session("Sep 27 - 09:00 AM", false, Some("Ärger mit Behörden"), None);
+            let named = session("ÉTÉ À PARIS", true, None, None);
+            upsert(conn, &titled);
+            upsert(conn, &named);
+            let hits = |q: &str| tab_rows_conn(conn, Some(q), None, &[], 10).unwrap().len();
+            assert_eq!(hits("ärger"), 1);
+            assert_eq!(hits("ÄRGER"), 1);
+            assert_eq!(hits("été"), 1);
+            assert_eq!(hits("100%"), 0, "no LIKE wildcards");
+            assert!(title_matches("ÉTÉ À PARIS", None, "été à"));
+            assert!(!title_matches("Garden", Some("Taxes"), "zz"));
+        });
+    }
+
+    #[test]
+    fn row_bytes_reads_the_stored_size() {
+        with_test_db(|conn| {
+            let s = session("Sep 28 - 09:00 AM", false, None, None);
+            upsert(conn, &s);
+            let n: i64 = conn
+                .query_row("SELECT octet_length(data) FROM sessions WHERE id = ?1", params![s.id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n as usize, get_row_data(conn, &s.id).unwrap().len());
+        });
+    }
+
+    #[test]
+    fn search_matches_name_and_title_and_misses_the_rest() {
+        with_test_db(|conn| {
+            upsert(conn, &session("Garden notes", false, None, None));
+            upsert(conn, &session("Sep 22 - 09:00 AM", false, Some("Garden Planning"), None));
+            upsert(conn, &session("Sep 23 - 09:00 AM", false, Some("Taxes"), None));
+            let (metas, total) = list_metadata_conn(conn, Some("GARDEN"), 0, 10).unwrap();
+            assert_eq!(total, 2);
+            let mut titles: Vec<String> = metas.iter().map(SessionMeta::display_title).collect();
+            titles.sort();
+            assert_eq!(titles, ["Garden Planning", "Garden notes"]);
+            // Pagination keeps the total.
+            let (page, total) = list_metadata_conn(conn, Some("garden"), 1, 1).unwrap();
+            assert_eq!((page.len(), total), (1, 2));
+        });
+    }
+
+    /// `list_version` moves when the listing changes (the History drawer
+    /// re-queries on it), and a save that changes nothing listed (a
+    /// streaming reply's other fields) leaves the row's listing hash alone.
+    #[test]
+    fn list_version_tracks_listing_changes_only() {
+        with_test_db(|conn| {
+            let mut s = session("Sep 24 - 09:00 AM", false, None, None);
+            let v0 = list_version();
+            upsert(conn, &s);
+            let v1 = list_version();
+            assert!(v1 > v0, "a new row bumps the version");
+
+            let before = build_row(&s, next_seq()).unwrap().list_hash;
+            s.scratchpad = "streaming scratch".into();
+            s.project_id = Some("p".into());
+            assert_eq!(build_row(&s, next_seq()).unwrap().list_hash, before);
+            s.tab_title = Some("Retitled".into());
+            assert_ne!(build_row(&s, next_seq()).unwrap().list_hash, before);
+            upsert(conn, &s);
+            let v2 = list_version();
+            assert!(v2 > v1, "a retitle bumps the version");
+
+            rename_session_conn(conn, &s.id, "Renamed").unwrap();
+            let v3 = list_version();
+            assert!(v3 > v2, "a rename from History bumps the version");
+            assert_eq!(list_metadata_conn(conn, None, 0, 10).unwrap().0[0].name, "Renamed");
+
+            delete_session_for_test(conn, &s.id);
+            assert!(list_version() > v3, "a delete bumps the version");
+            assert_eq!(list_metadata_conn(conn, None, 0, 10).unwrap().1, 0);
+        });
+    }
+
     #[test]
     fn search_matches_ai_topic_title() {
         with_test_db(|conn| {
@@ -1748,12 +2856,239 @@ mod list_metadata_tests {
 
     #[test]
     fn display_emoji_ignores_blank() {
-        let mut m = SessionMeta::from_row("a".into(), "n".into(), String::new(), 0, String::new(), None);
+        let mut m = SessionMeta {
+            id: "a".into(),
+            name: "n".into(),
+            last_updated: String::new(),
+            message_count: 0,
+            summary: String::new(),
+            tab_title: None,
+            tab_emoji: None,
+            name_user_set: false,
+        };
         assert_eq!(m.display_emoji(), None);
         m.tab_emoji = Some("  ".into());
         assert_eq!(m.display_emoji(), None);
         m.tab_emoji = Some("🐯".into());
         assert_eq!(m.display_emoji(), Some("🐯"));
+    }
+
+    // ── Pin migration ───────────────────────────────────────────────────
+
+    fn pin_of(conn: &Connection, id: &str) -> Option<String> {
+        let data = get_row_data(conn, id).unwrap();
+        serde_json::from_str::<Session>(&data).unwrap().composio_profile
+    }
+
+    fn row_seq(conn: &Connection, id: &str) -> i64 {
+        conn.query_row("SELECT seq FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+    }
+
+    fn pin_settings(home: Option<&str>) -> crate::settings::Settings {
+        let mut s = crate::settings::Settings::default();
+        for (id, name) in [("cm", "Clearmirror"), ("pg", "Puget")] {
+            s.composio_profiles.push(crate::settings::ComposioProfile {
+                id: id.into(),
+                name: name.into(),
+                ..Default::default()
+            });
+        }
+        s.home_composio_profile = home.map(str::to_string);
+        // Focus-driven: must never be the target.
+        s.active_composio_profile = Some("pg".into());
+        s
+    }
+
+    /// A Composio call stamped with `profile`.
+    fn composio_call(profile: &str) -> crate::components::chat::Message {
+        let mut tc = crate::components::shared::ToolCall::new(
+            format!("composio-native:{profile}"),
+            "GMAIL_SEND_EMAIL".into(),
+            serde_json::json!({}),
+            None,
+            None,
+        );
+        tc.profile_id = Some(profile.into());
+        crate::components::chat::Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".into(),
+            content: crate::components::shared::MessageContent::ToolCall(tc),
+            attachments: Vec::new(),
+            comments: Vec::new(),
+            created_at: chrono::Utc::now(),
+            usage: None,
+        }
+    }
+
+    /// The whole backfill on one connection, the way the thread runs it
+    /// (tiny batches, so the test crosses batch boundaries).
+    fn run_pin_backfill(
+        conn: &Connection,
+        rules: &crate::settings::Settings,
+        high_water: i64,
+        skip: &std::collections::HashSet<String>,
+    ) -> usize {
+        let mut cursor = meta(conn, META_PIN_CURSOR).and_then(|c| c.parse().ok()).unwrap_or(0);
+        let mut pinned = 0;
+        while let Some((last, rows)) = read_pin_batch(conn, cursor, 1).unwrap() {
+            let fixes = pin_fixes(rules, rows, high_water, skip);
+            pinned += write_pin_fixes(conn, &fixes, last).unwrap();
+            cursor = last;
+        }
+        meta_set_conn(conn, META_PIN_BACKFILLED, "1", next_seq()).unwrap();
+        pinned
+    }
+
+    #[test]
+    fn pin_backfill_follows_each_tabs_own_profile() {
+        with_test_db(|conn| {
+            let rules = pin_settings(Some("cm"));
+            // Its own most recent Composio call ran in Puget.
+            let mut worked = session("Worked in Puget", false, Some("Topic"), None);
+            worked.messages.push(composio_call("cm"));
+            worked.messages.push(composio_call("pg"));
+            worked.scratchpad = "notes".into();
+            // No Composio calls: Hobbes' home.
+            let quiet = session("Quiet", false, None, None);
+            // A legacy name pin: normalised to the id.
+            let mut named = session("Named", false, None, None);
+            named.composio_profile = Some("Puget".into());
+            let mut pinned = session("Pinned", false, None, None);
+            pinned.composio_profile = Some("pg".into());
+            let mut removed = session("Removed", false, None, None);
+            removed.composio_profile = Some("gone".into());
+            for s in [&worked, &quiet, &named, &pinned, &removed] {
+                upsert(conn, s);
+            }
+            let before = row_seq(conn, &worked.id);
+            let high_water = next_seq();
+
+            assert_eq!(run_pin_backfill(conn, &rules, high_water, &Default::default()), 3);
+
+            assert_eq!(pin_of(conn, &worked.id).as_deref(), Some("pg"), "its own calls, not Hobbes' home");
+            assert_eq!(pin_of(conn, &quiet.id).as_deref(), Some("cm"), "Hobbes' home");
+            assert_eq!(pin_of(conn, &named.id).as_deref(), Some("pg"));
+            assert_eq!(pin_of(conn, &pinned.id).as_deref(), Some("pg"));
+            assert_eq!(pin_of(conn, &removed.id).as_deref(), Some("gone"), "never repointed at another profile");
+            assert!(row_seq(conn, &worked.id) > before, "a fresh seq, so an older in-flight save can't undo it");
+            let back: Session = serde_json::from_str(&get_row_data(conn, &worked.id).unwrap()).unwrap();
+            assert_eq!(back.scratchpad, "notes", "the rest of the session is untouched");
+            assert_eq!(back.tab_title.as_deref(), Some("Topic"));
+            // Journaled with the write.
+            assert!(matches!(
+                &load_events_for_test(conn, &worked.id, 0).last().unwrap().event,
+                SessionEvent::ComposioProfileSet { profile: Some(p) } if p == "pg"
+            ));
+            assert_eq!(meta(conn, META_PIN_BACKFILLED).as_deref(), Some("1"));
+        });
+    }
+
+    #[test]
+    fn pin_backfill_without_a_rule_leaves_the_tab_unpinned() {
+        with_test_db(|conn| {
+            let quiet = session("Quiet", false, None, None);
+            upsert(conn, &quiet);
+            // No calls, no Hobbes home: today's behaviour (never the global).
+            assert_eq!(run_pin_backfill(conn, &pin_settings(None), next_seq(), &Default::default()), 0);
+            assert_eq!(pin_of(conn, &quiet.id), None);
+        });
+    }
+
+    #[test]
+    fn pin_backfill_never_touches_rows_with_an_in_memory_copy() {
+        with_test_db(|conn| {
+            let rules = pin_settings(Some("cm"));
+            let hydrated = session("Hydrated", false, None, None);
+            let system = session("Hobbes archive", false, None, None);
+            let loaded = session("Loaded earlier", false, None, None);
+            let later = session("Saved after the spawn", false, None, None);
+            for s in [&hydrated, &system, &loaded] {
+                upsert(conn, s);
+            }
+            let high_water = next_seq();
+            upsert(conn, &later);
+            // A system session the backfill wasn't told about: the registry
+            // knows it (it may learn an archive after the spawn).
+            crate::system_sessions::set_current(&system.id);
+            mark_row_loaded(&loaded.id, &get_row_data(conn, &loaded.id).unwrap());
+            let skip: std::collections::HashSet<String> = [hydrated.id.clone()].into();
+
+            assert_eq!(run_pin_backfill(conn, &rules, high_water, &skip), 0);
+
+            assert_eq!(pin_of(conn, &hydrated.id), None, "hydrated at spawn: pinned in memory instead");
+            assert_eq!(pin_of(conn, &system.id), None, "system sessions keep their own rules");
+            assert_eq!(pin_of(conn, &loaded.id), None, "a row with a fingerprint is left to its copy");
+            assert_eq!(pin_of(conn, &later.id), None, "written since the spawn: an in-memory copy's");
+            forget_fingerprint(&loaded.id);
+        });
+    }
+
+    /// A save landing between the batch read and its write wins: the fix
+    /// is dropped (its seq changed), not written over the newer row.
+    #[test]
+    fn pin_backfill_drops_a_fix_when_the_row_changed_since_its_read() {
+        with_test_db(|conn| {
+            let rules = pin_settings(Some("cm"));
+            let mut s = session("Open tab", false, None, None);
+            upsert(conn, &s);
+            let (last, rows) = read_pin_batch(conn, 0, PIN_BACKFILL_BATCH_BYTES).unwrap().unwrap();
+            let fixes = pin_fixes(&rules, rows, next_seq(), &Default::default());
+            assert_eq!(fixes.len(), 1);
+            // Meanwhile its copy saves, pinned elsewhere, with more content.
+            s.composio_profile = Some("pg".into());
+            s.scratchpad = "newer".into();
+            upsert(conn, &s);
+            assert_eq!(write_pin_fixes(conn, &fixes, last).unwrap(), 0);
+            let back: Session = serde_json::from_str(&get_row_data(conn, &s.id).unwrap()).unwrap();
+            assert_eq!(back.composio_profile.as_deref(), Some("pg"));
+            assert_eq!(back.scratchpad, "newer");
+            assert_eq!(meta(conn, META_PIN_CURSOR).as_deref(), Some(last.to_string().as_str()), "the cursor still moves");
+        });
+    }
+
+    /// Batches are cut by bytes (at least one row), and a restart resumes
+    /// from the stored cursor.
+    #[test]
+    fn pin_backfill_batches_by_bytes_and_resumes() {
+        with_test_db(|conn| {
+            let a = session("A", false, None, None);
+            let b = session("B", false, None, None);
+            upsert(conn, &a);
+            upsert(conn, &b);
+            let (first, rows) = read_pin_batch(conn, 0, 1).unwrap().unwrap();
+            assert_eq!(rows.len(), 1, "one row even when it alone exceeds the budget");
+            let (_, both) = read_pin_batch(conn, 0, i64::MAX).unwrap().unwrap();
+            assert_eq!(both.len(), 2);
+            // Interrupted after the first batch: the next run starts after it.
+            write_pin_fixes(conn, &[], first).unwrap();
+            let rules = pin_settings(Some("cm"));
+            assert_eq!(run_pin_backfill(conn, &rules, next_seq(), &Default::default()), 1);
+            assert_eq!(pin_of(conn, &rows[0].0), None, "behind the cursor: not revisited");
+        });
+    }
+
+    #[test]
+    fn a_tab_hydrating_unpinned_follows_the_pin_rule() {
+        clear_pin_rules();
+        let mut s = session("Old tab", false, None, None);
+        assert!(!pin_on_load(&s.id.clone(), &mut s), "no rules yet: nothing to pin to");
+        set_pin_rules(&pin_settings(None));
+        assert!(!pin_on_load(&s.id.clone(), &mut s), "no calls, no Hobbes home: left unpinned");
+        s.messages.push(composio_call("pg"));
+        assert!(pin_on_load(&s.id.clone(), &mut s));
+        assert_eq!(s.composio_profile.as_deref(), Some("pg"));
+        // A name pin becomes its id; an id pin is untouched.
+        s.composio_profile = Some("Clearmirror".into());
+        assert!(pin_on_load(&s.id.clone(), &mut s));
+        assert_eq!(s.composio_profile.as_deref(), Some("cm"));
+        assert!(!pin_on_load(&s.id.clone(), &mut s));
+        // The Hobbes session keeps its own rules.
+        let mut hobbes = session("Hobbes", false, None, None);
+        hobbes.messages.push(composio_call("pg"));
+        crate::system_sessions::set_current(&hobbes.id);
+        assert!(!pin_on_load(&hobbes.id.clone(), &mut hobbes));
+        assert_eq!(hobbes.composio_profile, None);
+        clear_pin_rules();
     }
 }
 
@@ -2017,5 +3352,135 @@ mod event_tests {
                 "fingerprint must be forgotten after delete"
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    const V1: &str = "0.13.0";
+    const V2: &str = "0.14.0";
+
+    /// A store at `dir/sessions.db` with one session row, closed.
+    fn existing_store(dir: &std::path::Path, version: &str) -> PathBuf {
+        let path = dir.join("sessions.db");
+        let conn = open_store(&path, version).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, name, last_updated, message_count, total_cost, total_tokens, has_timers, summary, search_text, seq, data)
+             VALUES ('a', 'first', '2026-11-11T00:00:00Z', 0, 0, 0, 0, '', '', 1, '{}')",
+            [],
+        )
+        .unwrap();
+        path
+    }
+
+    fn backups(dir: &std::path::Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".pre-"))
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn ids_in(path: &std::path::Path) -> Vec<String> {
+        let c = Connection::open(path).unwrap();
+        let mut stmt = c.prepare("SELECT id FROM sessions ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn a_fresh_install_takes_none_and_its_next_launch_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        assert!(backups(dir.path()).is_empty());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(backup_before_upgrade(&conn, &path, V1), BackupOutcome::UpToDate);
+        assert!(backups(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn taken_on_a_version_change_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        let conn = open_store(&path, V2).unwrap();
+        assert_eq!(backups(dir.path()), ["sessions.db.pre-0.14.0.bak"]);
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_VERSION).unwrap().as_deref(), Some(V2));
+        assert_eq!(ids_in(&dir.path().join("sessions.db.pre-0.14.0.bak")), ["a"]);
+        drop(conn);
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(backup_before_upgrade(&conn, &path, V2), BackupOutcome::UpToDate);
+    }
+
+    /// Rows still in the WAL (another connection holds it open, so nothing
+    /// was checkpointed on close) are in the backup.
+    #[test]
+    fn the_backup_includes_the_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        let writer = Connection::open(&path).unwrap();
+        writer.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+        writer
+            .execute(
+                "INSERT INTO sessions (id, name, last_updated, message_count, total_cost, total_tokens, has_timers, summary, search_text, seq, data)
+                 VALUES ('b', 'in the wal', '2026-11-11T00:00:00Z', 0, 0, 0, 0, '', '', 2, '{}')",
+                [],
+            )
+            .unwrap();
+        let wal = dir.path().join("sessions.db-wal");
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0, "the row is in the WAL");
+        let conn = Connection::open(&path).unwrap();
+        let BackupOutcome::Taken { path: bak, bytes } = backup_before_upgrade(&conn, &path, V2) else { panic!("no backup") };
+        assert!(bytes > 0);
+        assert_eq!(ids_in(&bak), ["a", "b"]);
+        drop(writer);
+    }
+
+    #[test]
+    fn only_the_newest_backup_is_kept_and_a_temp_file_is_never_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        drop(open_store(&path, V2).unwrap());
+        // A crash mid-copy left a partial temp file of a later version.
+        std::fs::write(dir.path().join("sessions.db.pre-0.15.0.bak.tmp"), b"partial").unwrap();
+        let (baks, tmps) = backup_files(&path);
+        assert_eq!(baks.len(), 1, "the temp file isn't a backup");
+        assert_eq!(tmps.len(), 1);
+        drop(open_store(&path, "0.15.0").unwrap());
+        assert_eq!(backups(dir.path()), ["sessions.db.pre-0.15.0.bak"], "older pruned, temp gone");
+        assert_eq!(ids_in(&dir.path().join("sessions.db.pre-0.15.0.bak")), ["a"]);
+    }
+
+    /// A backup that can't be written doesn't stop the open, isn't recorded
+    /// (so the next launch retries), and the retry, which postdates this
+    /// version's migrations, keeps the older backup.
+    #[test]
+    fn a_failed_backup_never_stops_the_open_and_is_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = existing_store(dir.path(), V1);
+        drop(open_store(&path, V2).unwrap());
+        // The temp path is taken by a directory: the copy fails.
+        let blocker = dir.path().join("sessions.db.pre-0.15.0.bak.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"x").unwrap();
+        let conn = open_store(&path, "0.15.0").expect("the open goes on");
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_VERSION).unwrap().as_deref(), Some(V2), "not recorded");
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_MISSED).unwrap().as_deref(), Some("0.15.0"));
+        assert_eq!(ids_in(&path), ["a"], "the store works");
+        assert_eq!(backups(dir.path()), ["sessions.db.pre-0.14.0.bak", "sessions.db.pre-0.15.0.bak.tmp"]);
+        drop(conn);
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        let conn = open_store(&path, "0.15.0").unwrap();
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_VERSION).unwrap().as_deref(), Some("0.15.0"));
+        assert_eq!(meta_get_conn(&conn, META_BACKUP_MISSED).unwrap(), None);
+        assert_eq!(
+            backups(dir.path()),
+            ["sessions.db.pre-0.14.0.bak", "sessions.db.pre-0.15.0.bak"],
+            "the older, pre-migration backup is kept"
+        );
     }
 }

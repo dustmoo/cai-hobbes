@@ -21,7 +21,7 @@
 //! a user message (`deliver_queued_relay`). Progress notes are appended
 //! quietly. A wake never resets the receiver's turn count (max-turns still
 //! apply), never runs while it has a call waiting on approval (the relay is
-//! appended and the next approved turn sees it), and in the Heartbeat session
+//! appended and the next approved turn sees it), and in the Hobbes session
 //! respects the Heartbeat's wake budget.
 //!
 //! **Guards.** [`RELAYS_PER_HOUR`] per link per direction; a turn a relay
@@ -358,19 +358,14 @@ pub struct Delivered {
     pub woke: bool,
 }
 
-/// Make sure `id` is in memory (it may be a closed tab); false when gone.
-fn ensure_hydrated(mut state: Signal<SessionState>, id: &str) -> bool {
-    if state.peek().sessions.contains_key(id) {
-        return true;
-    }
-    match crate::session_store::load_session(id) {
-        Some(session) => {
-            state.write().sessions.insert(id.to_string(), session);
-            true
-        }
-        None => false,
-    }
+/// Whether a worker whose link names `linked_parent` belongs to `parent`:
+/// the same chat, or `linked_parent` is a rotated-out system session whose
+/// successor is `parent` (`system_sessions::current_for`) — the successor
+/// carries the archive's worker list.
+fn parent_matches(linked_parent: &str, parent: &str) -> bool {
+    linked_parent == parent || crate::system_sessions::current_for(linked_parent) == parent
 }
+
 
 /// A worker's name on the link: its to-do's title, else its tab title.
 fn worker_title(planner: &PlannerState, worker: &Session) -> String {
@@ -383,13 +378,14 @@ fn worker_title(planner: &PlannerState, worker: &Session) -> String {
         .unwrap_or_else(|| worker.display_title())
 }
 
-/// Whether a wake into the Heartbeat session fits its budget (always true
-/// for any other session).
+/// Whether a wake into the Hobbes session (an unattended turn there, under
+/// the Heartbeat's rules) fits the Heartbeat's budget (always true for any
+/// other session).
 fn heartbeat_budget_allows(settings: &Settings, receiver: &str, now: DateTime<Utc>) -> bool {
-    let hb = crate::heartbeat::HEARTBEAT.peek();
-    if hb.session_id.as_deref() != Some(receiver) {
+    if !crate::system_sessions::is_current(receiver) {
         return true;
     }
+    let hb = crate::heartbeat::HEARTBEAT.peek();
     let budget = crate::heartbeat::budget::Budget::from_settings(settings);
     let spent = crate::heartbeat::budget::spent_since(
         &hb.trail,
@@ -415,7 +411,8 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
             Err(e) => return Err(e),
         }
     };
-    if !ensure_hydrated(session_state, out.to) {
+    // The receiver may be a closed tab.
+    if !SessionState::ensure_hydrated(session_state, out.to) {
         return Err("the other chat no longer exists".to_string());
     }
     // The edge itself, re-checked at delivery whatever the caller resolved.
@@ -432,7 +429,7 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
         let linked = worker
             .dispatch_link
             .as_ref()
-            .is_some_and(|l| l.parent_session_id == parent.id);
+            .is_some_and(|l| parent_matches(&l.parent_session_id, &parent.id));
         if !linked {
             return Err("those chats aren't linked by a dispatch".to_string());
         }
@@ -492,14 +489,15 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
     if wake {
         // Delivered by the background chat queue once the receiver is idle
         // (see `deliver_queued_relay`); the tab is reopened so the turn has
-        // somewhere visible to run. The Heartbeat stays out of the strip.
+        // somewhere visible to run. The Hobbes tab stays out of the strip
+        // (its turns run in the background, like a wake).
         crate::components::chat_queue::queue_push(
             &mut crate::components::chat_queue::CHAT_QUEUE.write(),
             out.to,
             crate::components::chat_queue::QueuedMessage::relay(incoming),
         );
         crate::components::chat_queue::request_drain();
-        if crate::heartbeat::HEARTBEAT.peek().session_id.as_deref() != Some(out.to) {
+        if !crate::system_sessions::is_current(out.to) {
             crate::request_tab_reopen(out.to);
         }
     } else {
@@ -508,6 +506,10 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
             crate::session_events::SessionEvent::Relay { message: incoming },
         );
     }
+    // The receiver now holds whatever the sender had read (the flow guard
+    // follows the data, hobbes_tabs::carry_sender_reads).
+    let settings = sig.settings.peek().clone();
+    crate::hobbes_tabs::carry_sender_reads(session_state, &settings, out.from, out.to, now);
     record_send(&mut guard(), out.from, out.to, now);
     SessionState::save_signal(&session_state, None);
     Ok(Delivered { woke: wake })
@@ -531,8 +533,16 @@ pub fn deliver_queued_relay(
         let Some(s) = state.sessions.get(session_id) else {
             return false;
         };
-        crate::heartbeat::wake::has_pending_approval(&s.messages)
-            || crate::agent_time_runtime::continuation_blocked(
+        // The Heartbeat's rule (`approval_blocks_wake`): a call waiting in
+        // the latest turn, or a recent unattended one. An unanswered
+        // approval further back is a dead bubble, and counting it would
+        // silence every relay into this chat for good (the Hobbes tab
+        // shares one long history).
+        crate::heartbeat::wake::approval_blocks_wake(
+            &s.messages,
+            Utc::now(),
+            chrono::Duration::hours(crate::session_rotation::APPROVAL_STALE_HOURS),
+        ) || crate::agent_time_runtime::continuation_blocked(
                 planner,
                 &crate::agent_time_runtime::LEASED_CHATS.peek(),
                 session_id,
@@ -642,11 +652,12 @@ fn message_parent(sig: RelaySignals, args: &serde_json::Value, session_id: &str)
         RelayKind::Result => auto_continue,
         _ => false,
     };
+    let parent = crate::system_sessions::current_for(&link.parent_session_id);
     let delivered = deliver(
         sig,
         Outgoing {
             from: session_id,
-            to: &link.parent_session_id,
+            to: &parent,
             direction: RelayDirection::ToParent,
             kind,
             text,
@@ -743,7 +754,7 @@ fn message_worker(sig: RelaySignals, args: &serde_json::Value, session_id: &str)
         let parent = state.sessions.get(session_id).ok_or("this chat isn't loaded")?;
         resolve_worker(&state, &sig.planner.peek(), parent, reference)?
     };
-    if !ensure_hydrated(sig.session_state, &worker) {
+    if !SessionState::ensure_hydrated(sig.session_state, &worker) {
         return Err("that worker's chat no longer exists".to_string());
     }
     let link = sig
@@ -752,7 +763,7 @@ fn message_worker(sig: RelaySignals, args: &serde_json::Value, session_id: &str)
         .sessions
         .get(&worker)
         .and_then(|s| s.dispatch_link.clone())
-        .filter(|l| l.parent_session_id == session_id)
+        .filter(|l| parent_matches(&l.parent_session_id, session_id))
         .ok_or("that chat isn't one of this chat's workers")?;
     if !todo_open(&sig.planner.peek(), link.todo_id.as_deref()) {
         return Err("that worker's to-do is closed".to_string());
@@ -845,11 +856,12 @@ pub fn send_completion_report(sig: RelaySignals, worker: &str) -> bool {
     };
     set_link(sig.session_state, worker, DispatchLink { report_sent: true, ..link.clone() });
     let wake = sig.settings.peek().dispatch_auto_continue;
+    let parent = crate::system_sessions::current_for(&link.parent_session_id);
     match deliver(
         sig,
         Outgoing {
             from: worker,
-            to: &link.parent_session_id,
+            to: &parent,
             direction: RelayDirection::ToParent,
             kind: RelayKind::Report,
             text,
@@ -866,11 +878,86 @@ pub fn send_completion_report(sig: RelaySignals, worker: &str) -> bool {
     }
 }
 
-/// A chat's turn ended: send its completion report if it is a finished
-/// worker, and forget what started the turn.
+/// A chat's turn ended: settle its to-do if it is a dispatched worker, send
+/// its completion report if that finished it, and forget what started the
+/// turn. Runs after the turn's Fleet report, so the live row is current.
 pub fn on_turn_complete(sig: RelaySignals, session_id: &str) {
+    settle_worker_todo(sig, session_id);
     send_completion_report(sig, session_id);
     clear_turn_origin(session_id);
+}
+
+/// What a chat worker's ended turn says about its run, when the Fleet has no
+/// row for it (the bridge is off): waiting on its own timer is still working,
+/// a held approval or a closing question waits on the person, anything else
+/// has finished.
+pub fn turn_end_signal_from_session(session: &Session) -> crate::todo::lanes::WorkerSignal {
+    use crate::todo::lanes::{WorkerSignal, WorkerStatus};
+    let turn_start = session
+        .messages
+        .iter()
+        .rposition(crate::voice::transcript::starts_turn)
+        .unwrap_or(0);
+    let held = crate::heartbeat::wake::has_pending_approval(&session.messages[turn_start..]);
+    let ask = crate::fleet::bridge::latest_turn_ask(&session.messages);
+    let (status, attention_message) = if session.next_pending_timer().is_some() {
+        (WorkerStatus::Working, None)
+    } else if held || ask.is_some() {
+        (WorkerStatus::WaitingOnUser, ask)
+    } else {
+        (WorkerStatus::Idle, None)
+    };
+    WorkerSignal {
+        status,
+        ended: false,
+        gate: None,
+        attention_message,
+        attention_at: None,
+        brief: None,
+        worker_name: session.display_title(),
+        idle_settled: status == WorkerStatus::Idle,
+    }
+}
+
+/// Re-read a dispatched chat worker's to-do state at its turn end, instead
+/// of waiting for a periodic sync to notice the worker went quiet. Uses the
+/// live Fleet row when there is one (it carries the brief's open item),
+/// else the session itself. Persists what changed.
+pub fn settle_worker_todo(sig: RelaySignals, worker: &str) {
+    let signal = {
+        let state = sig.session_state.peek();
+        let Some(session) = state.sessions.get(worker) else {
+            return;
+        };
+        let Some(link) = session.dispatch_link.as_ref().filter(|l| !l.report_sent) else {
+            return;
+        };
+        let open = link
+            .todo_id
+            .as_deref()
+            .and_then(|id| sig.planner.peek().todo(id).map(|t| !t.status.is_closed()))
+            .unwrap_or(false);
+        if !open {
+            return;
+        }
+        let now = Utc::now();
+        crate::fleet::shared()
+            .snapshot()
+            .sessions
+            .get(worker)
+            .map(|row| crate::todo::handlers::worker_signal_from_fleet(row, now))
+            .unwrap_or_else(|| turn_end_signal_from_session(session))
+    };
+    let mut planner = sig.planner;
+    let changed = crate::todo::handlers::apply_signal_to_linked(&mut planner.write(), worker, &signal, Utc::now());
+    let p = planner.peek();
+    for id in &changed {
+        if let Some(t) = p.todo(id) {
+            if let Err(e) = crate::todo::store::save_todo(t) {
+                tracing::error!("dispatch relay: to-do persist failed: {e}");
+            }
+        }
+    }
 }
 
 /// Workers owing a report, skipping any still mid-turn (their turn end
@@ -1078,6 +1165,91 @@ mod tests {
             let ctx = test_ctx_with(planner, Settings::default());
             let d = crate::todo::dispatch::dispatch_to_chat(ctx, &id, Default::default()).unwrap();
             assert!(ctx.session_state.peek().sessions.get(&d.session_id).unwrap().dispatch_link.is_none());
+        });
+    }
+
+    /// A completed Puget read, stamped `pg`.
+    fn puget_read() -> crate::components::chat::Message {
+        let mut tc = crate::components::shared::ToolCall::new(
+            "composio-native:Puget".into(),
+            "GMAIL_FETCH_EMAILS".into(),
+            serde_json::json!({}),
+            None,
+            None,
+        );
+        tc.profile_id = Some("pg".into());
+        tc.status = ToolCallStatus::Completed;
+        tc.completed_at = Some(Utc::now());
+        let mut m = crate::voice::session::transcript_message(true, "x");
+        m.author = "Hobbes".into();
+        m.content = MessageContent::ToolCall(tc);
+        m
+    }
+
+    fn reads_of(ctx: &BuiltinToolCtx, sid: &str) -> std::collections::BTreeSet<String> {
+        let settings = ctx.settings.peek().clone();
+        crate::mcp::manager::profile_reach::session_read_profiles(&settings, &ctx.session_state.peek().sessions[sid], Utc::now())
+    }
+
+    /// The two-hop route: a chat that read Puget hands content on (dispatch,
+    /// relay either way, completion report) and the receiver inherits Puget
+    /// as a source, so its own carry into Clearmirror is held. The hand-off
+    /// itself is never held.
+    #[test]
+    fn a_hand_off_carries_the_senders_reads() {
+        run!({
+            // Dispatch: the worker inherits what the parent read.
+            let mut planner = PlannerState::default();
+            let todo = Todo::new("Puget follow-up", 1.0);
+            let todo_id = todo.id.clone();
+            planner.todos.push(todo);
+            let mut ctx = test_ctx_with(planner, two_way());
+            let parent = ctx.session_state.write().create_session_raw(None);
+            ctx.session_state.write().sessions.get_mut(&parent).unwrap().messages.push(puget_read());
+            let d = crate::todo::dispatch::dispatch_to_chat(
+                ctx,
+                &todo_id,
+                crate::todo::dispatch::ChatDispatchOpts { parent_session_id: Some(&parent), ..Default::default() },
+            )
+            .unwrap();
+            crate::components::chat_queue::CHAT_QUEUE.write().clear();
+            assert!(reads_of(&ctx, &d.session_id).contains("pg"), "the worker holds Puget data now");
+            // …so its carry into Clearmirror is held.
+            let settings = Settings::default();
+            let none = Vec::new();
+            let policy = crate::mcp::manager::profile_flow::FlowPolicy::new(&settings, &none);
+            let cm = crate::mcp::manager::profile_reach::ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
+            let hold = crate::mcp::manager::profile_flow::flow_hold(
+                crate::mcp::manager::profile_flow::FlowClass::Carry,
+                Some(&cm),
+                Some(&cm),
+                &reads_of(&ctx, &d.session_id),
+                true,
+                &policy,
+                &[cm.clone()],
+            );
+            assert!(hold.is_some_and(|h| h.rule_key == "profile-flow:v2:pg>cm"));
+
+            // Relay worker → parent: the parent inherits the worker's reads.
+            let (ctx, parent, worker, _, _) = linked(two_way());
+            assert!(ctx.session_state.peek().sessions[&parent].carried_reads.is_empty());
+            let mut state_sig = ctx.session_state;
+            state_sig.write().sessions.get_mut(&worker).unwrap().messages.push(puget_read());
+            let (st, _) = handle_message_parent(ctx, &serde_json::json!({"text": "found it", "kind": "progress"}), &worker);
+            assert_eq!(st, ToolCallStatus::Completed, "the relay itself is never held");
+            assert!(reads_of(&ctx, &parent).contains("pg"));
+
+            // Relay parent → worker: the sibling worker inherits too.
+            let (ctx, parent, _, sibling, _) = linked(two_way());
+            let mut state_sig = ctx.session_state;
+            state_sig.write().sessions.get_mut(&parent).unwrap().messages.push(puget_read());
+            let (st, msg) = handle_message_worker(
+                ctx,
+                &serde_json::json!({"text": "use these numbers", "worker": sibling}),
+                &parent,
+            );
+            assert_eq!(st, ToolCallStatus::Completed, "{msg}");
+            assert!(reads_of(&ctx, &sibling).contains("pg"));
         });
     }
 
@@ -1302,9 +1474,9 @@ mod tests {
             // Mid-turn workers are left to their turn end.
             assert!(reports_due(&ctx.session_state.peek(), &ctx.planner.peek(), &[worker.clone()].into()).is_empty());
 
-            on_turn_complete(ctx.into(), &worker);
             sweep_completion_reports(ctx.into(), &HashSet::new());
             on_turn_complete(ctx.into(), &worker);
+            sweep_completion_reports(ctx.into(), &HashSet::new());
             let q = queued_relays(&parent);
             assert_eq!(q.len(), 1, "once");
             assert_eq!(q[0].kind, RelayKind::Report);
@@ -1319,6 +1491,66 @@ mod tests {
             assert!(send_completion_report(ctx.into(), &worker));
             assert!(queued_relays(&parent).is_empty());
             assert_eq!(relays(&ctx, &parent)[0].kind, RelayKind::Report);
+        });
+    }
+
+    fn push_reply(ctx: &mut BuiltinToolCtx, session: &str, text: &str) {
+        ctx.session_state.write().sessions.get_mut(session).unwrap().messages.push(Message {
+            id: uuid::Uuid::new_v4(),
+            author: "Hobbes".into(),
+            content: MessageContent::Text {
+                content: text.into(),
+                thought_signature: None,
+                thought_summary: None,
+                signature_provider: None,
+            },
+            attachments: vec![],
+            comments: vec![],
+            created_at: Utc::now(),
+            usage: None,
+        });
+    }
+
+    #[test]
+    fn a_worker_turn_end_settles_its_todo_and_reports_at_once() {
+        run!({
+            let (mut ctx, parent, worker, _, todo_id) = linked(Settings::default());
+            push_reply(&mut ctx, &worker, "Raised the foundation base by 0.2m; tested in VR.");
+            on_turn_complete(ctx.into(), &worker);
+            let t = ctx.planner.peek().todo(&todo_id).unwrap().clone();
+            assert_eq!(t.status, crate::todo::model::TodoStatus::Completed, "a clean finish closes (default)");
+            let q = queued_relays(&parent);
+            assert_eq!(q.len(), 1, "reported at the turn end, no settle wait");
+            assert!(q[0].text.contains("(completed)"), "{}", q[0].text);
+        });
+    }
+
+    #[test]
+    fn a_worker_turn_that_asks_or_waits_is_not_finished() {
+        run!({
+            let (mut ctx, parent, worker, _, todo_id) = linked(Settings::default());
+            push_reply(&mut ctx, &worker, "I found two venues. Which one should I book?");
+            on_turn_complete(ctx.into(), &worker);
+            let t = ctx.planner.peek().todo(&todo_id).unwrap().clone();
+            assert!(!t.status.is_closed());
+            assert_eq!(t.agent_state, Some(AgentState::NeedsYou));
+            assert!(queued_relays(&parent).is_empty(), "a question is not a finish");
+        });
+    }
+
+    #[test]
+    fn turn_end_signal_reads_timer_ask_and_finish() {
+        use crate::todo::lanes::WorkerStatus;
+        run!({
+            let (mut ctx, _, worker, _, _) = linked(Settings::default());
+            push_reply(&mut ctx, &worker, "Done.");
+            let sig = turn_end_signal_from_session(ctx.session_state.peek().sessions.get(&worker).unwrap());
+            assert_eq!(sig.status, WorkerStatus::Idle);
+            assert!(sig.idle_settled);
+            push_reply(&mut ctx, &worker, "Should I also update the docs?");
+            let sig = turn_end_signal_from_session(ctx.session_state.peek().sessions.get(&worker).unwrap());
+            assert_eq!(sig.status, WorkerStatus::WaitingOnUser);
+            assert!(!sig.idle_settled);
         });
     }
 

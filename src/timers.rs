@@ -85,6 +85,41 @@ pub enum WakeCondition {
     WorkerDone { todo_id: String },
 }
 
+// ── Scheduler wake-ups ──────────────────────────────────────────────────────
+//
+// The scheduler (main.rs) sleeps until the next pending deadline, and wakes
+// early when something it judges may have changed: a to-do was saved (a
+// `until_worker_done` condition may now be met) or a timer was created.
+
+static CHECK: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Longest the scheduler sleeps between checks: a backstop for a change that
+/// never asked for a check.
+pub const MAX_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ask the scheduler to look at its timers now. Cheap; coalesces.
+pub fn request_check() {
+    CHECK.notify_one();
+}
+
+/// How long the scheduler may sleep: until the earliest pending deadline,
+/// capped at [`MAX_CHECK_INTERVAL`]. Pure.
+pub fn next_check_in<'a>(timers: impl Iterator<Item = &'a ScheduledTimer>, now: DateTime<Utc>) -> std::time::Duration {
+    timers
+        .filter(|t| t.status == TimerStatus::Pending)
+        .map(|t| (t.fire_at - now).to_std().unwrap_or_default())
+        .min()
+        .map_or(MAX_CHECK_INTERVAL, |d| d.min(MAX_CHECK_INTERVAL))
+}
+
+/// Sleep for `max`, or less if a check is requested meanwhile.
+pub async fn wait_for_check(max: std::time::Duration) {
+    tokio::select! {
+        _ = CHECK.notified() => {}
+        _ = tokio::time::sleep(max) => {}
+    }
+}
+
 impl ScheduledTimer {
     /// A pending timer whose fire time has arrived.
     pub fn is_due(&self, now: DateTime<Utc>) -> bool {
@@ -337,6 +372,19 @@ mod tests {
             fired_at: None,
             fire_cause: None,
         }
+    }
+
+    #[test]
+    fn the_scheduler_sleeps_until_the_next_deadline() {
+        let now = Utc::now();
+        assert_eq!(next_check_in([].iter(), now), MAX_CHECK_INTERVAL, "nothing pending");
+        let soon = timer(now + chrono::Duration::seconds(7), TimerStatus::Pending);
+        let later = timer(now + chrono::Duration::hours(2), TimerStatus::Pending);
+        let fired = timer(now + chrono::Duration::seconds(1), TimerStatus::Fired);
+        assert_eq!(next_check_in([&later, &soon, &fired].into_iter(), now), std::time::Duration::from_secs(7));
+        assert_eq!(next_check_in([&later].into_iter(), now), MAX_CHECK_INTERVAL, "capped");
+        let overdue = timer(now - chrono::Duration::seconds(3), TimerStatus::Pending);
+        assert_eq!(next_check_in([&overdue].into_iter(), now), std::time::Duration::ZERO);
     }
 
     #[test]

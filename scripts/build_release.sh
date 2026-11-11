@@ -113,6 +113,10 @@ else
     echo "  ⏭️ NSFaceIDUsageDescription already present"
 fi
 
+# Microphone permission string (macOS kills an app that touches the mic without it)
+/usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription Hobbes listens while you talk to it in a voice conversation." "$PLIST" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string Hobbes listens while you talk to it in a voice conversation." "$PLIST"
+
 # Set LSMinimumSystemVersion to match MACOSX_DEPLOYMENT_TARGET (required for arm64-only builds)
 /usr/libexec/PlistBuddy -c "Set :LSMinimumSystemVersion 12.0" "$PLIST" 2>/dev/null || \
     /usr/libexec/PlistBuddy -c "Add :LSMinimumSystemVersion string 12.0" "$PLIST"

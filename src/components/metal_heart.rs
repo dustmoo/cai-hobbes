@@ -1,13 +1,7 @@
-//! Polished-steel heart that stands in for the Heartbeat session's tab emoji.
+//! Polished-steel heart: the Hobbes tab's Heartbeat badge
+//! (`hobbes_icon`), and the icon of pre-merge Heartbeat archives.
 
 use dioxus::prelude::*;
-
-/// The dedicated Heartbeat chat session's id, as a memo: a component that
-/// reads it re-renders when the id is first assigned, not on every write to
-/// the Heartbeat state (the runtime writes it every tick).
-pub fn use_heartbeat_session_id() -> Memo<Option<String>> {
-    use_memo(|| crate::heartbeat::HEARTBEAT.read().session_id.clone())
-}
 
 #[component]
 pub fn MetalHeart(#[props(default = 13)] size: u32) -> Element {

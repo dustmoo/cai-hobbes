@@ -182,6 +182,19 @@ impl<'a> PromptBuilder<'a> {
                     .map(|tool| ToolDefinition::from_mcp(tool, crate::mcp::manager::HOBBES_CORE_SERVER)),
             );
         }
+        // The Hobbes tab reading other conversations (hobbes_tabs): offered
+        // only to the live Hobbes session, whatever the setting says (with it
+        // off, each call asks the person). Fixed definitions, so the cached
+        // tool prefix never changes with the setting.
+        tools.retain(|t: &ToolDefinition| !crate::hobbes_tabs::is_tab_tool(&t.name));
+        let tab_tools_offered = crate::hobbes_tabs::tab_tools_offered(&self.session.id);
+        if tab_tools_offered {
+            tools.extend(
+                crate::mcp::core_client::CoreClient::tab_tools()
+                    .iter()
+                    .map(|tool| ToolDefinition::from_mcp(tool, crate::mcp::manager::HOBBES_CORE_SERVER)),
+            );
+        }
         let mut tools = sort_and_dedupe_tools(tools);
         // HOBBES_DISPATCH names the models the user allows for a chat worker.
         // Derived from settings only (sorted), so the cached prefix holds.
@@ -383,6 +396,16 @@ impl<'a> PromptBuilder<'a> {
             );
         }
 
+        // Whether the tab tools need the person's approval: a live key (not
+        // in STABLE_CONTEXT_KEYS), so flipping the setting reaches the model
+        // through the context ledger instead of rewriting the cached prefix.
+        if tab_tools_offered {
+            system_context_map.insert(
+                "other_tabs".to_string(),
+                json!(crate::hobbes_tabs::context_note(self.settings.hobbes_read_tabs)),
+            );
+        }
+
         // Check for fully configured Composio profiles and inject context
         if self
             .settings
@@ -390,23 +413,46 @@ impl<'a> PromptBuilder<'a> {
             .iter()
             .any(|p| p.is_fully_configured())
         {
-            let profile_id = self
-                .session
-                .composio_profile
-                .as_deref()
-                .or(self.settings.active_composio_profile.as_deref());
-            let active_profile_name = profile_id
-                .and_then(|id| self.settings.profile_name_for_id(id))
-                .unwrap_or("Default");
-
-            system_context_map.insert(
-                "composio_context".to_string(),
-                json!({
-                    "info": "You have access to external tools via Composio. Integrations are managed through 'Profiles'.",
-                    "active_profile": active_profile_name,
-                    "instruction": format!("The currently active profile determining your available tool connections is: '{}'.", active_profile_name)
-                })
-            );
+            // The turn's scope, as dispatch uses (profile_reach::turn_scope),
+            // so the prompt never names a profile the tab's calls don't run in.
+            let scope = crate::mcp::manager::profile_reach::turn_scope(self.settings, self.session);
+            let active_profile_name = scope.home_name().unwrap_or("none");
+            let reach = &scope.reach;
+            if reach.len() > 1 {
+                let others: Vec<&str> = reach[1..].iter().map(|p| p.name.as_str()).collect();
+                system_context_map.insert(
+                    "composio_context".to_string(),
+                    json!({
+                        "info": "You have access to external tools via Composio. Each profile is a separate organisation's connected accounts.",
+                        "home_profile": active_profile_name,
+                        "reachable_profiles": others,
+                        "instruction": crate::mcp::manager::profile_reach::reach_instruction(active_profile_name, &others),
+                    })
+                );
+            } else if scope.home.is_none() {
+                let why = if scope.pin_removed() {
+                    "This chat's Composio profile was removed"
+                } else {
+                    "This chat has no Composio profile"
+                };
+                system_context_map.insert(
+                    "composio_context".to_string(),
+                    json!({
+                        "info": "Integrations are managed through Composio 'Profiles'.",
+                        "active_profile": serde_json::Value::Null,
+                        "instruction": format!("{why}, so no profile is active: Composio tool calls will be refused until the person picks a profile on the profile chip. Don't try to work around it."),
+                    })
+                );
+            } else {
+                system_context_map.insert(
+                    "composio_context".to_string(),
+                    json!({
+                        "info": "You have access to external tools via Composio. Integrations are managed through 'Profiles'.",
+                        "active_profile": active_profile_name,
+                        "instruction": format!("The currently active profile determining your available tool connections is: '{}'.", active_profile_name)
+                    })
+                );
+            }
         }
 
         // Extract active skill context from messages and inject into system instruction

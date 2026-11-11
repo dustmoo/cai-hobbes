@@ -43,6 +43,12 @@ fn create_test_session() -> Session {
         context_ledger: Vec::new(),
         dispatch_link: None,
         dispatched_workers: Vec::new(),
+        carried_reads: Vec::new(),
+        profile_reach: Vec::new(),
+        profile_locked: false,
+        allowed_flows: Vec::new(),
+        summary_sources: Vec::new(),
+        turn_origin: Default::default(),
     }
 }
 
@@ -86,6 +92,76 @@ fn test_composio_context_injected_when_profile_is_fully_configured() {
         full_text.contains("external tools via Composio"),
         "System prompt should explain Composio"
     );
+}
+
+/// Multi-profile reach: an ordinary tab reaches every set-up profile by
+/// default, so the prompt carries the reach instruction; a tab locked to its
+/// home (or with no other set-up profile) gets the single-profile prompt.
+#[test]
+fn test_ordinary_tab_reach_is_open_unless_locked() {
+    use crate::settings::ComposioProfile;
+    let profile = |id: &str, name: &str| ComposioProfile {
+        id: id.to_string(),
+        name: name.to_string(),
+        user_id: Some("u".to_string()),
+        api_key: Some("k".to_string()),
+        ..Default::default()
+    };
+    let settings = Settings {
+        composio_profiles: vec![profile("cm", "Clearmirror"), profile("pg", "Puget")],
+        active_composio_profile: Some("cm".to_string()),
+        ..Default::default()
+    };
+    let system = |settings: &Settings, locked: bool| {
+        let mut session = create_test_session();
+        session.composio_profile = Some("cm".to_string());
+        session.profile_locked = locked;
+        PromptBuilder::new(&session, settings).build_prompt("Hello".to_string()).prompt.system.unwrap()
+    };
+    let mut single = settings.clone();
+    single.composio_profiles.truncate(1);
+    for plain in [system(&settings, true), system(&single, false)] {
+        assert!(plain.contains("The currently active profile determining your available tool connections is: 'Clearmirror'"));
+        assert!(!plain.contains("hobbes_profile"));
+        assert!(!plain.contains("reachable_profiles"));
+    }
+    let reach = system(&settings, false);
+    assert!(reach.contains("Your home profile is 'Clearmirror'"));
+    assert!(reach.contains("reachable_profiles"));
+    assert!(reach.contains("Puget"));
+}
+
+/// The profile the prompt names for a tab whose profile doesn't resolve:
+/// a pin naming a removed profile, or no pin and a dangling global id.
+#[test]
+fn test_prompt_profile_when_the_tab_profile_does_not_resolve() {
+    use crate::settings::ComposioProfile;
+    let settings = |active: &str| Settings {
+        composio_profiles: vec![ComposioProfile {
+            id: "cm".to_string(),
+            name: "Clearmirror".to_string(),
+            user_id: Some("u".to_string()),
+            api_key: Some("k".to_string()),
+            ..Default::default()
+        }],
+        active_composio_profile: Some(active.to_string()),
+        ..Default::default()
+    };
+    let system = |pin: Option<&str>, active: &str| {
+        let mut session = create_test_session();
+        session.composio_profile = pin.map(str::to_string);
+        PromptBuilder::new(&session, &settings(active)).build_prompt("Hello".to_string()).prompt.system.unwrap()
+    };
+    // Pinned to a removed profile: no profile is active (it used to say
+    // 'Default'), and never the global one.
+    let removed = system(Some("gone"), "cm");
+    assert!(removed.contains("profile was removed, so no profile is active"), "{removed}");
+    assert!(!removed.contains("'Default'") && !removed.contains("'Clearmirror'"), "{removed}");
+    // Unpinned, the global id dangling: no profile (it used to say 'Default').
+    let dangling = system(None, "gone");
+    assert!(dangling.contains("has no Composio profile, so no profile is active"), "{dangling}");
+    // Unpinned, the global id valid.
+    assert!(system(None, "cm").contains("connections is: 'Clearmirror'"));
 }
 
 #[test]
@@ -339,6 +415,11 @@ fn tool_call_msg(tool_name: &str, response: String, result_summary: Option<Strin
             model: None,
             round_id: None,
             cancelled: None,
+            hold_reason: None,
+            hold_rule_key: None,
+            risk_reason: None,
+            read_sources: Vec::new(),
+            origin: None,
         }),
         attachments: vec![],
         comments: vec![],
@@ -3081,6 +3162,28 @@ fn briefing_lists_changes_to_dispatched_work() {
 }
 
 #[test]
+fn a_rotated_session_s_predecessor_work_is_not_work_it_dispatched() {
+    use super::briefing::turn_briefing_in;
+    let session = create_test_session();
+    let prior = finished_turn_at(utc(0));
+    let lineage = vec!["old_session".to_string(), "test_session".to_string()];
+    // The predecessor's own to-do (it was the worker): not dispatched work.
+    let mut own = hb_event("worker_done", "Agent finished \"old own task\"", utc(70));
+    own.session_id = Some("old_session".into());
+    // A run the predecessor dispatched: still this chat's dispatched work.
+    let mut ran = hb_event("run_ended", "Fleet: dispatched run before rotation ended", utc(80));
+    ran.dispatched_from = Some("old_session".into());
+    let b = turn_briefing_in(&session, &lineage, &prior, &[own.clone(), ran], fixed_clock(120));
+    assert_eq!(
+        b,
+        format!("{BRIEFING_HEADER}\nWork you dispatched: Fleet: dispatched run before rotation ended ({}).", hhmm(utc(80)))
+    );
+    // Without the lineage the predecessor's own work would leak in.
+    assert!(turn_briefing_in(&session, &["test_session".to_string()], &prior, &[own], fixed_clock(120))
+        .contains("old own task"));
+}
+
+#[test]
 fn dispatched_work_rides_the_boundary_tail_and_replays_unchanged() {
     let mut sim = briefing_sim(LlmProvider::Claude);
     let last = utc(sim.clock);
@@ -3356,4 +3459,109 @@ fn relay_tools_are_offered_only_on_a_link() {
     session.dispatched_workers.push("w".into());
     assert!(names(&session, DispatchRelayMode::Report).is_empty());
     assert_eq!(names(&session, DispatchRelayMode::TwoWay), vec!["HOBBES_MESSAGE_WORKER"]);
+}
+
+/// The tab tools ride only on the live Hobbes session; the setting reaches
+/// the model as a live key, never through the cached system prefix or the
+/// tool definitions.
+#[test]
+fn tab_tools_are_offered_only_in_the_hobbes_session_and_the_setting_stays_out_of_the_prefix() {
+    let tab_names = |r: &super::system_context::SystemContextResult| -> Vec<String> {
+        r.tools.iter().map(|t| t.name.clone()).filter(|n| crate::hobbes_tabs::is_tab_tool(n)).collect()
+    };
+    let session = create_test_session();
+    let off = Settings::default();
+    let on = Settings { hobbes_read_tabs: true, ..Settings::default() };
+    // An ordinary chat: neither tool, no note.
+    let plain = PromptBuilder::new(&session, &on).build_system_context();
+    assert!(tab_names(&plain).is_empty());
+    assert!(!plain.volatile.contains_key("other_tabs"));
+
+    crate::system_sessions::set_current(&session.id);
+    let asks = PromptBuilder::new(&session, &off).build_system_context();
+    let free = PromptBuilder::new(&session, &on).build_system_context();
+    assert_eq!(tab_names(&asks), vec!["HOBBES_TAB_LIST", "HOBBES_TAB_READ"]);
+    assert_eq!(tab_names(&free), tab_names(&asks));
+    // Same prefix and tool definitions either way ...
+    assert_eq!(asks.system, free.system);
+    let defs = |r: &super::system_context::SystemContextResult| {
+        r.tools.iter().filter(|t| crate::hobbes_tabs::is_tab_tool(&t.name)).map(|t| format!("{t:?}")).collect::<Vec<_>>()
+    };
+    assert_eq!(defs(&asks), defs(&free));
+    // ... and the live note says whether it asks.
+    assert!(asks.volatile["other_tabs"].as_str().unwrap().contains("asks the user first"));
+    assert!(!free.volatile["other_tabs"].as_str().unwrap().contains("asks the user first"));
+    assert!(!asks.system.contains("other_tabs"));
+}
+
+// =========================================================================
+// Voice transcript lines in the model's view
+// =========================================================================
+
+fn hobbes_text_msg(text: &str) -> Message {
+    let mut m = user_text_msg(text);
+    m.author = "Hobbes".to_string();
+    m
+}
+
+fn prompt_texts(session: &Session) -> Vec<(ChatRole, String)> {
+    let settings = Settings::default();
+    let prompt = PromptBuilder::new(session, &settings).build_prompt(String::new());
+    prompt
+        .prompt
+        .messages
+        .iter()
+        .map(|m| {
+            let t = m
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            (m.role.clone(), t)
+        })
+        .collect()
+}
+
+#[test]
+fn spoken_line_after_reply_is_dropped_from_model_view() {
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg(&crate::voice::brain::framed_request("status?")),
+        hobbes_text_msg("All green."),
+        hobbes_text_msg("🔊 Everything is green."),
+        user_text_msg("thanks"),
+    ];
+    let texts = prompt_texts(&session);
+    assert!(texts.iter().all(|(_, t)| !t.contains("Everything is green")));
+    assert!(texts.iter().any(|(r, t)| *r == ChatRole::Assistant && t == "All green."));
+    // The frame of the current request is still sent.
+    assert!(texts.iter().any(|(_, t)| t.contains("[Voice request, relayed")));
+}
+
+#[test]
+fn standalone_spoken_line_becomes_labelled_context_not_assistant() {
+    let mut session = create_test_session();
+    session.messages = vec![
+        user_text_msg("🎙 hello"),
+        hobbes_text_msg("🔊 Which project?"),
+        user_text_msg("🎙 the website"),
+    ];
+    let texts = prompt_texts(&session);
+    assert!(texts.iter().any(|(r, t)| *r != ChatRole::Assistant && t == "[Hobbes' voice said aloud: Which project?]"));
+    assert!(texts.iter().all(|(r, _)| *r != ChatRole::Assistant));
+    assert_eq!(texts.last().map(|(r, _)| r.clone()), Some(ChatRole::System)); // tail, as ever
+}
+
+#[test]
+fn chat_without_voice_lines_is_unchanged_by_spoken_handling() {
+    let mut session = create_test_session();
+    session.messages = vec![user_text_msg("hi"), hobbes_text_msg("hello"), user_text_msg("again")];
+    let texts = prompt_texts(&session);
+    assert_eq!(texts[0], (ChatRole::User, "hi".to_string()));
+    assert_eq!(texts[1], (ChatRole::Assistant, "hello".to_string()));
+    assert_eq!(texts[2], (ChatRole::User, "again".to_string()));
 }

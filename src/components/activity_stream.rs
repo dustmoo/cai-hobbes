@@ -1657,6 +1657,11 @@ mod tests {
             model: None,
             round_id: None,
             cancelled: None,
+            hold_reason: None,
+            hold_rule_key: None,
+            risk_reason: None,
+            read_sources: Vec::new(),
+            origin: None,
         }
     }
 
@@ -2236,6 +2241,7 @@ mod tests {
                 color: color.to_string(),
                 chrome_profile_directory: None,
                 retained_curation: Default::default(),
+                personal: false,
             });
         settings
     }

@@ -245,17 +245,27 @@ pub fn dispatch_to_chat(
     // profile (else the global default), as every UI path that opens a tab
     // does. A tab with no profile would see every profile's Composio tools,
     // which collide by name ("Duplicate function declaration").
-    let profile = opts
-        .profile
-        .clone()
-        .or_else(|| opts.parent_session_id.and_then(|pid| {
-            deps.session_state
-                .peek()
-                .sessions
-                .get(pid)
-                .and_then(|s| s.composio_profile.clone())
-        }))
-        .or_else(|| deps.settings.peek().get_active_profile().map(|p| p.id.clone()));
+    //
+    // The dispatching tab's profile is its current turn's resolved scope
+    // (profile_reach::turn_scope) — not its raw pin, and not the global
+    // profile, which follows focus. A tab whose profile was removed can't
+    // hand work on: the worker would have nowhere legitimate to run.
+    let parent_scope = opts.parent_session_id.and_then(|pid| {
+        let settings = deps.settings.peek();
+        deps.session_state
+            .peek()
+            .sessions
+            .get(pid)
+            .map(|s| crate::mcp::manager::profile_reach::turn_scope(&settings, s))
+    });
+    if opts.profile.is_none() && parent_scope.as_ref().is_some_and(|s| s.pin_removed()) {
+        return Err("this tab's Composio profile was removed — pick one on the profile chip before dispatching".to_string());
+    }
+    let profile = match (&opts.profile, &parent_scope) {
+        (Some(p), _) => Some(p.clone()),
+        (None, Some(scope)) => scope.home_id().map(str::to_string),
+        (None, None) => deps.settings.peek().get_active_profile().map(|p| p.id.clone()),
+    };
     let new_id = {
         let mut state = deps.session_state.write();
         // create_session makes the new tab the active session; an unfocused
@@ -287,6 +297,12 @@ pub fn dispatch_to_chat(
     let linked = opts
         .parent_session_id
         .is_some_and(|parent| crate::todo::relay::record_link(deps.session_state, parent, &new_id, todo_id));
+    // The assignment may carry what the dispatching chat read: the worker
+    // inherits those sources (hobbes_tabs::carry_sender_reads).
+    if let Some(parent) = opts.parent_session_id {
+        let settings = deps.settings.peek().clone();
+        crate::hobbes_tabs::carry_sender_reads(deps.session_state, &settings, parent, &new_id, chrono::Utc::now());
+    }
     crate::session::SessionState::save_signal(&deps.session_state, None);
     let model = {
         let settings = deps.settings.peek();
@@ -315,7 +331,7 @@ pub fn dispatch_to_chat(
     crate::components::chat_queue::queue_push(
         &mut crate::components::chat_queue::CHAT_QUEUE.write(),
         &new_id,
-        crate::components::chat_queue::QueuedMessage::new(prompt, vec![]),
+        crate::components::chat_queue::QueuedMessage::new(prompt, vec![], crate::components::chat_queue::QueueOrigin::Unattended),
     );
     // Every worker gets a tab, through the reopen set rather than the
     // single `chat_command` slot: a turn that dispatches twice would
@@ -378,11 +394,13 @@ pub fn handle_dispatch(
                 .peek()
                 .resolve_dispatch_profile(args.get("profile").and_then(|v| v.as_str()))
                 .map_err(|e| format!("Not dispatched: {e}."))?;
-            // New tab, project-tagged, pinned, linked, seeded, focused.
+            // New tab, project-tagged, pinned, linked, seeded; focused
+            // unless the person turned that off.
+            let focus = deps.settings.peek().dispatch_focus_tab;
             let d = dispatch_to_chat(
                 deps,
                 todo_id,
-                ChatDispatchOpts { instructions, choice, parent_session_id, profile, focus: true },
+                ChatDispatchOpts { instructions, choice, parent_session_id, profile, focus },
             )?;
             Ok(format!(
                 "Dispatched '{}' to a new chat tab (session {}) on {}{}. The assignment \
@@ -702,6 +720,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_focus_setting_decides_whether_a_chat_dispatch_switches_tabs() {
+        let mut dom = dioxus::prelude::VirtualDom::new(|| {
+            let spawner = RecordingSpawner(Default::default());
+            for focus in [true, false] {
+                let (planner, id) = planner_with("Draft the release notes");
+                let mut settings = settings_with_profiles();
+                settings.dispatch_focus_tab = focus;
+                let mut ctx = test_ctx_with(planner, settings);
+                let here = ctx.session_state.write().create_session_raw(None);
+                ctx.session_state.write().active_session_id = here.clone();
+                handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&here)).unwrap();
+                let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
+                if focus {
+                    assert_eq!(
+                        *ctx.chat_command.peek(),
+                        Some(crate::components::chat_input::ChatCommand::SwitchToSession(sid))
+                    );
+                } else {
+                    assert_eq!(ctx.session_state.peek().active_session_id, here, "focus stays put");
+                    assert_eq!(*ctx.chat_command.peek(), None, "no tab switch");
+                }
+            }
+            dioxus::prelude::rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    #[test]
     fn a_chat_dispatch_runs_under_the_chosen_profile() {
         let mut dom = dioxus::prelude::VirtualDom::new(|| {
             let spawner = RecordingSpawner(Default::default());
@@ -728,6 +774,26 @@ pub(crate) mod tests {
             handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&parent)).unwrap();
             let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
             assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-cm"));
+
+            // Omitted, an unpinned parent whose global profile moved with
+            // focus mid-turn: the profile its turn started in.
+            let (planner, id) = planner_with("Pull the ClearMirror numbers");
+            let mut ctx = test_ctx_with(planner, settings_with_profiles());
+            let parent = ctx.session_state.write().create_session_raw(None);
+            crate::mcp::manager::profile_reach::begin_turn(&ctx.settings.peek(), &ctx.session_state.peek().sessions[&parent]);
+            ctx.settings.write().active_composio_profile = Some("p-puget".into());
+            handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&parent)).unwrap();
+            let sid = ctx.planner.peek().todo(&id).unwrap().linked_fleet_session.clone().unwrap();
+            assert_eq!(ctx.session_state.peek().sessions[&sid].composio_profile.as_deref(), Some("p-cm"));
+
+            // Omitted, the parent's profile removed: refused, nothing opened.
+            let (planner, id) = planner_with("Anything");
+            let mut ctx = test_ctx_with(planner, settings_with_profiles());
+            let parent = ctx.session_state.write().create_session_raw(Some("p-gone".into()));
+            let err = handle_dispatch(ctx, &serde_json::json!({"todo_id": id, "target": "chat"}), &spawner, Some(&parent))
+                .unwrap_err();
+            assert!(err.contains("profile was removed"), "{err}");
+            assert_eq!(ctx.session_state.peek().sessions.len(), 1, "no tab opened");
 
             // Unknown, or choice turned off: refused, nothing opened.
             let mut off = settings_with_profiles();

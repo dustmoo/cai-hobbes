@@ -64,15 +64,19 @@ pub struct SalienceCtx {
     pub intention_todo_ids: HashSet<String>,
     /// To-dos the Heartbeat itself dispatched.
     pub heartbeat_todo_ids: HashSet<String>,
-    /// The dedicated Heartbeat chat session, once it exists — runs
+    /// The Hobbes session (where wakes run), once it exists — runs
     /// dispatched from it count as the Heartbeat's own.
     pub heartbeat_session_id: Option<String>,
+    /// The Hobbes session's rotated-out archives, the pre-merge Heartbeat
+    /// and Voice sessions included (`system_sessions::lineage`): runs
+    /// dispatched from them before a rotation are still its own.
+    pub heartbeat_archived_ids: HashSet<String>,
     /// Projects with open agent-lane work (see [`agent_project_ids`]).
     pub agent_project_ids: HashSet<String>,
     /// `dispatch_auto_continue`: a finished run already hands its result
-    /// back to the chat that dispatched it, the Heartbeat session included.
+    /// back to the chat that dispatched it, the Hobbes session included.
     pub dispatch_auto_continue: bool,
-    /// To-dos whose Hobbes chat workers report back into the Heartbeat
+    /// To-dos whose Hobbes chat workers report back into the Hobbes
     /// session by dispatch relay (`todo::relay::relayed_todo_ids`): their
     /// completion report already starts a turn there.
     pub relayed_todo_ids: HashSet<String>,
@@ -104,15 +108,23 @@ impl SalienceCtx {
         }
     }
 
-    /// A run the Heartbeat session dispatched, whose result the auto-continue
+    /// A run the Hobbes session dispatched, whose result the auto-continue
     /// already delivers to it: a wake on top would be a second turn.
     fn continued_into_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
-        self.dispatch_auto_continue
-            && self.heartbeat_session_id.is_some()
-            && ev.dispatched_from == self.heartbeat_session_id
+        self.dispatch_auto_continue && self.dispatched_by_heartbeat(ev)
     }
 
-    /// A chat worker the Heartbeat session dispatched, whose completion the
+    /// Dispatched from the Hobbes session — the current one or any it
+    /// rotated out of (by a wake, a voice request or a typed turn alike:
+    /// it is one timeline).
+    fn dispatched_by_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
+        let Some(from) = ev.dispatched_from.as_deref() else {
+            return false;
+        };
+        self.heartbeat_session_id.as_deref() == Some(from) || self.heartbeat_archived_ids.contains(from)
+    }
+
+    /// A chat worker the Hobbes session dispatched, whose completion the
     /// dispatch relay already reports to it: a wake on top would be a
     /// second, unbudgeted turn.
     fn relayed_into_heartbeat(&self, ev: &HeartbeatEvent) -> bool {
@@ -124,7 +136,7 @@ impl SalienceCtx {
         ev.todo_id
             .as_ref()
             .is_some_and(|t| self.intention_todo_ids.contains(t) || self.heartbeat_todo_ids.contains(t))
-            || (self.heartbeat_session_id.is_some() && ev.dispatched_from == self.heartbeat_session_id)
+            || self.dispatched_by_heartbeat(ev)
     }
 }
 
@@ -167,8 +179,8 @@ pub trait Salience {
 /// | 2 | `worker_needs_you`, `worker_stuck`, `decision_raised` | WakeNow |
 /// | 3 | `ci_failed` on a project with open agent work | WakeNow  |
 /// | 4 | `ci_failed` elsewhere                         | Queue    |
-/// | 4b | `run_ended` from the Heartbeat session while auto-continue hands the result back | Note |
-/// | 4c | `worker_done` / `worker_review` for a chat worker that reports into the Heartbeat session by dispatch relay | Note |
+/// | 4b | `run_ended` from the Hobbes session while auto-continue hands the result back | Note |
+/// | 4c | `worker_done` / `worker_review` for a chat worker that reports into the Hobbes session by dispatch relay | Note |
 /// | 5 | `worker_done` / `worker_review` / `run_ended` / `session_needs_attention` the Heartbeat awaits (pending intention on the to-do, a to-do it dispatched, or a run from its own session) | WakeNow |
 /// | 6 | `worker_done`, `worker_review`, `session_needs_attention` | Queue |
 /// | 7 | `run_ended` (the dispatching chat is continued anyway) | Note |
@@ -358,16 +370,33 @@ mod tests {
         ctx.dispatch_auto_continue = true;
         assert_eq!(choice(&r, &ctx), Choice::Note);
         ctx.dispatch_auto_continue = false;
-        // No Heartbeat session: a run with no parent is not "awaited".
+        // No Hobbes session: a run with no parent is not "awaited".
         r.dispatched_from = None;
         ctx.heartbeat_session_id = None;
         assert_eq!(choice(&r, &ctx), Choice::Note);
     }
 
     #[test]
+    fn work_dispatched_before_a_rotation_is_still_the_heartbeat_s() {
+        let mut r = ev(EventSource::Fleet, KIND_RUN_ENDED, Urgency::Low);
+        r.dispatched_from = Some("hb-old".into());
+        let mut ctx = SalienceCtx { heartbeat_session_id: Some("hb-new".into()), ..Default::default() };
+        assert_eq!(choice(&r, &ctx), Choice::Note, "not its own until the lineage is known");
+        ctx.heartbeat_archived_ids.insert("hb-old".into());
+        assert_eq!(choice(&r, &ctx), Choice::WakeNow);
+        // Auto-continue hands the result to the successor already.
+        ctx.dispatch_auto_continue = true;
+        assert_eq!(choice(&r, &ctx), Choice::Note);
+        // Another chat's run is still not the Heartbeat's.
+        ctx.dispatch_auto_continue = false;
+        r.dispatched_from = Some("a-chat".into());
+        assert_eq!(choice(&r, &ctx), Choice::Note);
+    }
+
+    #[test]
     fn a_relayed_worker_s_completion_is_noted_not_woken() {
         // The Heartbeat dispatched a chat worker; its completion report
-        // reaches the Heartbeat session by relay, so worker_done must not
+        // reaches the Hobbes session by relay, so worker_done must not
         // wake it a second time. A worker that needs the person still wakes.
         let mut ctx = SalienceCtx::default();
         ctx.heartbeat_todo_ids.insert("t".into());

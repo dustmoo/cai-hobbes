@@ -279,8 +279,9 @@ pub struct FleetSession {
 pub enum Disposition {
     /// Working now (foreground, background, or on its own timer).
     Active,
-    /// Waiting on an answer: a permission gate, or a finished turn whose
-    /// brief names what it's blocked on.
+    /// Waiting on an answer: a permission gate or another hook-raised
+    /// question, or a finished turn whose brief names what it's blocked on
+    /// (that last kind only until [`PARKED_ENDS_AFTER_HOURS`] of quiet).
     Decision,
     /// Finished its turn, prompt open, nothing asked.
     Parked,
@@ -288,7 +289,12 @@ pub enum Disposition {
     Ended,
 }
 
-/// A parked session quiet this long reads as ended.
+/// A parked session quiet this long reads as ended. A question the brief
+/// read into the transcript decays on the same clock: half a day without
+/// the session moving means the person dealt with it elsewhere or let it
+/// go, and a stale ask must not hold "Needs you" forever. Questions a hook
+/// raised (gates, permission and input prompts) never decay — Claude Code
+/// is provably still waiting on those.
 pub const PARKED_ENDS_AFTER_HOURS: i64 = 12;
 
 /// Notification kinds that ask nothing of the person: Claude Code's
@@ -325,21 +331,32 @@ impl FleetSession {
         if self.ended_at.is_some() {
             return false;
         }
+        self.hook_asks() || self.brief_asks()
+    }
+
+    /// A question Claude Code itself is holding open: a pending gate, a
+    /// permission request, or a notification that asks (not a bare idle
+    /// prompt). Exempt from decay.
+    fn hook_asks(&self) -> bool {
         if self.pending_gate.is_some() {
             return true;
         }
         match &self.status {
             FleetStatus::NeedsAttention(AttentionKind::Gate) => true,
-            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message })
-                if !is_parked_notification(kind, message) =>
-            {
-                true
-            }
-            FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) | FleetStatus::Idle => {
-                self.blocked_on().is_some()
+            FleetStatus::NeedsAttention(AttentionKind::Notification { kind, message }) => {
+                !is_parked_notification(kind, message)
             }
             _ => false,
         }
+    }
+
+    /// A finished turn (idle or at the idle prompt) whose current brief
+    /// names what it's blocked on.
+    fn brief_asks(&self) -> bool {
+        matches!(
+            self.status,
+            FleetStatus::Idle | FleetStatus::NeedsAttention(AttentionKind::Notification { .. })
+        ) && self.blocked_on().is_some()
     }
 
     /// What the session asks, in words, when [`Self::asks_person`]: the
@@ -374,11 +391,15 @@ impl FleetSession {
         ) {
             return Disposition::Active;
         }
-        if self.asks_person() {
+        if self.hook_asks() {
             return Disposition::Decision;
         }
+        // Brief-derived questions decay with the parked clock.
         if now - self.last_event_at >= chrono::Duration::hours(PARKED_ENDS_AFTER_HOURS) {
             return Disposition::Ended;
+        }
+        if self.brief_asks() {
+            return Disposition::Decision;
         }
         Disposition::Parked
     }
@@ -508,8 +529,14 @@ pub struct FleetState {
 }
 
 impl FleetState {
+    /// Sessions that need the person now ([`Disposition::Decision`]) — the
+    /// same rule the Fleet view's "Needs you" group counts by.
     pub fn attention_count(&self) -> usize {
-        self.sessions.values().filter(|s| s.asks_person()).count()
+        let now = Utc::now();
+        self.sessions
+            .values()
+            .filter(|s| s.disposition(now) == Disposition::Decision)
+            .count()
     }
 }
 
@@ -787,6 +814,13 @@ pub fn reduce_with_prompt(
             session.pending_gate = None;
             session.attention_at = None;
             session.active_prompt = prompt_id.map(str::to_string);
+            // The user just answered whatever the last brief asked: its
+            // blocker belongs to a turn that is over. Cleared in the row
+            // itself (not only hidden by the dirty mark), so no reader —
+            // and no later clear of the dirty mark — can resurrect it.
+            if let Some(b) = session.brief.as_mut() {
+                b.blocked_on = None;
+            }
         }
         FleetEvent::SubagentStop { background_tasks, .. }
             if *background_tasks == 0 && session.status == FleetStatus::WorkingBackground =>
@@ -874,11 +908,16 @@ pub fn note_transcript_and_dirty(
     now: DateTime<Utc>,
 ) {
     // PromptSubmit dirties too: the user answering is exactly when blockers
-    // die, so the next brief should regenerate against the fresh turn.
-    let mark_dirty = matches!(
-        ev,
-        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. }
-    );
+    // die, so the next brief should regenerate against the fresh turn. So
+    // does a compaction restart: the transcript the old brief read from was
+    // just summarised away.
+    let mark_dirty = match ev {
+        FleetEvent::Stop { .. } | FleetEvent::SessionEnd { .. } | FleetEvent::PromptSubmit { .. } => {
+            true
+        }
+        FleetEvent::SessionStart { source, .. } => source == "compact",
+        _ => false,
+    };
     let path = transcript_path.filter(|p| !p.is_empty());
     if !mark_dirty && path.is_none() {
         return;
@@ -898,6 +937,21 @@ pub fn note_transcript_and_dirty(
     }
     for row in changed.iter_mut().filter(|r| r.id == ev.session_id()) {
         apply(row);
+    }
+}
+
+/// Clear a session's dirty mark when no new brief replaces the old one
+/// (unreadable transcript, empty digest, unusable reply). The dirty mark is
+/// what hid the old brief's blocker ([`FleetSession::blocked_on`]); clearing
+/// it alone would bring a question from before the latest turn back. So the
+/// blocker goes with it. A dirty mark newer than `started_at` (a turn that
+/// raced in) is left alone.
+pub fn clear_dirty_without_brief(s: &mut FleetSession, started_at: DateTime<Utc>) {
+    if s.brief_dirty_at.is_none_or(|d| d <= started_at) {
+        s.brief_dirty_at = None;
+        if let Some(b) = s.brief.as_mut() {
+            b.blocked_on = None;
+        }
     }
 }
 
@@ -1009,9 +1063,11 @@ pub fn sweep_stale(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSessi
 
 /// Retirement sweep: Idle sessions silent past [`RETIRE_MINUTES`] leave the
 /// live map with `ended_at` set to their last event (no span is open — the
-/// stale→Idle sweep or a Stop closed it long before). Working and
-/// needs-attention sessions are exempt: work proves itself with events, and
-/// attention must never fall off the board unanswered.
+/// stale→Idle sweep or a Stop closed it long before). Working sessions and
+/// those that ask the person something ([`FleetSession::asks_person`]) are
+/// exempt: work proves itself with events, and a question must never fall
+/// off the board unanswered. A bare `idle_prompt` (Claude Code's nudge after
+/// every finished turn) asks nothing, so it retires like Idle.
 pub fn sweep_retired(state: &mut FleetState, now: DateTime<Utc>) -> Vec<FleetSession> {
     sweep_retired_after(state, now, retire_minutes())
 }
@@ -1026,7 +1082,14 @@ pub fn sweep_retired_after(
     let retire: Vec<String> = state
         .sessions
         .values()
-        .filter(|s| s.status == FleetStatus::Idle && s.last_event_at < cutoff)
+        .filter(|s| {
+            let parked = match &s.status {
+                FleetStatus::Idle => true,
+                FleetStatus::NeedsAttention(AttentionKind::Notification { .. }) => !s.asks_person(),
+                _ => false,
+            };
+            parked && s.last_event_at < cutoff
+        })
         .map(|s| s.id.clone())
         .collect();
     let mut rows = Vec::new();
@@ -1069,8 +1132,10 @@ pub fn dismiss_in_state(state: &mut FleetState, session_id: &str) -> Option<Flee
 // the sweep runs on a plain tokio task with no Signal access.
 
 /// How long a finished dispatched run waits for its closing brief before the
-/// continuation fires anyway. The brief supervisor debounces on
-/// [`briefs::BRIEF_QUIET_SECS`]; the extra margin covers the LLM call itself.
+/// continuation fires anyway (the brief-never-comes fallback: briefs off, no
+/// connector, generation failing). Normally the brief lands well inside it —
+/// the supervisor is woken at once for a dispatched run's final brief — and
+/// the sweep runs the moment it does ([`FleetShared::set_brief`]).
 pub const DISPATCH_CONTINUE_GRACE_SECS: i64 = briefs::BRIEF_QUIET_SECS + 30;
 
 /// Supervisor mirror of `settings.dispatch_auto_continue` (the sweep has no
@@ -1123,6 +1188,40 @@ fn dispatch_done_at(s: &FleetSession) -> Option<DateTime<Utc>> {
     // actually completed.
     s.brief_dirty_at
         .or_else(|| s.brief.as_ref().map(|b| b.generated_at))
+}
+
+/// Is this dispatched run finished and still owed its hand-back to the parent
+/// chat? The brief supervisor shortens its quiet period for these rows
+/// ([`briefs::DISPATCH_BRIEF_QUIET_SECS`]) so the continuation carries a
+/// brief without waiting out the per-turn debounce.
+/// Nothing is owed while `dispatch_auto_continue` is off: no continuation
+/// fires then, so `continuation_sent` never latches, and a run would
+/// otherwise keep the short brief debounce (and a hand-back timer per Stop)
+/// for every turn of its life.
+pub fn awaiting_dispatch_handback(s: &FleetSession) -> bool {
+    owes_dispatch_handback(s, dispatch_auto_continue())
+}
+
+/// [`awaiting_dispatch_handback`] with the setting passed in (pure).
+pub fn owes_dispatch_handback(s: &FleetSession, auto_continue: bool) -> bool {
+    auto_continue && dispatch_done_at(s).is_some()
+}
+
+/// The instant a finished dispatched run's continuation fires even without
+/// a closing brief: its finish time plus [`DISPATCH_CONTINUE_GRACE_SECS`].
+/// `None` when the row owes no continuation (or auto-continue is off). The
+/// ingest path arms a one-shot sweep for this instant, so the fallback
+/// doesn't wait for the 60 s tick.
+pub fn dispatch_continue_deadline(s: &FleetSession) -> Option<DateTime<Utc>> {
+    dispatch_continue_deadline_with(s, dispatch_auto_continue())
+}
+
+/// [`dispatch_continue_deadline`] with the setting passed in (pure).
+pub fn dispatch_continue_deadline_with(s: &FleetSession, auto_continue: bool) -> Option<DateTime<Utc>> {
+    if !auto_continue {
+        return None;
+    }
+    dispatch_done_at(s).map(|done| done + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
 }
 
 /// The message the parent chat receives. First person to Hobbes, so the
@@ -1198,7 +1297,7 @@ pub fn sweep_dispatch_continuations(
             run_session_id: s.id.clone(),
             todo_id: s.dispatched_todo.clone(),
             session_name: s.display_name().to_string(),
-            progress: brief.map(briefs::progress_line),
+            progress: brief.map(|b| briefs::progress_line(b, s.blocked_on())),
         })
     };
 
@@ -1368,6 +1467,16 @@ pub struct FleetShared {
     /// Filled by the server's sweep (a plain tokio task), taken by the UI
     /// drain loop in `main.rs` — the one place that may touch the chat queue.
     continuations: Mutex<Vec<PendingContinuation>>,
+    /// Serialises [`Self::run_dispatch_continuations`]. Ended rows are read
+    /// from the store before the state lock and latched in the store after
+    /// it, so two overlapping runs could both see an unlatched ended row;
+    /// this lock closes that window. Lock order: `continuation_sweep` →
+    /// `state` → `continuations`. Never taken while `state` is held.
+    continuation_sweep: Mutex<()>,
+    /// Wakes the brief supervisor (`main.rs`) ahead of its tick when a
+    /// dispatched run finishes. A `notify_one` with no waiter stores a
+    /// permit, so a wake during an in-flight generation is not lost.
+    brief_wake: tokio::sync::Notify,
 }
 
 impl Default for FleetShared {
@@ -1383,7 +1492,55 @@ impl FleetShared {
             gates: Mutex::new(HashMap::new()),
             notify: tokio::sync::watch::channel(0).0,
             continuations: Mutex::new(Vec::new()),
+            continuation_sweep: Mutex::new(()),
+            brief_wake: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Wake the brief supervisor now instead of at its next tick.
+    pub fn wake_briefs(&self) {
+        self.brief_wake.notify_one();
+    }
+
+    /// Resolves when [`Self::wake_briefs`] is called (or a stored wake
+    /// permit is pending).
+    pub async fn briefs_woken(&self) {
+        self.brief_wake.notified().await;
+    }
+
+    /// Hand finished dispatched runs back to their parent chats: sweep the
+    /// live map plus today's ended store rows, latch what fired (live rows
+    /// persisted, ended rows merged in the store), queue the continuations
+    /// for the UI drain loop and poke. Returns whether anything fired.
+    ///
+    /// Event-driven (a brief landing, the post-finish grace timer) with the
+    /// server's 60 s sweep as backstop. Safe to call from anywhere that holds
+    /// no fleet lock: runs are serialised and the `continuation_sent` latch
+    /// is set under the state lock, so no run is delivered twice. A run that
+    /// finished before the last local midnight is stale news and drops.
+    pub fn run_dispatch_continuations(&self) -> bool {
+        if !dispatch_auto_continue() {
+            return false;
+        }
+        let _serial = self
+            .continuation_sweep
+            .lock()
+            .expect("fleet continuation sweep lock poisoned");
+        let ended = store::sessions_active_on(chrono::Local::now().date_naive());
+        let sweep = {
+            let mut state = self.state.lock().expect("fleet state lock poisoned");
+            sweep_dispatch_continuations(&mut state, &ended, Utc::now(), true)
+        };
+        if sweep.is_empty() {
+            return false;
+        }
+        store::persist_sessions(&sweep.live_rows);
+        for id in &sweep.ended_ids {
+            store::merge_session(id, |row| row.continuation_sent = true);
+        }
+        self.push_continuations(sweep.continuations);
+        self.poke();
+        true
     }
 
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
@@ -1524,10 +1681,25 @@ impl FleetShared {
             Some(row) => {
                 store::persist_sessions(std::slice::from_ref(&row));
                 self.poke();
+                // The closing brief a finished dispatched run was waiting on:
+                // hand it back now rather than at the next sweep tick.
+                if awaiting_dispatch_handback(&row) {
+                    self.run_dispatch_continuations();
+                }
                 true
             }
             None => false,
         }
+    }
+
+    /// A LIVE session's current blocker, through [`FleetSession::blocked_on`]
+    /// (`None` when the brief was overtaken or the session left the map).
+    pub fn blocked_on_of(&self, session_id: &str) -> Option<String> {
+        let state = self.state.lock().expect("fleet state lock poisoned");
+        state
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.blocked_on().map(str::to_string))
     }
 
     /// Refresh a LIVE session's Claude Code title (event-ingest path — no
@@ -1555,14 +1727,15 @@ impl FleetShared {
 
     /// Clear a LIVE session's dirty mark without writing a brief (unreadable
     /// transcript, empty digest) so the supervisor doesn't spin on it. Same
-    /// `started_at` race rule as [`Self::set_brief`]. Returns false when the
-    /// session isn't in the live map.
+    /// `started_at` race rule as [`Self::set_brief`]. The old brief's
+    /// blocker goes too ([`clear_dirty_without_brief`]). Returns false when
+    /// the session isn't in the live map.
     pub fn clear_brief_dirty(&self, session_id: &str, started_at: DateTime<Utc>) -> bool {
         let row = {
             let mut state = self.state.lock().expect("fleet state lock poisoned");
             match state.sessions.get_mut(session_id) {
                 Some(s) if s.brief_dirty_at.is_some_and(|d| d <= started_at) => {
-                    s.brief_dirty_at = None;
+                    clear_dirty_without_brief(s, started_at);
                     Some(s.clone())
                 }
                 Some(_) => return true, // newer dirty mark: leave it
@@ -1697,10 +1870,17 @@ mod tests {
         assert_eq!(row(serde_json::json!("Working"), Some("x")).disposition(now), Disposition::Active);
         assert_eq!(row(serde_json::json!("Idle"), None).disposition(now), Disposition::Parked);
 
-        // Parked past the cutoff reads as ended; a question never does.
+        // Parked past the cutoff reads as ended; so does a question the brief
+        // read into the transcript. A hook-raised question never decays.
         let later = utc("2026-10-23T20:00:00Z");
         assert_eq!(row(idle_prompt.clone(), None).disposition(later), Disposition::Ended);
-        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(later), Disposition::Decision);
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(utc("2026-10-23T19:59:00Z")), Disposition::Decision);
+        let much_later = utc("2026-10-23T21:00:00Z");
+        assert_eq!(row(idle_prompt.clone(), Some("pick one")).disposition(much_later), Disposition::Ended);
+        assert_eq!(row(serde_json::json!("Idle"), Some("pick one")).disposition(much_later), Disposition::Ended);
+        let permission_old = serde_json::json!({"NeedsAttention": {"Notification": {"kind": "permission_prompt", "message": "Allow Bash?"}}});
+        assert_eq!(row(permission_old, None).disposition(much_later), Disposition::Decision);
+        assert_eq!(row(serde_json::json!({"NeedsAttention": "Gate"}), None).disposition(much_later), Disposition::Decision);
         let mut ended = row(idle_prompt.clone(), Some("pick one"));
         ended.ended_at = Some(now);
         assert_eq!(ended.disposition(now), Disposition::Ended);
@@ -1842,6 +2022,60 @@ mod tests {
         let text = continuation_text("Ship CSV export", &c.session_name, None);
         assert!(text.contains("has finished"));
         assert!(text.contains("No closing brief was generated"));
+    }
+
+    #[test]
+    fn continue_deadline_is_finish_plus_grace_and_only_while_owed() {
+        let (mut state, stopped) = dispatched_state(Some("parent"));
+        let s = state.sessions.get_mut("run1").unwrap();
+        assert!(awaiting_dispatch_handback(s));
+        assert_eq!(
+            dispatch_continue_deadline(s),
+            Some(stopped + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
+        );
+        // A run that ended keys off its end time.
+        let ended = stopped + chrono::Duration::seconds(3);
+        s.ended_at = Some(ended);
+        assert_eq!(
+            dispatch_continue_deadline(s),
+            Some(ended + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
+        );
+        s.continuation_sent = true;
+        assert_eq!(dispatch_continue_deadline(s), None);
+        assert!(!awaiting_dispatch_handback(s));
+
+        let (state, _) = dispatched_state(None);
+        assert_eq!(dispatch_continue_deadline(&state.sessions["run1"]), None);
+    }
+
+    /// With auto-continue off nothing is ever handed back, so a finished
+    /// dispatched run owes nothing: no short brief debounce, no timer.
+    #[test]
+    fn auto_continue_off_owes_no_handback() {
+        let (state, _) = dispatched_state(Some("parent"));
+        let s = &state.sessions["run1"];
+        assert!(owes_dispatch_handback(s, true));
+        assert!(!owes_dispatch_handback(s, false));
+        assert!(dispatch_continue_deadline_with(s, true).is_some());
+        assert_eq!(dispatch_continue_deadline_with(s, false), None);
+    }
+
+    #[test]
+    fn a_landed_brief_hands_the_run_back_at_once_and_only_once() {
+        let (state, stopped) = dispatched_state(Some("parent"));
+        let shared = FleetShared::new();
+        *shared.state.lock().unwrap() = state;
+        let started = stopped + chrono::Duration::seconds(5);
+        assert!(shared.set_brief("run1", brief_at(started, "Shipped it."), started, None));
+        let queued = shared.take_continuations();
+        assert_eq!(queued.len(), 1, "no wait for the sweep tick");
+        assert_eq!(queued[0].run_session_id, "run1");
+        assert!(queued[0].progress.is_some());
+        assert!(shared.snapshot().sessions["run1"].continuation_sent);
+        // Later sweeps and briefs find the latch set.
+        assert!(!shared.run_dispatch_continuations());
+        shared.set_brief("run1", brief_at(started, "Again."), started, None);
+        assert!(shared.take_continuations().is_empty());
     }
 
     #[test]
@@ -2299,6 +2533,31 @@ mod tests {
             state.sessions.contains_key("stuck-gate"),
             "attention never falls off the board silently"
         );
+    }
+
+    #[test]
+    fn a_bare_idle_prompt_retires_but_a_real_question_does_not() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T09:00:00Z");
+        let notify = |id: &str, kind: &str| FleetEvent::Notification {
+            session_id: id.into(),
+            cwd: "/x".into(),
+            kind: kind.into(),
+            message: "Claude is waiting for your input".into(),
+        };
+        reduce(&mut state, &notify("parked", "idle_prompt"), t0);
+        reduce(&mut state, &notify("asks", "elicitation_dialog"), t0);
+        reduce(&mut state, &notify("parked-asking", "idle_prompt"), t0);
+        state.sessions.get_mut("parked-asking").unwrap().brief = Some(SessionBrief {
+            blocked_on: Some("pick a schema".into()),
+            ..brief_at(t0, "h")
+        });
+
+        let retired = sweep_retired_after(&mut state, t0 + chrono::Duration::minutes(95), 60);
+        let ids: Vec<&str> = retired.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, vec!["parked"]);
+        assert!(state.sessions.contains_key("asks"));
+        assert!(state.sessions.contains_key("parked-asking"), "its brief still asks something");
     }
 
     #[test]
@@ -2905,6 +3164,32 @@ mod tests {
     }
 
     #[test]
+    fn prompt_submit_clears_the_briefs_blocker_in_the_row_it_persists() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-10-23T08:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        reduce(&mut state, &stop("s1"), t0);
+        state.sessions.get_mut("s1").unwrap().brief = Some(SessionBrief {
+            blocked_on: Some("pick a schema".into()),
+            ..brief_at(t0, "h")
+        });
+        assert_eq!(state.sessions["s1"].blocked_on(), Some("pick a schema"));
+        let mut changed = reduce(
+            &mut state,
+            &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() },
+            utc("2026-10-23T08:05:00Z"),
+        );
+        note_transcript_and_dirty(&mut state, &mut changed, &FleetEvent::PromptSubmit { session_id: "s1".into(), cwd: "/x/proj".into() }, None, utc("2026-10-23T08:05:00Z"));
+        assert!(state.sessions["s1"].brief.as_ref().unwrap().blocked_on.is_none());
+        assert!(changed[0].brief.as_ref().unwrap().blocked_on.is_none(), "the persisted clone too");
+        // Even with the dirty mark cleared without a new brief, nothing comes back.
+        let s = state.sessions.get_mut("s1").unwrap();
+        s.brief_dirty_at = None;
+        assert!(s.blocked_on().is_none());
+        assert!(!s.asks_person());
+    }
+
+    #[test]
     fn tool_activity_heartbeat_extends_liveness_and_clears_gates() {
         let mut state = FleetState::default();
         let day = date("2026-08-25");
@@ -2989,6 +3274,23 @@ mod tests {
     }
 
     #[test]
+    fn a_compaction_restart_dirties_the_brief() {
+        let mut state = FleetState::default();
+        let t0 = utc("2026-08-25T10:00:00Z");
+        reduce(&mut state, &start("s1"), t0);
+        let compact = FleetEvent::SessionStart {
+            session_id: "s1".into(),
+            cwd: "/x/proj".into(),
+            source: "compact".into(),
+        };
+        let t1 = t0 + chrono::Duration::minutes(30);
+        let mut changed = reduce(&mut state, &compact, t1);
+        note_transcript_and_dirty(&mut state, &mut changed, &compact, None, t1);
+        assert_eq!(state.sessions["s1"].brief_dirty_at, Some(t1));
+        assert_eq!(changed[0].brief_dirty_at, Some(t1));
+    }
+
+    #[test]
     fn note_transcript_marks_the_removed_row_on_session_end() {
         let mut state = FleetState::default();
         let t0 = utc("2026-08-25T10:00:00Z");
@@ -3046,11 +3348,22 @@ mod tests {
         {
             let mut state = shared.state.lock().unwrap();
             reduce(&mut state, &stop("s1"), t0);
-            state.sessions.get_mut("s1").unwrap().brief_dirty_at = Some(t0);
+            let s = state.sessions.get_mut("s1").unwrap();
+            s.brief_dirty_at = Some(t0);
+            // A brief from before the latest turn, still holding its question.
+            s.brief = Some(SessionBrief {
+                blocked_on: Some("pick a schema".into()),
+                ..brief_at(t0 - chrono::Duration::minutes(5), "h")
+            });
         }
+        assert!(shared.blocked_on_of("s1").is_none(), "hidden while dirty");
         let started = t0 + chrono::Duration::seconds(50);
         assert!(shared.clear_brief_dirty("s1", started));
         assert!(shared.state.lock().unwrap().sessions["s1"].brief_dirty_at.is_none());
+        assert!(
+            shared.blocked_on_of("s1").is_none(),
+            "clearing dirty without a new brief must not resurrect the old blocker"
+        );
 
         // Newer dirty mark stays.
         {

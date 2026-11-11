@@ -142,11 +142,11 @@ pub fn use_hotkey_manager(permission_status: Signal<permissions::PermissionStatu
                 }
                 s if s.starts_with("switch_provider_") => {
                     if let Ok(idx) = s.replace("switch_provider_", "").parse::<usize>() {
-                        // Hotkey index maps to position in the canonical connector list
+                        // Hotkey index maps to position among chat-role connectors (the picker's order)
                         let connector_id = settings
                             .peek()
-                            .llm_connectors
-                            .get(idx)
+                            .chat_connectors()
+                            .nth(idx)
                             .map(|c| c.id.clone());
                         if let Some(id) = connector_id {
                             chat_command.set(Some(ChatCommand::SwitchConnector(id)));

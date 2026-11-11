@@ -125,6 +125,11 @@ mod tests {
                 model: None,
                 round_id: None,
                 cancelled: None,
+                hold_reason: None,
+                hold_rule_key: None,
+                risk_reason: None,
+                read_sources: Vec::new(),
+                origin: None,
             }),
             attachments: vec![],
             comments: vec![],
@@ -165,6 +170,12 @@ mod tests {
             context_ledger: Vec::new(),
             dispatch_link: None,
             dispatched_workers: Vec::new(),
+            carried_reads: Vec::new(),
+            profile_reach: Vec::new(),
+            profile_locked: false,
+            allowed_flows: Vec::new(),
+            summary_sources: Vec::new(),
+            turn_origin: Default::default(),
         }
     }
 

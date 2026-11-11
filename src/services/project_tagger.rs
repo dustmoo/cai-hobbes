@@ -140,6 +140,10 @@ pub fn maybe_auto_tag(
     planner: dioxus::prelude::Signal<crate::todo::PlannerState>,
 ) {
     use dioxus::prelude::{Readable, Writable};
+    // Heartbeat and Voice are part of the app, not topics.
+    if crate::system_sessions::is_system(session_id) {
+        return;
+    }
     let (name, summary) = {
         let state = session_state.peek();
         match state.sessions.get(session_id) {

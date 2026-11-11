@@ -95,6 +95,20 @@ pub(crate) fn turn_briefing(
     heartbeat_events: &[HeartbeatEvent],
     now: DateTime<Local>,
 ) -> String {
+    let lineage = crate::system_sessions::lineage_of(&session.id);
+    turn_briefing_in(session, &lineage, prior, heartbeat_events, now)
+}
+
+/// [`turn_briefing`] with the chat's lineage given: its id and, for a
+/// rotated system session, the sessions it replaced. Events about their own
+/// work aren't "work you dispatched".
+pub(crate) fn turn_briefing_in(
+    session: &Session,
+    lineage: &[String],
+    prior: &[Message],
+    heartbeat_events: &[HeartbeatEvent],
+    now: DateTime<Local>,
+) -> String {
     let Some(last) = previous_turn_at(prior) else {
         return String::new();
     };
@@ -118,11 +132,11 @@ pub(crate) fn turn_briefing(
     let skip = fired.len().saturating_sub(MAX_TIMERS);
     let fired = &fired[skip..];
 
+    let mine = |id: Option<&String>| id.is_some_and(|id| lineage.contains(id));
     let mut dispatched: Vec<&HeartbeatEvent> = heartbeat_events
         .iter()
         .filter(|e| e.at > last && e.at <= now_utc)
-        .filter(|e| e.dispatched_from.as_deref() == Some(session.id.as_str())
-            || e.session_id.as_deref() != Some(session.id.as_str()))
+        .filter(|e| mine(e.dispatched_from.as_ref()) || !mine(e.session_id.as_ref()))
         .collect();
     dispatched.sort_by(|a, b| a.at.cmp(&b.at).then_with(|| a.id.cmp(&b.id)));
     let skip = dispatched.len().saturating_sub(MAX_DISPATCHED);

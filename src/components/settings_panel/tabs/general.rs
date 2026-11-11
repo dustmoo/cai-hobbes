@@ -181,6 +181,7 @@ pub(in super::super) fn GeneralTab(
                                     }
                                 }
                             }
+                            super::ConnectorRoles { ctx }
                             if selected_kind(&local_settings.read(), &selected_connector_id.read()) == Some(crate::settings::LlmProvider::Gemini) {
                                 div {
                                     class: "pl-4 border-l-2 border-subtle",

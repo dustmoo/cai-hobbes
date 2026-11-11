@@ -148,6 +148,28 @@ pub const TIGER_GRID_EARS_UP: [&str; 16] = [
     "................",
 ];
 
+/// Speaking: the ears-up frame with the mouth open — a dark gap between the
+/// mouth corners (row 9) and a sliver below it (row 10). The Hobbes tab
+/// alternates it with [`TIGER_GRID_EARS_UP`] while voice is speaking.
+pub const TIGER_GRID_MOUTH_OPEN: [&str; 16] = [
+    "................",
+    ".soo........oos.",
+    ".osoo......ooso.",
+    ".oooooooooooooo.",
+    ".ossoooooooosso.",
+    ".oooeeooooeeooo.",
+    ".oooeeooooeeooo.",
+    ".ossoccssccosso.",
+    ".ooocccsscccooo.",
+    ".ossccssssccsso.",
+    "...ooccssccoo...",
+    "................",
+    "...bb..bb..bb...",
+    "...bbbbbbbbbb...",
+    "...bb..bb..bb...",
+    "................",
+];
+
 /// Walk a 16×16 grid as `(x, y, cell)`, skipping empty cells. Generic over
 /// the grid so [`HobbesTiger`]/[`HobbesTigerStencil`] (fixed to
 /// [`TIGER_GRID`]) and [`HobbesTigerFrame`] (any grid, for the animated
@@ -480,7 +502,7 @@ mod tests {
 
     #[test]
     fn frame_grids_are_16x16() {
-        for grid in [&TIGER_GRID, &TIGER_GRID_BLINK, &TIGER_GRID_EARS_UP] {
+        for grid in [&TIGER_GRID, &TIGER_GRID_BLINK, &TIGER_GRID_EARS_UP, &TIGER_GRID_MOUTH_OPEN] {
             assert_eq!(grid.len(), 16);
             for row in grid {
                 assert_eq!(row.chars().count(), 16, "row {row:?}");
@@ -493,6 +515,20 @@ mod tests {
         assert_ne!(TIGER_GRID, TIGER_GRID_BLINK);
         assert_ne!(TIGER_GRID, TIGER_GRID_EARS_UP);
         assert_ne!(TIGER_GRID_BLINK, TIGER_GRID_EARS_UP);
+    }
+
+    #[test]
+    fn mouth_open_differs_from_ears_up_only_in_the_mouth_rows() {
+        for (y, (a, b)) in TIGER_GRID_EARS_UP.iter().zip(TIGER_GRID_MOUTH_OPEN.iter()).enumerate() {
+            if y == 9 || y == 10 {
+                assert_ne!(a, b, "row {y} opens the mouth");
+            } else {
+                assert_eq!(a, b, "row {y}");
+            }
+        }
+        for row in TIGER_GRID_MOUTH_OPEN {
+            assert!(row.chars().all(|c| matches!(c, '.' | 'o' | 'c' | 'b' | 's' | 'e')), "row {row:?}");
+        }
     }
 
     #[test]

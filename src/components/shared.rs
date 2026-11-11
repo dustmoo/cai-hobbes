@@ -181,6 +181,44 @@ pub struct ToolCall {
     /// "cancelled" only for these, never for a call still in flight.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled: Option<String>,
+    /// Why Hobbes held this call for approval when it isn't the usual
+    /// permission prompt (e.g. a write crossing company profiles); shown in
+    /// the approval bubble.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
+    /// A flow hold's profile pairs (`profile_flow::pair_key`:
+    /// `profile-flow:v2:{from+from}>{to}`), harness-set, cleared at mint, so
+    /// the bubble can allow exactly those pairs; also the key decisions are
+    /// logged under. Never a trust rule's server. Older rows may carry the
+    /// retired format (`profile-flow:{from}>{to|local}`, `…:act>{to}`),
+    /// which is approved or denied once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_rule_key: Option<String>,
+    /// Who started the turn that minted this call (`Session::turn_origin`),
+    /// stamped by `stream_manager` over whatever the connector built — the
+    /// model can't set it. The scope gates read it on both tool-call paths,
+    /// so an approval resumed later keeps its turn's rules. `None` on
+    /// legacy rows and on calls never stamped (see
+    /// `builtin_tools::effective_origin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::session::TurnOrigin>,
+    /// The Composio profiles whose data a completed `HOBBES_TAB_READ`
+    /// brought into this session (`hobbes_tabs::read_sources`), stamped by
+    /// the harness when the read runs (cleared at mint, so the model can't
+    /// set it). The cross-company hold counts them for as long as this
+    /// message stays in the session, and its summary keeps them
+    /// (`profile_reach::tab_read_sources`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_sources: Vec<String>,
+    /// Why the call risk gate held this call for the person (a verb phrase,
+    /// `call_risk::Risk::Destructive`'s reason, e.g. "erases the whole disk
+    /// /dev/disk10"). Stamped by the harness when the streaming path holds a
+    /// voice or unattended call (`builtin_tools::risk_hold_reason`), cleared
+    /// at mint (`stamp_turn_origin`), never from model output. Shown on the
+    /// approval bubble, which then offers no "always allow"; the voice
+    /// controller finds it with `call_risk::pending_risk_hold`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub risk_reason: Option<String>,
 }
 
 /// Stop reason for a call cut off by the user's Stop.
@@ -259,6 +297,11 @@ impl ToolCall {
             model: None,
             round_id: None,
             cancelled: None,
+            hold_reason: None,
+            hold_rule_key: None,
+            read_sources: Vec::new(),
+            origin: None,
+            risk_reason: None,
         }
     }
 
@@ -352,6 +395,10 @@ pub struct SkillCall {
     pub raw_output: Option<String>, // Clean output for use_result
     #[serde(default)]
     pub profile_color: Option<String>, // Historical profile color for rendering
+    /// The origin of the turn that raised this skill call (harness-set; see
+    /// `ToolCall::origin`). A skill continuation resumes under it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::session::TurnOrigin>,
 }
 
 impl SkillCall {
@@ -368,6 +415,7 @@ impl SkillCall {
             has_scripts: false,
             raw_output: None,
             profile_color: None,
+            origin: None,
         }
     }
 }

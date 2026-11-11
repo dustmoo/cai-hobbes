@@ -16,6 +16,43 @@ use uuid::Uuid;
 
 use crate::processing::summarization_scheduler::SchedulerSignal;
 
+/// The sources a proactive summary of `session` is generated from (taken
+/// before the LLM call; `adopt_summary` unions them in). The durable set:
+/// for a system session only its tab reads and stored summary sources, so
+/// its clocked Composio reads never become permanent holds through the
+/// summary (`profile_reach::durable_summary_sources`).
+pub(crate) fn proactive_summary_sources(session: &crate::session::Session) -> Vec<String> {
+    crate::mcp::manager::profile_reach::durable_summary_sources(session)
+}
+
+/// Sessions whose running turn was asked to stop from outside the tree (a
+/// voice VOICE_CANCEL_BRAIN) at a moment no stream may be registered — the
+/// gap between tool rounds, where `request_stream_cancel` has nothing to
+/// cancel. The continuation flow (`chat.rs` `continue_prompt_flow`) checks
+/// it before starting the next round. Cleared when the turn ends, is
+/// stopped, or a new turn starts (a send, a queue pop).
+static ABORT_TURN: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn with_abort_turn<R>(f: impl FnOnce(&mut HashSet<String>) -> R) -> R {
+    let mut guard = ABORT_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    f(guard.get_or_insert_with(HashSet::new))
+}
+
+/// Ask `session_id`'s running turn not to start another round.
+pub fn request_turn_abort(session_id: &str) {
+    with_abort_turn(|s| s.insert(session_id.to_string()));
+}
+
+/// Consume an abort request for `session_id` (the continuation obeys it).
+pub fn take_turn_abort(session_id: &str) -> bool {
+    with_abort_turn(|s| s.remove(session_id))
+}
+
+/// Drop any abort request for `session_id` (its turn ended, or a new one starts).
+pub fn clear_turn_abort(session_id: &str) {
+    with_abort_turn(|s| s.remove(session_id));
+}
+
 #[derive(Clone, Copy)]
 pub struct StreamManagerContext {
     stream_receivers: Signal<HashMap<Uuid, UnboundedReceiver<StreamMessage>>>,
@@ -47,15 +84,42 @@ pub struct StreamManagerContext {
 }
 
 impl StreamManagerContext {
+    /// Every session with turn machinery in flight: streaming, a stream
+    /// mapped to it (set before `streaming_sessions` on start, and kept
+    /// through the gap before a continuation), a continuation in flight, or
+    /// a proactive summarization running. Reads subscribe the caller (the
+    /// `StreamBridge` mirror for `session_rotation`).
+    pub fn turn_activity(&self) -> HashSet<String> {
+        let mut out = self.streaming_sessions.read().clone();
+        out.extend(self.stream_session_map.read().values().cloned());
+        out.extend(self.summarizing_sessions.read().iter().cloned());
+        out.extend(self.continuation_controller.read().in_flight_sessions());
+        out
+    }
+
+    /// Sessions with a turn in flight, exactly as [`Self::turn_in_flight`]
+    /// judges one (streaming, a stream mapped to it, or a continuation
+    /// between rounds) — without proactive summarization, which runs beside
+    /// a turn and outlives it. Reads subscribe the caller (the `StreamBridge`
+    /// mirror behind `crate::session_turn_in_flight`).
+    pub fn turn_in_flight_sessions(&self) -> HashSet<String> {
+        let mut out = self.streaming_sessions.read().clone();
+        out.extend(self.stream_session_map.read().values().cloned());
+        out.extend(self.continuation_controller.read().in_flight_sessions());
+        out
+    }
+
     /// Report this session's lifecycle into the fleet (no-op while the
     /// bridge is disarmed). Name lookup peeks — never subscribes. Turn
-    /// completions carry the conversation summary so the fleet row gets a
-    /// re-entry brief without any transcript or extra LLM call.
+    /// completions carry a brief: headline from the conversation summary,
+    /// and an ask only when the turn's closing reply ends on a question
+    /// (`bridge::latest_turn_ask`) — never the summary's rolling blockers.
+    /// No transcript and no extra LLM call.
     fn fleet_report(&self, session_id: &str, signal: crate::fleet::bridge::HobbesSignal) {
         if !crate::fleet::bridge::enabled() {
             return;
         }
-        let (name, summary_json, next_timer) = {
+        let (name, summary_json, next_timer, ask) = {
             let state = self.session_state.peek();
             match state.sessions.get(session_id) {
                 Some(s) => {
@@ -64,9 +128,14 @@ impl StreamManagerContext {
                         || !cs.current_task.trim().is_empty())
                     .then(|| serde_json::to_value(cs).ok())
                     .flatten();
-                    (s.display_title(), json, s.next_pending_timer())
+                    (
+                        s.display_title(),
+                        json,
+                        s.next_pending_timer(),
+                        crate::fleet::bridge::latest_turn_ask(&s.messages),
+                    )
                 }
-                None => (String::new(), None, None),
+                None => (String::new(), None, None, None),
             }
         };
         // A turn that ends with a timer pending leaves the tab waiting on
@@ -77,22 +146,33 @@ impl StreamManagerContext {
             }
             other => other,
         };
-        let brief_source = summary_json.clone();
         let is_turn_end = matches!(
             signal,
             crate::fleet::bridge::HobbesSignal::TurnCompleted
                 | crate::fleet::bridge::HobbesSignal::TimerWaiting { .. }
                 | crate::fleet::bridge::HobbesSignal::Closed
         );
-        crate::fleet::bridge::report_with_brief(session_id, &name, signal, summary_json);
+        let is_final = matches!(signal, crate::fleet::bridge::HobbesSignal::Closed);
+        // A closed tab asks nothing; a timer wait or a finished turn asks
+        // what its closing reply asked.
+        let brief = is_turn_end
+            .then(|| {
+                crate::fleet::briefs::hobbes_turn_brief(
+                    summary_json.as_ref(),
+                    ask.filter(|_| !is_final),
+                    chrono::Utc::now(),
+                    is_final,
+                )
+            })
+            .flatten();
+        crate::fleet::bridge::report_turn(session_id, &name, signal, brief.clone());
 
         // Progress flows onto todos linked to THIS chat session too
-        // (display-only, mirroring the transcript-brief path).
+        // (display-only, mirroring the transcript-brief path). The brief was
+        // just built from this turn, so its blocker is current.
         if is_turn_end {
-            if let Some(brief) = brief_source.and_then(|v| {
-                crate::fleet::briefs::brief_from_summary_value(&v, chrono::Utc::now(), false)
-            }) {
-                let line = crate::fleet::briefs::progress_line(&brief);
+            if let Some(brief) = brief {
+                let line = crate::fleet::briefs::progress_line(&brief, brief.blocked_on.as_deref());
                 let mut planner = self.planner_state;
                 let changed = crate::todo::handlers::apply_brief_progress(
                     &mut planner.write(),
@@ -135,6 +215,32 @@ impl StreamManagerContext {
             .read()
             .values()
             .any(|v| v == session_id)
+    }
+
+    /// Mark `session_id` as streaming `message_id`. From here the stream
+    /// maps cover the turn, so a continuation's in-flight guard is released
+    /// now rather than at the stream's end: a stream cut off by Stop never
+    /// reaches `on_complete`, and a guard held until then would leave the
+    /// chat looking busy for good ([`Self::turn_in_flight`]).
+    fn register_stream(&mut self, message_id: Uuid, session_id: &str) {
+        self.streaming_sessions.write().insert(session_id.to_string());
+        self.stream_session_map.write().insert(message_id, session_id.to_string());
+        self.continuation_controller.write().clear_in_flight(session_id);
+        // A message the queue drain handed over has started: release its
+        // guard here, not only from the drain's backlog loop (which skips a
+        // session whose queue this pop emptied).
+        crate::components::chat_queue::release_dispatch(session_id);
+    }
+
+    /// Whether any part of a turn is in flight for `session_id`: streaming,
+    /// a stream mapped to it, or a continuation between rounds (the gap
+    /// after a tool round, while the next prompt is built). A new send must
+    /// wait for all of these, or two turns interleave. Peeks: no
+    /// subscription.
+    pub fn turn_in_flight(&self, session_id: &str) -> bool {
+        self.streaming_sessions.peek().contains(session_id)
+            || self.stream_session_map.peek().values().any(|v| v == session_id)
+            || self.continuation_controller.peek().is_in_flight(session_id)
     }
 
     /// Find the active message_id for a given session (for cancel).
@@ -237,6 +343,9 @@ impl StreamManagerContext {
         }
     }
 
+    // The turn's origin joined the turn-time inputs; a struct for them would
+    // touch every call site for no gain (one caller).
+    #[allow(clippy::too_many_arguments)]
     pub fn start_stream(
         mut self,
         message_id: Uuid,
@@ -245,11 +354,9 @@ impl StreamManagerContext {
         on_complete: impl FnOnce() + 'static,
         mcp_context: Option<crate::mcp::manager::McpContext>,
         profile_id: Option<String>,
+        origin: crate::session::TurnOrigin,
     ) {
-        self.streaming_sessions.write().insert(session_id.clone());
-        self.stream_session_map
-            .write()
-            .insert(message_id, session_id.clone());
+        self.register_stream(message_id, &session_id);
         self.fleet_report(&session_id, crate::fleet::bridge::HobbesSignal::TurnStarted);
         tracing::debug!(message_id = %message_id, session_id = %session_id, "'start_stream' entered.");
         // Create a channel for the MessageBubble to receive chunks.
@@ -269,6 +376,16 @@ impl StreamManagerContext {
         // later profile/connector switch must not relabel.
         let stream_connector_name = self.effective_connector(&session_id).map(|inst| inst.name);
         let stream_model = self.effective_model(&session_id);
+        // Who started the turn this stream belongs to, passed in with the
+        // turn (the send path, or the continuation that carries it) — never
+        // re-read from the session, which a send landing between rounds
+        // could change. Stamped on every tool call below, over anything the
+        // connector produced, so the scope gates — here and on the
+        // approval-resume path — see the turn's origin, not the model's say.
+        let stream_origin = origin;
+        // The turn's Composio profile is fixed when the turn starts
+        // (profile_reach::begin_turn, on the send path) and read per call
+        // below; `profile_id` (the tab's raw pin) is only its fallback.
 
         // Spawn a master task to manage the LLM call and state updates.
         let master_task_handle = spawn(async move {
@@ -306,6 +423,9 @@ impl StreamManagerContext {
             let mut dispatched_tool_calls: std::collections::HashSet<(String, String, u64)> =
                 std::collections::HashSet::new();
             let completed_tool_tasks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Woken by each finishing tool task so the end-of-turn wait below
+            // doesn't poll the counter.
+            let tool_task_done = std::sync::Arc::new(tokio::sync::Notify::new());
             let mut final_text_for_this_turn = String::new();
             let mut thought_signature_for_this_turn: Option<String> = None;
             let mut thought_summary_for_this_turn: Option<String> = None;
@@ -609,14 +729,116 @@ impl StreamManagerContext {
                         // or propagated above), so a later mid-chat provider switch
                         // never replays it to an incompatible provider.
                         tool_call = tool_call.with_signature_provider(stream_provider);
+                        // One resolution for the stamp, the guard and dispatch
+                        // (profile_reach::ProfileScope), so they can't disagree.
+                        let scope = {
+                            let settings_read = self.settings.peek();
+                            let state = self.session_state.peek();
+                            // The tab's live pin, so a repin since the round
+                            // started re-resolves the turn (turn_scope_for).
+                            match state.sessions.get(&session_id) {
+                                Some(s) => crate::mcp::manager::profile_reach::turn_scope(&settings_read, s),
+                                None => crate::mcp::manager::profile_reach::turn_scope_for(
+                                    &settings_read,
+                                    &session_id,
+                                    profile_id.as_deref(),
+                                    // Not hydrated: home only.
+                                    true,
+                                ),
+                            }
+                        };
                         tool_call = tool_call.with_turn_provenance(
-                            profile_id.clone(),
+                            scope.home_id().map(str::to_string),
                             stream_connector_name.clone(),
                             Some(stream_model.clone()),
                         );
                         // Every call in this response shares the turn's placeholder id,
                         // so the prompt builder can find the latest round.
                         tool_call.round_id = Some(message_id.to_string());
+                        crate::components::builtin_tools::stamp_turn_origin(&mut tool_call, stream_origin);
+
+                        // Multi-profile reach (profile_reach): route a Composio
+                        // call to the profile it names (restamped before it is
+                        // stored), and hold a call that carries one profile's
+                        // content into another's tools unless that pair is
+                        // allowed (profile_flow: rules only, no trust rules).
+                        let route = {
+                            use crate::mcp::manager::profile_flow as flow_mod;
+                            use crate::mcp::manager::profile_reach as reach_mod;
+                            let settings_read = self.settings.peek();
+                            let state = self.session_state.peek();
+                            let session = state.sessions.get(&session_id);
+                            let home = scope.home_id().map(str::to_string);
+                            // Every set-up profile, unless the tab is locked to home.
+                            let reach = &scope.reach;
+                            // No profile to act in: a Composio call is refused,
+                            // never left to the manager to guess.
+                            let route = reach_mod::route_in_scope(&scope, &mut tool_call);
+                            let read_from = session
+                                .map(|s| reach_mod::session_read_profiles(&settings_read, s, chrono::Utc::now()))
+                                .unwrap_or_default();
+                            // Checked with reach, or with another company's data
+                            // in play (reach since narrowed, or an earlier home).
+                            if reach_mod::flow_checked(reach, &read_from) && !matches!(route, reach_mod::Route::Refused(_)) {
+                                // Only calls into a Composio profile are judged.
+                                let target = match &route {
+                                    reach_mod::Route::To(t) => Some(t),
+                                    // Narrowed to home: a Composio call still lands at home.
+                                    reach_mod::Route::Unchanged
+                                        if crate::mcp::manager::is_composio_native(&tool_call.server_name) =>
+                                    {
+                                        reach.first()
+                                    }
+                                    _ => None,
+                                };
+                                let mut args: serde_json::Value =
+                                    serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
+                                reach_mod::strip_profile_arg(&tool_call.tool_name, &mut args);
+                                let class = flow_mod::classify_flow(&tool_call.tool_name, &args);
+                                // The harness's origin stamp (set just above), never
+                                // the model's, and whether anyone started the turn
+                                // (a timer, relay or returned work in an ordinary chat
+                                // is the person's origin, but nobody is present).
+                                let person = flow_mod::flow_person(
+                                    crate::components::builtin_tools::effective_origin(&tool_call, &session_id),
+                                    crate::components::chat_queue::turn_absent(&session_id),
+                                );
+                                let chat_flows = session.map(|s| s.allowed_flows.as_slice()).unwrap_or_default();
+                                let policy = flow_mod::FlowPolicy::new(&settings_read, chat_flows);
+                                let named = reach_mod::all_profiles(&settings_read);
+                                match flow_mod::flow_hold(class, target, reach.first(), &read_from, person, &policy, &named) {
+                                    Some(hold) => {
+                                        tool_call.hold_reason = Some(hold.reason);
+                                        tool_call.hold_rule_key = Some(hold.rule_key);
+                                    }
+                                    // Let through only by a standing allowance: leave a record.
+                                    None => {
+                                        if let Some(key) = flow_mod::allowed_carry_key(class, target, &read_from, &policy) {
+                                            crate::context::trust_store::log_decision(
+                                                crate::context::trust_store::TrustDecision::new(
+                                                    crate::context::trust_store::DecisionKind::RuleHit,
+                                                    &key,
+                                                    &tool_call.tool_name,
+                                                    crate::context::trust_store::arg_summary(&args),
+                                                    Some(session_id.clone()),
+                                                    session.and_then(|s| s.project_id.clone()),
+                                                    None,
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            // Only another company's client may need connecting
+                            // (home's is already up; a legacy single client
+                            // must not get a second, profile-keyed twin).
+                            let connect_target = match &route {
+                                reach_mod::Route::To(t) if Some(&t.id) != home.as_ref() => Some(t.clone()),
+                                _ => None,
+                            };
+                            (route, connect_target)
+                        };
+                        let (route, connect_target) = route;
 
                         tool_call_count += 1;
                         let mut tool_call_snapshot: Option<crate::components::chat::Message> = None;
@@ -684,13 +906,25 @@ impl StreamManagerContext {
                         let mut session_state = self.session_state;
                         let tool_results_tx_clone = tool_results_tx.clone();
                         let completed_tool_tasks_clone = completed_tool_tasks.clone();
-                        let profile_id_inner = profile_id.clone();
+                        let tool_task_done_clone = tool_task_done.clone();
+                        // Always the resolved home (never the raw pin), so
+                        // the executor runs where the guard checked.
+                        let profile_id_inner = scope.home_id().map(str::to_string);
                         let session_id_inner = session_id.clone();
                         let _handle = spawn(async move {
-                            let args_json: serde_json::Value =
+                            let mut args_json: serde_json::Value =
                                 serde_json::from_str(&tool_call.arguments)
                                     .unwrap_or(serde_json::Value::Null);
-                            let profile_id = profile_id_inner;
+                            // `profile` stays in the stored call (history) but
+                            // never reaches Composio.
+                            if crate::mcp::manager::is_composio_native(&tool_call.server_name) {
+                                crate::mcp::manager::profile_reach::strip_profile_arg(&tool_call.tool_name, &mut args_json);
+                            }
+                            // A routed call runs in its target profile.
+                            let profile_id = match &route {
+                                crate::mcp::manager::profile_reach::Route::To(p) => Some(p.id.clone()),
+                                _ => profile_id_inner,
+                            };
 
                             // Built-in tools run here, before MCP dispatch — they
                             // need SessionState and the skill/permission registries
@@ -723,9 +957,9 @@ impl StreamManagerContext {
                             // here, bypassing trust rules and always-allow
                             // (use_mcp_tool is never reached). The resume
                             // path in chat.rs runs the same gate. The
-                            // Heartbeat session gets the same scope rules
+                            // Heartbeat's (unattended) turns get the same scope rules
                             // (`scope_gates` runs both gates).
-                            let agent_time_gate =
+                            let mut agent_time_gate =
                                 crate::components::builtin_tools::scope_gates(
                                     builtin_ctx,
                                     &tool_call,
@@ -733,6 +967,19 @@ impl StreamManagerContext {
                                     &session_id_inner,
                                     false,
                                 );
+                            // Reach: an unknown profile is refused; content
+                            // crossing profiles is held (hold_reason above).
+                            match &route {
+                                crate::mcp::manager::profile_reach::Route::Refused(msg) => {
+                                    agent_time_gate = crate::components::builtin_tools::AgentTimeGate::Refuse(msg.clone());
+                                }
+                                _ if tool_call.hold_reason.is_some()
+                                    && agent_time_gate == crate::components::builtin_tools::AgentTimeGate::Proceed =>
+                                {
+                                    agent_time_gate = crate::components::builtin_tools::AgentTimeGate::ForceApproval;
+                                }
+                                _ => {}
+                            }
                             if agent_time_gate
                                 == crate::components::builtin_tools::AgentTimeGate::ForceApproval
                                 || (agent_time_gate
@@ -754,7 +1001,15 @@ impl StreamManagerContext {
                                         &tool_call_message_id,
                                     ) {
                                         if let crate::components::shared::MessageContent::ToolCall(tc) = &msg.content {
-                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(tc.clone());
+                                            let mut held = tc.clone();
+                                            // A destructive voice/unattended call: say why
+                                            // (the bubble shows it; no always-allow).
+                                            held.risk_reason = crate::components::builtin_tools::risk_hold_reason(
+                                                &tool_call,
+                                                &args_json,
+                                                &session_id_inner,
+                                            );
+                                            msg.content = crate::components::shared::MessageContent::PermissionRequest(held);
                                             pending_snapshot = Some(msg.clone());
                                         }
                                     }
@@ -768,6 +1023,7 @@ impl StreamManagerContext {
                                 }
                                 completed_tool_tasks_clone
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                tool_task_done_clone.notify_one();
                                 return;
                             }
 
@@ -850,6 +1106,7 @@ impl StreamManagerContext {
                                 let _ = tool_results_tx_clone.send(record);
                                 completed_tool_tasks_clone
                                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                tool_task_done_clone.notify_one();
                                 return;
                             }
 
@@ -871,17 +1128,37 @@ impl StreamManagerContext {
                                     }
                                 })
                             };
-                            let result_receiver = mcp_manager
-                                .read()
-                                .use_mcp_tool(
-                                    &tool_call.server_name,
-                                    &tool_call.tool_name,
-                                    args_json,
-                                    false,
-                                    profile_id.clone(),
-                                    session_ctx,
-                                )
-                                .await;
+                            // A call routed to another profile needs that
+                            // profile's client: connect it, and fail rather than
+                            // fall back to another company's account.
+                            // The manager is a handle of Arcs: clone it out
+                            // so no Signal guard is held across the awaits below.
+                            let manager = mcp_manager.peek().clone();
+                            let ensured: Result<(), String> = match &connect_target {
+                                Some(t) => {
+                                    let settings_snapshot = self.settings.peek().clone();
+                                    manager
+                                        .ensure_native_client_for_profile(&t.id, &settings_snapshot)
+                                        .await
+                                        .map_err(|e| format!("Couldn't connect the {} Composio account, so this wasn't run: {e}", t.name))
+                                }
+                                _ => Ok(()),
+                            };
+                            let result_receiver = match ensured {
+                                Err(e) => Err(e),
+                                Ok(()) => {
+                                    manager
+                                        .use_mcp_tool(
+                                            &tool_call.server_name,
+                                            &tool_call.tool_name,
+                                            args_json,
+                                            false,
+                                            profile_id.clone(),
+                                            session_ctx,
+                                        )
+                                        .await
+                                }
+                            };
 
                             let (status, response_str, is_permission_request, image_path) =
                                 match result_receiver {
@@ -910,8 +1187,7 @@ impl StreamManagerContext {
                                             // Detect "No connected account found" error from Composio
                                             if err_msg.contains("No connected account found") {
                                                 tracing::info!("Composio auth required error detected. Initiating connection flow...");
-                                                match mcp_manager
-                                                    .read()
+                                                match manager
                                                     .initiate_composio_auth(
                                                         &tool_call.server_name,
                                                         &tool_call.tool_name,
@@ -1080,8 +1356,19 @@ impl StreamManagerContext {
                                             &response_str,
                                         )
                                     {
+                                        // The turn's origin comes from the stored
+                                        // call, never from the response JSON.
+                                        tc.origin = None;
                                         if let crate::components::shared::MessageContent::ToolCall(orig) = &msg.content {
+                                            tc.origin = orig.origin;
                                             tc.round_id = orig.round_id.clone();
+                                            // Keep the routing: target profile,
+                                            // stored arguments (with `profile`)
+                                            // and any cross-company hold.
+                                            tc.profile_id = orig.profile_id.clone();
+                                            tc.arguments = orig.arguments.clone();
+                                            tc.hold_reason = orig.hold_reason.clone();
+                                            tc.hold_rule_key = orig.hold_rule_key.clone();
                                         }
                                         msg.content = crate::components::shared::MessageContent::PermissionRequest(tc);
                                     }
@@ -1127,6 +1414,7 @@ impl StreamManagerContext {
                             // Signal completion regardless of permission status
                             completed_tool_tasks_clone
                                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            tool_task_done_clone.notify_one();
                         });
                         is_first_message = false;
                     }
@@ -1215,9 +1503,16 @@ impl StreamManagerContext {
                                 // block produced. Move it past them (vec order and
                                 // `created_at` together, so the journal replays the
                                 // same layout).
+                                // Without tool calls the reply stays put, but it
+                                // is stamped when it finished, not when its
+                                // placeholder was pushed: a turn otherwise "ends"
+                                // at its start, and anything placed by time
+                                // (voice transcript lines) lands after a reply
+                                // that came later. Clamped, so order holds.
                                 final_snapshot = if tool_call_count > 0 {
                                     session.move_message_to_end(&message_id, now)
                                 } else {
+                                    session.restamp_message(&message_id, now);
                                     session.messages.iter().find(|m| m.id == message_id).cloned()
                                 };
                             }
@@ -1327,8 +1622,10 @@ impl StreamManagerContext {
 
             // Wait for all tool execution tasks to complete before proceeding to collect results.
             // This prevents a race condition where the receiver loop closes before all tools are finished.
+            // `notify_one` stores a permit, so a task finishing between the
+            // check and the await is never missed.
             while completed_tool_tasks.load(std::sync::atomic::Ordering::SeqCst) < tool_call_count {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                tool_task_done.notified().await;
             }
 
             drop(tool_results_tx);
@@ -1356,8 +1653,6 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
-            self.stream_receivers.write().remove(&message_id);
-                self.stream_receivers.write().remove(&message_id);
                     // A placeholder absorbed by a live activity block never
                     // mounted a bubble, so nobody ever took its receiver —
                     // drop it here rather than leaking the turn's chunks.
@@ -1367,6 +1662,9 @@ impl StreamManagerContext {
                     on_complete();
                     self.streaming_sessions.write().remove(&session_id);
                     *self.stream_activity.write() += 1; // Notify TabBar: stream ended
+                    // Held on approval: the turn has stopped. An abort aimed
+                    // at it must not drop the person's later resume.
+                    clear_turn_abort(&session_id);
                     self.scheduler.send(SchedulerSignal::Activity);
                     self.fleet_report(
                         &session_id,
@@ -1483,6 +1781,9 @@ impl StreamManagerContext {
                                     &active_session.active_context.conversation_summary,
                                 )
                                 .unwrap_or_else(|_| "{}".to_string());
+                                // Before the call: an undo in flight must not
+                                // drop sources from the summary it returns.
+                                let generated_from = proactive_summary_sources(&active_session);
 
                                 // Format last 5 messages for the summarizer
                                 let messages_text: Vec<String> = active_session
@@ -1496,12 +1797,11 @@ impl StreamManagerContext {
                                     })
                                     .collect();
 
-                                let active_profile_name = settings_snapshot
-                                    .active_composio_profile
-                                    .as_deref()
-                                    .and_then(|id| settings_snapshot.profile_name_for_id(id))
-                                    .unwrap_or("None")
-                                    .to_string();
+                                // This tab's profile, not the focused tab's (global) one.
+                                let active_profile_name = crate::mcp::manager::profile_reach::profile_note_name(
+                                    &settings_snapshot,
+                                    &active_session,
+                                );
                                 let system_note =
                                     format!("[System: Active Profile '{}']", active_profile_name);
                                 let recent = std::iter::once(system_note)
@@ -1541,30 +1841,28 @@ impl StreamManagerContext {
                                                     summary_json
                                                 ) {
                                                     tracing::info!(session_id = %session_id_clone, "Proactive summary updated (background)");
-                                                    let summary_value =
-                                                        serde_json::to_value(&summary)
-                                                            .unwrap_or(serde_json::Value::Null);
                                                     // Tab identity (emoji/topic) rides the same
                                                     // background summary — no extra LLM call.
                                                     // See `apply_tab_identity_from_summary`'s
                                                     // doc comment: every caller that computes a
                                                     // ConversationSummary must call this, or a
                                                     // tab's emoji/topic silently never gets set.
-                                                    let tab_titled = {
+                                                    // Stamps the companies whose data the
+                                                    // summary may hold (crate::session::adopt_summary).
+                                                    let (summary_value, tab_titled) = {
                                                         let mut state = session_state.write();
-                                                        state
-                                                            .sessions
-                                                            .get_mut(&session_id_clone)
-                                                            .and_then(|session| {
-                                                                let titled = crate::session::apply_tab_identity_from_summary(
-                                                                    session, &summary,
-                                                                );
-                                                                session
-                                                                    .active_context
-                                                                    .conversation_summary = summary;
-                                                                titled
-                                                            })
+                                                        match state.sessions.get_mut(&session_id_clone) {
+                                                            Some(session) => crate::session::adopt_summary(session, summary, &generated_from),
+                                                            None => (
+                                                                serde_json::to_value(&summary)
+                                                                    .unwrap_or(serde_json::Value::Null),
+                                                                None,
+                                                            ),
+                                                        }
                                                     };
+                                                    // The tab's Fleet row picks up the new
+                                                    // headline; its ask stays the turn's own.
+                                                    crate::fleet::bridge::refresh_brief(&session_id_clone, &summary_value);
                                                     log_event(
                                                         &session_id_clone,
                                                         SessionEvent::SummaryComputed {
@@ -1669,7 +1967,7 @@ impl StreamManagerContext {
 
                 self.continuation_controller
                     .write()
-                    .trigger_continuation(session_id.clone());
+                    .trigger_continuation(session_id.clone(), stream_origin);
                 return; // End this stream task. The continuation will start a new one.
             }
 
@@ -1677,7 +1975,7 @@ impl StreamManagerContext {
             // Before finalizing the turn, check for watch word matches
             // that indicate the model stalled mid-response (OpenAI-compat only).
             if self
-                .check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id)
+                .check_watch_word_recovery(&session_id, &final_text_for_this_turn, &message_id, stream_origin)
                 .await
             {
                 return; // Watch word recovery triggered continuation — end this stream task.
@@ -1779,7 +2077,7 @@ impl StreamManagerContext {
                             ) {
                                 self.continuation_controller
                                     .write()
-                                    .trigger_continuation(session_id.clone());
+                                    .trigger_continuation(session_id.clone(), stream_origin);
                             }
                             return; // End this stream task. Continuation will retry.
                         }
@@ -1882,8 +2180,19 @@ impl StreamManagerContext {
                 self.session_state,
                 &session_id,
             );
-            // Dispatch relay: a finished worker reports to its parent chat
-            // (once), and a relay-started turn is over.
+            on_complete();
+            self.streaming_sessions.write().remove(&session_id);
+            *self.stream_activity.write() += 1; // Notify TabBar: stream ended
+            // The turn is over: an abort aimed at it has nothing left to stop.
+            clear_turn_abort(&session_id);
+            self.scheduler.send(SchedulerSignal::Activity);
+            self.fleet_report(
+                &session_id,
+                crate::fleet::bridge::HobbesSignal::TurnCompleted,
+            );
+            // Dispatch relay: a finished worker settles its to-do and reports
+            // to its parent chat (once), and a relay-started turn is over.
+            // After the Fleet report, so the worker's row reads this turn end.
             crate::todo::relay::on_turn_complete(
                 crate::todo::relay::RelaySignals {
                     session_state: self.session_state,
@@ -1892,15 +2201,9 @@ impl StreamManagerContext {
                 },
                 &session_id,
             );
-
-            on_complete();
-            self.streaming_sessions.write().remove(&session_id);
-            *self.stream_activity.write() += 1; // Notify TabBar: stream ended
-            self.scheduler.send(SchedulerSignal::Activity);
-            self.fleet_report(
-                &session_id,
-                crate::fleet::bridge::HobbesSignal::TurnCompleted,
-            );
+            // Voice-tab news (dispatched work back, a late brain answer) is
+            // spoken rather than left for the Fleet toast.
+            crate::voice::controller::on_turn_end(self.session_state, self.settings, &session_id);
             tracing::debug!(message_id = %message_id, "Completion signal SENT.");
 
             // Remove the handle from the map upon completion
@@ -2008,6 +2311,7 @@ impl StreamManagerContext {
         session_id: &str,
         final_text: &str,
         message_id: &Uuid,
+        origin: crate::session::TurnOrigin,
     ) -> bool {
         let watch_config = match self.watch_word_config(session_id) {
             Some(c) if !final_text.is_empty() => c,
@@ -2144,7 +2448,7 @@ impl StreamManagerContext {
 
         self.continuation_controller
             .write()
-            .trigger_continuation(session_id.to_string());
+            .trigger_continuation(session_id.to_string(), origin);
         true
     }
 
@@ -2285,6 +2589,10 @@ impl StreamManagerContext {
         self.streaming_sessions.write().remove(session_id);
         *self.stream_activity.write() += 1; // Notify TabBar: stream cancelled
         self.stream_session_map.write().remove(message_id);
+        // Stop ends the turn: no continuation of it is in flight any more
+        // (a cancelled task never runs its `on_complete`).
+        self.continuation_controller.write().clear_in_flight(session_id);
+        clear_turn_abort(session_id);
         self.fleet_report(
             session_id,
             crate::fleet::bridge::HobbesSignal::TurnCompleted,
@@ -2520,6 +2828,136 @@ mod tests {
             stamps.windows(2).all(|w| w[0] <= w[1]),
             "vec order must stay created_at-monotonic"
         );
+    }
+
+    /// A stream manager over fresh signals, for tests that need one (call
+    /// inside a component: it uses hooks).
+    fn test_manager() -> (StreamManagerContext, Signal<ContinuationController>, Signal<SessionState>) {
+        let session_state = use_context_provider(|| Signal::new(SessionState::new()));
+        let settings = use_context_provider(|| Signal::new(Settings::default()));
+        let permission_manager = use_context_provider(|| Signal::new(PermissionManager::new(settings)));
+        let secret_manager = use_context_provider(|| Signal::new(SecretManager::new()));
+        let mcp_manager = use_context_provider(|| {
+            Signal::new(McpManager::new(PathBuf::new(), permission_manager, secret_manager, settings))
+        });
+        let continuation_controller = use_context_provider(|| Signal::new(ContinuationController::new()));
+        let llm_connector = use_context_provider(|| {
+            Signal::new(Arc::new(crate::llm::GeminiConnector::new(settings.read().gemini_config.clone()))
+                as Arc<dyn crate::llm::LlmConnector>)
+        });
+        let scheduler = use_coroutine(|_| async {});
+        let manager = StreamManagerContext {
+            chat_command: Signal::new(None),
+            stream_receivers: Signal::new(HashMap::new()),
+            active_stream_handles: Signal::new(HashMap::new()),
+            llm_connector,
+            session_state,
+            mcp_manager,
+            tool_call_summarizer: Signal::new(ToolCallSummarizer::new()),
+            settings,
+            continuation_controller,
+            scheduler,
+            permission_manager,
+            skill_registry: Signal::new(crate::skills::SkillRegistry::new()),
+            mcp_context: Signal::new(crate::mcp::manager::McpContext {
+                servers: Vec::new(),
+                connected_toolkit_slugs: Vec::new(),
+            }),
+            planner_state: Signal::new(crate::todo::PlannerState::default()),
+            stream_activity: Signal::new(0),
+            streaming_sessions: Signal::new(HashSet::new()),
+            stream_session_map: Signal::new(HashMap::new()),
+            content_generated: Signal::new(HashSet::new()),
+            save_error_signal: Signal::new(None),
+            usage_log: Signal::new(crate::usage_log::UsageLog::default()),
+            summarizing_sessions: Signal::new(HashSet::new()),
+        };
+        (manager, continuation_controller, session_state)
+    }
+
+    /// An approval for a chat whose turn is still in flight waits: it
+    /// resumes when the turn ends, never beside it, and is never dropped.
+    #[test]
+    fn an_approval_waits_for_the_turn_in_flight() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let (mut manager, mut continuation_controller, _) = test_manager();
+            continuation_controller.write().register_callback(std::rc::Rc::new(|_, _| {}));
+            continuation_controller.write().trigger_continuation("busy".into(), TurnOrigin::Heartbeat);
+            let waiting = vec!["busy".to_string(), "idle".to_string()];
+            let (now, later) = crate::components::chat::split_resumable(waiting, |id| manager.turn_in_flight(id));
+            assert_eq!((now, later.clone()), (vec!["idle".to_string()], vec!["busy".to_string()]));
+            // The turn ends (its stream registers, then completes): it resumes.
+            let msg = Uuid::new_v4();
+            manager.register_stream(msg, "busy");
+            manager.cancel_stream(&msg, "busy");
+            let (now, later) = crate::components::chat::split_resumable(later, |id| manager.turn_in_flight(id));
+            assert_eq!((now, later), (vec!["busy".to_string()], vec![]));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    /// Stop during a continuation ends the turn: the chat isn't left looking
+    /// busy (every later send queued for good, every wake held).
+    #[test]
+    fn stop_during_a_continuation_leaves_the_chat_free() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let (mut manager, mut continuation_controller, mut session_state) = test_manager();
+            continuation_controller.write().register_callback(std::rc::Rc::new(|_, _| {}));
+            let sid = session_state.write().create_session_raw(None);
+            // A tool round ended; its continuation is on its way ...
+            continuation_controller.write().trigger_continuation(sid.clone(), TurnOrigin::Heartbeat);
+            assert!(manager.turn_in_flight(&sid));
+            // ... its stream registers (the maps now cover the turn) ...
+            let msg = Uuid::new_v4();
+            manager.register_stream(msg, &sid);
+            assert!(!continuation_controller.peek().is_in_flight(&sid), "the stream took over the guard");
+            assert!(manager.turn_in_flight(&sid));
+            // ... and the person presses Stop: the task is aborted, its
+            // on_complete never runs, and nothing is left in flight.
+            manager.cancel_stream(&msg, &sid);
+            assert!(!manager.turn_in_flight(&sid));
+            // Stop in the gap before the stream registered, too.
+            continuation_controller.write().trigger_continuation(sid.clone(), TurnOrigin::User);
+            manager.cancel_stream(&Uuid::new_v4(), &sid);
+            assert!(!manager.turn_in_flight(&sid));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
+    }
+
+    /// The gap between a tool round and its continuation's stream: nothing
+    /// is streaming, but the turn isn't over. A send must see it as busy,
+    /// and the origin travels with the continuation, not the session field
+    /// a send landing in the gap could change.
+    #[test]
+    fn a_continuation_carries_its_origin_and_counts_as_in_flight() {
+        use crate::session::TurnOrigin;
+        let mut dom = VirtualDom::new(|| {
+            let (stream_manager, mut continuation_controller, _) = test_manager();
+            let got: std::rc::Rc<std::cell::RefCell<Vec<(String, TurnOrigin)>>> = Default::default();
+            {
+                let got = got.clone();
+                continuation_controller
+                    .write()
+                    .register_callback(std::rc::Rc::new(move |sid, origin| got.borrow_mut().push((sid, origin))));
+            }
+            assert!(!stream_manager.turn_in_flight("wake-session"));
+            // A wake's tool round ended: its continuation is triggered with
+            // the wake's origin.
+            continuation_controller.write().trigger_continuation("wake-session".into(), TurnOrigin::Heartbeat);
+            // Nothing streams, yet the turn is in flight: a typed send or the
+            // drain queues instead of starting a second turn inside it.
+            assert!(!stream_manager.streaming_sessions.peek().contains("wake-session"));
+            assert!(stream_manager.turn_in_flight("wake-session"));
+            assert_eq!(&*got.borrow(), &[("wake-session".to_string(), TurnOrigin::Heartbeat)]);
+            continuation_controller.write().clear_in_flight("wake-session");
+            assert!(!stream_manager.turn_in_flight("wake-session"));
+            rsx! { div {} }
+        });
+        crate::test_support::rebuild_or_fail(&mut dom);
     }
 
     #[tokio::test]

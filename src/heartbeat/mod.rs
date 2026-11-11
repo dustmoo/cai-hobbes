@@ -3,12 +3,12 @@
 //!
 //! Perception (cheap watchers, no LLM) turns planner, Fleet and CI changes
 //! into events; salience routes each to ignore / note / queue / wake; the
-//! budget caps wakes; a wake hands the dedicated Heartbeat session a
+//! budget caps wakes; a wake hands the Hobbes session (`hobbes_session`) a
 //! briefing. Design: the "Hobbes Heartbeat" doc.
 //!
 //! The engine (perception, salience, state, budget, wake) is pure; the
 //! runtime (`runtime.rs`, spawned from `main.rs`) polls it every 30 s,
-//! keeps the dedicated Heartbeat session and delivers wakes through the
+//! keeps the Hobbes session and delivers wakes through the
 //! background chat queue. One poll looks like:
 //!
 //! ```text
@@ -17,7 +17,7 @@
 //! let decisions = salience.decide(&evs, &ctx);
 //! state.ingest(evs, decisions, now);
 //! let anchors = anchors::due_anchors(&state, &DayView::capture(..), now);
-//! match wake::decide_wake(&state, &budget, spent_today, now, session_busy, &anchors) {
+//! match wake::decide_wake_gated(&state, &budget, spent_today, now, session_busy, &anchors) {
 //!     Fire(trigger)  => { /* drain_queue → wake message → record_wake(fired),
 //!                           mark the anchors fired */ }
 //!     Defer { .. }   => { /* record_wake(deferred); events stay queued */ }
@@ -25,7 +25,8 @@
 //! }
 //! ```
 //!
-//! Tool calls from the Heartbeat session pass `trust::gate_verdict`
+//! Tool calls from a wake's turn (`TurnOrigin::Heartbeat`, carried by each
+//! call) pass `trust::gate_verdict`
 //! (`builtin_tools::heartbeat_gate`) at both tool-call sites.
 
 pub mod anchors;
@@ -281,6 +282,16 @@ mod tests {
         assert_eq!(back, e);
         let c: CiConclusion = serde_json::from_str("\"skipped\"").unwrap();
         assert_eq!(c, CiConclusion::Other);
+    }
+
+    #[test]
+    fn the_pre_merge_session_pointer_survives_a_save() {
+        // Until the one-time merge reads it, a save mustn't drop it.
+        let state = from_json(r#"{"session_id":"old-heartbeat"}"#);
+        assert_eq!(state.legacy_session_id.as_deref(), Some("old-heartbeat"));
+        let v = serde_json::to_value(&state).unwrap();
+        assert_eq!(v["session_id"], "old-heartbeat");
+        assert!(serde_json::to_value(HeartbeatState::default()).unwrap().get("session_id").is_none());
     }
 
     #[test]

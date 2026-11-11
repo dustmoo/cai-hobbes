@@ -8,7 +8,7 @@ mod trust_rules;
 
 use shared::{comparable, flush_draft_into_instance, load_instance_into_draft};
 use tabs::{
-    AboutTab, BehaviorTab, DataTab, GeneralTab, HotkeysTab, McpTab, PermissionsTab, PlannerTab,
+    AboutTab, BehaviorTab, DataTab, GeneralTab, HobbesTab, HotkeysTab, McpTab, PermissionsTab, PlannerTab,
     SkillsTab,
 };
 
@@ -44,6 +44,7 @@ fn settings_tab_label(tab: crate::settings::SettingsTab) -> &'static str {
     use crate::settings::SettingsTab as T;
     match tab {
         T::General => "General",
+        T::Hobbes => "Hobbes",
         T::Mcp => "MCP Tools",
         T::Behavior => "Behavior",
         T::Planner => "Planner",
@@ -336,9 +337,26 @@ pub fn SettingsPanel(
     // This is crucial for reflecting changes made elsewhere in the app (e.g., 'remember my choice' in a confirmation modal).
     // It uses .peek() to avoid creating a dependency on local_settings, preventing an infinite loop.
     // NOTE: This will discard any unsaved changes in the settings panel when external changes occur.
+    // The saved settings as the draft last synced from them: a change that
+    // only touches app-written fields (`shared::patch_draft`) is patched in,
+    // keeping the draft's other unsaved edits.
+    let mut synced_global = use_signal(|| settings.peek().clone());
     use_effect(move || {
         let global_settings = settings.read();
+        let prev = synced_global.peek().clone();
+        synced_global.set(global_settings.clone());
         if comparable(&global_settings) != comparable(&local_settings.peek()) {
+            let patched = {
+                let draft = local_settings.peek();
+                shared::patch_draft(&prev, &global_settings, &draft)
+                    .map(|p| (comparable(&p) != comparable(&draft), p))
+            };
+            if let Some((changed, patched)) = patched {
+                if changed {
+                    local_settings.set(patched);
+                }
+                return;
+            }
             let mut draft = global_settings.clone();
             // Re-load the selected connector's config into the editing mirrors
             let selected = selected_connector_id
@@ -693,6 +711,7 @@ pub fn SettingsPanel(
                 div {
                     class: if nav_railed { "flex flex-col gap-0.5 py-2" } else { "flex flex-col gap-0.5 p-2" },
                     SettingsNavItem { tab: crate::settings::SettingsTab::General, icon: fi_icons::FiSettings, railed: nav_railed }
+                    SettingsNavItem { tab: crate::settings::SettingsTab::Hobbes, icon: fi_icons::FiMessageCircle, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Mcp, icon: fi_icons::FiCpu, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Behavior, icon: fi_icons::FiSliders, railed: nav_railed }
                     SettingsNavItem { tab: crate::settings::SettingsTab::Planner, icon: fi_icons::FiCheckSquare, railed: nav_railed }
@@ -726,6 +745,7 @@ pub fn SettingsPanel(
                    class: "flex-1 overflow-y-auto pr-2",
                    match ui_state.read().active_settings_tab {
                        crate::settings::SettingsTab::Planner => rsx! { PlannerTab { ctx } },
+                       crate::settings::SettingsTab::Hobbes => rsx! { HobbesTab { ctx } },
                        crate::settings::SettingsTab::General => rsx! {
                            GeneralTab {
                                ctx,

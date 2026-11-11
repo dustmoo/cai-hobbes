@@ -25,6 +25,8 @@ pub fn known_context_window(model: &str) -> Option<usize> {
     const TABLE: &[(&str, usize)] = &[
         // GPT-4.1 family: 1M context.
         ("gpt-4.1", 1_000_000),
+        // GPT-6 / 6.1 (astra, sol, terra, luna): 1.05M.
+        ("gpt-6", 1_050_000),
         // GPT-5.x: specific minor versions before the broad `gpt-5`.
         ("gpt-5.4", 1_000_000),
         ("gpt-5.5", 512_000),
@@ -54,6 +56,8 @@ mod tests {
         assert_eq!(known_context_window("gpt-4.1-mini"), Some(1_000_000));
         assert_eq!(known_context_window("gpt-5.4"), Some(1_000_000));
         assert_eq!(known_context_window("gpt-5.5"), Some(512_000));
+        assert_eq!(known_context_window("gpt-6-astra"), Some(1_050_000));
+        assert_eq!(known_context_window("gpt-6.1-terra"), Some(1_050_000));
         // Bare gpt-5 / gpt-5-mini must NOT be shadowed by the 5.4/5.5 entries.
         assert_eq!(known_context_window("gpt-5"), Some(400_000));
         assert_eq!(known_context_window("gpt-5-mini"), Some(400_000));

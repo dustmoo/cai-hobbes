@@ -266,6 +266,10 @@ pub fn approve_held_call(
     session_id: &str,
     execution_id: &str,
 ) -> bool {
+    // An archived system session is read-only: nothing in it resumes.
+    if crate::system_sessions::is_archive(session_id) {
+        return false;
+    }
     let found = resolve_held_call(
         &mut session_state.write(),
         session_id,
@@ -293,6 +297,9 @@ pub fn deny_held_call(
     execution_id: &str,
     text: &str,
 ) -> bool {
+    if crate::system_sessions::is_archive(session_id) {
+        return false;
+    }
     let found = resolve_held_call(
         &mut session_state.write(),
         session_id,
@@ -306,6 +313,135 @@ pub fn deny_held_call(
         tracing::warn!("deny: no held call {execution_id} in session {session_id}");
     }
     found
+}
+
+/// **Pure.** The still-held call in message `message_id` of `session_id`,
+/// with the session's project id (for the decision log): `None` when the
+/// session isn't hydrated or the message isn't a `PermissionRequest` any
+/// more (already answered).
+pub fn held_call_for_message(
+    state: &crate::session::SessionState,
+    session_id: &str,
+    message_id: uuid::Uuid,
+) -> Option<(ToolCall, Option<String>)> {
+    let session = state.sessions.get(session_id)?;
+    session.messages.iter().find(|m| m.id == message_id).and_then(|m| match &m.content {
+        super::shared::MessageContent::PermissionRequest(tc) => Some((tc.clone(), session.project_id.clone())),
+        _ => None,
+    })
+}
+
+/// Resolve the held call in message `message_id` the way the bubble's
+/// buttons do (`crate::request_permission_decision` lands here): the same
+/// trust-decision log entry (`Approved` / `Denied`, none for a skill load,
+/// like `SkillToolPermissionPrompt`), then [`approve_held_call`] or
+/// [`deny_held_call`] with [`DENIED_BY_USER`]. Never authors a trust rule.
+/// Returns whether a held call was found.
+pub fn decide_held_message(
+    session_state: Signal<crate::session::SessionState>,
+    session_id: &str,
+    message_id: uuid::Uuid,
+    approve: bool,
+) -> bool {
+    let held = held_call_for_message(&session_state.peek(), session_id, message_id);
+    let Some((tc, project_id)) = held else {
+        tracing::warn!("permission decision: no held call in message {message_id} of session {session_id}");
+        return false;
+    };
+    if !is_skill_invoke_request(&tc) {
+        let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+        crate::context::trust_store::log_decision(crate::context::trust_store::TrustDecision::new(
+            if approve {
+                crate::context::trust_store::DecisionKind::Approved
+            } else {
+                crate::context::trust_store::DecisionKind::Denied
+            },
+            tc.hold_rule_key.as_deref().unwrap_or(&tc.server_name),
+            &tc.tool_name,
+            crate::context::trust_store::arg_summary(&args),
+            Some(session_id.to_string()),
+            project_id,
+            None,
+        ));
+    }
+    if approve {
+        approve_held_call(session_state, session_id, &tc.execution_id)
+    } else {
+        deny_held_call(session_state, session_id, &tc.execution_id, DENIED_BY_USER)
+    }
+}
+
+/// After the person allowed profile pairs (in this chat or always) on the
+/// held call of round `round_id`, approve the other calls of that round
+/// still held only for pairs now allowed: those
+/// `profile_flow::released_by_allowance` returns (the person's own turn,
+/// never a risk hold, an unattended hold or a leftover from an earlier
+/// round), in a chat that isn't running agent time, and whose run the
+/// normal permission flow would allow without asking ([`normal_flow_allows`])
+/// — so no gate but the flow guard held them. Each goes through the shared
+/// approve path and is logged as Approved. Returns how many were released.
+pub fn release_allowed_flow_holds(
+    session_state: Signal<crate::session::SessionState>,
+    settings: &crate::settings::Settings,
+    planner: &crate::todo::PlannerState,
+    session_id: &str,
+    round_id: Option<&str>,
+) -> usize {
+    let Some(round_id) = round_id else { return 0 };
+    // Agent time holds outside effects for the person, call by call.
+    if planner.is_agent_time_session(session_id) || crate::agent_time_runtime::is_agent_time_chat_now(planner, session_id) {
+        return 0;
+    }
+    let (calls, project_id) = {
+        let state = session_state.peek();
+        let Some(s) = state.sessions.get(session_id) else { return 0 };
+        let policy = crate::mcp::manager::profile_flow::FlowPolicy::new(settings, &s.allowed_flows);
+        let calls: Vec<ToolCall> = crate::mcp::manager::profile_flow::released_by_allowance(&s.messages, &policy, round_id)
+            .into_iter()
+            .filter(|tc| normal_flow_allows(settings, tc, s.project_id.as_deref()))
+            .collect();
+        (calls, s.project_id.clone())
+    };
+    for tc in &calls {
+        let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+        crate::context::trust_store::log_decision(crate::context::trust_store::TrustDecision::new(
+            crate::context::trust_store::DecisionKind::Approved,
+            tc.hold_rule_key.as_deref().unwrap_or(&tc.server_name),
+            &tc.tool_name,
+            crate::context::trust_store::arg_summary(&args),
+            Some(session_id.to_string()),
+            project_id.clone(),
+            None,
+        ));
+        approve_held_call(session_state, session_id, &tc.execution_id);
+    }
+    calls.len()
+}
+
+/// **Pure.** Whether the normal permission flow would run `tc` without
+/// asking: a trust rule matches it (as `McpManager::use_mcp_tool` matches
+/// them, on the raw server name and the arguments without the profile
+/// argument), or the global and per-server MCP permission allows it. A
+/// server's per-tool always-allow list isn't visible here, so a call only it
+/// would allow stays held for its own click (the safe side).
+pub fn normal_flow_allows(settings: &crate::settings::Settings, tc: &ToolCall, project_id: Option<&str>) -> bool {
+    let mut args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+    crate::mcp::manager::profile_reach::strip_profile_arg(&tc.tool_name, &mut args);
+    let trusted = crate::context::trust::evaluate(
+        &settings.permission_settings.trust_rules,
+        &tc.server_name,
+        &tc.tool_name,
+        &args,
+        &crate::context::trust::TrustCtx { project_id },
+    )
+    .is_some();
+    let check_name = if crate::mcp::manager::is_composio_native(&tc.server_name) {
+        crate::mcp::manager::COMPOSIO_NATIVE_PREFIX
+    } else {
+        tc.server_name.as_str()
+    };
+    trusted
+        || settings.permission_settings.mcp_permission(check_name) == crate::context::permissions::PermissionStatus::Allowed
 }
 
 /// The message carrying this execution id, within one session.
@@ -365,17 +501,34 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 .join(" ")
         })
         .filter(|p| !p.is_empty());
+    // The owning tab's project, so "only in {project}" scopes a trust rule
+    // to the project of the chat it was raised in (flow holds author no
+    // rules: their choices allow profile pairs).
     let session_project: Option<(String, String)> = {
         let state = session_state.read();
         state
             .sessions
-            .get(&state.active_session_id)
+            .get(&props.session_id)
             .and_then(|s| s.project_id.clone())
             .and_then(|pid| {
                 crate::services::project_tagger::project_title(&planner.read().projects, &pid)
                     .map(|t| (pid.clone(), t.to_string()))
             })
     };
+    // A flow hold (profile_flow): content moving between profiles. Never
+    // a trust rule: its choices allow its profile pairs, in this chat or
+    // always. A key in the retired format (or an unattended act outside
+    // home, which has no pairs) is approved or denied once.
+    let flow_held = tool_call
+        .hold_rule_key
+        .as_deref()
+        .is_some_and(|k| k.starts_with(crate::mcp::manager::profile_flow::FLOW_KEY_PREFIX));
+    let held_flow = tool_call
+        .hold_rule_key
+        .as_deref()
+        .and_then(crate::mcp::manager::profile_flow::parse_held_flow)
+        .filter(|h| !h.sources.is_empty());
+    let rule_server = tool_call.server_name.clone();
     let allow_label = match &command_prefix {
         Some(p) => format!("Always allow `{p}`"),
         None => format!(
@@ -383,11 +536,48 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             tool_call.tool_name, tool_call.server_name
         ),
     };
+    // The Hobbes tab reading another conversation (hobbes_tabs): "always"
+    // turns the setting on instead of writing a trust rule, so the setting
+    // stays the one place that permission lives.
+    let tab_read = crate::hobbes_tabs::is_tab_tool(&tool_call.tool_name);
+    let allow_label = if tab_read { crate::hobbes_tabs::ALWAYS_LABEL.to_string() } else { allow_label };
+    let session_project = if tab_read { None } else { session_project };
+    // The tab being read, by name: from memory when it is open, else its
+    // row, looked up off the UI thread (P-017).
+    let mut tab_target = use_signal(|| None::<String>);
+    use_hook({
+        let target = tab_read
+            .then(|| parsed_args.as_ref().and_then(|a| a.get("session_id")).and_then(|v| v.as_str()).map(str::to_string))
+            .flatten();
+        move || {
+            if let Some(id) = target {
+                spawn(async move {
+                    let label = crate::hobbes_tabs::tab_label(session_state, &id).await;
+                    tab_target.set(Some(label));
+                });
+            }
+        }
+    });
+    let tab_description: Option<String> = tab_read.then(|| {
+        if tool_call.tool_name == crate::hobbes_tabs::TAB_LIST {
+            "Hobbes wants to list your other conversations (titles, projects and last activity).".to_string()
+        } else {
+            match tab_target.read().as_deref() {
+                Some(label) => format!("Hobbes wants to read your conversation {label}."),
+                None => "Hobbes wants to read another of your conversations.".to_string(),
+            }
+        }
+    });
     let mut make_rule = use_signal(|| false);
     let mut scope_to_project = use_signal(|| false);
 
     // Built-ins that always ask can't be pre-approved: no trust-rule option.
     let always_asks = crate::components::builtin_tools::always_asks(&tool_call.tool_name);
+    // Held by the call risk gate (a destructive call from a voice or
+    // unattended turn): asked every time, so no trust-rule option either —
+    // a rule would bypass nothing here, yet loosen typed chat.
+    let risk_reason = tool_call.risk_reason.clone();
+    let risk_held = risk_reason.is_some();
     // HOBBES_PROJECT_MERGE states what moves. Titles and to-dos are in
     // memory; the chat count is an index lookup run off the UI thread
     // (P-017), filled in when it lands.
@@ -435,14 +625,14 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
     let decision_base = {
         let tc = tool_call.clone();
         let args = parsed_args.clone().unwrap_or(serde_json::Value::Null);
-        let session_id = session_state.peek().active_session_id.clone();
+        let session_id = props.session_id.clone();
         let project_id = session_project.as_ref().map(|(id, _)| id.clone());
         move |kind: crate::context::trust_store::DecisionKind,
               rule_id: Option<String>| {
             crate::context::trust_store::log_decision(
                 crate::context::trust_store::TrustDecision::new(
                     kind,
-                    &tc.server_name,
+                    tc.hold_rule_key.as_deref().unwrap_or(&tc.server_name),
                     &tc.tool_name,
                     crate::context::trust_store::arg_summary(&args),
                     Some(session_id.clone()),
@@ -453,7 +643,69 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
         }
     };
     let log_on_deny = decision_base.clone();
-    let log_on_approve = decision_base;
+    let log_on_approve = decision_base.clone();
+    // The flow choices (not on a risk hold, which asks every time).
+    let flow_choices = held_flow.clone().filter(|_| !risk_held);
+    let flow_always_label = flow_choices
+        .as_ref()
+        .map(|h| crate::mcp::manager::profile_flow::always_label(&settings.peek(), h))
+        .unwrap_or_default();
+    let allow_flows = {
+        let held = flow_choices.clone();
+        let session_id = props.session_id.clone();
+        let execution_id = tool_call.execution_id.clone();
+        let round_id = tool_call.round_id.clone();
+        let log = decision_base;
+        move |always: bool| {
+            let Some(held) = held.clone() else { return };
+            let pairs = held.pairs();
+            if always {
+                {
+                    let mut s = settings.write();
+                    for f in &pairs {
+                        s.add_profile_flow(&f.from, &f.to);
+                    }
+                }
+                let snapshot = settings.peek().clone();
+                if let Err(e) = settings_manager.read().save(&snapshot) {
+                    tracing::error!("settings save failed: {e}");
+                }
+                log(crate::context::trust_store::DecisionKind::ApprovedRuleCreated, None);
+            } else {
+                let mut state_sig = session_state;
+                let flows = {
+                    let mut state = state_sig.write();
+                    state.sessions.get_mut(&session_id).map(|s| {
+                        for f in pairs {
+                            if !s.allowed_flows.contains(&f) {
+                                s.allowed_flows.push(f);
+                            }
+                        }
+                        s.allowed_flows.clone()
+                    })
+                };
+                if let Some(flows) = flows {
+                    crate::session_events::log_event(
+                        &session_id,
+                        crate::session_events::SessionEvent::FlowsAllowed { flows },
+                    );
+                    crate::session::SessionState::save_async(&session_state.read(), None);
+                }
+                log(crate::context::trust_store::DecisionKind::Approved, None);
+            }
+            approve_held_call(session_state, &session_id, &execution_id);
+            // Other calls held only for pairs now allowed run too.
+            release_allowed_flow_holds(
+                session_state,
+                &settings.peek(),
+                &planner.peek(),
+                &session_id,
+                round_id.as_deref(),
+            );
+        }
+    };
+    let mut allow_in_chat = allow_flows.clone();
+    let mut allow_always = allow_flows;
 
     rsx! {
         div {
@@ -469,6 +721,12 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             }
             div {
                 class: "mt-4 pt-4 border-t border-yellow-800 space-y-2 text-yellow-200",
+                if let Some(reason) = tool_call.hold_reason.clone() {
+                    p { class: "font-medium text-yellow-100", "{reason}" }
+                }
+                if let Some(reason) = risk_reason.clone() {
+                    p { class: "font-medium text-yellow-100", "Held because this {reason}." }
+                }
                 p {
                     "The AI wants to use the tool "
                     span { class: "font-mono text-sm", "{tool_call.tool_name}" }
@@ -519,13 +777,17 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 if let Some(desc) = merge_description {
                     p { class: "font-semibold text-yellow-100", "{desc}" }
                 }
+                if let Some(desc) = tab_description {
+                    p { class: "font-semibold text-yellow-100", "{desc}" }
+                }
                 p { "Do you want to allow this?" }
-                if always_asks {
+                if always_asks || risk_held {
                     p { class: "text-xs text-yellow-200/70", "Hobbes asks every time for this one; it can't be set to always allow." }
                 }
                 // Trust-rule authoring at the moment of decision (the skill
-                // prompt's remember-choice idiom).
-                if !always_asks {
+                // prompt's remember-choice idiom). Never for a flow hold:
+                // its choices are the buttons below.
+                if !always_asks && !risk_held && !flow_held {
                 div {
                     class: "flex flex-col gap-1 pt-1",
                     div {
@@ -571,7 +833,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 }
             }
             div {
-                class: "mt-4 flex justify-end gap-4",
+                class: if flow_choices.is_some() { "mt-4 flex flex-wrap justify-end gap-2" } else { "mt-4 flex justify-end gap-4" },
                 button {
                     class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
                     onclick: move |_| {
@@ -591,11 +853,23 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                     class: "px-4 py-2 rounded-md bg-green-600 text-fg hover:bg-green-500",
                     onclick: move |_| {
                         let owning_session_id = owning_session_id_approve.clone();
-                        // Author the rule first (when asked), then approve.
-                        if *make_rule.peek() {
+                        // "Always" on a tab read turns the setting on (saved
+                        // like any settings edit) rather than writing a rule.
+                        if *make_rule.peek() && tab_read && !risk_held {
+                            crate::hobbes_tabs::allow_always(&mut settings.write());
+                            let snapshot = settings.peek().clone();
+                            if let Err(e) = settings_manager.read().save(&snapshot) {
+                                tracing::error!("settings save failed: {e}");
+                            }
+                            log_on_approve(
+                                crate::context::trust_store::DecisionKind::ApprovedRuleCreated,
+                                None,
+                            );
+                        } else if *make_rule.peek() && !risk_held {
+                            // Author the rule first (when asked), then approve.
                             let rule = crate::context::permissions::TrustRule {
                                 id: uuid::Uuid::new_v4().to_string(),
-                                server: tool_call.server_name.clone(),
+                                server: rule_server.clone(),
                                 tool: Some(tool_call.tool_name.clone()),
                                 command_prefix: command_prefix.clone(),
                                 project_id: (*scope_to_project.peek())
@@ -627,7 +901,19 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                         // so this must not be re-derived from the active tab.
                         approve_held_call(session_state, &owning_session_id, &tool_call.execution_id);
                     },
-                    "Approve"
+                    if flow_choices.is_some() { "Allow once" } else { "Approve" }
+                }
+                if flow_choices.is_some() {
+                    button {
+                        class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
+                        onclick: move |_| allow_in_chat(false),
+                        "Allow in this chat"
+                    }
+                    button {
+                        class: "px-4 py-2 rounded-md bg-input text-fg hover:bg-gray-500",
+                        onclick: move |_| allow_always(true),
+                        "{flow_always_label}"
+                    }
                 }
             }
         }
@@ -657,6 +943,7 @@ fn skill_call_from_invoke(tool_call: &ToolCall) -> super::shared::SkillCall {
         skill_name: field("name"),
         arguments: field("arguments"),
         status: super::shared::SkillCallStatus::Pending,
+        origin: tool_call.origin,
         ..Default::default()
     }
 }
@@ -834,6 +1121,63 @@ mod tests {
     }
 
     #[test]
+    fn held_call_for_message_finds_only_a_still_held_request() {
+        let held = permission_request_message("exec-h");
+        let done = tool_call_message("exec-d");
+        let (mut state, id) = session_with_messages(vec![held.clone(), done.clone()]);
+        state.sessions.get_mut(&id).unwrap().project_id = Some("proj-1".into());
+        let (tc, project) = super::held_call_for_message(&state, &id, held.id).unwrap();
+        assert_eq!(tc.execution_id, "exec-h");
+        assert_eq!(project.as_deref(), Some("proj-1"));
+        assert!(super::held_call_for_message(&state, &id, done.id).is_none());
+        assert!(super::held_call_for_message(&state, "no-such-session", held.id).is_none());
+        // Resolved (as the buttons do): no longer held.
+        super::resolve_held_call(&mut state, &id, "exec-h", &super::HeldResolution::Approve).unwrap();
+        assert!(super::held_call_for_message(&state, &id, held.id).is_none());
+    }
+
+    /// Stored sessions may hold calls the retired guard held, with keys in
+    /// its format: they still load, offer no pair choices, and approve or
+    /// deny once. A session's allowed pairs round-trip.
+    #[test]
+    fn old_format_flow_holds_still_resolve_once() {
+        for (i, key) in ["profile-flow:pg>local", "profile-flow:act>pg", "profile-flow:ac+pg>cm"].iter().enumerate() {
+            for approve in [true, false] {
+                let mut msg = permission_request_message(&format!("exec-old-{i}"));
+                if let MessageContent::PermissionRequest(tc) = &mut msg.content {
+                    tc.hold_reason = Some("This writes to Puget in a conversation that has read Clearmirror data.".into());
+                    tc.hold_rule_key = Some(key.to_string());
+                }
+                // Through serde, as a stored row would arrive.
+                let msg: Message = serde_json::from_value(serde_json::to_value(&msg).unwrap()).unwrap();
+                let (mut state, id) = session_with_messages(vec![msg.clone()]);
+                let (tc, _) = super::held_call_for_message(&state, &id, msg.id).unwrap();
+                assert!(crate::mcp::manager::profile_flow::parse_held_flow(tc.hold_rule_key.as_deref().unwrap()).is_none());
+                // Confirmable aloud too, once.
+                let spoken = crate::call_risk::pending_risk_hold(&state.sessions[&id].messages).unwrap();
+                assert!(spoken.reason.starts_with("writes to Puget"), "{}", spoken.reason);
+                let how = if approve {
+                    super::HeldResolution::Approve
+                } else {
+                    super::HeldResolution::Deny(super::DENIED_BY_USER.to_string())
+                };
+                super::resolve_held_call(&mut state, &id, &tc.execution_id, &how).unwrap();
+                assert!(super::held_call_for_message(&state, &id, msg.id).is_none());
+                assert!(state.sessions[&id].allowed_flows.is_empty(), "never allows a flow");
+            }
+        }
+        let (mut state, id) = new_session();
+        let s = state.sessions.get_mut(&id).unwrap();
+        s.allowed_flows.push(crate::context::permissions::ProfileFlow { from: "pg".into(), to: "cm".into() });
+        let back: Session = serde_json::from_value(serde_json::to_value(&*s).unwrap()).unwrap();
+        assert_eq!(back.allowed_flows, s.allowed_flows);
+        // An old row without the field loads empty.
+        let mut old = serde_json::to_value(&*s).unwrap();
+        old.as_object_mut().unwrap().remove("allowed_flows");
+        assert!(serde_json::from_value::<Session>(old).unwrap().allowed_flows.is_empty());
+    }
+
+    #[test]
     fn returns_none_for_text_message() {
         let (mut state, id) = session_with_messages(vec![text_message("just text")]);
         let session = state.sessions.get_mut(&id).unwrap();
@@ -848,5 +1192,39 @@ mod tests {
         ]);
         let session = state.sessions.get_mut(&id).unwrap();
         assert!(message_mut_by_execution_id(session, "exec-unknown").is_none());
+    }
+
+    /// Releasing a flow hold never skips the normal permission flow: only a
+    /// call that flow would run without asking may go with its siblings.
+    #[test]
+    fn released_holds_must_pass_the_normal_permission_flow() {
+        use crate::context::permissions::{ToolCategory, TrustRule};
+        let tc = ToolCall {
+            server_name: "composio-native:Clearmirror.ai".into(),
+            tool_name: "GMAIL_SEND_EMAIL".into(),
+            arguments: r#"{"to":"a@b.c","hobbes_profile":"Clearmirror.ai"}"#.into(),
+            ..Default::default()
+        };
+        // Auto-approval off: the call would ask, so it stays held.
+        let mut s = crate::settings::Settings::default();
+        s.permission_settings.auto_approval_enabled = false;
+        assert!(!super::normal_flow_allows(&s, &tc, None));
+        // Auto-approval on for MCP: the normal flow runs it.
+        s.permission_settings.auto_approval_enabled = true;
+        s.permission_settings.granular_permissions.insert(ToolCategory::Mcp, true);
+        assert!(super::normal_flow_allows(&s, &tc, None));
+        // …unless Composio is set to ask.
+        s.permission_settings.mcp_server_permissions.insert(crate::mcp::manager::COMPOSIO_NATIVE_PREFIX.into(), false);
+        assert!(!super::normal_flow_allows(&s, &tc, None));
+        // A trust rule for exactly this tool lets it through.
+        s.permission_settings.trust_rules.push(TrustRule {
+            id: "r".into(),
+            server: tc.server_name.clone(),
+            tool: Some(tc.tool_name.clone()),
+            command_prefix: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+        });
+        assert!(super::normal_flow_allows(&s, &tc, None));
     }
 }

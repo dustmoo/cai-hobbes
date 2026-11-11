@@ -172,10 +172,12 @@ pub struct HeartbeatState {
     pub trail: Vec<WakeRecord>,
     #[serde(default)]
     pub reactions: Vec<Reaction>,
-    /// The dedicated Heartbeat chat session wakes are delivered to, once
-    /// created (not an open tab unless the user opens it).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    /// The pre-merge Heartbeat session (wakes now go to the Hobbes session,
+    /// `hobbes_session`). Never written by this build, only kept so a save
+    /// before the one-time merge can't lose it; the merge reads it
+    /// (`hobbes_session::legacy_sessions`).
+    #[serde(default, rename = "session_id", skip_serializing_if = "Option::is_none")]
+    pub legacy_session_id: Option<String>,
     /// "Clear trail": the card hides wake records at or before this time.
     /// The records stay for the budget (the hourly cap and today's spend
     /// count them) until they age out.
@@ -294,17 +296,16 @@ impl HeartbeatState {
         self.events.iter().filter(|e| e.at > since).collect()
     }
 
-    /// Events after `since` about work `session_id` carries or dispatched
-    /// (its `session_id` or `dispatched_from`) — the briefing's "changes to
-    /// work you dispatched".
-    pub fn events_for_session_since(&self, session_id: &str, since: DateTime<Utc>) -> Vec<&HeartbeatEvent> {
+    /// Events after `since` about work a chat carries or dispatched (its
+    /// `session_id` or `dispatched_from`) — the briefing's "changes to work
+    /// you dispatched". `session_ids` is the chat's id, plus, for a rotated
+    /// system session, the ids it rotated out of (`system_sessions::lineage`).
+    pub fn events_for_session_since(&self, session_ids: &[String], since: DateTime<Utc>) -> Vec<&HeartbeatEvent> {
+        let mine = |id: Option<&String>| id.is_some_and(|id| session_ids.contains(id));
         self.events
             .iter()
             .filter(|e| e.at > since)
-            .filter(|e| {
-                e.session_id.as_deref() == Some(session_id)
-                    || e.dispatched_from.as_deref() == Some(session_id)
-            })
+            .filter(|e| mine(e.session_id.as_ref()) || mine(e.dispatched_from.as_ref()))
             .collect()
     }
 
@@ -595,8 +596,10 @@ mod tests {
         let other = ev("todo_overdue", now());
         s.ingest(vec![old, mine, dispatched, other], vec![], now());
         let since = now() - Duration::hours(1);
-        assert_eq!(s.events_for_session_since("sess", since).len(), 2);
-        assert_eq!(s.events_for_session_since("nobody", since).len(), 0);
+        assert_eq!(s.events_for_session_since(&["sess".to_string()], since).len(), 2);
+        assert_eq!(s.events_for_session_since(&["nobody".to_string()], since).len(), 0);
+        // A rotated session also sees work dispatched from its predecessor.
+        assert_eq!(s.events_for_session_since(&["new".to_string(), "sess".to_string()], since).len(), 2);
         assert_eq!(s.events_since(since).len(), 3);
         assert_eq!(s.events_since(now() - Duration::hours(4)).len(), 4);
     }

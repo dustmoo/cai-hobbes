@@ -99,3 +99,76 @@ pub(super) fn TrustRulesSection() -> Element {
         }
     }
 }
+
+/// Always-allowed profile pairs ("Puget → Clearmirror.ai"): content read
+/// from the first may be carried into the second without a flow hold
+/// (`mcp::manager::profile_flow`). Added from a flow hold's "Always allow";
+/// listed here with removal, like trust rules.
+#[component]
+pub(super) fn ProfileFlowsSection() -> Element {
+    let mut settings = use_context::<Signal<Settings>>();
+    let settings_manager = use_context::<Signal<SettingsManager>>();
+    let save_error = use_context::<crate::components::shared::SaveErrorContext>().0;
+    let mut armed_delete = use_signal(|| Option::<(String, String)>::None);
+
+    let rows: Vec<(String, String, String)> = {
+        let s = settings.read();
+        s.permission_settings
+            .profile_flows
+            .iter()
+            .map(|f| (f.from.clone(), f.to.clone(), crate::mcp::manager::profile_flow::pair_label(&s, f)))
+            .collect()
+    };
+    rsx! {
+        div {
+            class: "border border-subtle rounded-lg mb-4",
+            div {
+                class: "p-4 bg-section rounded-lg",
+                onmouseleave: move |_| armed_delete.set(None),
+                h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium mb-1", "Allowed Profile Flows" }
+                p { class: "text-xs text-fg-muted mb-3",
+                    "Content read from the first profile may be carried into the second without asking. Added from a permission prompt (\"Always allow…\"); one direction only."
+                }
+                if rows.is_empty() {
+                    p { class: "text-sm text-fg-muted", "No flows yet. Choose \"Always allow\" when Hobbes asks before moving content between profiles." }
+                }
+                div {
+                    class: "space-y-2",
+                    for (from, to, label) in rows {
+                        {
+                            let key = (from.clone(), to.clone());
+                            let is_armed = armed_delete.read().as_ref() == Some(&key);
+                            rsx! {
+                                div {
+                                    key: "{from}>{to}",
+                                    class: "flex items-center gap-2 rounded border border-faint bg-input/30 px-3 py-2 text-sm",
+                                    span { class: "text-sm text-fg truncate", "{label}" }
+                                    div { class: "flex-1" }
+                                    button {
+                                        class: if is_armed {
+                                            "shrink-0 px-2 py-0.5 rounded text-xs font-bold bg-red-900/60 text-red-200 hover:bg-red-800/60"
+                                        } else {
+                                            "shrink-0 px-2 py-0.5 rounded text-xs text-fg-muted hover:text-red-400 hover:bg-red-500/10"
+                                        },
+                                        onclick: move |_| {
+                                            if is_armed {
+                                                settings.write().remove_profile_flow(&key.0, &key.1);
+                                                settings_manager
+                                                    .peek()
+                                                    .save_async(settings.peek().clone(), Some(save_error));
+                                                armed_delete.set(None);
+                                            } else {
+                                                armed_delete.set(Some(key.clone()));
+                                            }
+                                        },
+                                        if is_armed { "Confirm remove" } else { "Remove" }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

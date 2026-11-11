@@ -1,3 +1,4 @@
+use super::super::shared::Toggle;
 use super::super::SettingsCtx;
 use dioxus::prelude::*;
 use dioxus_free_icons::{Icon, icons::fi_icons};
@@ -262,6 +263,29 @@ pub(in super::super) fn McpTab(
                                                                             profile.color = color.clone();
                                                                         }
                                                                     }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                // Personal profile (profile_flow::FlowPolicy)
+                                                div {
+                                                    class: "mb-3 flex items-center justify-between gap-4",
+                                                    div {
+                                                        label { class: "block text-xs font-medium text-fg-muted mb-1", "Personal profile" }
+                                                        p {
+                                                            class: "text-xs text-fg-muted",
+                                                            "Content moves freely between a personal profile and your others."
+                                                        }
+                                                    }
+                                                    Toggle {
+                                                        checked: local_settings.read().composio_profiles.iter().any(|p| p.id == active_id && p.personal),
+                                                        onchange: {
+                                                            let id = active_id.clone();
+                                                            move |v: bool| {
+                                                                let mut settings = local_settings.write();
+                                                                if let Some(profile) = settings.composio_profiles.iter_mut().find(|p| p.id == id) {
+                                                                    profile.personal = v;
                                                                 }
                                                             }
                                                         }

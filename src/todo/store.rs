@@ -314,6 +314,8 @@ fn fmt_date(d: &chrono::NaiveDate) -> String {
 // ── Writes ──────────────────────────────────────────────────────────────────
 
 pub fn upsert_todo_conn(conn: &Connection, todo: &Todo, seq: i64) -> rusqlite::Result<()> {
+    // A saved to-do may meet a timer's `until_worker_done` condition.
+    crate::timers::request_check();
     let data = serde_json::to_string(todo).map_err(|e| {
         rusqlite::Error::ToSqlConversionFailure(Box::new(e))
     })?;

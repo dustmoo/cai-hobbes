@@ -15,6 +15,9 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
     let settings = use_context::<Signal<Settings>>();
     let mut editing_session_id = use_signal(|| None::<String>);
     let mut temp_session_name = use_signal(String::new);
+    // The Hobbes tab (and its archives) draw their fixed icon, never the
+    // stored emoji, same as the tab strip and sidebar.
+    let hobbes_id = crate::components::hobbes_icon::use_hobbes_session_id();
 
     // Pagination and Filtering State
     let mut filter_query = use_signal(String::new);
@@ -38,53 +41,46 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
 
     // Listen for Global Commands (e.g., Delete Session Hotkey) removed - now handled in main.rs
 
-    // Subscribe to session state so renames / new messages / deletions in
-    // hydrated sessions re-render the list. The listing itself comes from the
-    // SQLite store, so closed sessions never need to be loaded into memory.
+    // Bumped by the store whenever a write changes what this list shows
+    // (sessions added, deleted, renamed, retitled, new messages) — not on
+    // every save of a streaming reply. Awaited on a watch channel with a
+    // slow fallback tick.
+    let mut list_version = use_signal(session_store::list_version);
+    use_future(move || async move {
+        let mut rx = session_store::subscribe_list_version();
+        loop {
+            // Wake on the store's bump; the slow tick covers a missed one.
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), rx.changed()).await;
+            let v = session_store::list_version();
+            if v != *list_version.peek() {
+                list_version.set(v);
+            }
+        }
+    });
+
+    // The page, read off the UI thread, and re-read only when the page,
+    // page size, search or the store's listing changes.
+    let listing = use_resource(move || {
+        let query = debounced_query.read().to_lowercase();
+        let limit = *items_per_page.read();
+        let page = *current_page.read();
+        list_version.read();
+        async move {
+            tokio::task::spawn_blocking(move || load_page(&query, page, limit)).await.ok()
+        }
+    });
+
+    // Subscribe to session state so renames / new messages in hydrated
+    // sessions show live (the overlay below); the listing itself comes from
+    // the SQLite store, so closed sessions never need to be loaded into memory.
     let sessions = session_state.read();
     let active_id = sessions.active_session_id.clone();
-
-    let query = debounced_query.read().to_lowercase();
     let limit = *items_per_page.read();
-    let offset = (*current_page.read() * limit) as i64;
 
-    // Phase 1: DB-backed listing — exact substring match on name, summary,
-    // and message text content (search_text column), newest first, paginated
-    // in SQL. Phase 2 (only when exact finds nothing): fuzzy match on
-    // name + summary over lightweight metadata rows.
-    let (mut page_metas, total_items) = if query.is_empty() {
-        let (metas, total) = session_store::list_metadata(None, offset, limit as i64);
-        (metas, total as usize)
-    } else {
-        let (metas, total) = session_store::list_metadata(Some(&query), offset, limit as i64);
-        if total > 0 {
-            (metas, total as usize)
-        } else {
-            let mut scored: Vec<(String, isize)> = session_store::all_name_summaries()
-                .into_iter()
-                .filter_map(|(id, name, summary)| {
-                    let name_score =
-                        best_match(&query, &name.to_lowercase()).map(|m| m.score());
-                    let summary_score =
-                        best_match(&query, &summary.to_lowercase()).map(|m| m.score());
-                    let best = match (name_score, summary_score) {
-                        (Some(a), Some(b)) => Some(a.max(b)),
-                        (Some(a), None) => Some(a),
-                        (None, Some(b)) => Some(b),
-                        (None, None) => None,
-                    };
-                    best.map(|score| (id, score))
-                })
-                .collect();
-            scored.sort_by(|a, b| b.1.cmp(&a.1));
-            let total = scored.len();
-            let start = (offset as usize).min(total);
-            let end = (start + limit).min(total);
-            let page_ids: Vec<String> =
-                scored[start..end].iter().map(|(id, _)| id.clone()).collect();
-            (session_store::metadata_by_ids(&page_ids), total)
-        }
-    };
+    // `None` only until the first page lands (the drawer just opened).
+    let loaded = listing.read().clone().flatten();
+    let is_loaded = loaded.is_some();
+    let (mut page_metas, total_items) = loaded.unwrap_or_default();
 
     // Overlay in-memory data for hydrated sessions: the async DB write can
     // lag a rename/new message by a beat, and memory is authoritative.
@@ -97,17 +93,20 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
             meta.name_user_set = live.name_user_set;
         }
     }
+    drop(sessions);
 
     let total_pages = (total_items as f64 / limit as f64).ceil() as usize;
     let total_pages = if total_pages == 0 { 1 } else { total_pages };
 
     // Ensure current page is valid
-    if *current_page.read() >= total_pages {
+    if is_loaded && *current_page.peek() >= total_pages {
         current_page.set(total_pages.saturating_sub(1));
     }
 
     let paginated_sessions = page_metas;
-    let count_label = if total_items == 1 {
+    let count_label = if !is_loaded {
+        String::new()
+    } else if total_items == 1 {
         "1 chat".to_string()
     } else {
         format!("{total_items} chats")
@@ -154,7 +153,9 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
             div {
                 class: "flex-1 overflow-y-auto min-h-0",
                 if paginated_sessions.is_empty() {
-                    div { class: "text-sm text-fg-muted px-2 py-8", "No chats found." }
+                    if is_loaded {
+                        div { class: "text-sm text-fg-muted px-2 py-8", "No chats found." }
+                    }
                 } else {
                     span { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium px-2", "Chats" }
                 }
@@ -165,6 +166,7 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                         let session_id = session.id.clone();
                         let session_name = session.display_title();
                         let session_emoji = session.display_emoji().map(str::to_string);
+                        let is_system = crate::components::hobbes_icon::is_system_tab(hobbes_id, &session.id);
                         let session_summary = session.summary.clone();
                         let session_date = format_session_date(&session.last_updated);
 
@@ -191,7 +193,15 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
                                     // chats that have no emoji yet.
                                     span {
                                         class: "w-5 shrink-0 text-center text-[13px] leading-5",
-                                        if let Some(e) = &session_emoji { "{e}" }
+                                        if is_system {
+                                            span {
+                                                class: "inline-flex h-5 items-center justify-center",
+                                                crate::components::hobbes_icon::SystemTabIcon {
+                                                    session_id: session_id.clone(),
+                                                    emoji: session_emoji.clone(),
+                                                }
+                                            }
+                                        } else if let Some(e) = &session_emoji { "{e}" }
                                     }
                                     div {
                                         class: "min-w-0 flex-1",
@@ -335,6 +345,45 @@ pub fn SessionManager(_props: SessionManagerProps) -> Element {
             }
         }
     }
+}
+
+/// One History page: `(rows, total matches)`. Blocking (SQLite); run it off
+/// the UI thread.
+///
+/// Phase 1: DB-backed listing — exact substring match on name, summary, and
+/// `search_text` (AI title + message text), newest first, paginated in SQL.
+/// Phase 2 (only when exact finds nothing): fuzzy match on name + summary
+/// over lightweight metadata rows.
+fn load_page(query: &str, page: usize, limit: usize) -> (Vec<session_store::SessionMeta>, usize) {
+    let offset = (page * limit) as i64;
+    if query.is_empty() {
+        let (metas, total) = session_store::list_metadata(None, offset, limit as i64);
+        return (metas, total as usize);
+    }
+    let (metas, total) = session_store::list_metadata(Some(query), offset, limit as i64);
+    if total > 0 {
+        return (metas, total as usize);
+    }
+    let mut scored: Vec<(String, isize)> = session_store::all_name_summaries()
+        .into_iter()
+        .filter_map(|(id, name, summary)| {
+            let name_score = best_match(query, &name.to_lowercase()).map(|m| m.score());
+            let summary_score = best_match(query, &summary.to_lowercase()).map(|m| m.score());
+            let best = match (name_score, summary_score) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            best.map(|score| (id, score))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    let total = scored.len();
+    let start = (offset as usize).min(total);
+    let end = (start + limit).min(total);
+    let page_ids: Vec<String> = scored[start..end].iter().map(|(id, _)| id.clone()).collect();
+    (session_store::metadata_by_ids(&page_ids), total)
 }
 
 /// Formats a fixed-width RFC3339 `last_updated` timestamp as a short
