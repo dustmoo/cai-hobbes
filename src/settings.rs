@@ -886,15 +886,10 @@ pub fn is_sandboxed() -> bool {
     }
 }
 
-/// Returns the branded app name based on distribution variant.
-/// - Sandboxed (App Store): "Hobbes"
-/// - Unsandboxed (Pro/Direct Download): "Hobbes Pro"
+/// The app's name. Always "Hobbes": Pro is a license, shown under
+/// Settings → About, not a different app.
 pub fn get_app_name() -> &'static str {
-    if is_sandboxed() {
-        "Hobbes"
-    } else {
-        "Hobbes Pro"
-    }
+    "Hobbes"
 }
 
 /// Attribution line for About screens (applies to both variants)
@@ -1088,7 +1083,7 @@ pub struct VoiceProfile {
     pub language: Option<String>,
 }
 
-/// Global voice settings (Settings → Voice).
+/// Global voice settings (Settings → Hobbes).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct VoiceSettings {
     /// Master switch. Off by default; read through `voice::voice_active`.

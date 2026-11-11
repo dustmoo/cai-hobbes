@@ -253,7 +253,7 @@ pub(in super::super) fn GeneralTab(
                                             }
                                             p {
                                                 class: "text-xs text-fg-muted mt-2",
-                                                "API keys stored securely in your local keychain. (PRO build)"
+                                                "API keys stored securely in your local keychain."
                                             }
                                         }
                                     }

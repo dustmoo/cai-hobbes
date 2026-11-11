@@ -4259,7 +4259,7 @@ fn LoadingScreen() -> Element {
                 }
                 div {
                     class: "space-y-2 text-center",
-                    h2 { class: "text-xl font-medium tracking-tight", "Hobbes Pro" }
+                    h2 { class: "text-xl font-medium tracking-tight", "Hobbes" }
                     p { class: "text-sm text-fg-muted", "Initializing workspace..." }
                 }
             }

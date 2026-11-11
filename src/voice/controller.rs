@@ -455,7 +455,7 @@ pub fn announce_prompt_merged(text: &str, mid_conversation: bool, kind: Announce
 
 /// Shown once per app run when a conversation starts without echo
 /// cancellation on speakers.
-pub const ECHO_HINT: &str = "Hobbes may not hear you while it talks on speakers. Headphones, or Echo cancellation \"On\" in Settings → Voice, fixes it.";
+pub const ECHO_HINT: &str = "Hobbes may not hear you while it talks on speakers. Headphones, or Echo cancellation \"On\" in Settings → Hobbes, fixes it.";
 /// How long the hint stays up.
 const ECHO_HINT_FOR: Duration = Duration::from_secs(20);
 static ECHO_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
@@ -530,8 +530,11 @@ struct Resolved {
 
 fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
     let settings = ctx.settings.peek();
+    if !crate::voice::voice_available() {
+        return Err(crate::entitlement::pro_note("Voice"));
+    }
     if !crate::voice::voice_active(&settings) {
-        return Err("Voice is off. Turn it on in Settings → Voice.".into());
+        return Err("Voice is off. Turn it on in Settings → Hobbes.".into());
     }
     let (provider, setup) = realtime_for(&settings)?;
     Ok(Resolved {
@@ -548,7 +551,7 @@ fn resolve(ctx: BuiltinToolCtx) -> Result<Resolved, String> {
 /// (also used by the Settings connection test).
 pub fn realtime_for(settings: &crate::settings::Settings) -> Result<(Box<dyn RealtimeVoice>, RealtimeSetup), String> {
     let Some(conn) = settings.voice_connector() else {
-        return Err("Pick a voice profile in Settings → Voice.".into());
+        return Err("Pick a voice profile in Settings → Hobbes.".into());
     };
     if !crate::settings::realtime_capable(conn) {
         return Err(crate::settings::VOICE_NEEDS_REALTIME.into());

@@ -117,15 +117,11 @@ fi
 # Fleet click-to-terminal drives iTerm2/Terminal over Apple Events. Without
 # this key macOS never shows the Automation prompt and every call fails with
 # -1743 (the apple-events entitlement is in HobbesPro.entitlements).
-/usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription Hobbes Pro switches to the terminal tab where a Claude Code session is running." "$PLIST" 2>/dev/null || \
-/usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Hobbes Pro switches to the terminal tab where a Claude Code session is running." "$PLIST"
+/usr/libexec/PlistBuddy -c "Set :NSAppleEventsUsageDescription Hobbes switches to the terminal tab where a Claude Code session is running." "$PLIST" 2>/dev/null || \
+/usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string Hobbes switches to the terminal tab where a Claude Code session is running." "$PLIST"
 
-# Set the app name to "Hobbes Pro" for direct download builds
 /usr/libexec/PlistBuddy -c "Set :NSMicrophoneUsageDescription Hobbes listens while you talk to it in a voice conversation." "$PLIST" 2>/dev/null || \
 /usr/libexec/PlistBuddy -c "Add :NSMicrophoneUsageDescription string Hobbes listens while you talk to it in a voice conversation." "$PLIST"
-
-/usr/libexec/PlistBuddy -c "Set :CFBundleName Hobbes Pro" "$PLIST" 2>/dev/null || \
-/usr/libexec/PlistBuddy -c "Add :CFBundleName string Hobbes Pro" "$PLIST"
 
 # Add attribution/copyright
 /usr/libexec/PlistBuddy -c "Set :NSHumanReadableCopyright Made w/ ❤️ by Clear Mirror LLC, Gemini 2.5, 3 and Claude model families." "$PLIST" 2>/dev/null || \

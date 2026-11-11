@@ -128,6 +128,19 @@ fn verify_with_key(key: &str, vk: &VerifyingKey) -> Result<LicenseInfo, LicenseE
 
 static PRO_ACTIVE: AtomicBool = AtomicBool::new(false);
 static LICENSE: RwLock<Option<LicenseInfo>> = RwLock::new(None);
+/// The key stored at startup failed verification (and was dropped).
+static STORED_KEY_INVALID: AtomicBool = AtomicBool::new(false);
+
+/// The one-line pointer shown wherever a Pro feature is locked.
+pub fn pro_note(feature: &str) -> String {
+    format!("{feature} is a Hobbes Pro feature. Add a license key under About to unlock it.")
+}
+
+/// Whether the key stored from an earlier run no longer verifies, so the
+/// About tab can say so instead of looking as if no key was ever entered.
+pub fn stored_key_invalid() -> bool {
+    STORED_KEY_INVALID.load(Ordering::Relaxed)
+}
 
 /// Is Pro unlocked right now? Cheap; callable from anywhere (components,
 /// background tasks). Reflects the last verified license set via
@@ -150,12 +163,14 @@ pub fn current_license() -> Option<LicenseInfo> {
 pub fn activate(info: LicenseInfo) {
     *LICENSE.write().expect("license lock poisoned") = Some(info);
     PRO_ACTIVE.store(true, Ordering::Relaxed);
+    STORED_KEY_INVALID.store(false, Ordering::Relaxed);
 }
 
 /// Drop any active license (key removed in settings).
 pub fn clear() {
     *LICENSE.write().expect("license lock poisoned") = None;
     PRO_ACTIVE.store(false, Ordering::Relaxed);
+    STORED_KEY_INVALID.store(false, Ordering::Relaxed);
 }
 
 /// Startup hydration: verify the keychain-stored license (if any) and set the
@@ -170,6 +185,7 @@ pub fn hydrate_from_stored_key(stored: Option<&str>) {
             Err(e) => {
                 tracing::warn!("Stored license key failed verification: {}", e);
                 clear();
+                STORED_KEY_INVALID.store(true, Ordering::Relaxed);
             }
         },
         None => clear(),
@@ -393,7 +409,9 @@ mod tests {
         // Hydration path: bad stored key clears, good state only via verify.
         hydrate_from_stored_key(Some("HOBBES-PRO.garbage.garbage"));
         assert!(!pro_active());
+        assert!(stored_key_invalid(), "a stored key that fails is reported");
         hydrate_from_stored_key(None);
         assert!(!pro_active());
+        assert!(!stored_key_invalid());
     }
 }

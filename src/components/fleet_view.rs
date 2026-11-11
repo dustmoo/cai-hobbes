@@ -391,7 +391,9 @@ pub fn FleetView() -> Element {
                 div {
                     class: "px-6 py-8 text-sm text-fg-muted space-y-2",
                     p { "No Claude Code sessions observed yet." }
-                    if !enabled {
+                    if !crate::entitlement::pro_active() {
+                        p { {crate::entitlement::pro_note("Fleet observation")} }
+                    } else if !enabled {
                         p { "Turn on the fleet in Settings → Fleet, then Connect Claude Code." }
                     } else if !connected {
                         p { "Hooks aren't registered yet — open Settings → Fleet and hit \"Connect Claude Code\"." }
