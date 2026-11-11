@@ -1,3 +1,54 @@
+# Hobbes v0.14.0 — Voice
+
+## ✨ New Features
+
+### Talk to Hobbes (Pro)
+- **A voice conversation with Hobbes.** Tap the voice hotkey to talk hands-free, or hold it to push-to-talk. Hobbes answers out loud, briefly by default and at length when you ask, and you can interrupt it. Set it up in Settings → Hobbes with a Gemini API key.
+- **It does real work while you talk.** The voice hands requests to Hobbes' full chat, keeps the conversation going while that runs, and tells you the result when it's ready. Work that finishes later is announced too.
+- **30 voices,** filterable by name or style, each with a one-sentence sample.
+- **Echo cancellation** on macOS so Hobbes doesn't hear itself on speakers, a microphone picker, and a mic and speaker test in Settings.
+- **Risky actions are confirmed out loud.** When something is held for your approval during a voice conversation, Hobbes asks and takes a spoken yes or no. The button is still there.
+
+### One Hobbes tab
+- **Heartbeat, voice and your own messages now share one chat,** the Hobbes tab, marked with the pixel tiger. Your earlier Heartbeat chat is kept as a read-only archive.
+- **It stays a manageable size.** The Hobbes chat starts fresh when it grows large, carrying a summary forward, and can also start fresh daily at a time you choose.
+- **It can read your other tabs.** With "Read other tabs" on, Hobbes can list your conversations and read one when you ask about it. It asks first unless you choose always.
+- **A Hobbes page in Settings** gathers its home profile, Voice and the Heartbeat.
+
+### Working across profiles
+- **Every tab can use all your Composio profiles.** A tab acts in its home profile unless the work belongs in another. The profile chip shows the home, and a lock keeps a tab to its home only.
+- **A guard on content moving between profiles.** Hobbes asks before it sends, drafts or writes content into one profile's accounts from a chat that has read another's. Choose Allow once, Allow in this chat or Always allow for that pair of profiles. Reading, labelling and archiving never ask.
+- **Personal profiles.** Mark a profile as personal and content moves freely between it and the others. Allowed pairs are listed in Settings → Permissions.
+
+### Safer unattended and spoken work
+- **Destructive commands are checked.** On voice turns and turns nobody is watching (timers, the Heartbeat, returned work), Hobbes checks each call and holds ones that would delete, overwrite or force-push, with the reason shown. Commands that are clearly malformed are sent back to be fixed. Typed chat is unchanged.
+- **Trust follows who started the turn.** Your always-allow rules apply to turns you start, not to ones Hobbes starts on its own.
+
+### Heartbeat
+- **Your schedule, your way.** Set workdays, briefing times and days off.
+
+### Models
+- **Gemini 4 Carbon** is supported, with a 1M-token context and thinking levels. Existing installs get it in a free model slot.
+- **GPT-6.1 models,** and OpenAI cached input is now billed at the cached rate.
+
+### Smaller things
+- **Choose whether a dispatched chat takes over the screen:** Settings → Planner → When an Agent Starts.
+- **A backup before each upgrade.** The first launch of a new version copies your chat database next to the original before changing anything.
+
+## 🐛 Fixes
+- **Stop works between tool steps.** A turn could not be stopped while it was preparing its next step.
+- **Agent to-dos settle when their worker finishes,** closed or left for review as you've set, and one you reopen stays open.
+- **"Needs you" is more accurate in the Fleet.** It counts what a session is actually asking, clears a question you answered elsewhere, and drops blockers from earlier turns.
+- **A dispatched chat uses its parent's profile,** and a worker's news points at the worker's tab.
+- **An old unanswered approval no longer blocks** relays into a chat or Heartbeat wakes.
+- **The input toolbar and message controls stay inside a narrow window.**
+- **History opens faster,** and startup does less work on large chat databases.
+- **Less background polling.** Timers, hand-backs and waits now react to events.
+
+## 🛡️ Security
+- Updated `rmcp` (3.9) and the bundled SQLite (via `rusqlite` 0.42) for new RustSec advisories.
+- Voice transcripts, microphone names and API keys are kept out of the logs.
+
 # Hobbes v0.13.0 — The Heartbeat
 
 ## ✨ New Features

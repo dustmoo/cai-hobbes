@@ -99,11 +99,15 @@ jobs:
         VERSION=$(grep '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
         echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
         mv "$DMG_PATH" "Hobbes-macOS-v${VERSION}.dmg"
+        # The release body is this version's section only (the top one);
+        # GitHub keeps earlier releases' notes on their own pages.
+        awk '/^# Hobbes v/{n++} n==1' RELEASE_NOTES.md > release_body.md
+        test -s release_body.md
 
     - name: Upload macOS Release Asset
       uses: softprops/action-gh-release@v2
       with:
-        body_path: RELEASE_NOTES.md
+        body_path: release_body.md
         files: Hobbes-macOS-v${{ steps.version.outputs.VERSION }}.dmg
 
   # ── ENABLED: Azure certificate validation completed ──
