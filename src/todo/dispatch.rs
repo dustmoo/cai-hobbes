@@ -297,6 +297,12 @@ pub fn dispatch_to_chat(
     let linked = opts
         .parent_session_id
         .is_some_and(|parent| crate::todo::relay::record_link(deps.session_state, parent, &new_id, todo_id));
+    // The assignment may carry what the dispatching chat read: the worker
+    // inherits those sources (hobbes_tabs::carry_sender_reads).
+    if let Some(parent) = opts.parent_session_id {
+        let settings = deps.settings.peek().clone();
+        crate::hobbes_tabs::carry_sender_reads(deps.session_state, &settings, parent, &new_id, chrono::Utc::now());
+    }
     crate::session::SessionState::save_signal(&deps.session_state, None);
     let model = {
         let settings = deps.settings.peek();

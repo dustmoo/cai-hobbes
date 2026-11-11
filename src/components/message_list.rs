@@ -402,8 +402,11 @@ pub fn MessageList(
                                                     let should_render = !text.trim().is_empty() || is_generating || !message.attachments.is_empty();
                                                     // A voice request that repeats the heard line
                                                     // just above it shows as a hand-off marker under
-                                                    // that bubble, not as a second copy of it.
-                                                    let echo = crate::voice::display::echoes_heard_line(&sorted_messages, *idx);
+                                                    // that bubble, not as a second copy of it — only
+                                                    // while that bubble is rendered (not above the
+                                                    // Load More cut-off).
+                                                    let echo = crate::voice::display::echoes_heard_line(&sorted_messages, *idx)
+                                                        .is_some_and(|heard| crate::voice::display::marker_shown(heard, skip));
 
                                                     if echo {
                                                         let request = crate::voice::display::display_text(text).to_string();

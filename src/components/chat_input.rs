@@ -530,6 +530,7 @@ pub fn ChatInput(
         // a queued message, else the person. Taken once, here, so no branch
         // (a /skill, /unload) can leave it for a later send to pick up.
         let turn_origin = chat_queue::take_turn_origin(&target_sid);
+        let turn_absent = chat_queue::take_pending_absent(&target_sid);
         // Skill Command Detection
         {
             // /unload command — remove a loaded skill from session context.
@@ -862,6 +863,7 @@ pub fn ChatInput(
 
         // The send path takes it back (`chat.rs` send_message).
         chat_queue::set_pending_origin(&target_sid, turn_origin);
+        chat_queue::set_pending_absent(&target_sid, turn_absent);
         on_send.call((user_message, atts, target_sid));
     },
     );
@@ -991,6 +993,9 @@ pub fn ChatInput(
                 // unattended one in the Hobbes session gets the Heartbeat's
                 // rules). Harness-decided here, never by the model.
                 let origin = chat_queue::drain_origin(&qm, &session_id);
+                // Nobody present (a timer, relay, returned work): the flow
+                // guard treats the turn as unattended in any chat.
+                let absent = chat_queue::nobody_present(qm.origin);
                 match qm.relay {
                     // A waking dispatch relay: append it and start a turn
                     // with no user message (todo::relay). Never resets the
@@ -1005,6 +1010,7 @@ pub fn ChatInput(
                         // Only a relay that starts a turn gives it an origin
                         // (the continuation records it on the session).
                         if start {
+                            chat_queue::set_turn_absent(&session_id, absent);
                             continuation_controller
                                 .write()
                                 .trigger_continuation(session_id.clone(), origin);
@@ -1012,6 +1018,7 @@ pub fn ChatInput(
                     }
                     None => {
                         chat_queue::set_pending_origin(&session_id, origin);
+                        chat_queue::set_pending_absent(&session_id, absent);
                         submit.call((qm.text, qm.attachments, session_id.clone()));
                     }
                 }

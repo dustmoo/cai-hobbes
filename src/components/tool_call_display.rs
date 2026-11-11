@@ -371,6 +371,38 @@ pub fn decide_held_message(
     }
 }
 
+/// After the person allowed profile pairs (in this chat or always), approve
+/// every call still held in `session_id` whose pairs are now all allowed
+/// (`profile_flow::released_by_allowance`: never a risk-held call or an
+/// unattended act), each through the shared approve path and logged as
+/// Approved. Returns how many were released.
+pub fn release_allowed_flow_holds(
+    session_state: Signal<crate::session::SessionState>,
+    settings: &crate::settings::Settings,
+    session_id: &str,
+) -> usize {
+    let (calls, project_id) = {
+        let state = session_state.peek();
+        let Some(s) = state.sessions.get(session_id) else { return 0 };
+        let policy = crate::mcp::manager::profile_flow::FlowPolicy::new(settings, &s.allowed_flows);
+        (crate::mcp::manager::profile_flow::released_by_allowance(&s.messages, &policy), s.project_id.clone())
+    };
+    for tc in &calls {
+        let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+        crate::context::trust_store::log_decision(crate::context::trust_store::TrustDecision::new(
+            crate::context::trust_store::DecisionKind::Approved,
+            tc.hold_rule_key.as_deref().unwrap_or(&tc.server_name),
+            &tc.tool_name,
+            crate::context::trust_store::arg_summary(&args),
+            Some(session_id.to_string()),
+            project_id.clone(),
+            None,
+        ));
+        approve_held_call(session_state, session_id, &tc.execution_id);
+    }
+    calls.len()
+}
+
 /// The message carrying this execution id, within one session.
 fn message_mut_by_execution_id<'a>(
     session: &'a mut crate::session::Session,
@@ -620,6 +652,8 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 log(crate::context::trust_store::DecisionKind::Approved, None);
             }
             approve_held_call(session_state, &session_id, &execution_id);
+            // Other calls held only for pairs now allowed run too.
+            release_allowed_flow_holds(session_state, &settings.peek(), &session_id);
         }
     };
     let mut allow_in_chat = allow_flows.clone();

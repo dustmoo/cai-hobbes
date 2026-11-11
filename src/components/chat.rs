@@ -869,6 +869,8 @@ pub fn ChatWindow(
             // queued message, else the person (a typed send). Taken first,
             // synchronously, so it can't outlive this send.
             let turn_origin = crate::components::chat_queue::take_turn_origin(&target_id);
+            // Whether nobody is present for it (the flow guard's view).
+            let turn_absent = crate::components::chat_queue::take_pending_absent(&target_id);
             // An archived system session is read-only (session_rotation).
             if crate::system_sessions::is_archive(&target_id) {
                 tracing::warn!(session_id = %target_id, "send refused: archived system session");
@@ -876,6 +878,7 @@ pub fn ChatWindow(
             }
             // A new turn: a stop aimed at an earlier one must not end it.
             crate::components::stream_manager::clear_turn_abort(&target_id);
+            crate::components::chat_queue::set_turn_absent(&target_id, turn_absent);
             spawn({
                 let mut session_state = session_state;
                 let settings = settings;

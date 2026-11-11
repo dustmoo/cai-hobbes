@@ -2086,7 +2086,7 @@ fn arg_strings(args: &serde_json::Value, out: &mut Vec<String>) {
 
 /// Split a tool name into lowercase word tokens: separators (`_ - . : /`
 /// and the `__` server prefix) and camelCase boundaries both split.
-fn name_tokens(name: &str) -> Vec<String> {
+pub(crate) fn name_tokens(name: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut prev_lower = false;

@@ -545,6 +545,33 @@ pub fn carry_reads(
     crate::session_events::log_event(reader, crate::session_events::SessionEvent::ReadsCarried { reads: merged });
 }
 
+/// **A hand-off carries what the sender read.** Content a chat passes to
+/// another (a dispatch's assignment, a relay message, a worker's report)
+/// may hold every company the sender has read
+/// (`profile_reach::session_read_profiles`), so the receiver inherits those
+/// sources as carried reads stamped `now` ([`carry_reads`], journaled as
+/// `ReadsCarried`), exactly like a tab read. The receiver's own clock then
+/// applies: none in an ordinary tab, the read window in the Hobbes session.
+/// The flow guard thus follows the data across the hop without holding the
+/// hand-off itself.
+pub fn carry_sender_reads(
+    session_state: Signal<SessionState>,
+    settings: &crate::settings::Settings,
+    from: &str,
+    to: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let sources = {
+        let state = session_state.peek();
+        state
+            .sessions
+            .get(from)
+            .map(|s| crate::mcp::manager::profile_reach::session_read_profiles(settings, s, now))
+            .unwrap_or_default()
+    };
+    carry_reads(session_state, to, &sources, now);
+}
+
 fn single_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }

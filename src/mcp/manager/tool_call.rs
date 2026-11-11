@@ -969,13 +969,11 @@ impl McpManager {
                             cleared_count
                         ))]))
                     } else if tool.name == "COMPOSIO_EXECUTE_TOOL" {
-                        // Extract tool_name and arguments - handle missing tool_name as error
-                        match args.get("tool_name").and_then(|v| v.as_str()) {
-                            Some(target_tool_name) => {
-                                let tool_args = args
-                                    .get("arguments")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        // Extract tool_name and arguments - handle missing tool_name as error.
+                        // The same reading the flow guard classifies
+                        // (profile_flow::execute_target), so what is judged is what runs.
+                        match super::profile_flow::execute_target(&args) {
+                            Some((target_tool_name, tool_args)) => {
                                 tracing::debug!(
                                     "COMPOSIO_EXECUTE_TOOL: executing '{}'",
                                     target_tool_name

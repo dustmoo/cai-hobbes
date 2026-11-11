@@ -9,33 +9,44 @@
 //!    [`FlowClass::Act`] (changes state but carries no content: label,
 //!    archive, mark read, move, trash) or [`FlowClass::Carry`] (puts
 //!    content somewhere: send, draft, create, post, upload, write …). The
-//!    leading verb of the tool name decides (the first token after the
-//!    toolkit prefix that is in a verb list), not any token anywhere; the
-//!    Composio execute meta tools are judged by the call(s) they run; an
-//!    Act whose arguments hold free text is a Carry; an unrecognised verb is
-//!    a Carry (fail closed). The agent-time scope keeps its own, stricter
-//!    test (`todo::agent_time::agent_time_scope`).
+//!    leading verb of the tool name decides (the first word after the
+//!    toolkit prefix that is a listed verb). A read verb joined to a write
+//!    (`FIND_REPLACE`, `GET_OR_CREATE`) takes the write. Noun markers
+//!    (`…_EVENTS_INSTANCES`, `…_CONVERSATIONS_HISTORY`) make a name a read
+//!    only as its last word, with no verb anywhere and only plural nouns
+//!    before it. An edit (add, update, patch, set …) is a Carry unless it is
+//!    positively content-free (a label, star, reaction, status … object, or
+//!    arguments that are all ids, times and short enum values); any other
+//!    Act whose arguments hold free text is a Carry. `COMPOSIO_EXECUTE_TOOL`
+//!    is judged by exactly what the dispatcher runs ([`execute_target`]).
+//!    Anything unrecognised is a Carry (fail closed). The agent-time scope
+//!    keeps its own, stricter test (`todo::agent_time::agent_time_scope`).
 //! 2. **Is it held?** [`flow_hold`]: only calls into a Composio profile are
 //!    judged (terminal, files, browser, other MCP servers, dispatch and
 //!    relay messages are left to the normal permission flow and the call
-//!    risk gate). A Carry into profile T is held unless every pair
-//!    (source → T) is allowed, where the sources are the profiles the chat
-//!    has read (`profile_reach::session_read_profiles`) other than T. On an
-//!    unattended turn (a Heartbeat wake) any non-Read call into a profile
-//!    other than the chat's home is held as well.
+//!    risk gate; a dispatch or relay hands the sender's read sources to the
+//!    receiving chat instead, `hobbes_tabs::carry_sender_reads`). A Carry
+//!    into profile T is held unless every pair (source → T) is allowed,
+//!    where the sources are the profiles the chat has read
+//!    (`profile_reach::session_read_profiles`) other than T. On a turn
+//!    nobody is present for (a Heartbeat wake, or a fired timer, relay or
+//!    returned work in any chat, [`flow_person`]) any non-Read call into a
+//!    profile other than the chat's home is held as well.
 //! 3. **What is remembered?** Pairs, not tools ([`FlowPolicy`]): a pair is
 //!    allowed when either profile is personal (`ComposioProfile::personal`),
 //!    when it is on the always-allowed list (`PermissionSettings::
 //!    profile_flows`), or when it was allowed for this chat
 //!    (`Session::allowed_flows`). Flow holds never consult or create trust
 //!    rules; the rules the old guard wrote (`profile-flow:` servers) are
-//!    dropped when settings load.
+//!    dropped when settings load. A Carry let through by an allowance is
+//!    logged as a trust decision ([`allowed_carry_key`]).
 //!
 //! A held call carries its pairs in `ToolCall::hold_rule_key`
 //! ([`pair_key`], parsed back by [`parse_held_flow`]) so the approval bubble
 //! can offer "Allow in this chat" and "Always allow" for exactly those
-//! pairs. Keys in the old format (`…>local`, `act>…`) parse to nothing and
-//! are approved or denied once.
+//! pairs (and release sibling calls those pairs now cover,
+//! [`released_by_allowance`]). Keys in the old format (`…>local`, `act>…`)
+//! parse to nothing and are approved or denied once.
 
 use std::collections::BTreeSet;
 
@@ -44,6 +55,7 @@ use serde_json::Value;
 use super::profile_reach::ReachProfile;
 use crate::context::permissions::ProfileFlow;
 use crate::settings::Settings;
+use crate::todo::agent_time::name_tokens;
 
 /// Trust-rule server prefix the old guard remembered flows under (dropped
 /// at load, `Settings::drop_legacy_flow_trust_rules`), and the prefix of
@@ -54,17 +66,15 @@ pub const FLOW_KEY_PREFIX: &str = "profile-flow:";
 pub const PAIR_KEY_PREFIX: &str = "profile-flow:v2:";
 
 /// The meta tool that runs another Composio tool by name.
-const EXECUTE_TOOL: &str = "COMPOSIO_EXECUTE_TOOL";
-/// The meta tool that runs several Composio tools in one call.
-const MULTI_EXECUTE_TOOL: &str = "COMPOSIO_MULTI_EXECUTE_TOOL";
+pub const EXECUTE_TOOL: &str = "COMPOSIO_EXECUTE_TOOL";
 
-/// Hobbes' discovery / loading meta tools: they read tool lists only.
+/// Hobbes' discovery / loading meta tools (`composio_client::meta`,
+/// `hobbes-meta`): they read tool lists only. Any other meta tool is judged
+/// by its name like an ordinary tool (`COMPOSIO_MULTI_EXECUTE_TOOL` → Carry).
 const DISCOVERY_TOOLS: &[&str] = &[
     "COMPOSIO_DISCOVER_APPS",
     "COMPOSIO_GET_APP_TOOLS",
     "COMPOSIO_CLEAR_TOOLS",
-    "COMPOSIO_SEARCH_TOOLS",
-    "COMPOSIO_GET_TOOL_SCHEMAS",
     "MCP_LOAD_SERVER_TOOLS",
     "MCP_UNLOAD_SERVER_TOOLS",
 ];
@@ -80,12 +90,19 @@ pub enum FlowClass {
     Carry,
 }
 
-/// Verbs (and read markers) that only read.
+/// Verbs that only read, wherever they lead the name.
 const READ_VERBS: &[&str] = &[
-    "get", "fetch", "list", "search", "find", "read", "query", "lookup", "look", "retrieve", "view", "download",
-    "export", "check", "describe", "count", "show", "browse", "scan", "inspect", "preview", "poll", "discover",
-    "explore", "history", "instances", "snapshot", "tree", "info", "details", "stats", "whoami",
+    "get", "fetch", "list", "search", "find", "read", "query", "lookup", "retrieve", "download", "export",
+    "describe", "browse", "scan", "inspect", "preview", "poll", "discover", "explore", "whoami",
 ];
+
+/// Read verbs that are as often nouns: a read only as the first word after
+/// the toolkit prefix (`GITHUB_VIEW_…`, never `…_OPEN_A_VIEW`).
+const WEAK_READ_VERBS: &[&str] = &["view", "check", "count", "show", "look"];
+
+/// Nouns that name a read (`GOOGLECALENDAR_EVENTS_INSTANCES`,
+/// `SLACK_CONVERSATIONS_HISTORY`), never verbs: see [`marker_read`].
+const READ_MARKERS: &[&str] = &["history", "info", "details", "stats", "instances", "view", "views"];
 
 /// Verbs that put content somewhere.
 const CARRY_VERBS: &[&str] = &[
@@ -99,19 +116,32 @@ const CARRY_VERBS: &[&str] = &[
 /// Verbs that change state without carrying content of their own.
 const ACT_VERBS: &[&str] = &[
     "label", "unlabel", "archive", "unarchive", "mark", "star", "unstar", "flag", "unflag", "move", "trash",
-    "untrash", "delete", "remove", "modify", "update", "patch", "edit", "set", "change", "rename", "mute",
-    "unmute", "pin", "unpin", "snooze", "close", "reopen", "resolve", "assign", "unassign", "accept", "decline",
-    "reject", "cancel", "complete", "enable", "disable", "approve", "lock", "unlock", "add", "stop", "start",
-    "subscribe", "unsubscribe", "follow", "unfollow", "react", "join", "leave", "restore", "toggle", "clear",
-    "merge", "kick", "ban", "unban", "block", "unblock", "hide", "unhide", "empty", "purge", "erase", "destroy",
-    "drop",
+    "untrash", "delete", "remove", "mute", "unmute", "pin", "unpin", "snooze", "close", "reopen", "resolve",
+    "assign", "unassign", "accept", "decline", "reject", "cancel", "complete", "enable", "disable", "approve",
+    "lock", "unlock", "stop", "start", "subscribe", "unsubscribe", "follow", "unfollow", "react", "join",
+    "leave", "restore", "toggle", "clear", "merge", "kick", "ban", "unban", "block", "unblock", "hide",
+    "unhide", "empty", "purge", "erase", "destroy", "drop",
 ];
 
-/// Act verbs that edit things: their object decides ([`CONTENT_OBJECTS`]).
-const EDIT_VERBS: &[&str] = &["add", "update", "edit", "patch", "modify", "set", "change"];
+/// Edit verbs: a Carry unless positively content-free ([`edit_class`]).
+const EDIT_VERBS: &[&str] = &["add", "update", "edit", "patch", "modify", "set", "change", "rename"];
 
-/// Objects whose edit writes content (`GOOGLEDOCS_UPDATE_DOCUMENT…`,
-/// `GITHUB_ADD_COMMENT…`), unlike a label or reaction.
+/// Writes that, joined to a read verb (`FIND_REPLACE`, `FIND_AND_UPDATE`,
+/// `GET_OR_CREATE`), make the name that write. Only unambiguous verbs: a
+/// noun-like one (`GET_LABEL`, `GET_COMMIT`, `GET_DRAFT`) stays a read.
+const JOINED_WRITES: &[&str] = &[
+    "replace", "create", "update", "delete", "remove", "write", "insert", "append", "upsert", "modify", "edit",
+    "add", "move", "trash",
+];
+
+/// Objects an edit can change without carrying content.
+const CONTENT_FREE_OBJECTS: &[&str] = &[
+    "label", "labels", "star", "stars", "reaction", "reactions", "emoji", "status", "flag", "flags", "read",
+    "unread", "assignee", "assignees", "tag", "tags", "priority", "important", "pin", "pins",
+];
+
+/// Objects whose edit always writes content (`…_UPDATE_DOCUMENT…`,
+/// `…_ADD_COMMENT…`), whatever the arguments look like.
 const CONTENT_OBJECTS: &[&str] = &[
     "comment", "comments", "note", "notes", "reply", "replies", "document", "documents", "doc", "docs", "page",
     "pages", "content", "contents", "text", "body", "block", "blocks", "paragraph", "cell", "cells", "value",
@@ -128,65 +158,41 @@ const TEXT_KEYS: &[&str] = &[
     "notes", "summary", "caption", "subject", "title", "snippet", "reply",
 ];
 
+/// Argument keys (last word) whose values identify rather than say anything.
+const ID_KEYS: &[&str] = &["id", "ids", "url", "urls", "uri", "link", "token", "slug", "uuid", "sha", "etag", "ref"];
+
+/// Argument keys (last word) holding times and dates.
+const TIME_KEYS: &[&str] = &[
+    "time", "date", "datetime", "start", "end", "due", "timezone", "zone", "tz", "at", "when", "duration",
+    "until", "since", "timestamp", "hour", "hours", "minute", "minutes", "seconds", "day", "days",
+];
+
+/// Argument keys (last word) holding short enum-style values.
+const ENUM_KEYS: &[&str] = &[
+    "status", "state", "type", "kind", "color", "colour", "priority", "visibility", "mode", "role", "label",
+    "labels", "flag", "flags", "starred", "read", "unread", "important", "archived", "pinned", "done",
+    "completed", "position", "index", "order", "transparency",
+];
+
 /// A string at least this long is free text whatever its key.
 const LONG_TEXT: usize = 200;
 
-/// The words of a tool name or argument key, lowercased: split on `_`, `-`,
-/// `.`, spaces and camelCase boundaries.
-fn words(name: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut prev_lower = false;
-    for c in name.chars() {
-        if !c.is_alphanumeric() {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-            prev_lower = false;
-            continue;
-        }
-        if c.is_uppercase() && prev_lower && !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
-        }
-        prev_lower = c.is_lowercase() || c.is_ascii_digit();
-        cur.extend(c.to_lowercase());
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-/// The class of the leading verb of `tool` (and its position), if any: the
-/// first word after the toolkit prefix that is in a verb list, else the
-/// prefix itself (`read_file`).
-fn leading_verb(tokens: &[String]) -> Option<(usize, FlowClass)> {
-    let class_of = |t: &str| {
-        if READ_VERBS.contains(&t) {
-            Some(FlowClass::Read)
-        } else if CARRY_VERBS.contains(&t) {
-            Some(FlowClass::Carry)
-        } else if ACT_VERBS.contains(&t) {
-            Some(FlowClass::Act)
-        } else {
-            None
-        }
-    };
-    let after_prefix = tokens.iter().enumerate().skip(1).find_map(|(i, t)| class_of(t).map(|c| (i, c)));
-    after_prefix.or_else(|| tokens.first().and_then(|t| class_of(t)).map(|c| (0, c)))
+/// The last word of an argument key, lowercased (`addLabelIds` → `ids`).
+fn key_word(key: &str) -> String {
+    name_tokens(key).pop().unwrap_or_default()
 }
 
 /// Whether `args` hold free text: a string under a body/content/description-
 /// style key (its last word in [`TEXT_KEYS`]), or any string of at least
-/// [`LONG_TEXT`] characters outside id / url keys.
+/// [`LONG_TEXT`] characters outside id keys.
 pub fn has_free_text(args: &Value) -> bool {
     fn walk(v: &Value, key: Option<&str>) -> bool {
-        let last = key.map(|k| words(k).pop().unwrap_or_default()).unwrap_or_default();
-        let id_like = matches!(last.as_str(), "id" | "ids" | "url" | "urls" | "uri" | "link" | "token");
+        let last = key.map(key_word).unwrap_or_default();
         match v {
             Value::String(s) => {
                 let s = s.trim();
-                (!s.is_empty() && TEXT_KEYS.contains(&last.as_str())) || (!id_like && s.chars().count() >= LONG_TEXT)
+                (!s.is_empty() && TEXT_KEYS.contains(&last.as_str()))
+                    || (!ID_KEYS.contains(&last.as_str()) && s.chars().count() >= LONG_TEXT)
             }
             Value::Array(items) => items.iter().any(|i| walk(i, key)),
             Value::Object(map) => map.iter().any(|(k, v)| walk(v, Some(k))),
@@ -196,25 +202,105 @@ pub fn has_free_text(args: &Value) -> bool {
     walk(args, None)
 }
 
-/// The tool an execute meta tool runs, and its arguments (an object, or a
-/// JSON string holding one).
-fn inner_call(call: &Value) -> Option<(String, Value)> {
-    let name = ["tool_slug", "tool_name", "tool", "slug", "action"]
-        .iter()
-        .find_map(|k| call.get(*k).and_then(Value::as_str))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?
-        .to_string();
-    let args = ["arguments", "params", "input", "args"]
-        .iter()
-        .find_map(|k| call.get(*k))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let args = match args {
-        Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::String(s)),
-        other => other,
-    };
-    Some((name, args))
+/// Whether every value in `args` is positively content-free: ids, times and
+/// dates, and short enum-style values (no spaces, at most 40 characters)
+/// under status / type / label-style keys. Anything under any other key —
+/// a name, a cell value, a property — is content.
+pub fn content_free_args(args: &Value) -> bool {
+    fn ok(v: &Value, key: &str) -> bool {
+        match v {
+            Value::Null | Value::Bool(_) => true,
+            Value::Array(items) => items.iter().all(|i| ok(i, key)),
+            Value::Object(map) => map.iter().all(|(k, v)| ok(v, k)),
+            Value::Number(_) | Value::String(_) => {
+                let w = key_word(key);
+                let w = w.as_str();
+                let text = v.as_str().map(str::trim);
+                if ID_KEYS.contains(&w) {
+                    text.is_none_or(|s| s.chars().count() < LONG_TEXT)
+                } else if TIME_KEYS.contains(&w) {
+                    text.is_none_or(|s| s.chars().count() <= 64)
+                } else if ENUM_KEYS.contains(&w) {
+                    text.is_none_or(|s| s.chars().count() <= 40 && !s.contains(char::is_whitespace))
+                } else {
+                    false
+                }
+            }
+        }
+    }
+    match args {
+        Value::Object(map) => map.iter().all(|(k, v)| ok(v, k)),
+        Value::Null => true,
+        _ => false,
+    }
+}
+
+/// **What `COMPOSIO_EXECUTE_TOOL` runs**: its `tool_name` and `arguments`
+/// (an empty object when absent) — the one reading both the dispatcher
+/// (`mcp::manager::tool_call`) and the classifier use, so what is judged is
+/// what runs. `None` when `tool_name` isn't a string (the dispatcher
+/// refuses the call).
+pub fn execute_target(args: &Value) -> Option<(&str, Value)> {
+    let name = args.get("tool_name")?.as_str()?;
+    let inner = args.get("arguments").cloned().unwrap_or_else(|| Value::Object(Default::default()));
+    Some((name, inner))
+}
+
+/// The class of the verb `tokens[at]` (with `tokens` the name's words after
+/// the toolkit prefix) for a call with `args`.
+fn verb_class(tokens: &[String], at: usize, args: &Value) -> FlowClass {
+    let verb = tokens[at].as_str();
+    if CARRY_VERBS.contains(&verb) {
+        FlowClass::Carry
+    } else if EDIT_VERBS.contains(&verb) {
+        edit_class(&tokens[at + 1..], args)
+    } else if ACT_VERBS.contains(&verb) {
+        if has_free_text(args) {
+            FlowClass::Carry
+        } else {
+            FlowClass::Act
+        }
+    } else {
+        FlowClass::Read
+    }
+}
+
+/// An edit is a Carry unless it carries no free text, its object (the
+/// words before the first preposition) is no content object, and either
+/// that object is content-free (a label, star, reaction …) or every
+/// argument is ([`content_free_args`]).
+fn edit_class(after: &[String], args: &Value) -> FlowClass {
+    let object: Vec<&str> =
+        after.iter().map(String::as_str).take_while(|t| !OBJECT_STOPS.contains(t)).collect();
+    if object.iter().any(|t| CONTENT_OBJECTS.contains(t)) {
+        return FlowClass::Carry;
+    }
+    let object_free = object.iter().any(|t| CONTENT_FREE_OBJECTS.contains(t));
+    if !has_free_text(args) && (object_free || content_free_args(args)) {
+        FlowClass::Act
+    } else {
+        FlowClass::Carry
+    }
+}
+
+/// Whether `t` is a verb candidate at position `at` of the name's words
+/// after the prefix.
+fn is_candidate(t: &str, at: usize) -> bool {
+    READ_VERBS.contains(&t)
+        || (at == 0 && WEAK_READ_VERBS.contains(&t))
+        || CARRY_VERBS.contains(&t)
+        || ACT_VERBS.contains(&t)
+        || EDIT_VERBS.contains(&t)
+}
+
+/// A name with no verb is a read only when its last word is a read marker
+/// and every word before it (after the prefix) is a plural noun
+/// (`EVENTS_INSTANCES`, `CONVERSATIONS_HISTORY`); `SYNC_HISTORY` or
+/// `OPEN_A_VIEW` may hide an unlisted verb, so they fail closed.
+fn marker_read(body: &[String]) -> bool {
+    let Some((last, before)) = body.split_last() else { return false };
+    READ_MARKERS.contains(&last.as_str())
+        && before.iter().all(|t| t.len() > 2 && t.ends_with('s') && !t.ends_with("ss"))
 }
 
 /// **Classify a call** by what it does with content (see the module doc).
@@ -232,45 +318,37 @@ fn classify_at(tool_name: &str, args: &Value, depth: u8) -> FlowClass {
         return FlowClass::Read;
     }
     if tool_name == EXECUTE_TOOL {
-        return match inner_call(args) {
-            Some((inner, inner_args)) => classify_at(&inner, &inner_args, depth + 1),
-            None => FlowClass::Carry,
+        let Some((inner, inner_args)) = execute_target(args) else {
+            return FlowClass::Carry;
         };
+        // A JSON string is judged as the object it holds; anything else
+        // that isn't an object can't be read.
+        let inner_args = match inner_args {
+            Value::String(s) => match serde_json::from_str::<Value>(&s) {
+                Ok(v @ Value::Object(_)) => v,
+                _ => return FlowClass::Carry,
+            },
+            v @ (Value::Object(_) | Value::Null) => v,
+            _ => return FlowClass::Carry,
+        };
+        return classify_at(inner.trim(), &inner_args, depth + 1);
     }
-    if tool_name == MULTI_EXECUTE_TOOL {
-        // The strictest of the calls it runs; nothing readable = Carry.
-        let calls = args
-            .get("tools")
-            .or_else(|| args.get("calls"))
-            .or_else(|| args.get("actions"))
-            .and_then(Value::as_array);
-        let classes: Vec<FlowClass> = calls
-            .map(|c| {
-                c.iter()
-                    .map(|call| match inner_call(call) {
-                        Some((inner, inner_args)) => classify_at(&inner, &inner_args, depth + 1),
-                        None => FlowClass::Carry,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        return classes.into_iter().max().unwrap_or(FlowClass::Carry);
-    }
-    let tokens = words(tool_name);
-    let Some((at, class)) = leading_verb(&tokens) else {
-        return FlowClass::Carry;
+    let tokens = name_tokens(tool_name);
+    let body: &[String] = if tokens.len() > 1 { &tokens[1..] } else { &tokens };
+    let Some(at) = body.iter().enumerate().position(|(i, t)| is_candidate(t, i)) else {
+        return if marker_read(body) { FlowClass::Read } else { FlowClass::Carry };
     };
-    match class {
-        FlowClass::Act => {
-            let edits_content = EDIT_VERBS.contains(&tokens[at].as_str())
-                && tokens[at + 1..]
-                    .iter()
-                    .take_while(|t| !OBJECT_STOPS.contains(&t.as_str()))
-                    .any(|t| CONTENT_OBJECTS.contains(&t.as_str()));
-            if edits_content || has_free_text(args) {
-                FlowClass::Carry
-            } else {
-                FlowClass::Act
+    match verb_class(body, at, args) {
+        FlowClass::Read => {
+            // A read joined to a write takes the write (`FIND_REPLACE`,
+            // `FIND_AND_UPDATE`, `GET_OR_CREATE`).
+            let mut next = at + 1;
+            if body.get(next).is_some_and(|t| t == "and" || t == "or") {
+                next += 1;
+            }
+            match body.get(next) {
+                Some(t) if JOINED_WRITES.contains(&t.as_str()) => verb_class(body, next, args),
+                _ => FlowClass::Read,
             }
         }
         other => other,
@@ -418,6 +496,51 @@ pub fn flow_hold(
     None
 }
 
+/// Whether the flow guard treats a turn as the person's: a typed or voice
+/// turn (`TurnOrigin::is_person`) that the person actually started — not
+/// one a fired timer, a relay or returned work started in an ordinary chat
+/// (`absent`, `chat_queue::turn_absent`), which other gates still treat as
+/// the person's.
+pub fn flow_person(origin: crate::session::TurnOrigin, absent: bool) -> bool {
+    origin.is_person() && !absent
+}
+
+/// The pair key of a Carry that [`flow_hold`] let through only because the
+/// policy allows its pairs (a settings pair, a chat pair or a personal
+/// profile): logged as a trust decision so standing allowances leave a
+/// record. `None` when nothing foreign was in play.
+pub fn allowed_carry_key(
+    class: FlowClass,
+    target: Option<&ReachProfile>,
+    read_from: &BTreeSet<String>,
+    policy: &FlowPolicy,
+) -> Option<String> {
+    let target = target.filter(|_| class == FlowClass::Carry)?;
+    let sources: Vec<&str> = read_from.iter().map(String::as_str).filter(|s| *s != target.id).collect();
+    (!sources.is_empty() && sources.iter().all(|s| policy.allows(s, &target.id))).then(|| pair_key(&sources, &target.id))
+}
+
+/// The calls still held in `messages` that `policy` now covers: flow holds
+/// whose every pair is allowed. Never a risk-held call, an unattended act
+/// (no pairs) or a call in the old key format. Returns their execution ids
+/// with the call, for the bubble to approve each once.
+pub fn released_by_allowance(
+    messages: &[crate::components::chat::Message],
+    policy: &FlowPolicy,
+) -> Vec<crate::components::shared::ToolCall> {
+    messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            crate::components::shared::MessageContent::PermissionRequest(tc) if tc.risk_reason.is_none() => {
+                let held = parse_held_flow(tc.hold_rule_key.as_deref()?)?;
+                (!held.sources.is_empty() && held.pairs().iter().all(|f| policy.allows(&f.from, &f.to)))
+                    .then(|| tc.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The bubble's wording for a held flow's choices: "Always allow Puget
 /// content into Clearmirror.ai" (one label for all its pairs).
 pub fn always_label(settings: &Settings, held: &HeldFlow) -> String {
@@ -473,8 +596,11 @@ mod tests {
             ("GMAIL_GET_LABEL", json!({"label_id": "L1"}), Read),
             ("SLACK_FETCH_MESSAGE_THREAD_FROM_A_CONVERSATION", json!({"channel": "C1", "ts": "1"}), Read),
             ("GOOGLECALENDAR_EVENTS_INSTANCES", json!({"eventId": "e"}), Read),
-            ("browser_snapshot", json!({}), Read),
-            ("directory_tree", json!({"path": "/tmp"}), Read),
+            ("SLACK_CONVERSATIONS_HISTORY", json!({"channel": "C1"}), Read),
+            ("GITHUB_LIST_COMMITS", json!({"repo": "r"}), Read),
+            ("GITHUB_LIST_COMMENTS_FOR_AN_ISSUE", json!({}), Read),
+            ("GITHUB_GET_A_COMMIT", json!({}), Read),
+            ("GMAIL_GET_DRAFT", json!({}), Read),
             ("GMAIL_FETCH_EMAILS", json!({"query": "from:a"}), Read),
             ("GMAIL_LIST_DRAFTS", json!({}), Read),
             ("COMPOSIO_DISCOVER_APPS", json!({}), Read),
@@ -489,10 +615,24 @@ mod tests {
             ("GMAIL_MOVE_TO_TRASH", json!({"message_id": "m"}), Act),
             ("SLACK_ADD_REACTION_TO_AN_ITEM", json!({"name": "thumbsup"}), Act),
             ("GOOGLECALENDAR_PATCH_EVENT", json!({"event_id": "e", "start_time": "10:00"}), Act),
+            (
+                "GOOGLECALENDAR_PATCH_EVENT",
+                json!({"calendar_id": "primary", "event_id": "e", "start": {"dateTime": "2026-11-12T10:00:00", "timeZone": "America/Denver"}, "event_duration_hour": 1}),
+                Act,
+            ),
             // An Act carrying free text is a Carry.
             ("GOOGLECALENDAR_PATCH_EVENT", json!({"event_id": "e", "description": "Puget Q3 numbers"}), Carry),
             ("GOOGLECALENDAR_UPDATE_EVENT", json!({"event_id": "e", "summary": "Puget sync"}), Carry),
             ("SLACK_ADD_REACTION_TO_AN_ITEM", json!({"name": "x".repeat(250)}), Carry),
+            // An edit is a Carry unless positively content-free.
+            ("GOOGLESHEETS_BATCH_UPDATE", json!({"spreadsheet_id": "s", "values": [["Puget Q3", "1.2M"]]}), Carry),
+            ("GOOGLESHEETS_VALUES_UPDATE", json!({"spreadsheet_id": "s", "range": "Sheet1!A1", "values": [[1200000]]}), Carry),
+            ("TRELLO_ADD_CARDS", json!({"name": "Puget follow-up", "desc": "Call Sam"}), Carry),
+            ("HUBSPOT_UPDATE_CONTACT", json!({"contact_id": "1", "properties": {"company": "Puget"}}), Carry),
+            ("NOTION_RENAME_PAGE", json!({"page_id": "p", "name": "Puget plan"}), Carry),
+            ("ASANA_UPDATE_TASK", json!({"task_gid": "1", "completed": true, "due_on": "2026-11-12"}), Carry),
+            ("ASANA_UPDATE_TASK", json!({"task_id": "1", "completed": true, "due_date": "2026-11-12"}), Act),
+            ("LINEAR_SET_ISSUE_STATUS", json!({"issue_id": "1", "status": "Done"}), Act),
             // Editing a content object is a Carry.
             ("GOOGLEDOCS_UPDATE_DOCUMENT_MARKDOWN", json!({"id": "d"}), Carry),
             ("GITHUB_ADD_COMMENT_TO_ISSUE", json!({"issue": 1}), Carry),
@@ -507,20 +647,18 @@ mod tests {
             // The execute meta tool is judged by the call it runs.
             (EXECUTE_TOOL, json!({"tool_name": "GMAIL_FETCH_EMAILS", "arguments": {}}), Read),
             (EXECUTE_TOOL, json!({"tool_name": "GMAIL_SEND_EMAIL", "arguments": {"body": "hi"}}), Carry),
-            (EXECUTE_TOOL, json!({"tool_slug": "GMAIL_ADD_LABEL_TO_EMAIL", "arguments": "{\"message_id\":\"m\"}"}), Act),
+            (EXECUTE_TOOL, json!({"tool_name": "GMAIL_ADD_LABEL_TO_EMAIL", "arguments": "{\"message_id\":\"m\"}"}), Act),
+            (EXECUTE_TOOL, json!({"tool_name": "GMAIL_FETCH_EMAILS"}), Read),
+            (EXECUTE_TOOL, json!({"tool_name": "GMAIL_SEND_EMAIL", "arguments": "not json"}), Carry),
+            (EXECUTE_TOOL, json!({"tool_name": "GMAIL_FETCH_EMAILS", "arguments": [1]}), Carry),
+            (EXECUTE_TOOL, json!({"tool_name": 7}), Carry),
             (EXECUTE_TOOL, json!({}), Carry),
-            // Multi-execute: the strictest inner call.
-            (
-                MULTI_EXECUTE_TOOL,
-                json!({"tools": [{"tool_slug": "GMAIL_FETCH_EMAILS", "arguments": {}}, {"tool_slug": "GMAIL_SEND_EMAIL", "arguments": {}}]}),
-                Carry,
-            ),
-            (
-                MULTI_EXECUTE_TOOL,
-                json!({"tools": [{"tool_slug": "GMAIL_FETCH_EMAILS", "arguments": {}}, {"tool_slug": "GMAIL_GET_PROFILE", "arguments": {}}]}),
-                Read,
-            ),
-            (MULTI_EXECUTE_TOOL, json!({}), Carry),
+            // Only `tool_name` runs: a `tool_slug` beside it is ignored both ways.
+            (EXECUTE_TOOL, json!({"tool_slug": "GMAIL_FETCH_EMAILS", "tool_name": "GMAIL_SEND_EMAIL", "arguments": {}}), Carry),
+            (EXECUTE_TOOL, json!({"tool_slug": "GMAIL_SEND_EMAIL", "arguments": {}}), Carry),
+            // A meta tool Hobbes doesn't offer is judged by its name.
+            ("COMPOSIO_MULTI_EXECUTE_TOOL", json!({"tools": [{"tool_slug": "GMAIL_FETCH_EMAILS"}]}), Carry),
+            ("COMPOSIO_REMOTE_WORKBENCH", json!({}), Carry),
             // Unknown verbs fail closed.
             ("ACME_FROBNICATE_WIDGET", json!({}), Carry),
             ("FROBNICATE", json!({}), Carry),
@@ -536,9 +674,91 @@ mod tests {
         assert_eq!(classify_flow("GMAIL_GET_MESSAGE_LABEL_PROFILE", &json!({})), Read);
         // The verb, not the object: "send" in the object of a read.
         assert_eq!(classify_flow("SLACK_LIST_SEND_QUEUE", &json!({})), Read);
-        // A local tool whose only verb is its first word.
-        assert_eq!(classify_flow("read_file", &json!({"path": "/x"})), Read);
-        assert_eq!(classify_flow("getFileInfo", &json!({})), Read);
+        // A read joined to a write takes the write.
+        assert_eq!(classify_flow("GOOGLESHEETS_FIND_REPLACE", &json!({"find": "a", "replacement": "b"})), Carry);
+        assert_eq!(classify_flow("ACME_FIND_AND_UPDATE", &json!({"record": "x"})), Carry);
+        assert_eq!(classify_flow("ACME_GET_OR_CREATE_CONTACT", &json!({})), Carry);
+        assert_eq!(classify_flow("ACME_SEARCH_AND_DELETE", &json!({"ids": ["1"]})), Act);
+        // Noun markers: a read only as the last word, after plural nouns and no verb.
+        assert_eq!(classify_flow("ACME_LOG_CALL_DETAILS", &json!({})), Carry);
+        assert_eq!(classify_flow("ACME_OPEN_A_VIEW", &json!({})), Carry);
+        assert_eq!(classify_flow("ACME_SYNC_HISTORY", &json!({})), Carry);
+        assert_eq!(classify_flow("ACME_HISTORY_EXPORT_SYNC", &json!({})), Read, "export is a read verb");
+        assert_eq!(classify_flow("SLACK_USERS_INFO", &json!({})), Read);
+        assert_eq!(classify_flow("ACME_ADDRESS_INFO", &json!({})), Carry, "-ss is no plural");
+        // Weak read verbs only right after the prefix.
+        assert_eq!(classify_flow("GITHUB_VIEW_REPO", &json!({})), Read);
+        assert_eq!(classify_flow("ACME_SAVE_VIEW", &json!({})), Carry);
+        // Markers that existed only for local tools are gone.
+        assert_eq!(classify_flow("browser_snapshot", &json!({})), Carry);
+        assert_eq!(classify_flow("directory_tree", &json!({})), Carry);
+    }
+
+    #[test]
+    fn content_free_args_are_ids_times_and_short_enums() {
+        assert!(content_free_args(&json!({"messageIds": ["a"], "addLabelIds": ["L"], "starred": true})));
+        assert!(content_free_args(&json!({"start": {"dateTime": "2026-11-12T10:00", "timeZone": "UTC"}})));
+        assert!(content_free_args(&json!({"status": "IN_PROGRESS"})));
+        assert!(content_free_args(&json!({})));
+        assert!(!content_free_args(&json!({"status": "waiting on Puget legal"})));
+        assert!(!content_free_args(&json!({"name": "x"})));
+        assert!(!content_free_args(&json!({"values": [[1]]})));
+        assert!(!content_free_args(&json!("x")));
+    }
+
+    #[test]
+    fn the_dispatcher_and_the_classifier_read_the_same_target() {
+        let args = json!({"tool_slug": "A_GET", "tool_name": "B_SEND", "arguments": {"to": "x"}});
+        let (name, inner) = execute_target(&args).unwrap();
+        assert_eq!((name, inner), ("B_SEND", json!({"to": "x"})));
+        assert_eq!(execute_target(&json!({"tool_name": "B"})).unwrap().1, json!({}));
+        assert!(execute_target(&json!({"tool_slug": "B"})).is_none());
+    }
+
+    #[test]
+    fn person_flow_and_audit_and_release() {
+        use crate::session::TurnOrigin;
+        assert!(flow_person(TurnOrigin::User, false));
+        assert!(flow_person(TurnOrigin::Voice, false));
+        assert!(!flow_person(TurnOrigin::User, true), "a timer or relay in an ordinary chat");
+        assert!(!flow_person(TurnOrigin::Heartbeat, false));
+
+        let s = settings(&[("cm", "Clearmirror.ai", false), ("pg", "Puget", false), ("ac", "Acme", false)]);
+        let cm = p("cm", "Clearmirror.ai");
+        let chat = vec![flow("pg", "cm")];
+        let policy = FlowPolicy::new(&s, &chat);
+        // Let through by the chat pair: recorded.
+        assert_eq!(allowed_carry_key(Carry, Some(&cm), &read(&["pg"]), &policy).as_deref(), Some("profile-flow:v2:pg>cm"));
+        // Nothing foreign, a read, an act, or a hold: nothing to record.
+        assert_eq!(allowed_carry_key(Carry, Some(&cm), &read(&["cm"]), &policy), None);
+        assert_eq!(allowed_carry_key(Read, Some(&cm), &read(&["pg"]), &policy), None);
+        assert_eq!(allowed_carry_key(Act, Some(&cm), &read(&["pg"]), &policy), None);
+        assert_eq!(allowed_carry_key(Carry, Some(&cm), &read(&["ac", "pg"]), &policy), None);
+
+        // Sibling holds the allowance now covers.
+        let held = |exec: &str, key: &str, risk: Option<&str>| {
+            let mut m = crate::voice::session::transcript_message(true, "x");
+            m.content = crate::components::shared::MessageContent::PermissionRequest(crate::components::shared::ToolCall {
+                execution_id: exec.into(),
+                hold_rule_key: Some(key.into()),
+                risk_reason: risk.map(str::to_string),
+                ..Default::default()
+            });
+            m
+        };
+        let msgs = vec![
+            held("covered", "profile-flow:v2:pg>cm", None),
+            held("other-pair", "profile-flow:v2:ac+pg>cm", None),
+            held("risky", "profile-flow:v2:pg>cm", Some("deletes x")),
+            held("unattended", "profile-flow:v2:>cm", None),
+            held("old", "profile-flow:pg>cm", None),
+        ];
+        let out: Vec<String> = released_by_allowance(&msgs, &policy).into_iter().map(|t| t.execution_id).collect();
+        assert_eq!(out, ["covered"]);
+        let both = vec![flow("pg", "cm"), flow("ac", "cm")];
+        let out: Vec<String> =
+            released_by_allowance(&msgs, &FlowPolicy::new(&s, &both)).into_iter().map(|t| t.execution_id).collect();
+        assert_eq!(out, ["covered", "other-pair"]);
     }
 
     #[test]

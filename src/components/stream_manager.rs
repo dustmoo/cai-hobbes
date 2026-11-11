@@ -795,16 +795,38 @@ impl StreamManagerContext {
                                     serde_json::from_str(&tool_call.arguments).unwrap_or(serde_json::Value::Null);
                                 reach_mod::strip_profile_arg(&tool_call.tool_name, &mut args);
                                 let class = flow_mod::classify_flow(&tool_call.tool_name, &args);
-                                // The harness's origin stamp (set just above), never the model's.
-                                let person = crate::components::builtin_tools::effective_origin(&tool_call, &session_id).is_person();
+                                // The harness's origin stamp (set just above), never
+                                // the model's, and whether anyone started the turn
+                                // (a timer, relay or returned work in an ordinary chat
+                                // is the person's origin, but nobody is present).
+                                let person = flow_mod::flow_person(
+                                    crate::components::builtin_tools::effective_origin(&tool_call, &session_id),
+                                    crate::components::chat_queue::turn_absent(&session_id),
+                                );
                                 let chat_flows = session.map(|s| s.allowed_flows.as_slice()).unwrap_or_default();
                                 let policy = flow_mod::FlowPolicy::new(&settings_read, chat_flows);
                                 let named = reach_mod::all_profiles(&settings_read);
-                                if let Some(hold) =
-                                    flow_mod::flow_hold(class, target, reach.first(), &read_from, person, &policy, &named)
-                                {
-                                    tool_call.hold_reason = Some(hold.reason);
-                                    tool_call.hold_rule_key = Some(hold.rule_key);
+                                match flow_mod::flow_hold(class, target, reach.first(), &read_from, person, &policy, &named) {
+                                    Some(hold) => {
+                                        tool_call.hold_reason = Some(hold.reason);
+                                        tool_call.hold_rule_key = Some(hold.rule_key);
+                                    }
+                                    // Let through only by a standing allowance: leave a record.
+                                    None => {
+                                        if let Some(key) = flow_mod::allowed_carry_key(class, target, &read_from, &policy) {
+                                            crate::context::trust_store::log_decision(
+                                                crate::context::trust_store::TrustDecision::new(
+                                                    crate::context::trust_store::DecisionKind::RuleHit,
+                                                    &key,
+                                                    &tool_call.tool_name,
+                                                    crate::context::trust_store::arg_summary(&args),
+                                                    Some(session_id.clone()),
+                                                    session.and_then(|s| s.project_id.clone()),
+                                                    None,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             // Only another company's client may need connecting

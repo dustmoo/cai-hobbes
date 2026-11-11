@@ -121,6 +121,63 @@ pub fn take_turn_origin(session_id: &str) -> crate::session::TurnOrigin {
         .unwrap_or_default()
 }
 
+/// Whether nobody is present for a queued message's turn: anything but
+/// the person typing or speaking (a fired timer, a relay, returned work, a
+/// Heartbeat wake). Unlike [`resolve_origin`], the same in every chat.
+pub fn nobody_present(origin: QueueOrigin) -> bool {
+    !matches!(origin, QueueOrigin::Person | QueueOrigin::Voice)
+}
+
+type SessionSet = std::sync::Mutex<Option<std::collections::HashSet<String>>>;
+
+/// Sessions whose next send the drain started with nobody present, until
+/// the send path takes it ([`take_pending_absent`]); mirrors
+/// [`PENDING_ORIGINS`].
+static PENDING_ABSENT: SessionSet = std::sync::Mutex::new(None);
+
+/// Sessions whose current turn nobody is present for ([`turn_absent`]),
+/// set when a turn starts. Read only by the cross-company flow guard
+/// (`profile_flow::flow_person`); every other gate keeps reading the turn's
+/// `TurnOrigin`, under which such a turn in an ordinary chat is the
+/// person's. Runtime only: a turn doesn't outlive the process.
+static ABSENT_TURNS: SessionSet = std::sync::Mutex::new(None);
+
+fn set_in(set: &SessionSet, session_id: &str, on: bool) {
+    if let Ok(mut s) = set.lock() {
+        let s = s.get_or_insert_with(Default::default);
+        if on {
+            s.insert(session_id.to_string());
+        } else {
+            s.remove(session_id);
+        }
+    }
+}
+
+/// The drain is about to submit a queued message for `session_id`.
+pub fn set_pending_absent(session_id: &str, absent: bool) {
+    set_in(&PENDING_ABSENT, session_id, absent);
+}
+
+/// Whether the send now starting in `session_id` has nobody present: what
+/// the drain left, else not (a typed send). Taken once.
+pub fn take_pending_absent(session_id: &str) -> bool {
+    PENDING_ABSENT
+        .lock()
+        .ok()
+        .and_then(|mut s| s.as_mut().map(|s| s.remove(session_id)))
+        .unwrap_or(false)
+}
+
+/// A turn starts in `session_id`, with nobody present or not.
+pub fn set_turn_absent(session_id: &str, absent: bool) {
+    set_in(&ABSENT_TURNS, session_id, absent);
+}
+
+/// Whether nobody is present for the turn running in `session_id`.
+pub fn turn_absent(session_id: &str) -> bool {
+    ABSENT_TURNS.lock().ok().is_some_and(|s| s.as_ref().is_some_and(|s| s.contains(session_id)))
+}
+
 /// App-wide, per-session queue keyed by session id. A `GlobalSignal` (rather
 /// than a context) so it survives `ChatWindow`/`ChatInput` remounts on tab
 /// switches and holds queues for background sessions too.
@@ -340,6 +397,26 @@ mod tests {
         assert!(!dispatch_owned_by(&ids, "s", a), "A's timer must not clear B's guard");
         assert!(dispatch_owned_by(&ids, "s", b));
         assert!(!dispatch_owned_by(&ids, "other", b));
+    }
+
+    /// The flow guard's view of who is present: only the person typing or
+    /// speaking; a timer, relay or returned work is nobody, in any chat,
+    /// while `resolve_origin` keeps calling it the person's outside the
+    /// Hobbes session.
+    #[test]
+    fn nobody_is_present_for_timers_relays_and_returned_work() {
+        assert!(!nobody_present(QueueOrigin::Person));
+        assert!(!nobody_present(QueueOrigin::Voice));
+        assert!(nobody_present(QueueOrigin::Unattended));
+        assert!(nobody_present(QueueOrigin::HeartbeatWake));
+        assert_eq!(resolve_origin(QueueOrigin::Unattended, false), crate::session::TurnOrigin::User, "other gates unchanged");
+        set_pending_absent("absent-test", true);
+        assert!(take_pending_absent("absent-test"));
+        assert!(!take_pending_absent("absent-test"), "taken once");
+        set_turn_absent("absent-test", true);
+        assert!(turn_absent("absent-test"));
+        set_turn_absent("absent-test", false);
+        assert!(!turn_absent("absent-test"));
     }
 
     #[test]

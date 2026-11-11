@@ -506,6 +506,10 @@ fn deliver(sig: RelaySignals, out: Outgoing) -> Result<Delivered, String> {
             crate::session_events::SessionEvent::Relay { message: incoming },
         );
     }
+    // The receiver now holds whatever the sender had read (the flow guard
+    // follows the data, hobbes_tabs::carry_sender_reads).
+    let settings = sig.settings.peek().clone();
+    crate::hobbes_tabs::carry_sender_reads(session_state, &settings, out.from, out.to, now);
     record_send(&mut guard(), out.from, out.to, now);
     SessionState::save_signal(&session_state, None);
     Ok(Delivered { woke: wake })
@@ -1161,6 +1165,91 @@ mod tests {
             let ctx = test_ctx_with(planner, Settings::default());
             let d = crate::todo::dispatch::dispatch_to_chat(ctx, &id, Default::default()).unwrap();
             assert!(ctx.session_state.peek().sessions.get(&d.session_id).unwrap().dispatch_link.is_none());
+        });
+    }
+
+    /// A completed Puget read, stamped `pg`.
+    fn puget_read() -> crate::components::chat::Message {
+        let mut tc = crate::components::shared::ToolCall::new(
+            "composio-native:Puget".into(),
+            "GMAIL_FETCH_EMAILS".into(),
+            serde_json::json!({}),
+            None,
+            None,
+        );
+        tc.profile_id = Some("pg".into());
+        tc.status = ToolCallStatus::Completed;
+        tc.completed_at = Some(Utc::now());
+        let mut m = crate::voice::session::transcript_message(true, "x");
+        m.author = "Hobbes".into();
+        m.content = MessageContent::ToolCall(tc);
+        m
+    }
+
+    fn reads_of(ctx: &BuiltinToolCtx, sid: &str) -> std::collections::BTreeSet<String> {
+        let settings = ctx.settings.peek().clone();
+        crate::mcp::manager::profile_reach::session_read_profiles(&settings, &ctx.session_state.peek().sessions[sid], Utc::now())
+    }
+
+    /// The two-hop route: a chat that read Puget hands content on (dispatch,
+    /// relay either way, completion report) and the receiver inherits Puget
+    /// as a source, so its own carry into Clearmirror is held. The hand-off
+    /// itself is never held.
+    #[test]
+    fn a_hand_off_carries_the_senders_reads() {
+        run!({
+            // Dispatch: the worker inherits what the parent read.
+            let mut planner = PlannerState::default();
+            let todo = Todo::new("Puget follow-up", 1.0);
+            let todo_id = todo.id.clone();
+            planner.todos.push(todo);
+            let mut ctx = test_ctx_with(planner, two_way());
+            let parent = ctx.session_state.write().create_session_raw(None);
+            ctx.session_state.write().sessions.get_mut(&parent).unwrap().messages.push(puget_read());
+            let d = crate::todo::dispatch::dispatch_to_chat(
+                ctx,
+                &todo_id,
+                crate::todo::dispatch::ChatDispatchOpts { parent_session_id: Some(&parent), ..Default::default() },
+            )
+            .unwrap();
+            crate::components::chat_queue::CHAT_QUEUE.write().clear();
+            assert!(reads_of(&ctx, &d.session_id).contains("pg"), "the worker holds Puget data now");
+            // …so its carry into Clearmirror is held.
+            let settings = Settings::default();
+            let none = Vec::new();
+            let policy = crate::mcp::manager::profile_flow::FlowPolicy::new(&settings, &none);
+            let cm = crate::mcp::manager::profile_reach::ReachProfile { id: "cm".into(), name: "Clearmirror".into() };
+            let hold = crate::mcp::manager::profile_flow::flow_hold(
+                crate::mcp::manager::profile_flow::FlowClass::Carry,
+                Some(&cm),
+                Some(&cm),
+                &reads_of(&ctx, &d.session_id),
+                true,
+                &policy,
+                &[cm.clone()],
+            );
+            assert!(hold.is_some_and(|h| h.rule_key == "profile-flow:v2:pg>cm"));
+
+            // Relay worker → parent: the parent inherits the worker's reads.
+            let (ctx, parent, worker, _, _) = linked(two_way());
+            assert!(ctx.session_state.peek().sessions[&parent].carried_reads.is_empty());
+            let mut state_sig = ctx.session_state;
+            state_sig.write().sessions.get_mut(&worker).unwrap().messages.push(puget_read());
+            let (st, _) = handle_message_parent(ctx, &serde_json::json!({"text": "found it", "kind": "progress"}), &worker);
+            assert_eq!(st, ToolCallStatus::Completed, "the relay itself is never held");
+            assert!(reads_of(&ctx, &parent).contains("pg"));
+
+            // Relay parent → worker: the sibling worker inherits too.
+            let (ctx, parent, _, sibling, _) = linked(two_way());
+            let mut state_sig = ctx.session_state;
+            state_sig.write().sessions.get_mut(&parent).unwrap().messages.push(puget_read());
+            let (st, msg) = handle_message_worker(
+                ctx,
+                &serde_json::json!({"text": "use these numbers", "worker": sibling}),
+                &parent,
+            );
+            assert_eq!(st, ToolCallStatus::Completed, "{msg}");
+            assert!(reads_of(&ctx, &sibling).contains("pg"));
         });
     }
 
