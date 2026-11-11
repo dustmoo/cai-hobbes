@@ -115,6 +115,49 @@ pub(crate) fn resumed_turn_origin<'a>(
         .unwrap_or_default()
 }
 
+/// How long a reachable profile whose Composio connect failed is left alone
+/// before the next prompt build tries it again.
+const REACH_CONNECT_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Reachable profiles whose last connect failed, and when.
+static REACH_CONNECT_FAILED: std::sync::Mutex<Option<HashMap<String, std::time::Instant>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a prompt build should try to connect reachable `profile_id` now:
+/// not while a recent attempt's failure is still within [`REACH_CONNECT_RETRY`].
+fn reach_connect_due(profile_id: &str, now: std::time::Instant) -> bool {
+    let guard = REACH_CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|m| m.get(profile_id))
+        .is_none_or(|failed| now.duration_since(*failed) >= REACH_CONNECT_RETRY)
+}
+
+/// Note how a reach connect went: a failure starts the back-off, a success
+/// clears it.
+fn record_reach_connect(profile_id: &str, ok: bool, now: std::time::Instant) {
+    let mut guard = REACH_CONNECT_FAILED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    if ok {
+        map.remove(profile_id);
+    } else {
+        map.insert(profile_id.to_string(), now);
+    }
+}
+
+/// A continuation that obeyed a stop request ends its turn: nothing streams
+/// for the session any more (the approval resume marks it streaming before
+/// its continuation), the UI and queue drain are told.
+fn end_stopped_continuation(stream_manager: StreamManagerContext, session_id: &str) {
+    let mut streaming = stream_manager.streaming_sessions;
+    if streaming.peek().contains(session_id) && stream_manager.active_message_for_session(session_id).is_none() {
+        streaming.write().remove(session_id);
+    }
+    let mut activity = stream_manager.stream_activity;
+    *activity.write() += 1;
+    crate::components::chat_queue::request_drain();
+}
+
 /// Approvals that can resume now, and those whose chat still has a turn in
 /// flight (they wait in the approval set and resume when it ends).
 pub(crate) fn split_resumable(waiting: Vec<String>, in_flight: impl Fn(&str) -> bool) -> (Vec<String>, Vec<String>) {
@@ -225,15 +268,15 @@ pub fn ChatWindow(
         };
         let profile_id = scope.home_id().map(str::to_string);
 
+        // The manager is a handle of Arcs: clone it out so no Signal guard is
+        // held across the awaits below.
+        let manager = mcp_manager.peek().clone();
         // ensure_native_client_for_profile can accept name or ID — pass the ID
         if let Some(ref id) = profile_id {
-            let _ = mcp_manager
-                .read()
-                .ensure_native_client_for_profile(id, &settings_snapshot)
-                .await;
+            let _ = manager.ensure_native_client_for_profile(id, &settings_snapshot).await;
         }
 
-        let mut fresh = mcp_manager.read().get_mcp_context(profile_id.clone()).await;
+        let mut fresh = manager.get_mcp_context(profile_id.clone()).await;
         // No profile to act in: no Composio tools at all (get_mcp_context
         // would still offer a profile-less legacy client, or every profile's).
         if scope.home.is_none() {
@@ -242,18 +285,25 @@ pub fn ChatWindow(
         // Multi-profile reach (Heartbeat / Voice, and every ordinary tab
         // not locked to its home on the chip): the other reachable profiles'
         // Composio tools join the home set, each call naming its profile
-        // (mcp::manager::profile_reach).
+        // (mcp::manager::profile_reach). Connected side by side, and a
+        // profile whose connect just failed isn't retried on every round
+        // (`reach_connect_due`); a call routed to it still connects (and
+        // reports a failure) on its own path.
         let reach = scope.reach;
         if reach.len() > 1 {
-            let mut others = Vec::new();
-            for p in &reach[1..] {
-                let _ = mcp_manager
-                    .read()
-                    .ensure_native_client_for_profile(&p.id, &settings_snapshot)
-                    .await;
-                let ctx = mcp_manager.read().get_mcp_context(Some(p.id.clone())).await;
-                others.push((p.clone(), ctx));
-            }
+            let fetches = reach[1..].iter().map(|p| {
+                let manager = manager.clone();
+                let settings_snapshot = &settings_snapshot;
+                async move {
+                    if reach_connect_due(&p.id, std::time::Instant::now()) {
+                        let ok = manager.ensure_native_client_for_profile(&p.id, settings_snapshot).await.is_ok();
+                        record_reach_connect(&p.id, ok, std::time::Instant::now());
+                    }
+                    let ctx = manager.get_mcp_context(Some(p.id.clone())).await;
+                    (p.clone(), ctx)
+                }
+            });
+            let others = futures::future::join_all(fetches).await;
             fresh = crate::mcp::manager::profile_reach::merge_reach(fresh, &reach[0], &others);
         }
         {
@@ -485,6 +535,9 @@ pub fn ChatWindow(
                 let _ = crate::components::continuation_controller::take_approval_origins(&owning_id);
                 continue;
             }
+            // The person's approval resumes the turn: no earlier stop request
+            // applies to it (a Stop pressed from here on does).
+            crate::components::stream_manager::clear_turn_abort(&owning_id);
             // Indicate activity now, before the task runs, so the queue
             // drain reacting to the same tick sees the chat busy and waits.
             stream_manager
@@ -802,9 +855,16 @@ pub fn ChatWindow(
                     *stream_manager.stream_activity.write() += 1;
                     return;
                 }
-                // The person's approval resumes the turn: no earlier stop
-                // request applies to it.
-                crate::components::stream_manager::clear_turn_abort(&owning_id);
+                // Stopped while the approved calls ran (the resume cleared any
+                // earlier stop request when it started): the results stay, the
+                // turn ends here.
+                if crate::components::stream_manager::take_turn_abort(&owning_id) {
+                    tracing::info!(session_id = %owning_id, "Continuation skipped: the turn was stopped.");
+                    stream_manager.streaming_sessions.write().remove(&owning_id);
+                    *stream_manager.stream_activity.write() += 1;
+                    crate::components::chat_queue::request_drain();
+                    return;
+                }
                 continuation_controller
                     .write()
                     .trigger_continuation(owning_id.clone(), resumed_origin);
@@ -1214,6 +1274,11 @@ pub fn ChatWindow(
         let session_id = current_target_id.read().clone();
         if let Some(msg_id) = stream_manager.active_message_for_session(&session_id) {
             stream_manager.cancel_stream(&msg_id, &session_id);
+        } else if stream_manager.turn_in_flight(&session_id) || stream_manager.is_session_streaming(&session_id) {
+            // The gap between tool rounds (a continuation building its next
+            // prompt, or approved calls running): no stream to cancel, so ask
+            // the turn not to start another round.
+            crate::components::stream_manager::request_turn_abort(&session_id);
         }
     };
 
@@ -1234,7 +1299,7 @@ pub fn ChatWindow(
                 // no next round. Dropping the guard ends the turn.
                 if crate::components::stream_manager::take_turn_abort(&target_id) {
                     tracing::info!(session_id = %target_id, "Continuation skipped: the turn was stopped.");
-                    crate::components::chat_queue::request_drain();
+                    end_stopped_continuation(stream_manager, &target_id);
                     return;
                 }
                 let mut session_state = session_state;
@@ -1333,7 +1398,7 @@ pub fn ChatWindow(
                 if crate::components::stream_manager::take_turn_abort(&target_id) {
                     tracing::info!(session_id = %target_id, "Continuation dropped before streaming: the turn was stopped.");
                     session_state.write().remove_message_in_session(&target_id, &hobbes_message_id);
-                    crate::components::chat_queue::request_drain();
+                    end_stopped_continuation(stream_manager, &target_id);
                     return;
                 }
 
@@ -1634,7 +1699,12 @@ pub fn ChatWindow(
     use_effect(move || {
         // Belt-and-braces: re-run when stream_activity bumps. Real subscription is is_session_streaming.
         let _ = stream_manager.stream_activity.read();
-        let streaming = stream_manager.is_session_streaming(&current_target_id.read());
+        // The whole turn, not only its streams: in the gap between tool
+        // rounds a send queues, so the input shows Queue + Stop there too.
+        // (`turn_in_flight_sessions` subscribes to every part of it.)
+        let sid = current_target_id.read().clone();
+        let streaming = stream_manager.is_session_streaming(&sid)
+            || stream_manager.turn_in_flight_sessions().contains(&sid);
         if *is_sending.peek() != streaming {
             is_sending.set(streaming);
         }
@@ -3079,6 +3149,21 @@ pub fn WelcomeMessage() -> Element {
 #[cfg(test)]
 mod bubble_sync_tests {
     use super::should_mirror_session_text;
+
+    /// A reachable profile whose connect failed is left alone for a while,
+    /// then tried again; a success clears the back-off.
+    #[test]
+    fn a_failing_reach_connect_is_not_retried_every_round() {
+        use super::{reach_connect_due, record_reach_connect, REACH_CONNECT_RETRY};
+        let t0 = std::time::Instant::now();
+        let id = "reach-backoff-test";
+        assert!(reach_connect_due(id, t0));
+        record_reach_connect(id, false, t0);
+        assert!(!reach_connect_due(id, t0 + std::time::Duration::from_secs(10)));
+        assert!(reach_connect_due(id, t0 + REACH_CONNECT_RETRY));
+        record_reach_connect(id, true, t0);
+        assert!(reach_connect_due(id, t0));
+    }
 
     #[test]
     fn finished_turn_still_reconciles_from_session_state() {

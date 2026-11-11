@@ -1408,7 +1408,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                         &current_session_id.peek(),
                                                         &settings.peek(),
                                                     );
-                                                    let new_context = mcp_manager.read().get_mcp_context(profile_id).await;
+                                                    let manager = mcp_manager.peek().clone();
+                                                    let new_context = manager.get_session_mcp_context(profile_id).await;
                                                     mcp_context.set(new_context);
                                                     let current = *refresh_trigger.peek();
                                                     refresh_trigger.set(current + 1);
@@ -1735,7 +1736,8 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                                                         &current_session_id.peek(),
                                                                         &updated_settings,
                                                                     );
-                                                                    let new_context = mcp_manager.read().get_mcp_context(profile_id).await;
+                                                                    let manager = mcp_manager.peek().clone();
+                                                                    let new_context = manager.get_session_mcp_context(profile_id).await;
                                                                     mcp_context.set(new_context);
                                                                     // Invalidate cache and trigger refresh
                                                                     mcp_manager.read().invalidate_status_cache();
@@ -1904,7 +1906,7 @@ fn StatusCard(status: McpServerStatus, refresh_trigger: Signal<i32>) -> Element 
                                     &current_session_id.peek(),
                                     &updated,
                                 );
-                                mcp_context.set(manager.get_mcp_context(profile_id).await);
+                                mcp_context.set(manager.get_session_mcp_context(profile_id).await);
                                 match manager.get_composio_toolkits().await {
                                     Ok(kits) => toolkits.set(kits),
                                     Err(e) => tracing::error!("Failed to refresh toolkits: {}", e),
@@ -2096,7 +2098,7 @@ fn ToolkitToolEditor(
                             &current_session_id.peek(),
                             &updated_settings,
                         );
-                        let new_context = manager.get_mcp_context(profile_id).await;
+                        let new_context = manager.get_session_mcp_context(profile_id).await;
                         mcp_context.set(new_context);
                         let current = *refresh_trigger.peek();
                         refresh_trigger.set(current + 1);

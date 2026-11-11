@@ -41,7 +41,12 @@ const GO_AWAY_MARGIN: Duration = Duration::from_millis(1500);
 const GO_AWAY_HARD_CAP: Duration = Duration::from_secs(8);
 /// ~2 s of mic audio buffered during a reconnect.
 const MAX_BUFFERED_AUDIO_SAMPLES: usize = 2 * INPUT_SAMPLE_RATE as usize;
+/// Cap on buffered non-audio controls (tool responses, context): far above
+/// what a reconnect sees, only a guard against a runaway.
 const MAX_BUFFERED_CONTROLS: usize = 256;
+/// A send to the socket stalled this long: treat the socket as dead and
+/// resume, instead of piling mic audio up behind it.
+const SEND_STALL: Duration = Duration::from_secs(5);
 const DEFAULT_OUTPUT_RATE: u32 = 24_000;
 
 type Conn = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -103,16 +108,10 @@ fn live_models_from_page(body: &Value) -> Vec<String> {
 // Pure message building
 // ---------------------------------------------------------------------------
 
-/// Build the `setup` message. `resume_handle` = `None` on first connect.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn setup_json(setup: &RealtimeSetup, resume_handle: Option<&str>) -> Value {
-    setup_json_with(setup, resume_handle, false)
-}
-
-/// As [`setup_json`]; `modalities_top_level` puts `responseModalities`
-/// directly under `setup` (the quickstart placement) instead of
-/// `generationConfig`.
-fn setup_json_with(setup: &RealtimeSetup, resume_handle: Option<&str>, modalities_top_level: bool) -> Value {
+/// Build the `setup` message. `resume_handle` = `None` on first connect;
+/// `modalities_top_level` puts `responseModalities` directly under `setup`
+/// (the quickstart placement) instead of `generationConfig`.
+fn setup_json(setup: &RealtimeSetup, resume_handle: Option<&str>, modalities_top_level: bool) -> Value {
     let mut s = Map::new();
     s.insert("model".into(), json!(format!("models/{}", setup.model)));
 
@@ -163,12 +162,7 @@ fn setup_json_with(setup: &RealtimeSetup, resume_handle: Option<&str>, modalitie
         s.insert("tools".into(), json!([{"functionDeclarations": decls}]));
     }
 
-    if setup.manual_activity {
-        s.insert(
-            "realtimeInputConfig".into(),
-            json!({"automaticActivityDetection": {"disabled": true}}),
-        );
-    } else if let Some(ms) = setup.end_of_turn_ms {
+    if let Some(ms) = setup.end_of_turn_ms {
         // Low end-of-speech sensitivity ends turns less often; the silence
         // window is the person's setting (Settings → Voice).
         s.insert(
@@ -219,8 +213,6 @@ pub fn control_json(c: &RealtimeControl) -> Option<Value> {
             "data": encode_pcm(pcm),
             "mimeType": format!("audio/pcm;rate={INPUT_SAMPLE_RATE}"),
         }}}),
-        RealtimeControl::ActivityStart => json!({"realtimeInput": {"activityStart": {}}}),
-        RealtimeControl::ActivityEnd => json!({"realtimeInput": {"activityEnd": {}}}),
         RealtimeControl::AudioStreamEnd => json!({"realtimeInput": {"audioStreamEnd": true}}),
         RealtimeControl::ToolResponse { id, name, response, scheduling, will_continue } => {
             let mut obj = match response {
@@ -449,6 +441,14 @@ async fn send_json(ws: &mut Conn, v: &Value) -> Result<(), String> {
     ws.send(Message::Text(v.to_string())).await.map_err(|e| e.to_string())
 }
 
+/// [`send_json`] bounded by [`SEND_STALL`] (a stalled socket counts as failed).
+async fn send_json_bounded(ws: &mut Conn, v: &Value) -> Result<(), String> {
+    match tokio::time::timeout(SEND_STALL, send_json(ws, v)).await {
+        Ok(r) => r,
+        Err(_) => Err("send stalled".to_string()),
+    }
+}
+
 /// Open the socket, send setup, wait for `setupComplete`.
 async fn open(
     key: &str,
@@ -460,7 +460,7 @@ async fn open(
         let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(key).as_str())
             .await
             .map_err(|e| format!("connect failed: {e}"))?;
-        send_json(&mut ws, &setup_json_with(setup, handle, modalities_top_level))
+        send_json(&mut ws, &setup_json(setup, handle, modalities_top_level))
             .await
             .map_err(|e| format!("setup send failed: {e}"))?;
         loop {
@@ -543,11 +543,14 @@ async fn drive<F: Future>(
     }
 }
 
-/// Bounded control buffer: audio beyond ~2 s is dropped.
+/// Bounded control buffer: audio beyond ~2 s is dropped; other controls
+/// (tool responses, context) are capped separately, so a full audio buffer
+/// never costs a tool response.
 #[derive(Default)]
 struct ControlBuffer {
     items: VecDeque<RealtimeControl>,
     audio_samples: usize,
+    others: usize,
 }
 
 impl ControlBuffer {
@@ -557,9 +560,43 @@ impl ControlBuffer {
                 return;
             }
             self.audio_samples += pcm.len();
+        } else {
+            if self.others >= MAX_BUFFERED_CONTROLS {
+                return;
+            }
+            self.others += 1;
         }
-        if self.items.len() < MAX_BUFFERED_CONTROLS {
-            self.items.push_back(c);
+        self.items.push_back(c);
+    }
+
+    /// Everything buffered, oldest first; the buffer is left empty.
+    fn take_all(&mut self) -> VecDeque<RealtimeControl> {
+        self.audio_samples = 0;
+        self.others = 0;
+        std::mem::take(&mut self.items)
+    }
+
+    /// Put `unsent` (oldest first) back ahead of anything buffered since,
+    /// for the next resume.
+    fn restore(&mut self, unsent: VecDeque<RealtimeControl>) {
+        let newer = self.take_all();
+        for c in unsent.into_iter().chain(newer) {
+            self.push(c);
+        }
+    }
+}
+
+/// Send what was buffered during a reconnect. On a failed send, the unsent
+/// rest (that control included) goes back into `buf` for the next resume,
+/// which the dead socket triggers on the next loop iteration.
+async fn replay(ws: &mut Conn, buf: &mut ControlBuffer) {
+    let mut pending = buf.take_all();
+    while let Some(c) = pending.pop_front() {
+        let Some(v) = control_json(&c) else { continue };
+        if send_json_bounded(ws, &v).await.is_err() {
+            pending.push_front(c);
+            buf.restore(pending);
+            return;
         }
     }
 }
@@ -633,9 +670,13 @@ async fn pump(
                     return "closed".to_string();
                 }
                 Some(c) => match control_json(&c) {
-                    Some(v) => match send_json(&mut ws, &v).await {
+                    Some(v) => match send_json_bounded(&mut ws, &v).await {
                         Ok(()) => None,
-                        Err(_) => Some("send failed"),
+                        Err(_) => {
+                            // Not lost: it goes out after the resume.
+                            buf.push(c);
+                            Some("send failed")
+                        }
                     },
                     None => None,
                 },
@@ -700,15 +741,7 @@ async fn pump(
             Reconnect::Ok(new_ws) => {
                 ws = *new_ws;
                 tracing::info!("voice: gemini live reconnected");
-                let pending: Vec<RealtimeControl> = buf.items.drain(..).collect();
-                buf.audio_samples = 0;
-                for c in pending {
-                    if let Some(v) = control_json(&c) {
-                        if send_json(&mut ws, &v).await.is_err() {
-                            break; // next loop iteration will see the dead socket
-                        }
-                    }
-                }
+                replay(&mut ws, &mut buf).await;
                 if !emit(tx, RealtimeEvent::Reconnected) {
                     return "event receiver dropped".to_string();
                 }
@@ -741,7 +774,7 @@ mod tests {
 
     #[test]
     fn setup_minimal() {
-        let v = setup_json(&base(), None);
+        let v = setup_json(&base(), None, false);
         let s = &v["setup"];
         assert_eq!(s["model"], "models/gemini-live-x");
         assert_eq!(s["generationConfig"]["responseModalities"], json!(["AUDIO"]));
@@ -760,7 +793,7 @@ mod tests {
     fn setup_tools_behavior() {
         let mut st = base();
         st.tools = vec![tool("a", true), tool("b", false)];
-        let v = setup_json(&st, None);
+        let v = setup_json(&st, None, false);
         let d = &v["setup"]["tools"][0]["functionDeclarations"];
         assert_eq!(d[0]["behavior"], "NON_BLOCKING");
         assert!(d[1].get("behavior").is_none());
@@ -768,14 +801,13 @@ mod tests {
     }
 
     #[test]
-    fn setup_manual_voice_language_resume() {
+    fn setup_voice_language_resume() {
         let mut st = base();
-        st.manual_activity = true;
         st.voice_name = Some("Puck".into());
         st.language = Some("en-US".into());
-        let v = setup_json(&st, Some("h1"));
+        let v = setup_json(&st, Some("h1"), false);
         let s = &v["setup"];
-        assert_eq!(s["realtimeInputConfig"]["automaticActivityDetection"]["disabled"], true);
+        assert!(s.get("realtimeInputConfig").is_none());
         let sp = &s["generationConfig"]["speechConfig"];
         assert_eq!(sp["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"], "Puck");
         assert_eq!(sp["languageCode"], "en-US");
@@ -786,29 +818,25 @@ mod tests {
     fn setup_end_of_turn_tuning() {
         let mut st = base();
         st.end_of_turn_ms = Some(900);
-        let v = setup_json(&st, None);
+        let v = setup_json(&st, None, false);
         let aad = &v["setup"]["realtimeInputConfig"]["automaticActivityDetection"];
         assert_eq!(aad["endOfSpeechSensitivity"], "END_SENSITIVITY_LOW");
         assert_eq!(aad["silenceDurationMs"], 900);
         assert!(aad.get("disabled").is_none());
-        // Manual activity wins: detection off, no tuning.
-        st.manual_activity = true;
-        let v = setup_json(&st, None);
-        assert_eq!(v["setup"]["realtimeInputConfig"], json!({"automaticActivityDetection": {"disabled": true}}));
     }
 
     #[test]
     fn setup_language_only_and_top_level_modalities() {
         let mut st = base();
         st.language = Some("fr-FR".into());
-        let v = setup_json_with(&st, None, true);
+        let v = setup_json(&st, None, true);
         let s = &v["setup"];
         assert_eq!(s["responseModalities"], json!(["AUDIO"]));
         assert!(s["generationConfig"].get("responseModalities").is_none());
         assert!(s["generationConfig"]["speechConfig"].get("voiceConfig").is_none());
         assert_eq!(s["generationConfig"]["speechConfig"]["languageCode"], "fr-FR");
         // No speech parts and top-level: no empty generationConfig.
-        let v = setup_json_with(&base(), None, true);
+        let v = setup_json(&base(), None, true);
         assert!(v["setup"].get("generationConfig").is_none());
     }
 
@@ -825,8 +853,6 @@ mod tests {
 
     #[test]
     fn activity_controls() {
-        assert_eq!(control_json(&RealtimeControl::ActivityStart).unwrap(), json!({"realtimeInput": {"activityStart": {}}}));
-        assert_eq!(control_json(&RealtimeControl::ActivityEnd).unwrap(), json!({"realtimeInput": {"activityEnd": {}}}));
         assert_eq!(control_json(&RealtimeControl::AudioStreamEnd).unwrap(), json!({"realtimeInput": {"audioStreamEnd": true}}));
         assert!(control_json(&RealtimeControl::Close).is_none());
     }
@@ -1025,10 +1051,50 @@ mod tests {
         for _ in 0..10 {
             b.push(RealtimeControl::Audio(vec![0; 8000]));
         }
-        b.push(RealtimeControl::ActivityEnd);
+        b.push(RealtimeControl::AudioStreamEnd);
         assert_eq!(b.items.len(), 5);
         assert_eq!(scrub("SECRET", "bad url ?key=SECRET"), "bad url ?key=<key>");
         assert!(is_modalities_error("Unknown name \"responseModalities\" at setup"));
+    }
+
+    fn tool_response(id: &str) -> RealtimeControl {
+        RealtimeControl::ToolResponse {
+            id: id.into(),
+            name: "T".into(),
+            response: json!({}),
+            scheduling: None,
+            will_continue: false,
+        }
+    }
+
+    #[test]
+    fn a_full_audio_buffer_keeps_tool_responses() {
+        let mut b = ControlBuffer::default();
+        for _ in 0..10 {
+            b.push(RealtimeControl::Audio(vec![0; 8000]));
+        }
+        b.push(tool_response("t1"));
+        assert_eq!(b.items.len(), 5);
+        assert_eq!(b.items.back(), Some(&tool_response("t1")));
+    }
+
+    #[test]
+    fn restore_puts_unsent_controls_back_in_order() {
+        let mut b = ControlBuffer::default();
+        b.push(RealtimeControl::Audio(vec![1; 100]));
+        b.push(tool_response("t1"));
+        b.push(tool_response("t2"));
+        let mut pending = b.take_all();
+        assert!(b.items.is_empty() && b.audio_samples == 0 && b.others == 0);
+        // The first went out; the send of t1 failed.
+        pending.pop_front();
+        // A control buffered meanwhile goes after the unsent ones.
+        b.push(tool_response("t3"));
+        b.restore(pending);
+        let order: Vec<_> = b.items.iter().cloned().collect();
+        assert_eq!(order, vec![tool_response("t1"), tool_response("t2"), tool_response("t3")]);
+        assert_eq!(b.others, 3);
+        assert_eq!(b.audio_samples, 0);
     }
 
     /// Live protocol check against the real API (no mic / speaker):
@@ -1052,7 +1118,6 @@ mod tests {
                 parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}),
                 non_blocking: true,
             }],
-            manual_activity: false,
             end_of_turn_ms: None,
         };
         let mut s = GeminiLive::new(key).connect(setup).await.expect("connect");

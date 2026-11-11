@@ -74,7 +74,6 @@ pub fn classify_spoken(messages: &[Message], idx: usize) -> SpokenLine {
     }
 }
 
-/// Lowercased words only, so punctuation and spacing don't count.
 /// Whether `messages[idx]` is a voice request that only repeats what the
 /// person was just heard saying: the nearest earlier User message (past
 /// anything the voice said aloud) is a heard line with the same words. The

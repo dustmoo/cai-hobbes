@@ -76,6 +76,9 @@ struct Shared {
     /// older generation are dropped and don't touch `queued`.
     generation: AtomicU64,
     echo_cancelled: AtomicBool,
+    /// The watchdog ran out of engine restarts: capture is dead until the
+    /// next `start` (or a later rebuild in a fresh budget window succeeds).
+    capture_failed: AtomicBool,
 }
 
 impl Shared {
@@ -127,6 +130,7 @@ impl VoiceProcessingIo {
             queued: AtomicUsize::new(0),
             generation: AtomicU64::new(0),
             echo_cancelled: AtomicBool::new(false),
+            capture_failed: AtomicBool::new(false),
         });
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<Cmd>();
         let thread_shared = shared.clone();
@@ -196,6 +200,10 @@ impl AudioIo for VoiceProcessingIo {
 
     fn echo_safe(&self) -> bool {
         self.shared.echo_cancelled.load(Ordering::Acquire)
+    }
+
+    fn capture_failed(&self) -> bool {
+        self.shared.capture_failed.load(Ordering::Acquire)
     }
 
     fn stop(&mut self) {
@@ -308,12 +316,15 @@ impl ThreadState {
             .as_ref()
             .is_some_and(|e| unsafe { e.engine.isRunning() });
         if running {
+            self.shared.capture_failed.store(false, Ordering::Release);
             return;
         }
         if !self.restarts.take(Instant::now()) {
             if !self.restarts.exhausted_warned {
                 tracing::warn!("voice audio: engine keeps stopping; giving up on restarts for now");
                 self.restarts.exhausted_warned = true;
+                // Tell the controller: no mic audio will arrive.
+                self.shared.capture_failed.store(true, Ordering::Release);
             }
             return;
         }
@@ -330,6 +341,7 @@ impl ThreadState {
         match cmd {
             Cmd::Start { mic_tx, reply } => {
                 self.teardown();
+                self.shared.capture_failed.store(false, Ordering::Release);
                 self.mic_tx = Some(mic_tx);
                 self.restarts = RestartBudget::new(3, Duration::from_secs(60));
                 let res = self.build();
@@ -736,7 +748,7 @@ pub fn list_input_devices() -> Vec<AudioDevice> {
 
 /// Whether any process is running IO on the input device `uid` (what the
 /// system mic indicator reflects). `None` if the device isn't present.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn device_running_somewhere(uid: &str) -> Option<bool> {
     use objc2_core_audio::kAudioDevicePropertyDeviceIsRunningSomewhere;
     let (id, _) = input_devices_with_ids().into_iter().find(|(_, d)| d.uid == uid)?;
@@ -748,7 +760,7 @@ pub fn device_running_somewhere(uid: &str) -> Option<bool> {
 /// Whether this process is running audio input on any device (macOS 14+;
 /// `None` when the HAL can't say). Unlike the device's "running somewhere"
 /// flag this ignores other apps.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn this_process_running_input() -> Option<bool> {
     use objc2_core_audio::{kAudioHardwarePropertyTranslatePIDToProcessObject, kAudioProcessPropertyIsRunningInput};
     let pid = std::process::id() as i32;
@@ -826,7 +838,7 @@ fn output_kind(
 // ---------------------------------------------------------------------------
 
 /// `AVAudioApplication` is macOS 14+.
-fn has_audio_application() -> bool {
+pub(super) fn has_audio_application() -> bool {
     AnyClass::get(c"AVAudioApplication").is_some()
 }
 
@@ -893,6 +905,7 @@ mod tests {
             queued: AtomicUsize::new(2),
             generation: AtomicU64::new(0),
             echo_cancelled: AtomicBool::new(false),
+            capture_failed: AtomicBool::new(false),
         };
         s.invalidate_queue();
         assert_eq!(s.queued.load(Ordering::Acquire), 0);

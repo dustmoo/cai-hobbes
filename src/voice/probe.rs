@@ -122,12 +122,9 @@ pub async fn mic_check(
     }
     let mut io = opened.io;
     let _ = tokio::task::spawn_blocking(move || io.stop()).await;
-    tracing::info!(
-        "voice: mic check on '{}': {} frames, peak {:.3}",
-        report.input_name,
-        report.frames,
-        report.max_peak
-    );
+    // The device name can carry the person's name: debug only.
+    tracing::debug!("voice: mic check on '{}'", report.input_name);
+    tracing::info!("voice: mic check: {} frames, peak {:.3}", report.frames, report.max_peak);
     Ok(report)
 }
 

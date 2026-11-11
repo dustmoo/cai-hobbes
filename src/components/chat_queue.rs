@@ -136,10 +136,12 @@ type SessionSet = std::sync::Mutex<Option<std::collections::HashSet<String>>>;
 static PENDING_ABSENT: SessionSet = std::sync::Mutex::new(None);
 
 /// Sessions whose current turn nobody is present for ([`turn_absent`]),
-/// set when a turn starts. Read only by the cross-company flow guard
-/// (`profile_flow::flow_person`); every other gate keeps reading the turn's
-/// `TurnOrigin`, under which such a turn in an ordinary chat is the
-/// person's. Runtime only: a turn doesn't outlive the process.
+/// set when a turn starts. Read by the cross-company flow guard
+/// (`profile_flow::flow_person`) and the call risk gate
+/// (`builtin_tools::risk_gate_applies`); every other gate (the Heartbeat's
+/// included) keeps reading the turn's `TurnOrigin`, under which such a turn
+/// in an ordinary chat is the person's. Runtime only: a turn doesn't
+/// outlive the process.
 static ABSENT_TURNS: SessionSet = std::sync::Mutex::new(None);
 
 fn set_in(set: &SessionSet, session_id: &str, on: bool) {

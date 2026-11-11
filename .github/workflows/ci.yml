@@ -63,7 +63,9 @@ jobs:
       if: runner.os == 'Linux'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libglib2.0-dev libsecret-1-dev pkg-config libwebkit2gtk-4.1-dev
+        # libasound2-dev: cpal (voice audio fallback) links ALSA through
+        # alsa-sys, whose build script finds it with pkg-config.
+        sudo apt-get install -y libglib2.0-dev libsecret-1-dev pkg-config libwebkit2gtk-4.1-dev libasound2-dev
 
     - name: Setup Node.js
       uses: actions/setup-node@v4

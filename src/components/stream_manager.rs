@@ -1131,11 +1131,13 @@ impl StreamManagerContext {
                             // A call routed to another profile needs that
                             // profile's client: connect it, and fail rather than
                             // fall back to another company's account.
+                            // The manager is a handle of Arcs: clone it out
+                            // so no Signal guard is held across the awaits below.
+                            let manager = mcp_manager.peek().clone();
                             let ensured: Result<(), String> = match &connect_target {
                                 Some(t) => {
                                     let settings_snapshot = self.settings.peek().clone();
-                                    mcp_manager
-                                        .read()
+                                    manager
                                         .ensure_native_client_for_profile(&t.id, &settings_snapshot)
                                         .await
                                         .map_err(|e| format!("Couldn't connect the {} Composio account, so this wasn't run: {e}", t.name))
@@ -1145,8 +1147,7 @@ impl StreamManagerContext {
                             let result_receiver = match ensured {
                                 Err(e) => Err(e),
                                 Ok(()) => {
-                                    mcp_manager
-                                        .read()
+                                    manager
                                         .use_mcp_tool(
                                             &tool_call.server_name,
                                             &tool_call.tool_name,
@@ -1186,8 +1187,7 @@ impl StreamManagerContext {
                                             // Detect "No connected account found" error from Composio
                                             if err_msg.contains("No connected account found") {
                                                 tracing::info!("Composio auth required error detected. Initiating connection flow...");
-                                                match mcp_manager
-                                                    .read()
+                                                match manager
                                                     .initiate_composio_auth(
                                                         &tool_call.server_name,
                                                         &tool_call.tool_name,
@@ -1653,8 +1653,6 @@ impl StreamManagerContext {
                     }
                     self.active_stream_handles.write().remove(&message_id);
                     self.content_generated.write().remove(&message_id); // Cleanup
-            self.stream_receivers.write().remove(&message_id);
-                self.stream_receivers.write().remove(&message_id);
                     // A placeholder absorbed by a live activity block never
                     // mounted a bubble, so nobody ever took its receiver —
                     // drop it here rather than leaking the turn's chunks.

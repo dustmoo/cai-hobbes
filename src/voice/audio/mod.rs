@@ -80,6 +80,11 @@ pub trait AudioIo: Send {
     /// false the controller holds the mic back while the voice speaks,
     /// sending it only when the person talks over it (`voice::floor`).
     fn echo_safe(&self) -> bool;
+    /// The backend gave up keeping capture alive (e.g. the device kept
+    /// dropping out and restarts ran out): no more mic audio will arrive.
+    fn capture_failed(&self) -> bool {
+        false
+    }
     /// Stop everything. Idempotent; also done on drop.
     fn stop(&mut self);
 }
@@ -180,7 +185,9 @@ pub fn open(input_uid: Option<&str>, echo: VoiceEcho) -> Result<Opened, AudioErr
     let name = chosen.as_ref().map(|d| d.name.clone());
     let io = cpal_io::CpalIo::new(name.as_deref(), output == OutputKind::Headphones)?;
     let input_name = name.or(default_name).unwrap_or_else(|| "the system default mic".into());
-    tracing::info!("voice audio: mic '{input_name}', no echo cancellation; output {output:?}");
+    // Device names often carry the person's name: debug only.
+    tracing::info!("voice audio: no echo cancellation; output {output:?}");
+    tracing::debug!("voice audio: mic '{input_name}'");
     Ok(Opened { io: Box::new(io), input_name, voice_processing: false })
 }
 
@@ -188,7 +195,8 @@ pub fn open(input_uid: Option<&str>, echo: VoiceEcho) -> Result<Opened, AudioErr
 fn open_voice_processing(default_name: Option<String>, output: OutputKind) -> Result<Opened, AudioError> {
     let io = macos::VoiceProcessingIo::new()?;
     let input_name = default_name.unwrap_or_else(|| "the system default mic".into());
-    tracing::info!("voice audio: mic '{input_name}' (system default) with Apple voice processing; output {output:?}");
+    tracing::info!("voice audio: system default mic with Apple voice processing; output {output:?}");
+    tracing::debug!("voice audio: mic '{input_name}'");
     Ok(Opened { io: Box::new(io), input_name, voice_processing: true })
 }
 
@@ -206,6 +214,20 @@ pub fn mic_permission() -> MicPermission {
     #[cfg(not(target_os = "macos"))]
     {
         MicPermission::Granted
+    }
+}
+
+/// Whether [`mic_permission`] can report the real state. Before macOS 14
+/// (no `AVAudioApplication`) it can't: it always says `Undetermined`, and
+/// the OS raises its own prompt when the mic is first opened.
+pub fn mic_permission_queryable() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::has_audio_application()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
     }
 }
 

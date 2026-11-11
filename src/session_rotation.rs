@@ -716,20 +716,33 @@ pub fn check_all(
 /// before the write is known to have landed). Rare: a rotation every week
 /// or so, the merge once.
 fn commit_rows(sessions: &[&Session], olds: &[&str], new_id: &str) -> Result<(), String> {
+    let archives = system_sessions::archives_after_rotation(olds, new_id);
+    let (rows, meta) = rows_and_meta(sessions, &archives, new_id)?;
+    crate::session_store::write_rows_and_meta(&rows, &meta)?;
+    crate::session_store::mark_rows_saved(&rows);
+    Ok(())
+}
+
+/// What [`commit_rows`] writes in its one transaction: the session rows,
+/// the archive list `archives` and the session pointer at `new_id`.
+pub(crate) type CommitWrites = (Vec<crate::session_store::SessionRow>, Vec<(String, String, i64)>);
+
+pub(crate) fn rows_and_meta(
+    sessions: &[&Session],
+    archives: &system_sessions::Archives,
+    new_id: &str,
+) -> Result<CommitWrites, String> {
     use crate::session_store as store;
     let rows = sessions
         .iter()
         .map(|s| store::build_row(s, store::next_seq()).map_err(|e| e.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
-    let archives = system_sessions::archives_after_rotation(olds, new_id);
-    let archives_json = serde_json::to_string(&archives).map_err(|e| e.to_string())?;
+    let archives_json = serde_json::to_string(archives).map_err(|e| e.to_string())?;
     let meta = vec![
         (system_sessions::ARCHIVES_META_KEY.to_string(), archives_json, store::next_seq()),
         (crate::hobbes_session::META_KEY.to_string(), new_id.to_string(), store::next_seq()),
     ];
-    store::write_rows_and_meta(&rows, &meta)?;
-    store::mark_rows_saved(&rows);
-    Ok(())
+    Ok((rows, meta))
 }
 
 fn commit(p: &Prepared) -> Result<(), String> {

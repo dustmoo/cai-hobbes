@@ -75,7 +75,8 @@ impl Archives {
         self
     }
 
-    fn parse(json: &str) -> Option<Self> {
+    /// The persisted list (meta [`ARCHIVES_META_KEY`]), normalized.
+    pub(crate) fn parse(json: &str) -> Option<Self> {
         serde_json::from_str::<Archives>(json).ok().map(Archives::normalize)
     }
 }

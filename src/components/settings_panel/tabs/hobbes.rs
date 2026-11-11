@@ -181,7 +181,16 @@ fn HobbesTabCard(ctx: SettingsCtx) -> Element {
 #[component]
 fn VoiceCard(ctx: SettingsCtx) -> Element {
     let mut local_settings = ctx.local_settings;
-    let mut mic = use_signal(crate::voice::audio::mic_permission);
+    // Before macOS 14 the permission can't be read or requested up front
+    // (the OS prompts on first capture): offer no "Allow" button that can't
+    // do anything; the mic check below shows a real problem.
+    let mut mic = use_signal(|| {
+        if crate::voice::audio::mic_permission_queryable() {
+            crate::voice::audio::mic_permission()
+        } else {
+            MicPermission::Granted
+        }
+    });
     let mut devices = use_signal(crate::voice::audio::list_input_devices);
     let mut output = use_signal(crate::voice::audio::default_output_kind);
     let mut check_level = use_signal(|| None::<f32>);

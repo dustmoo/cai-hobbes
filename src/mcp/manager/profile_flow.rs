@@ -44,8 +44,10 @@
 //! A held call carries its pairs in `ToolCall::hold_rule_key`
 //! ([`pair_key`], parsed back by [`parse_held_flow`]) so the approval bubble
 //! can offer "Allow in this chat" and "Always allow" for exactly those
-//! pairs (and release sibling calls those pairs now cover,
-//! [`released_by_allowance`]). Keys in the old format (`…>local`, `act>…`)
+//! pairs (and release sibling calls of the same round, minted on the
+//! person's turn, that those pairs now cover, [`released_by_allowance`]).
+//! A hold on a turn nobody is present for carries no pairs: the person
+//! approves that one call. Keys in the old format (`…>local`, `act>…`)
 //! parse to nothing and are approved or denied once.
 
 use std::collections::BTreeSet;
@@ -390,7 +392,8 @@ pub struct FlowHold {
 }
 
 /// The key a held call carries: its unallowed sources and its target.
-/// Empty sources = an unattended act outside home, approved once only.
+/// Empty sources = a hold on a turn nobody was present for (an act outside
+/// home, or a carry of foreign data), approved once only.
 pub fn pair_key(sources: &[&str], target: &str) -> String {
     format!("{PAIR_KEY_PREFIX}{}>{target}", sources.join("+"))
 }
@@ -472,13 +475,23 @@ pub fn flow_hold(
             .filter(|s| *s != target.id && !policy.allows(s, &target.id))
             .collect();
         if !sources.is_empty() {
-            return Some(FlowHold {
-                reason: format!(
-                    "This sends content into {} from a chat that has read {}.",
-                    target.name,
-                    data_of(names, &sources)
-                ),
-                rule_key: pair_key(&sources, &target.id),
+            let data = data_of(names, &sources);
+            // On a turn nobody is present for, the person approves this one
+            // call: no pairs in the key, so no allowance offered or applied
+            // ([`released_by_allowance`]).
+            return Some(if person {
+                FlowHold {
+                    reason: format!("This sends content into {} from a chat that has read {data}.", target.name),
+                    rule_key: pair_key(&sources, &target.id),
+                }
+            } else {
+                FlowHold {
+                    reason: format!(
+                        "This sends content into {} from a chat that has read {data}, on a turn nobody is watching.",
+                        target.name
+                    ),
+                    rule_key: pair_key(&[], &target.id),
+                }
             });
         }
     }
@@ -499,8 +512,8 @@ pub fn flow_hold(
 /// Whether the flow guard treats a turn as the person's: a typed or voice
 /// turn (`TurnOrigin::is_person`) that the person actually started — not
 /// one a fired timer, a relay or returned work started in an ordinary chat
-/// (`absent`, `chat_queue::turn_absent`), which other gates still treat as
-/// the person's.
+/// (`absent`, `chat_queue::turn_absent`; the call risk gate reads it too,
+/// the Heartbeat and agent-time gates treat such a turn as the person's).
 pub fn flow_person(origin: crate::session::TurnOrigin, absent: bool) -> bool {
     origin.is_person() && !absent
 }
@@ -520,18 +533,27 @@ pub fn allowed_carry_key(
     (!sources.is_empty() && sources.iter().all(|s| policy.allows(s, &target.id))).then(|| pair_key(&sources, &target.id))
 }
 
-/// The calls still held in `messages` that `policy` now covers: flow holds
-/// whose every pair is allowed. Never a risk-held call, an unattended act
-/// (no pairs) or a call in the old key format. Returns their execution ids
-/// with the call, for the bubble to approve each once.
+/// The calls still held in `messages` that `policy` now covers, released
+/// along with the call the person just allowed (round `round_id`): flow
+/// holds from that same round whose every pair is allowed, minted on a turn
+/// the person started (typed or voice — never a Heartbeat, unattended or
+/// legacy unstamped call), and not risk-held. Calls left over from earlier
+/// rounds, unattended acts and carries (no pairs) and old-format keys are
+/// never released. The caller adds what this can't see: no other gate
+/// would hold the call (`tool_call_display::release_allowed_flow_holds`).
 pub fn released_by_allowance(
     messages: &[crate::components::chat::Message],
     policy: &FlowPolicy,
+    round_id: &str,
 ) -> Vec<crate::components::shared::ToolCall> {
     messages
         .iter()
         .filter_map(|m| match &m.content {
-            crate::components::shared::MessageContent::PermissionRequest(tc) if tc.risk_reason.is_none() => {
+            crate::components::shared::MessageContent::PermissionRequest(tc)
+                if tc.risk_reason.is_none()
+                    && tc.round_id.as_deref() == Some(round_id)
+                    && tc.origin.is_some_and(|o| o.is_person()) =>
+            {
                 let held = parse_held_flow(tc.hold_rule_key.as_deref()?)?;
                 (!held.sources.is_empty() && held.pairs().iter().all(|f| policy.allows(&f.from, &f.to)))
                     .then(|| tc.clone())
@@ -736,29 +758,39 @@ mod tests {
         assert_eq!(allowed_carry_key(Carry, Some(&cm), &read(&["ac", "pg"]), &policy), None);
 
         // Sibling holds the allowance now covers.
-        let held = |exec: &str, key: &str, risk: Option<&str>| {
+        let held_in = |exec: &str, key: &str, risk: Option<&str>, origin: Option<TurnOrigin>, round: &str| {
             let mut m = crate::voice::session::transcript_message(true, "x");
             m.content = crate::components::shared::MessageContent::PermissionRequest(crate::components::shared::ToolCall {
                 execution_id: exec.into(),
                 hold_rule_key: Some(key.into()),
                 risk_reason: risk.map(str::to_string),
+                origin,
+                round_id: Some(round.into()),
                 ..Default::default()
             });
             m
         };
+        let held = |exec: &str, key: &str, risk: Option<&str>| held_in(exec, key, risk, Some(TurnOrigin::User), "r1");
         let msgs = vec![
             held("covered", "profile-flow:v2:pg>cm", None),
             held("other-pair", "profile-flow:v2:ac+pg>cm", None),
             held("risky", "profile-flow:v2:pg>cm", Some("deletes x")),
             held("unattended", "profile-flow:v2:>cm", None),
             held("old", "profile-flow:pg>cm", None),
+            held_in("voice", "profile-flow:v2:pg>cm", None, Some(TurnOrigin::Voice), "r1"),
+            held_in("heartbeat", "profile-flow:v2:pg>cm", None, Some(TurnOrigin::Heartbeat), "r1"),
+            held_in("legacy", "profile-flow:v2:pg>cm", None, None, "r1"),
+            held_in("earlier-round", "profile-flow:v2:pg>cm", None, Some(TurnOrigin::User), "r0"),
         ];
-        let out: Vec<String> = released_by_allowance(&msgs, &policy).into_iter().map(|t| t.execution_id).collect();
-        assert_eq!(out, ["covered"]);
+        let out: Vec<String> = released_by_allowance(&msgs, &policy, "r1").into_iter().map(|t| t.execution_id).collect();
+        assert_eq!(out, ["covered", "voice"]);
         let both = vec![flow("pg", "cm"), flow("ac", "cm")];
         let out: Vec<String> =
-            released_by_allowance(&msgs, &FlowPolicy::new(&s, &both)).into_iter().map(|t| t.execution_id).collect();
-        assert_eq!(out, ["covered", "other-pair"]);
+            released_by_allowance(&msgs, &FlowPolicy::new(&s, &both), "r1").into_iter().map(|t| t.execution_id).collect();
+        assert_eq!(out, ["covered", "other-pair", "voice"]);
+        // Another round: only its own holds.
+        let out: Vec<String> = released_by_allowance(&msgs, &policy, "r0").into_iter().map(|t| t.execution_id).collect();
+        assert_eq!(out, ["earlier-round"]);
     }
 
     #[test]
@@ -841,9 +873,13 @@ mod tests {
         assert!(hold(Carry, Some(&pg), &read(&["cm"]), false, &FlowPolicy::new(&personal, &none)).is_some());
         // …but not at home (the Heartbeat gate has its own rules).
         assert_eq!(hold(Act, Some(&cm), &pg_read, false, &policy), None);
-        // A foreign Carry on an unattended turn offers the pair.
+        // A foreign Carry on an unattended turn is approved once: no pairs to
+        // allow or release (outside home and at home alike).
         let h = hold(Carry, Some(&pg), &read(&["cm"]), false, &policy).unwrap();
-        assert_eq!(h.rule_key, "profile-flow:v2:cm>pg");
+        assert_eq!(h.rule_key, "profile-flow:v2:>pg");
+        assert!(h.reason.contains("from a chat that has read Clearmirror.ai data, on a turn nobody is watching"), "{}", h.reason);
+        let h = hold(Carry, Some(&cm), &pg_read, false, &policy).unwrap();
+        assert_eq!(parse_held_flow(&h.rule_key).unwrap().sources, Vec::<String>::new());
     }
 
     #[test]

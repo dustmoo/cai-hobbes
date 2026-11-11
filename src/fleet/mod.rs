@@ -1194,15 +1194,33 @@ fn dispatch_done_at(s: &FleetSession) -> Option<DateTime<Utc>> {
 /// chat? The brief supervisor shortens its quiet period for these rows
 /// ([`briefs::DISPATCH_BRIEF_QUIET_SECS`]) so the continuation carries a
 /// brief without waiting out the per-turn debounce.
+/// Nothing is owed while `dispatch_auto_continue` is off: no continuation
+/// fires then, so `continuation_sent` never latches, and a run would
+/// otherwise keep the short brief debounce (and a hand-back timer per Stop)
+/// for every turn of its life.
 pub fn awaiting_dispatch_handback(s: &FleetSession) -> bool {
-    dispatch_done_at(s).is_some()
+    owes_dispatch_handback(s, dispatch_auto_continue())
+}
+
+/// [`awaiting_dispatch_handback`] with the setting passed in (pure).
+pub fn owes_dispatch_handback(s: &FleetSession, auto_continue: bool) -> bool {
+    auto_continue && dispatch_done_at(s).is_some()
 }
 
 /// The instant a finished dispatched run's continuation fires even without
 /// a closing brief: its finish time plus [`DISPATCH_CONTINUE_GRACE_SECS`].
-/// `None` when the row owes no continuation. The ingest path arms a one-shot
-/// sweep for this instant, so the fallback doesn't wait for the 60 s tick.
+/// `None` when the row owes no continuation (or auto-continue is off). The
+/// ingest path arms a one-shot sweep for this instant, so the fallback
+/// doesn't wait for the 60 s tick.
 pub fn dispatch_continue_deadline(s: &FleetSession) -> Option<DateTime<Utc>> {
+    dispatch_continue_deadline_with(s, dispatch_auto_continue())
+}
+
+/// [`dispatch_continue_deadline`] with the setting passed in (pure).
+pub fn dispatch_continue_deadline_with(s: &FleetSession, auto_continue: bool) -> Option<DateTime<Utc>> {
+    if !auto_continue {
+        return None;
+    }
     dispatch_done_at(s).map(|done| done + chrono::Duration::seconds(DISPATCH_CONTINUE_GRACE_SECS))
 }
 
@@ -2028,6 +2046,18 @@ mod tests {
 
         let (state, _) = dispatched_state(None);
         assert_eq!(dispatch_continue_deadline(&state.sessions["run1"]), None);
+    }
+
+    /// With auto-continue off nothing is ever handed back, so a finished
+    /// dispatched run owes nothing: no short brief debounce, no timer.
+    #[test]
+    fn auto_continue_off_owes_no_handback() {
+        let (state, _) = dispatched_state(Some("parent"));
+        let s = &state.sessions["run1"];
+        assert!(owes_dispatch_handback(s, true));
+        assert!(!owes_dispatch_handback(s, false));
+        assert!(dispatch_continue_deadline_with(s, true).is_some());
+        assert_eq!(dispatch_continue_deadline_with(s, false), None);
     }
 
     #[test]

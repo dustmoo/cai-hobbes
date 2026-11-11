@@ -209,8 +209,18 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
     }
 
     let derived = derive_agent_state(todo, Some(signal));
-    if let Some(state) = derived {
-        todo.agent_state = Some(state);
+    // The finish policy judges a run once, as it finishes: only a move INTO
+    // `Done` from a live state (working, waiting, stuck, unknown). A to-do
+    // already `Done` or `Review` was judged before — by this policy, by an
+    // older build, or the person reopened it since — so a settled worker
+    // must not close it again or flip it out of review on every sync.
+    let already_judged = matches!(before.0, Some(AgentState::Done) | Some(AgentState::Review));
+    let finish_now = derived == Some(AgentState::Done) && !already_judged;
+    match derived {
+        // A run left for review stays there while it stays finished.
+        Some(AgentState::Done) if before.0 == Some(AgentState::Review) => {}
+        Some(state) => todo.agent_state = Some(state),
+        None => {}
     }
     todo.open_item = signal
         .brief
@@ -219,9 +229,8 @@ pub fn apply_worker_signal(todo: &mut Todo, signal: &WorkerSignal, now: DateTime
         .map(str::trim)
         .filter(|b| !b.is_empty())
         .map(str::to_string);
-    // Only a finish derived now: a to-do already left for review isn't
-    // re-judged on every sync.
-    let finished = derived == Some(AgentState::Done) && apply_finish_policy(todo, finish_closes(), now);
+    // Only a finish that happened now (see `already_judged` above).
+    let finished = finish_now && apply_finish_policy(todo, finish_closes(), now);
     let changed = finished || before != (todo.agent_state, todo.decision.clone(), todo.open_item.clone());
     if changed {
         todo.updated_at = now;
@@ -559,6 +568,59 @@ mod tests {
             brief: None,
             worker_name: "puget-app-packs".into(),
             idle_settled: false,
+        }
+    }
+
+    #[test]
+    fn the_finish_policy_judges_a_run_once_as_it_finishes() {
+        let now = Utc::now();
+        let mut settled = signal(WorkerStatus::Idle);
+        settled.idle_settled = true;
+        let mut ended = signal(WorkerStatus::Idle);
+        ended.ended = true;
+
+        // A run finishing now (it was working): closed (default policy).
+        let mut t = agent_todo();
+        t.agent_state = Some(AgentState::Working);
+        assert!(apply_worker_signal(&mut t, &settled, now));
+        assert_eq!(t.status, TodoStatus::Completed);
+
+        // Upgrade: open to-dos an older build already settled — Done (a
+        // clean end) or Review (a long idle) — are left exactly as they are.
+        for state in [AgentState::Done, AgentState::Review] {
+            for sig in [&settled, &ended] {
+                let mut old = agent_todo();
+                old.agent_state = Some(state);
+                let stamp = old.updated_at;
+                assert!(!apply_worker_signal(&mut old, sig, now), "{state:?}: no change");
+                assert!(!old.status.is_closed(), "{state:?}: not completed on upgrade");
+                assert_eq!(old.agent_state, Some(state));
+                assert_eq!(old.updated_at, stamp, "no re-save");
+            }
+        }
+
+        // The person reopens a closed one: the next Fleet event leaves it open.
+        t.reopen(now);
+        for _ in 0..3 {
+            assert!(!apply_worker_signal(&mut t, &settled, now));
+            assert_eq!(t.status, TodoStatus::Open, "reopened stays open");
+        }
+        // ...until its worker runs again and finishes: that run closes it.
+        assert!(apply_worker_signal(&mut t, &signal(WorkerStatus::Working), now));
+        assert!(apply_worker_signal(&mut t, &settled, now));
+        assert_eq!(t.status, TodoStatus::Completed);
+
+        // Focused (in progress): left for review once, then not re-judged.
+        let mut f = agent_todo();
+        f.status = TodoStatus::InProgress;
+        f.agent_state = Some(AgentState::Working);
+        assert!(apply_worker_signal(&mut f, &settled, now));
+        assert_eq!(f.agent_state, Some(AgentState::Review));
+        let later = now + chrono::Duration::minutes(5);
+        for _ in 0..3 {
+            assert!(!apply_worker_signal(&mut f, &settled, later), "no churn");
+            assert_eq!(f.agent_state, Some(AgentState::Review));
+            assert_eq!(f.updated_at, now);
         }
     }
 

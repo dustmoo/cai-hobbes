@@ -581,8 +581,8 @@ fn backfill_search_tab_titles(conn: &Connection) -> rusqlite::Result<()> {
     }
     conn.execute(
         "UPDATE sessions
-         SET search_text = lower(json_extract(data, '$.tab_title')) || char(10) || search_text
-         WHERE trim(coalesce(json_extract(data, '$.tab_title'), '')) <> ''",
+         SET search_text = lower(CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END) || char(10) || search_text
+         WHERE trim(coalesce(CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END, '')) <> ''",
         [],
     )?;
     meta_set_conn(conn, META_SEARCH_TAB_TITLE, "1", 0)
@@ -618,8 +618,8 @@ fn backfill_project_id_column(conn: &Connection) -> rusqlite::Result<()> {
     let started = std::time::Instant::now();
     let updated = conn.execute(
         "UPDATE sessions
-         SET project_id = json_extract(data, '$.project_id')
-         WHERE project_id IS NOT json_extract(data, '$.project_id')",
+         SET project_id = CASE WHEN json_valid(data) THEN json_extract(data, '$.project_id') END
+         WHERE project_id IS NOT CASE WHEN json_valid(data) THEN json_extract(data, '$.project_id') END",
         [],
     )?;
     meta_set_conn(conn, META_PROJECT_ID_COLUMN, "1", 0)?;
@@ -703,9 +703,9 @@ fn backfill_tab_title_batch(conn: &Connection, after: i64, batch: i64) -> rusqli
     };
     conn.execute(
         "UPDATE sessions
-         SET tab_title = json_extract(data, '$.tab_title')
+         SET tab_title = CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END
          WHERE rowid > ?1 AND rowid <= ?2
-           AND tab_title IS NOT json_extract(data, '$.tab_title')",
+           AND tab_title IS NOT CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_title') END",
         params![after, last],
     )?;
     Ok(Some(last))
@@ -1012,28 +1012,36 @@ pub fn forget_fingerprint(id: &str) {
 /// seq predates a delete tombstone are dropped — they were collected before
 /// the session was deleted and must not resurrect it.
 pub fn write_rows_and_meta(rows: &[SessionRow], meta: &[(String, String, i64)]) -> Result<(), String> {
-    with_conn(|conn| {
-        let tx = conn.unchecked_transaction()?;
-        {
-            let mut tombs = tombstones().lock().unwrap();
-            for row in rows {
-                match tombs.get(&row.id) {
-                    Some(del_seq) if row.seq < *del_seq => continue,
-                    Some(_) => {
-                        // Row collected after the delete — the id was
-                        // re-created, so the tombstone no longer applies.
-                        tombs.remove(&row.id);
-                    }
-                    None => {}
+    with_conn(|conn| write_rows_and_meta_conn(conn, rows, meta))
+}
+
+/// [`write_rows_and_meta`] against a connection: one transaction, so on an
+/// error nothing of it lands.
+pub(crate) fn write_rows_and_meta_conn(
+    conn: &Connection,
+    rows: &[SessionRow],
+    meta: &[(String, String, i64)],
+) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut tombs = tombstones().lock().unwrap();
+        for row in rows {
+            match tombs.get(&row.id) {
+                Some(del_seq) if row.seq < *del_seq => continue,
+                Some(_) => {
+                    // Row collected after the delete — the id was
+                    // re-created, so the tombstone no longer applies.
+                    tombs.remove(&row.id);
                 }
-                upsert_row(&tx, row)?;
+                None => {}
             }
+            upsert_row(&tx, row)?;
         }
-        for (key, value, seq) in meta {
-            meta_set_conn(&tx, key, value, *seq)?;
-        }
-        tx.commit()
-    })
+    }
+    for (key, value, seq) in meta {
+        meta_set_conn(&tx, key, value, *seq)?;
+    }
+    tx.commit()
 }
 
 // ── Meta ────────────────────────────────────────────────────────────────────
@@ -1166,7 +1174,9 @@ pub fn row_bytes(id: &str) -> Option<u64> {
     with_conn(|conn| {
         use rusqlite::OptionalExtension;
         conn.query_row(
-            "SELECT length(CAST(data AS BLOB)) FROM sessions WHERE id = ?1",
+            // `octet_length` reads the size from the record header; a
+            // `CAST` would load the whole value (overflow pages and all).
+            "SELECT octet_length(data) FROM sessions WHERE id = ?1",
             params![id],
             |r| r.get::<_, i64>(0),
         )
@@ -1537,12 +1547,27 @@ impl TabRow {
     }
 }
 
+/// Whether a conversation's name or AI title contains `query_lower` (already
+/// lowercased), folding case with Unicode rules (`str::to_lowercase`). The
+/// one matcher for the Hobbes tab's listing, in memory
+/// (`hobbes_tabs::session_matches`) and from the store ([`tab_rows`]), so a
+/// hydrated tab and a stored one match the same queries.
+pub fn title_matches(name: &str, tab_title: Option<&str>, query_lower: &str) -> bool {
+    let has = |t: &str| t.to_lowercase().contains(query_lower);
+    has(name) || tab_title.is_some_and(has)
+}
+
 /// Newest-first conversation rows, skipping `exclude` (the Hobbes lineage
 /// and the hydrated sessions the caller lists from memory). `query`
-/// matches the name and the AI title only; `project_id` filters on the
-/// indexed column. The query matches the `name` and `tab_title` columns, so
-/// no row's JSON is parsed to filter; the selected `json_extract`s run only
-/// for the rows returned (the `last_updated` index walk stops at `LIMIT`).
+/// matches the name and the AI title only ([`title_matches`]); `project_id`
+/// filters on the indexed column.
+///
+/// Two steps, so no row's JSON is parsed to filter: the `last_updated`
+/// index walk reads only the `id`, `name` and `tab_title` columns and
+/// matches the query in Rust (SQLite's `LIKE` folds ASCII case only), and
+/// stops once `limit` rows are kept; each match's JSON-only fields are then
+/// read by id. A row whose `data` isn't valid JSON is skipped (it couldn't
+/// be read with `HOBBES_TAB_READ` either) and doesn't fail the listing.
 pub fn tab_rows(query: Option<&str>, project_id: Option<&str>, exclude: &[String], limit: i64) -> Vec<TabRow> {
     with_conn(|conn| tab_rows_conn(conn, query, project_id, exclude, limit)).unwrap_or_else(|e| {
         tracing::error!("tab_rows failed: {e}");
@@ -1557,18 +1582,14 @@ pub(crate) fn tab_rows_conn(
     exclude: &[String],
     limit: i64,
 ) -> rusqlite::Result<Vec<TabRow>> {
+    use rusqlite::OptionalExtension;
+    let limit = limit.max(0) as usize;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let query = query.map(str::trim).filter(|q| !q.is_empty()).map(str::to_lowercase);
     let mut clauses: Vec<String> = Vec::new();
     let mut values: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
-        let escaped = q.to_lowercase().replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        values.push(format!("%{escaped}%").into());
-        let n = values.len();
-        // Name and title only (`hobbes_tabs::session_matches`): a listing
-        // must not search content. Both are columns: no JSON is parsed.
-        clauses.push(format!(
-            "(name LIKE ?{n} ESCAPE '\\' COLLATE NOCASE OR tab_title LIKE ?{n} ESCAPE '\\' COLLATE NOCASE)"
-        ));
-    }
     if let Some(p) = project_id {
         values.push(p.to_string().into());
         clauses.push(format!("project_id = ?{}", values.len()));
@@ -1580,28 +1601,51 @@ pub(crate) fn tab_rows_conn(
         clauses.push(format!("id NOT IN ({})", marks.join(", ")));
     }
     let where_clause = if clauses.is_empty() { String::new() } else { format!("WHERE {}", clauses.join(" AND ")) };
-    let sql = format!(
-        "SELECT id, name, tab_title, json_extract(data, '$.tab_emoji'), \
-         coalesce(json_extract(data, '$.name_user_set'), 0), project_id, \
-         json_extract(data, '$.composio_profile'), last_updated, message_count \
-         FROM sessions {where_clause} ORDER BY last_updated DESC LIMIT {}",
-        limit.max(0)
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(values), |r| {
-        Ok(TabRow {
-            id: r.get(0)?,
-            name: r.get(1)?,
-            tab_title: r.get(2)?,
-            tab_emoji: r.get(3)?,
-            name_user_set: r.get::<_, i64>(4)? != 0,
-            project_id: r.get(5)?,
-            composio_profile: r.get(6)?,
-            last_updated: r.get(7)?,
-            message_count: r.get(8)?,
-        })
-    })?;
-    rows.collect()
+    // Step 1: columns only. No SQL LIMIT: the walk stops in Rust once
+    // `limit` rows are kept, which a skipped (malformed) row doesn't count
+    // towards.
+    let mut walk = conn.prepare(&format!(
+        "SELECT id, name, tab_title, project_id, last_updated, message_count          FROM sessions {where_clause} ORDER BY last_updated DESC"
+    ))?;
+    // Step 2: the JSON-only fields of one kept row; `json_valid` first, so
+    // a malformed row reads as NULL instead of failing the statement.
+    let mut fields = conn.prepare(
+        "SELECT json_valid(data),          CASE WHEN json_valid(data) THEN json_extract(data, '$.tab_emoji') END,          CASE WHEN json_valid(data) THEN coalesce(json_extract(data, '$.name_user_set'), 0) END,          CASE WHEN json_valid(data) THEN json_extract(data, '$.composio_profile') END          FROM sessions WHERE id = ?1",
+    )?;
+    let mut rows = walk.query(rusqlite::params_from_iter(values))?;
+    let mut out = Vec::new();
+    while let Some(r) = rows.next()? {
+        let (id, name, tab_title): (String, String, Option<String>) = (r.get(0)?, r.get(1)?, r.get(2)?);
+        if query.as_deref().is_some_and(|q| !title_matches(&name, tab_title.as_deref(), q)) {
+            continue;
+        }
+        type Fields = (bool, Option<String>, Option<i64>, Option<String>);
+        let Some((valid, tab_emoji, name_user_set, composio_profile)) = fields
+            .query_row(params![id], |f| Ok::<Fields, _>((f.get(0)?, f.get(1)?, f.get(2)?, f.get(3)?)))
+            .optional()?
+        else {
+            continue;
+        };
+        if !valid {
+            tracing::warn!(session_id = %id, "tab_rows: skipped a row whose data isn't valid JSON");
+            continue;
+        }
+        out.push(TabRow {
+            id,
+            name,
+            tab_title,
+            tab_emoji,
+            name_user_set: name_user_set.unwrap_or(0) != 0,
+            project_id: r.get(3)?,
+            composio_profile,
+            last_updated: r.get(4)?,
+            message_count: r.get(5)?,
+        });
+        if out.len() >= limit {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Read one session for viewing only (`HOBBES_TAB_READ`, the Heartbeat's
@@ -2448,6 +2492,90 @@ mod list_metadata_tests {
             assert_eq!(metas[0].display_title(), "Quarterly Budget Review");
             assert_eq!(metas[1].tab_title, None);
             assert_eq!(metas[1].display_title(), "Sep 21 - 09:00 AM");
+        });
+    }
+
+    /// One row whose `data` isn't JSON: the column backfills skip it and
+    /// still finish (their done flags set), instead of failing every launch.
+    #[test]
+    fn a_malformed_row_never_stops_the_column_backfills() {
+        with_test_db(|conn| {
+            let a = session("Sep 25 - 09:00 AM", false, Some("Garden"), None);
+            let bad = session("Sep 25 - 10:00 AM", false, Some("Broken"), None);
+            let c = session("Sep 25 - 11:00 AM", false, Some("Taxes"), None);
+            for s in [&a, &bad, &c] {
+                upsert(conn, s);
+            }
+            conn.execute("UPDATE sessions SET data = '{not json' WHERE id = ?1", params![bad.id]).unwrap();
+            conn.execute("UPDATE sessions SET tab_title = NULL, project_id = 'stale'", []).unwrap();
+
+            test_support::backfill_tab_titles(conn);
+            assert!(meta(conn, META_TAB_TITLE_COLUMN).is_some(), "the backfill finished");
+            let title = |id: &str| -> Option<String> {
+                conn.query_row("SELECT tab_title FROM sessions WHERE id = ?1", params![id], |r| r.get(0)).unwrap()
+            };
+            assert_eq!(title(&a.id).as_deref(), Some("Garden"));
+            assert_eq!(title(&bad.id), None, "skipped");
+            assert_eq!(title(&c.id).as_deref(), Some("Taxes"), "rows after it are still filled");
+
+            conn.execute("DELETE FROM meta WHERE key IN (?1, ?2)", params![META_PROJECT_ID_COLUMN, META_SEARCH_TAB_TITLE])
+                .unwrap();
+            backfill_project_id_column(conn).unwrap();
+            backfill_search_tab_titles(conn).unwrap();
+            assert!(meta(conn, META_PROJECT_ID_COLUMN).is_some() && meta(conn, META_SEARCH_TAB_TITLE).is_some());
+        });
+    }
+
+    /// `HOBBES_TAB_LIST`'s store rows: a malformed row is skipped, not the
+    /// whole listing, and doesn't count towards the limit.
+    #[test]
+    fn tab_rows_skip_a_malformed_row() {
+        with_test_db(|conn| {
+            let now = chrono::Utc::now();
+            let mut rows = Vec::new();
+            for (i, title) in ["Oldest", "Middle", "Broken newest"].into_iter().enumerate() {
+                let mut s = session(&format!("Sep 26 - 0{i}:00 AM"), false, Some(title), Some("🧾"));
+                s.last_updated = now - chrono::Duration::minutes(10 - i as i64);
+                upsert(conn, &s);
+                rows.push(s);
+            }
+            conn.execute("UPDATE sessions SET data = '{not json' WHERE id = ?1", params![rows[2].id]).unwrap();
+            let listed = tab_rows_conn(conn, None, None, &[], 2).unwrap();
+            let titles: Vec<String> = listed.iter().map(TabRow::display_title).collect();
+            assert_eq!(titles, ["Middle", "Oldest"]);
+            assert_eq!(listed[0].tab_emoji.as_deref(), Some("🧾"));
+            assert!(tab_rows_conn(conn, Some("broken"), None, &[], 10).unwrap().is_empty());
+        });
+    }
+
+    /// The store's title search folds case like the in-memory one
+    /// (`str::to_lowercase`), not just ASCII the way SQLite's `LIKE` does.
+    #[test]
+    fn tab_rows_fold_non_ascii_case_like_memory() {
+        with_test_db(|conn| {
+            let titled = session("Sep 27 - 09:00 AM", false, Some("Ärger mit Behörden"), None);
+            let named = session("ÉTÉ À PARIS", true, None, None);
+            upsert(conn, &titled);
+            upsert(conn, &named);
+            let hits = |q: &str| tab_rows_conn(conn, Some(q), None, &[], 10).unwrap().len();
+            assert_eq!(hits("ärger"), 1);
+            assert_eq!(hits("ÄRGER"), 1);
+            assert_eq!(hits("été"), 1);
+            assert_eq!(hits("100%"), 0, "no LIKE wildcards");
+            assert!(title_matches("ÉTÉ À PARIS", None, "été à"));
+            assert!(!title_matches("Garden", Some("Taxes"), "zz"));
+        });
+    }
+
+    #[test]
+    fn row_bytes_reads_the_stored_size() {
+        with_test_db(|conn| {
+            let s = session("Sep 28 - 09:00 AM", false, None, None);
+            upsert(conn, &s);
+            let n: i64 = conn
+                .query_row("SELECT octet_length(data) FROM sessions WHERE id = ?1", params![s.id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n as usize, get_row_data(conn, &s.id).unwrap().len());
         });
     }
 

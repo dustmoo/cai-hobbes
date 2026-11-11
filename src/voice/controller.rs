@@ -462,9 +462,60 @@ static ECHO_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Mic / speaker problems and provider failures end up here.
 fn fail(msg: impl Into<String>) {
+    fail_naming_mic(msg, "");
+}
+
+/// As [`fail`], for a message that may name the mic `mic`: device names
+/// often carry the person's name, so the logged copy leaves it out.
+fn fail_naming_mic(msg: impl Into<String>, mic: &str) {
     let msg = msg.into();
-    tracing::warn!("voice: {msg}");
+    tracing::warn!("voice: {}", redact_mic(&msg, mic));
     VOICE_UI.write().error = Some(msg);
+}
+
+/// `msg` with the mic name `mic` replaced, for logs.
+fn redact_mic(msg: &str, mic: &str) -> String {
+    if mic.trim().is_empty() { msg.to_string() } else { msg.replace(mic, "<mic>") }
+}
+
+/// Shown when the mic can't be used for lack of permission.
+const MIC_ACCESS_NEEDED: &str =
+    "Hobbes needs microphone access for voice (System Settings → Privacy & Security → Microphone).";
+/// Shown when the audio backend gave up restarting capture.
+const MIC_STOPPED: &str =
+    "The microphone stopped (the audio device keeps changing). End the conversation and start it again.";
+/// Close reason when voice is switched off (or unlicensed) mid-conversation.
+const VOICE_TURNED_OFF: &str = "voice turned off";
+
+/// Whether a conversation that closed for `reason` ended normally (no error shown).
+fn ends_quietly(reason: &str) -> bool {
+    matches!(reason, "ended" | "stopped" | "goodbye" | "idle" | "app closing" | "announced" | VOICE_TURNED_OFF)
+}
+
+/// Whether news still queued at the end is announced afterwards. Not after
+/// an announcement that never found the floor (it would only start the same
+/// one again), nor when the app is closing, nor after Stop (they asked for
+/// quiet; the text is in the Hobbes tab), nor once voice is off.
+fn speaks_leftovers(reason: &str) -> bool {
+    !matches!(reason, "announced" | "app closing" | "stopped" | VOICE_TURNED_OFF)
+}
+
+/// The mic problem to show: capture given up by the backend first; then a
+/// silent / absent mic, which before macOS 14 (`permission_unknown`, the
+/// permission couldn't be checked up front) most likely means no access.
+fn live_mic_warning(capture_failed: bool, permission_unknown: bool, warning: Option<String>) -> Option<String> {
+    if capture_failed {
+        return Some(MIC_STOPPED.to_string());
+    }
+    warning.map(|w| if permission_unknown { MIC_ACCESS_NEEDED.to_string() } else { w })
+}
+
+/// Stop audio off the UI thread: the VPIO engine teardown waits on its
+/// audio thread (up to a few seconds).
+async fn stop_audio(mut io: Box<dyn AudioIo>) {
+    if let Err(e) = tokio::task::spawn_blocking(move || io.stop()).await {
+        tracing::warn!("voice audio: stop failed: {e}");
+    }
 }
 
 /// What a session needs from settings, resolved up front.
@@ -521,7 +572,6 @@ pub fn realtime_for(settings: &crate::settings::Settings) -> Result<(Box<dyn Rea
         voice_name: vp.voice_name.filter(|v| !v.trim().is_empty()),
         language: vp.language.filter(|v| !v.trim().is_empty()),
         tools: tools::voice_tool_decls(settings.planner_enabled),
-        manual_activity: false,
         end_of_turn_ms: Some(settings.voice.end_of_turn()),
     };
     Ok((Box::new(crate::voice::gemini_live::GeminiLive::new(key)), setup))
@@ -602,12 +652,16 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         }
     };
 
-    // Microphone permission (prompts the first time).
+    // Microphone permission (prompts the first time). Before macOS 14 it
+    // can't be read or requested: open the mic and let the OS prompt; a
+    // failed open or a silent mic then reads as missing access.
+    let permission_unknown = !audio::mic_permission_queryable();
     match audio::mic_permission() {
         MicPermission::Granted => {}
+        MicPermission::Undetermined if permission_unknown => {}
         MicPermission::Undetermined => {
             if audio::request_mic_permission().await != MicPermission::Granted {
-                fail("Hobbes needs microphone access for voice (System Settings → Privacy & Security → Microphone).");
+                fail(MIC_ACCESS_NEEDED);
                 return;
             }
         }
@@ -631,21 +685,29 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // Opening and starting the engine blocks for a second or two (VPIO
     // setup): off the UI thread.
     let mic_first = announcing_text.is_none();
-    let started = tokio::task::spawn_blocking(move || -> Result<audio::Opened, String> {
-        let mut o = audio::open(input_device.as_deref(), echo).map_err(|e| format!("Couldn't open the microphone: {e}"))?;
+    // Errors carry the mic's name when known (left out of the log).
+    let started = tokio::task::spawn_blocking(move || -> Result<audio::Opened, (String, String)> {
+        let mut o = audio::open(input_device.as_deref(), echo)
+            .map_err(|e| (format!("Couldn't open the microphone: {e}"), String::new()))?;
         // An announcement starts with the mic off (a press opens it).
         o.io.set_capture(mic_first);
-        o.io.start(mic_tx).map_err(|e| format!("Couldn't start audio on {}: {e}", o.input_name))?;
+        if let Err(e) = o.io.start(mic_tx) {
+            return Err((format!("Couldn't start audio on {}: {e}", o.input_name), o.input_name));
+        }
         Ok(o)
     })
     .await;
-    let mut audio_io: Box<dyn AudioIo> = match started {
+    let audio_io: Box<dyn AudioIo> = match started {
         Ok(Ok(o)) => {
             ui.mic = o.input_name;
             o.io
         }
-        Ok(Err(e)) => {
-            fail(e);
+        Ok(Err((e, mic))) => {
+            if permission_unknown {
+                fail(MIC_ACCESS_NEEDED);
+            } else {
+                fail_naming_mic(e, &mic);
+            }
             return;
         }
         Err(e) => {
@@ -687,17 +749,17 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     let mut rt = match connected {
         Some(Ok(s)) => s,
         Some(Err(e)) => {
-            audio_io.stop();
+            stop_audio(audio_io).await;
             fail(format!("Couldn't reach the voice model: {e}"));
             return;
         }
         None => {
-            audio_io.stop();
+            stop_audio(audio_io).await;
             tracing::info!("voice: stopped while connecting");
             return;
         }
     };
-    tracing::info!("voice: conversation started (mic '{}', echo-safe: {})", ui.mic, ui.echo_safe);
+    tracing::info!("voice: conversation started (echo-safe: {})", ui.echo_safe);
     let live_at = Instant::now();
     // The mic device is open from the press; push-to-talk releases it
     // between holds (see the end of the loop).
@@ -780,6 +842,28 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     ui.error = None;
     *VOICE_UI.write() = ui.clone();
 
+    // One mic frame through the echo gate (see `MicPath`), for the mic
+    // branch and the frames drained on a key release alike.
+    macro_rules! mic_path {
+        () => {
+            MicPath {
+                audio: &*audio_io,
+                control: &rt.control,
+                echo_safe: ui.echo_safe,
+                mic_drop_until,
+                stats: &mut stats,
+                playback: &mut playback,
+                ring: &mut ring,
+                barge: &mut barge,
+                noise: &mut noise,
+                model_turn: &mut model_turn,
+                spoke: &mut spoke,
+                pending_lines: &mut pending_lines,
+                floor: &mut floor_state,
+            }
+        };
+    }
+
     let close_reason = loop {
         // Utterances finished during this iteration are the ones after this.
         let lines_before = pending_lines.len();
@@ -787,60 +871,12 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
             frame = mic_rx.recv() => {
                 let Some(frame) = frame else { break "audio stopped".to_string() };
                 let p = probe::peak(&frame);
-                stats.mic_frames += 1;
-                stats.max_peak = stats.max_peak.max(p);
                 level_window = level_window.max(p);
                 let mic_open = held || mode == Some(Mode::Conversation);
                 let now = Instant::now();
-                // Without echo cancellation or headphones the model would
-                // hear itself (playback, and its tail just after).
-                let audible = playback.observe(audio_io.is_playing(), now);
-                match floor::mic_gate(mic_open, held, ui.echo_safe, audible, mic_drop_until, now) {
-                    MicGate::Closed => {}
-                    MicGate::Drop => stats.echo_frames_dropped += 1,
-                    MicGate::Hold => {
-                        // Keep the muted frame; send it after all if the
-                        // person is talking over Hobbes.
-                        let ms = floor::frame_ms(frame.len());
-                        ring.push(frame);
-                        if let Some(rise_ms) = barge.observe(p, ms) {
-                            audio_io.flush();
-                            playback.reset();
-                            model_turn.cut();
-                            stats.barge_ins += 1;
-                            spoke.finish_into(true, &mut pending_lines);
-                            // From where their voice rose above the echo, with
-                            // a short pre-roll; the rest was Hobbes' own echo.
-                            let (buffered, echo) = ring.drain_recent(rise_ms + floor::BARGE_PREROLL_MS);
-                            stats.echo_frames_dropped += echo as u64;
-                            tracing::info!(
-                                "voice: local barge-in; sending {} buffered mic frames ({echo} echo dropped)",
-                                buffered.len()
-                            );
-                            for f in buffered {
-                                stats.sent_frames += 1;
-                                let _ = rt.control.send(RealtimeControl::Audio(f));
-                            }
-                            floor_state.person_spoke(now);
-                            ui.phase = Phase::Listening;
-                            last_activity = now;
-                        }
-                    }
-                    MicGate::Send => {
-                        // Playback over without a barge-in: what was kept was
-                        // Hobbes' own echo.
-                        if !ring.is_empty() {
-                            stats.echo_frames_dropped += ring.clear() as u64;
-                            barge.playback_ended();
-                        }
-                        // The level counts toward the floor only when it can't
-                        // be Hobbes' own voice.
-                        if noise.is_speech(p) && (ui.echo_safe || !audible) {
-                            floor_state.person_spoke(now);
-                        }
-                        stats.sent_frames += 1;
-                        let _ = rt.control.send(RealtimeControl::Audio(frame));
-                    }
+                if mic_path!().route(frame, p, mic_open, held, now) {
+                    ui.phase = Phase::Listening;
+                    last_activity = now;
                 }
             }
             ev = rt.events.recv() => {
@@ -1108,16 +1144,10 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         // during the connect) goes out before the release,
                         // through the same echo gate as any mic frame.
                         while let Ok(frame) = mic_rx.try_recv() {
+                            let p = probe::peak(&frame);
                             let now = Instant::now();
-                            let audible = playback.observe(audio_io.is_playing(), now);
-                            match floor::mic_gate(true, false, ui.echo_safe, audible, mic_drop_until, now) {
-                                MicGate::Closed => {}
-                                MicGate::Drop => stats.echo_frames_dropped += 1,
-                                MicGate::Hold => ring.push(frame),
-                                MicGate::Send => {
-                                    stats.sent_frames += 1;
-                                    let _ = rt.control.send(RealtimeControl::Audio(frame));
-                                }
+                            if mic_path!().route(frame, p, true, false, now) {
+                                ui.phase = Phase::Listening;
                             }
                         }
                         held = false;
@@ -1140,10 +1170,18 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                 }
             }
             _ = tick.tick() => {
+                // Voice switched off in Settings, or the licence lapsed.
+                if !crate::voice::voice_active(&ctx.settings.peek()) {
+                    break VOICE_TURNED_OFF.to_string();
+                }
                 ui.level = level_window;
                 level_window = 0.0;
-                if capture_on {
-                    ui.mic_warning = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic);
+                if capture_on || audio_io.capture_failed() {
+                    ui.mic_warning = live_mic_warning(
+                        audio_io.capture_failed(),
+                        permission_unknown,
+                        mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic),
+                    );
                 }
                 if notice_until.is_some_and(|t| Instant::now() >= t) {
                     notice_until = None;
@@ -1322,16 +1360,16 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     }
     let _ = rt.control.send(RealtimeControl::Close);
     audio_io.flush();
-    audio_io.stop();
+    let capture_failed = audio_io.capture_failed();
     finish_in_order(&mut heard, &mut spoke, &mut pending_lines);
     flush_lines(ctx, &voice_session, &mut pending_lines, true);
+    // The VPIO teardown can block for a second or more: off the UI thread.
+    stop_audio(audio_io).await;
     if !queue.is_empty() {
-        // Said afterwards, as announcements (the announce settings apply).
-        // Not after an announcement that never found the floor (it would
-        // only start the same one again), nor when the app is closing, nor
-        // after Stop (they asked for quiet; the text is in the Hobbes tab).
+        // Said afterwards, as announcements (the announce settings apply),
+        // except where `speaks_leftovers` says not.
         let unspoken = queue.drain_as_announcements();
-        if matches!(close_reason.as_str(), "announced" | "app closing" | "stopped") {
+        if !speaks_leftovers(&close_reason) {
             tracing::info!("voice: {} queued item(s) not spoken before the end", unspoken.len());
         } else {
             tracing::info!("voice: {} queued item(s) not spoken; announcing them afterwards", unspoken.len());
@@ -1341,12 +1379,95 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
         }
     }
     tracing::info!("voice: conversation ended ({close_reason}); {}", stats.summary());
-    if let Some(w) = mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic).filter(|_| ever_captured) {
-        fail(w);
+    let warning = live_mic_warning(
+        capture_failed,
+        permission_unknown,
+        mic_warning(live_at.elapsed(), stats.mic_frames, stats.max_peak, &ui.mic),
+    );
+    if let Some(w) = warning.filter(|_| ever_captured) {
+        fail_naming_mic(w, &ui.mic);
         return;
     }
-    if !matches!(close_reason.as_str(), "ended" | "stopped" | "goodbye" | "idle" | "app closing" | "announced") {
+    if !ends_quietly(&close_reason) {
         fail(format!("The voice conversation ended: {close_reason}"));
+    }
+}
+
+/// One mic frame's way through the echo gate, shared by the mic branch and
+/// the frames drained on a key release. Borrows what a frame can touch for
+/// the one call.
+struct MicPath<'a> {
+    audio: &'a dyn AudioIo,
+    control: &'a mpsc::UnboundedSender<RealtimeControl>,
+    echo_safe: bool,
+    mic_drop_until: Option<Instant>,
+    stats: &'a mut Stats,
+    playback: &'a mut PlaybackTail,
+    ring: &'a mut MicRing,
+    barge: &'a mut BargeIn,
+    noise: &'a mut NoiseGate,
+    model_turn: &'a mut ModelTurn,
+    spoke: &'a mut Utterance,
+    pending_lines: &'a mut Vec<PendingLine>,
+    floor: &'a mut Floor,
+}
+
+impl MicPath<'_> {
+    /// Send, hold or drop `frame` (mic peak `p`); `mic_open` / `held` as in
+    /// [`floor::mic_gate`]. Returns true on a local barge-in (the caller
+    /// shows the person as heard).
+    fn route(&mut self, frame: Vec<i16>, p: f32, mic_open: bool, held: bool, now: Instant) -> bool {
+        self.stats.mic_frames += 1;
+        self.stats.max_peak = self.stats.max_peak.max(p);
+        // Without echo cancellation or headphones the model would hear
+        // itself (playback, and its tail just after).
+        let audible = self.playback.observe(self.audio.is_playing(), now);
+        match floor::mic_gate(mic_open, held, self.echo_safe, audible, self.mic_drop_until, now) {
+            MicGate::Closed => false,
+            MicGate::Drop => {
+                self.stats.echo_frames_dropped += 1;
+                false
+            }
+            MicGate::Hold => {
+                // Keep the muted frame; send it after all if the person is
+                // talking over Hobbes.
+                let ms = floor::frame_ms(frame.len());
+                self.ring.push(frame);
+                let Some(rise_ms) = self.barge.observe(p, ms) else { return false };
+                self.audio.flush();
+                self.playback.reset();
+                self.model_turn.cut();
+                self.stats.barge_ins += 1;
+                self.spoke.finish_into(true, self.pending_lines);
+                // From where their voice rose above the echo, with a short
+                // pre-roll; the rest was Hobbes' own echo.
+                let (buffered, echo) = self.ring.drain_recent(rise_ms + floor::BARGE_PREROLL_MS);
+                self.stats.echo_frames_dropped += echo as u64;
+                tracing::info!("voice: local barge-in; sending {} buffered mic frames ({echo} echo dropped)", buffered.len());
+                for f in buffered {
+                    self.stats.sent_frames += 1;
+                    let _ = self.control.send(RealtimeControl::Audio(f));
+                }
+                self.floor.person_spoke(now);
+                true
+            }
+            MicGate::Send => {
+                // Playback over without a barge-in: what was kept was
+                // Hobbes' own echo.
+                if !self.ring.is_empty() {
+                    self.stats.echo_frames_dropped += self.ring.clear() as u64;
+                    self.barge.playback_ended();
+                }
+                // The level counts toward the floor only when it can't be
+                // Hobbes' own voice.
+                if self.noise.is_speech(p) && (self.echo_safe || !audible) {
+                    self.floor.person_spoke(now);
+                }
+                self.stats.sent_frames += 1;
+                let _ = self.control.send(RealtimeControl::Audio(frame));
+                false
+            }
+        }
     }
 }
 
@@ -2309,5 +2430,113 @@ mod tests {
         let t = live_tail(&long);
         assert!(t.starts_with('…') && t.ends_with("END"));
         assert_eq!(live_tail(" short "), "short");
+    }
+
+    #[test]
+    fn turning_voice_off_ends_quietly_without_leftover_announcements() {
+        assert!(ends_quietly(VOICE_TURNED_OFF));
+        assert!(!speaks_leftovers(VOICE_TURNED_OFF));
+        assert!(ends_quietly("idle") && speaks_leftovers("idle"));
+        assert!(!ends_quietly("socket closed") && speaks_leftovers("socket closed"));
+        assert!(!speaks_leftovers("stopped") && !speaks_leftovers("announced"));
+    }
+
+    #[test]
+    fn mic_problems_rank_and_reword() {
+        let silent = Some("No audio is arriving from BRIO".to_string());
+        // A backend that gave up wins over everything.
+        assert_eq!(live_mic_warning(true, false, None).as_deref(), Some(MIC_STOPPED));
+        assert_eq!(live_mic_warning(true, true, silent.clone()).as_deref(), Some(MIC_STOPPED));
+        // Before macOS 14 a silent mic most likely means no access.
+        assert_eq!(live_mic_warning(false, true, silent.clone()).as_deref(), Some(MIC_ACCESS_NEEDED));
+        assert_eq!(live_mic_warning(false, false, silent.clone()), silent);
+        assert_eq!(live_mic_warning(false, true, None), None);
+    }
+
+    #[test]
+    fn logged_failures_leave_the_mic_name_out() {
+        assert_eq!(redact_mic("No audio is arriving from Dustin's AirPods.", "Dustin's AirPods"), "No audio is arriving from <mic>.");
+        assert_eq!(redact_mic("server closed", ""), "server closed");
+    }
+
+    /// Output stub: only `is_playing` matters to the gate.
+    struct FakeAudio {
+        playing: bool,
+    }
+
+    impl AudioIo for FakeAudio {
+        fn start(&mut self, _: mpsc::UnboundedSender<Vec<i16>>) -> Result<(), crate::voice::audio::AudioError> {
+            Ok(())
+        }
+        fn play(&self, _: &[i16], _: u32) {}
+        fn flush(&self) {}
+        fn is_playing(&self) -> bool {
+            self.playing
+        }
+        fn set_mic_enabled(&self, _: bool) {}
+        fn echo_safe(&self) -> bool {
+            false
+        }
+        fn stop(&mut self) {}
+    }
+
+    #[derive(Default)]
+    struct PathState {
+        stats: Stats,
+        playback: PlaybackTail,
+        ring: MicRing,
+        barge: BargeIn,
+        noise: NoiseGate,
+        model_turn: ModelTurn,
+        lines: Vec<PendingLine>,
+        floor: Floor,
+    }
+
+    fn route(st: &mut PathState, audio: &FakeAudio, echo_safe: bool, mic_open: bool, held: bool) -> Vec<RealtimeControl> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut spoke = Utterance::new(false);
+        let mut path = MicPath {
+            audio,
+            control: &tx,
+            echo_safe,
+            mic_drop_until: None,
+            stats: &mut st.stats,
+            playback: &mut st.playback,
+            ring: &mut st.ring,
+            barge: &mut st.barge,
+            noise: &mut st.noise,
+            model_turn: &mut st.model_turn,
+            spoke: &mut spoke,
+            pending_lines: &mut st.lines,
+            floor: &mut st.floor,
+        };
+        let barged = path.route(vec![100; 320], 0.01, mic_open, held, Instant::now());
+        assert!(!barged);
+        let mut out = Vec::new();
+        while let Ok(c) = rx.try_recv() {
+            out.push(c);
+        }
+        out
+    }
+
+    #[test]
+    fn the_mic_path_sends_holds_or_closes() {
+        let quiet = FakeAudio { playing: false };
+        let talking = FakeAudio { playing: true };
+        let mut st = PathState::default();
+        // Open mic, nothing playing: sent.
+        assert_eq!(route(&mut st, &quiet, false, true, false), vec![RealtimeControl::Audio(vec![100; 320])]);
+        assert_eq!((st.stats.mic_frames, st.stats.sent_frames), (1, 1));
+        // Closed (push-to-talk between holds): nothing.
+        assert!(route(&mut st, &quiet, false, false, false).is_empty());
+        assert_eq!(st.stats.mic_frames, 2);
+        // Echo-unsafe while Hobbes talks: held back in the ring.
+        assert!(route(&mut st, &talking, false, true, false).is_empty());
+        assert!(!st.ring.is_empty());
+        // Echo-safe, or the key held: sent even over playback; the ring
+        // (Hobbes' own echo) is discarded.
+        assert_eq!(route(&mut st, &talking, false, true, true).len(), 1);
+        assert!(st.ring.is_empty());
+        assert_eq!(route(&mut st, &talking, true, true, false).len(), 1);
     }
 }

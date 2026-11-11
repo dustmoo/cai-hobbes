@@ -327,8 +327,10 @@ pub fn tab_read_gate(deps: BuiltinToolCtx, tool_call: &ToolCall, session_id: &st
 
 /// **The call risk gate** (`call_risk`): judges what a call would do —
 /// rules only, no LLM — for calls minted by a voice-relayed turn
-/// (`TurnOrigin::Voice`) or an unattended one ([`effective_origin`]); a
-/// no-op (`Proceed`) for a typed turn. Safe proceeds into the normal flow
+/// (`TurnOrigin::Voice`), an unattended one ([`effective_origin`]), or a
+/// turn nobody is present for in an ordinary chat (a fired timer, a relay or
+/// returned work: `chat_queue::turn_absent`, [`risk_gate_applies`]); a
+/// no-op (`Proceed`) for a turn the person typed. Safe proceeds into the normal flow
 /// (always-allow and trust rules included); Malformed is refused with a
 /// message telling the model what to fix (the person isn't asked);
 /// Destructive is held as a `PermissionRequest` whatever always-allow or
@@ -343,13 +345,13 @@ pub fn risk_gate(
     session_id: &str,
     user_approved: bool,
 ) -> AgentTimeGate {
-    use crate::call_risk::{classify, gate_applies, gate_decision, RiskGate};
+    use crate::call_risk::{classify, decide, RiskGate};
     let origin = effective_origin(tool_call, session_id);
-    if !gate_applies(origin) {
+    if !risk_gate_applies(tool_call, session_id) {
         return AgentTimeGate::Proceed;
     }
     let risk = classify(&tool_call.server_name, &tool_call.tool_name, args_json);
-    let decision = gate_decision(origin, &risk, user_approved);
+    let decision = decide(&risk, user_approved);
     if risk != crate::call_risk::Risk::Safe {
         let action = match &decision {
             RiskGate::Proceed => "approved",
@@ -376,13 +378,26 @@ pub fn risk_gate(
 /// origin and judges it Destructive, else `None`. Pure apart from the
 /// origin lookup; logs nothing.
 pub fn risk_hold_reason(tool_call: &ToolCall, args_json: &serde_json::Value, session_id: &str) -> Option<String> {
-    if !crate::call_risk::gate_applies(effective_origin(tool_call, session_id)) {
+    if !risk_gate_applies(tool_call, session_id) {
         return None;
     }
     match crate::call_risk::classify(&tool_call.server_name, &tool_call.tool_name, args_json) {
         crate::call_risk::Risk::Destructive { reason } => Some(reason),
         _ => None,
     }
+}
+
+/// Whether the call risk gate judges `tool_call`: its turn's origin is a
+/// voice or unattended one, or nobody is present for the turn running in
+/// `session_id` (`chat_queue::turn_absent`: a timer, relay or returned work
+/// in an ordinary chat — the person's origin, but nobody watching). Both are
+/// harness state, never model output. The Heartbeat gate's reach is
+/// unchanged: it reads the origin alone.
+pub fn risk_gate_applies(tool_call: &ToolCall, session_id: &str) -> bool {
+    crate::call_risk::gate_applies_to(
+        effective_origin(tool_call, session_id),
+        crate::components::chat_queue::turn_absent(session_id),
+    )
 }
 
 /// The stricter of two gate results: Refuse > ForceApproval > Proceed; on a
@@ -1918,6 +1933,31 @@ mod tests {
             let mut todo_voice = call("HOBBES_TODO_CREATE");
             stamp_turn_origin(&mut todo_voice, TurnOrigin::Voice);
             assert_eq!(scope_gates(ctx, &todo_voice, &serde_json::json!({}), "risk-hobbes", false), AgentTimeGate::Proceed);
+
+            // A timer, relay or returned work in an ordinary chat: the
+            // person's origin, but nobody present — the risk gate judges it.
+            let ordinary = "risk-ordinary-tab";
+            let gate_in = |tc: &ToolCall, approved: bool| {
+                let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap();
+                scope_gates(ctx, tc, &args, ordinary, approved)
+            };
+            crate::components::chat_queue::set_turn_absent(ordinary, true);
+            let absent_wipe = exec(TurnOrigin::User, wipe);
+            assert_eq!(gate_in(&absent_wipe, false), AgentTimeGate::ForceApproval);
+            assert_eq!(gate_in(&absent_wipe, true), AgentTimeGate::Proceed);
+            assert!(matches!(gate_in(&exec(TurnOrigin::User, "rm -rf <path>"), false), AgentTimeGate::Refuse(_)));
+            assert_eq!(gate_in(&exec(TurnOrigin::User, "ls -la"), false), AgentTimeGate::Proceed);
+            assert_eq!(
+                risk_hold_reason(&absent_wipe, &args, ordinary).as_deref(),
+                Some("erases the whole disk /dev/disk10")
+            );
+            // The Heartbeat gate's reach is unchanged: a planner write on such
+            // a turn is still the person's (no Heartbeat refusal).
+            assert_eq!(scope_gates(ctx, &call("HOBBES_TODO_CREATE"), &serde_json::json!({}), ordinary, false), AgentTimeGate::Proceed);
+            // The person typing again: untouched, as before.
+            crate::components::chat_queue::set_turn_absent(ordinary, false);
+            assert_eq!(gate_in(&exec(TurnOrigin::User, wipe), false), AgentTimeGate::Proceed);
+            assert_eq!(risk_hold_reason(&exec(TurnOrigin::User, wipe), &args, ordinary), None);
             rsx! { div {} }
         });
         crate::test_support::rebuild_or_fail(&mut dom);

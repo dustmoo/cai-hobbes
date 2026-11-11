@@ -371,21 +371,36 @@ pub fn decide_held_message(
     }
 }
 
-/// After the person allowed profile pairs (in this chat or always), approve
-/// every call still held in `session_id` whose pairs are now all allowed
-/// (`profile_flow::released_by_allowance`: never a risk-held call or an
-/// unattended act), each through the shared approve path and logged as
-/// Approved. Returns how many were released.
+/// After the person allowed profile pairs (in this chat or always) on the
+/// held call of round `round_id`, approve the other calls of that round
+/// still held only for pairs now allowed: those
+/// `profile_flow::released_by_allowance` returns (the person's own turn,
+/// never a risk hold, an unattended hold or a leftover from an earlier
+/// round), in a chat that isn't running agent time, and whose run the
+/// normal permission flow would allow without asking ([`normal_flow_allows`])
+/// — so no gate but the flow guard held them. Each goes through the shared
+/// approve path and is logged as Approved. Returns how many were released.
 pub fn release_allowed_flow_holds(
     session_state: Signal<crate::session::SessionState>,
     settings: &crate::settings::Settings,
+    planner: &crate::todo::PlannerState,
     session_id: &str,
+    round_id: Option<&str>,
 ) -> usize {
+    let Some(round_id) = round_id else { return 0 };
+    // Agent time holds outside effects for the person, call by call.
+    if planner.is_agent_time_session(session_id) || crate::agent_time_runtime::is_agent_time_chat_now(planner, session_id) {
+        return 0;
+    }
     let (calls, project_id) = {
         let state = session_state.peek();
         let Some(s) = state.sessions.get(session_id) else { return 0 };
         let policy = crate::mcp::manager::profile_flow::FlowPolicy::new(settings, &s.allowed_flows);
-        (crate::mcp::manager::profile_flow::released_by_allowance(&s.messages, &policy), s.project_id.clone())
+        let calls: Vec<ToolCall> = crate::mcp::manager::profile_flow::released_by_allowance(&s.messages, &policy, round_id)
+            .into_iter()
+            .filter(|tc| normal_flow_allows(settings, tc, s.project_id.as_deref()))
+            .collect();
+        (calls, s.project_id.clone())
     };
     for tc in &calls {
         let args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
@@ -401,6 +416,32 @@ pub fn release_allowed_flow_holds(
         approve_held_call(session_state, session_id, &tc.execution_id);
     }
     calls.len()
+}
+
+/// **Pure.** Whether the normal permission flow would run `tc` without
+/// asking: a trust rule matches it (as `McpManager::use_mcp_tool` matches
+/// them, on the raw server name and the arguments without the profile
+/// argument), or the global and per-server MCP permission allows it. A
+/// server's per-tool always-allow list isn't visible here, so a call only it
+/// would allow stays held for its own click (the safe side).
+pub fn normal_flow_allows(settings: &crate::settings::Settings, tc: &ToolCall, project_id: Option<&str>) -> bool {
+    let mut args: serde_json::Value = serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+    crate::mcp::manager::profile_reach::strip_profile_arg(&tc.tool_name, &mut args);
+    let trusted = crate::context::trust::evaluate(
+        &settings.permission_settings.trust_rules,
+        &tc.server_name,
+        &tc.tool_name,
+        &args,
+        &crate::context::trust::TrustCtx { project_id },
+    )
+    .is_some();
+    let check_name = if crate::mcp::manager::is_composio_native(&tc.server_name) {
+        crate::mcp::manager::COMPOSIO_NATIVE_PREFIX
+    } else {
+        tc.server_name.as_str()
+    };
+    trusted
+        || settings.permission_settings.mcp_permission(check_name) == crate::context::permissions::PermissionStatus::Allowed
 }
 
 /// The message carrying this execution id, within one session.
@@ -460,9 +501,9 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
                 .join(" ")
         })
         .filter(|p| !p.is_empty());
-    // The owning tab's project, so "only in {project}" scopes a rule (a
-    // cross-company flow key included) to the project of the chat it was
-    // raised in.
+    // The owning tab's project, so "only in {project}" scopes a trust rule
+    // to the project of the chat it was raised in (flow holds author no
+    // rules: their choices allow profile pairs).
     let session_project: Option<(String, String)> = {
         let state = session_state.read();
         state
@@ -613,6 +654,7 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
         let held = flow_choices.clone();
         let session_id = props.session_id.clone();
         let execution_id = tool_call.execution_id.clone();
+        let round_id = tool_call.round_id.clone();
         let log = decision_base;
         move |always: bool| {
             let Some(held) = held.clone() else { return };
@@ -653,7 +695,13 @@ pub fn PermissionPrompt(props: PermissionPromptProps) -> Element {
             }
             approve_held_call(session_state, &session_id, &execution_id);
             // Other calls held only for pairs now allowed run too.
-            release_allowed_flow_holds(session_state, &settings.peek(), &session_id);
+            release_allowed_flow_holds(
+                session_state,
+                &settings.peek(),
+                &planner.peek(),
+                &session_id,
+                round_id.as_deref(),
+            );
         }
     };
     let mut allow_in_chat = allow_flows.clone();
@@ -1144,5 +1192,39 @@ mod tests {
         ]);
         let session = state.sessions.get_mut(&id).unwrap();
         assert!(message_mut_by_execution_id(session, "exec-unknown").is_none());
+    }
+
+    /// Releasing a flow hold never skips the normal permission flow: only a
+    /// call that flow would run without asking may go with its siblings.
+    #[test]
+    fn released_holds_must_pass_the_normal_permission_flow() {
+        use crate::context::permissions::{ToolCategory, TrustRule};
+        let tc = ToolCall {
+            server_name: "composio-native:Clearmirror.ai".into(),
+            tool_name: "GMAIL_SEND_EMAIL".into(),
+            arguments: r#"{"to":"a@b.c","hobbes_profile":"Clearmirror.ai"}"#.into(),
+            ..Default::default()
+        };
+        // Auto-approval off: the call would ask, so it stays held.
+        let mut s = crate::settings::Settings::default();
+        s.permission_settings.auto_approval_enabled = false;
+        assert!(!super::normal_flow_allows(&s, &tc, None));
+        // Auto-approval on for MCP: the normal flow runs it.
+        s.permission_settings.auto_approval_enabled = true;
+        s.permission_settings.granular_permissions.insert(ToolCategory::Mcp, true);
+        assert!(super::normal_flow_allows(&s, &tc, None));
+        // …unless Composio is set to ask.
+        s.permission_settings.mcp_server_permissions.insert(crate::mcp::manager::COMPOSIO_NATIVE_PREFIX.into(), false);
+        assert!(!super::normal_flow_allows(&s, &tc, None));
+        // A trust rule for exactly this tool lets it through.
+        s.permission_settings.trust_rules.push(TrustRule {
+            id: "r".into(),
+            server: tc.server_name.clone(),
+            tool: Some(tc.tool_name.clone()),
+            command_prefix: None,
+            project_id: None,
+            created_at: chrono::Utc::now(),
+        });
+        assert!(super::normal_flow_allows(&s, &tc, None));
     }
 }

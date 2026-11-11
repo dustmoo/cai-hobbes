@@ -31,7 +31,7 @@ pub struct ToolDecl {
 
 /// How the model should handle a late tool result (async tools only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // Interrupt / Silent: part of the contract, unused by the controller yet
+#[allow(dead_code)] // Interrupt: part of the contract, unused by the controller yet
 pub enum Scheduling {
     /// Stop what it is saying and deal with the result now.
     Interrupt,
@@ -52,10 +52,7 @@ pub struct RealtimeSetup {
     /// BCP-47 language hint for speech output/transcription. `None` = auto.
     pub language: Option<String>,
     pub tools: Vec<ToolDecl>,
-    /// Push-to-talk: the provider's own voice-activity detection is off and
-    /// the controller marks speech with `ActivityStart` / `ActivityEnd`.
-    pub manual_activity: bool,
-    /// Automatic activity only: the silence (ms) that ends the person's
+    /// The silence (ms) that ends the person's
     /// turn, with the provider told to end turns less eagerly, so a
     /// thinking pause doesn't hand the model half a sentence. `None` =
     /// provider defaults.
@@ -90,15 +87,11 @@ pub enum RealtimeEvent {
 
 /// Controller → provider.
 #[derive(Clone, Debug, PartialEq)]
-#[allow(dead_code)] // ActivityStart / End: manual-activity providers
 pub enum RealtimeControl {
     /// Mic audio: mono 16-bit PCM at [`INPUT_SAMPLE_RATE`].
     Audio(Vec<i16>),
-    /// Push-to-talk pressed (manual activity only).
-    ActivityStart,
-    /// Push-to-talk released (manual activity only).
-    ActivityEnd,
-    /// The mic paused for a while (automatic activity only).
+    /// The mic paused for a while (the provider's activity detection
+    /// closes the person's turn).
     AudioStreamEnd,
     ToolResponse {
         id: String,

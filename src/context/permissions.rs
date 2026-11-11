@@ -67,6 +67,42 @@ pub struct ProfileFlow {
     pub to: String,
 }
 
+impl PermissionSettings {
+    /// The global and per-server MCP permission for `server_name` (no
+    /// trust rules, no per-tool always-allow): what
+    /// `PermissionManager::check_mcp_permission` answers. Pure.
+    pub fn mcp_permission(&self, server_name: &str) -> PermissionStatus {
+        // 1. Global Auto-Approval Check
+        if !self.auto_approval_enabled {
+            return PermissionStatus::RequiresPrompt;
+        }
+
+        // 2. ToolCategory::Mcp Global Toggle
+        if !self
+            .granular_permissions
+            .get(&ToolCategory::Mcp)
+            .copied()
+            .unwrap_or(false)
+        {
+            // If global MCP tools are disabled, we return RequiresPrompt instead of Denied
+            // to allow manual overrides for individual tool calls.
+            return PermissionStatus::RequiresPrompt;
+        }
+
+        // 3. Per-Server Toggle
+        if let Some(&allowed) = self.mcp_server_permissions.get(server_name) {
+            if allowed {
+                PermissionStatus::Allowed
+            } else {
+                PermissionStatus::RequiresPrompt
+            }
+        } else {
+            // Default to Allowed if no specific server setting exists (but global is on)
+            PermissionStatus::Allowed
+        }
+    }
+}
+
 impl Default for PermissionSettings {
     fn default() -> Self {
         Self {
@@ -92,41 +128,7 @@ impl PermissionManager {
     }
 
     pub fn check_mcp_permission(&self, server_name: &str) -> PermissionStatus {
-        let settings = self.settings.read();
-
-        // 1. Global Auto-Approval Check
-        if !settings.permission_settings.auto_approval_enabled {
-            return PermissionStatus::RequiresPrompt;
-        }
-
-        // 2. ToolCategory::Mcp Global Toggle
-        if !settings
-            .permission_settings
-            .granular_permissions
-            .get(&ToolCategory::Mcp)
-            .copied()
-            .unwrap_or(false)
-        {
-            // If global MCP tools are disabled, we return RequiresPrompt instead of Denied
-            // to allow manual overrides for individual tool calls.
-            return PermissionStatus::RequiresPrompt;
-        }
-
-        // 3. Per-Server Toggle
-        if let Some(&allowed) = settings
-            .permission_settings
-            .mcp_server_permissions
-            .get(server_name)
-        {
-            if allowed {
-                PermissionStatus::Allowed
-            } else {
-                PermissionStatus::RequiresPrompt
-            }
-        } else {
-            // Default to Allowed if no specific server setting exists (but global is on)
-            PermissionStatus::Allowed
-        }
+        self.settings.read().permission_settings.mcp_permission(server_name)
     }
 
     pub fn is_turn_limit_reached_for(&self, turn_count: u32) -> bool {
