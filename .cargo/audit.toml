@@ -37,5 +37,24 @@ ignore = [
 
     # Additional deep transitive Dioxus/Wry deps:
     "RUSTSEC-2025-0057",
-    "RUSTSEC-2025-0141"
+    "RUSTSEC-2025-0141",
+
+    # ---- No upstream fix available yet ----
+    # Policy: an ignore is allowed ONLY when no upstream fix exists (or the
+    # vulnerable code is provably not compiled), with the reason recorded
+    # here. This file is the single ignore list: CI and the weekly audit
+    # both run a plain `cargo audit`.
+
+    # quick-xml 0.39, pulled ONLY by wayland-scanner (Linux build-time
+    # codegen of trusted wayland protocol XML; not attacker-reachable). Its
+    # latest release still pins ^0.39. Drop when wayland-scanner moves to
+    # quick-xml >= 0.41.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+
+    # webbrowser BROWSER-env argument injection. Fixed in webbrowser >= 1.2.2
+    # but dioxus-desktop 0.6 pins ^0.8; the exploit needs an attacker-
+    # controlled BROWSER env var on the user's own machine. Drop on the
+    # Dioxus 0.7 upgrade.
+    "RUSTSEC-2026-0257"
 ]
