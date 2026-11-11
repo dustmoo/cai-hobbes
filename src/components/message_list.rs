@@ -400,8 +400,24 @@ pub fn MessageList(
                                                     // is absorbed into the adjacent ToolCall card, so an empty text message
                                                     // with only thinking metadata should be hidden.
                                                     let should_render = !text.trim().is_empty() || is_generating || !message.attachments.is_empty();
+                                                    // A voice request that repeats the heard line
+                                                    // just above it shows as a hand-off marker under
+                                                    // that bubble, not as a second copy of it.
+                                                    let echo = crate::voice::display::echoes_heard_line(&sorted_messages, *idx);
 
-                                                    if should_render {
+                                                    if echo {
+                                                        let request = crate::voice::display::display_text(text).to_string();
+                                                        rsx! {
+                                                            div {
+                                                                class: "flex justify-end",
+                                                                span {
+                                                                    class: "text-xs text-fg-muted px-2 cursor-default",
+                                                                    title: "{request}",
+                                                                    "↳ Asked Hobbes"
+                                                                }
+                                                            }
+                                                        }
+                                                    } else if should_render {
                                                         rsx! {
                                                             MessageBubble {
                                                                 message: display_message(message),

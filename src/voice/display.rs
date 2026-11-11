@@ -74,6 +74,43 @@ pub fn classify_spoken(messages: &[Message], idx: usize) -> SpokenLine {
     }
 }
 
+/// Lowercased words only, so punctuation and spacing don't count.
+fn normalized(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether `messages[idx]` is a voice request that only repeats what the
+/// person was just heard saying: the nearest earlier User message (past
+/// anything the voice said aloud) is a heard line with the same words. The
+/// chat shows such a request as a hand-off marker rather than a second
+/// copy of the person's bubble. Depends only on messages up to `idx`.
+pub fn echoes_heard_line(messages: &[Message], idx: usize) -> bool {
+    let Some(MessageContent::Text { content, .. }) = messages.get(idx).map(|m| &m.content) else {
+        return false;
+    };
+    if messages[idx].author != "User" || !crate::voice::brain::is_voice_request(content) {
+        return false;
+    }
+    let request = display_text(content);
+    let request = request.strip_prefix(HEARD_PREFIX.trim_end()).unwrap_or(request);
+    let heard = messages[..idx]
+        .iter()
+        .rev()
+        .find(|m| spoken_text(m).is_none())
+        .filter(|m| m.author == "User")
+        .and_then(|m| m.content.get_text_content())
+        .filter(|t| t.starts_with(HEARD_PREFIX) && !crate::voice::brain::is_voice_request(t));
+    heard.is_some_and(|t| {
+        let n = normalized(&t);
+        !n.is_empty() && n == normalized(request)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +156,35 @@ mod tests {
         assert_eq!(classify_spoken(&ms, 1), SpokenLine::Normal);
         assert_eq!(classify_spoken(&ms, 2), SpokenLine::Drop);
         assert_eq!(classify_spoken(&ms, 3), SpokenLine::Drop);
+    }
+
+    #[test]
+    fn request_repeating_heard_line_is_an_echo() {
+        let req = crate::voice::brain::framed_request("Please dispatch a cab to Gemini Carbon.");
+        let ms = vec![
+            msg("User", "🎙 please dispatch a cab to Gemini Carbon"),
+            msg("Hobbes", "🔊 On it."),
+            msg("User", &req),
+        ];
+        assert!(echoes_heard_line(&ms, 2));
+        // Directly after the heard line, too.
+        assert!(echoes_heard_line(&[ms[0].clone(), ms[2].clone()], 1));
+    }
+
+    #[test]
+    fn paraphrase_or_no_heard_line_is_not_an_echo() {
+        let req = crate::voice::brain::framed_request("Send Sam the Q3 numbers");
+        let paraphrase = vec![msg("User", "🎙 can you get Sam those numbers"), msg("User", &req)];
+        assert!(!echoes_heard_line(&paraphrase, 1));
+        let typed = vec![msg("User", "Send Sam the Q3 numbers"), msg("User", &req)];
+        assert!(!echoes_heard_line(&typed, 1));
+        // A brain reply in between ends the match.
+        let replied = vec![msg("User", "🎙 Send Sam the Q3 numbers"), msg("Hobbes", "Done."), msg("User", &req)];
+        assert!(!echoes_heard_line(&replied, 2));
+        // Not a voice request at all.
+        let plain = vec![msg("User", "🎙 hi"), msg("User", "🎙 hi")];
+        assert!(!echoes_heard_line(&plain, 1));
+        assert!(!echoes_heard_line(&[msg("User", &req)], 0));
     }
 
     #[test]
