@@ -9,7 +9,7 @@
 //! with [`FleetOrigin::Hobbes`] telling them apart.
 //!
 //! Gating: reports are dropped unless the supervisor has armed the bridge
-//! (`fleet_enabled && pro_active()`, the same condition as the listener —
+//! (`fleet_enabled && fleet_available()`, the same condition as the listener —
 //! which also means the server's staleness sweep is running whenever Hobbes
 //! rows are live). Callers never need settings access.
 //!

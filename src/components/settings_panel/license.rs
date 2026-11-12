@@ -75,13 +75,27 @@ pub(super) fn LicenseSection() -> Element {
         license_rev += 1;
     };
 
+    let gated = crate::entitlement::anything_gated();
+    // Nothing needs a key in this build: show the section only to someone
+    // who already has one, so they can see it is kept (or remove it).
+    if !gated && current.is_none() {
+        return rsx! {};
+    }
+
     rsx! {
         div {
             class: "border border-subtle rounded-lg mb-4",
             div {
                 class: "p-4 bg-section rounded-lg",
                 h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "License" }
-                p { class: "text-sm text-fg-muted mb-3", "Unlock Voice, Fleet and other Pro features with a license key." }
+                p {
+                    class: "text-sm text-fg-muted mb-3",
+                    if gated {
+                        "Unlock Voice, Fleet and other Pro features with a license key."
+                    } else {
+                        "Voice and Fleet no longer need a license, so everything in this version works without one. Your key stays stored."
+                    }
+                }
 
                 if let Some(info) = current {
                     div {

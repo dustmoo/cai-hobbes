@@ -1121,7 +1121,7 @@ pub(crate) fn TodayRail(
     // Pro surfaces: the agent lane (+ its summary suffix) and the strategic
     // readout. Recording is never gated — the rows exist either way; a Free
     // build simply doesn't display the split.
-    let pro = crate::entitlement::pro_active();
+    let pro = crate::fleet::fleet_available();
     let strategic_line: Option<String> = if pro {
         let person_today = model::person_minutes_on(&state.focus_sessions, day);
         let agent_today = model::agent_minutes_on(&state.focus_sessions, day);
@@ -1383,7 +1383,7 @@ pub(crate) fn TodayRail(
         let _tick = *now_tick.read();
         let live = fleet_state.read();
         let _live_count = live.sessions.len();
-        if !crate::entitlement::pro_active() {
+        if !crate::fleet::fleet_available() {
             return Vec::new();
         }
         let bound = if day == today() {

@@ -3359,7 +3359,7 @@ pub fn planner_today_context(
     // this edge — the pure core stays fleet-free.
     if settings.fleet_enabled
         && settings.fleet_briefs_enabled
-        && crate::entitlement::pro_active()
+        && crate::fleet::fleet_available()
     {
         let now = chrono::Utc::now();
         let rows = crate::fleet::store::sessions_active_on(today);

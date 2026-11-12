@@ -1,3 +1,30 @@
+# Hobbes v0.14.2 — Voice and Fleet for everyone
+
+Voice and the Fleet no longer need a license. Everything in Hobbes now works without a key. If you are coming from v0.13, everything below is new.
+
+## ✨ New in v0.14.2
+
+- **Voice is free.** Turn it on in Settings → Hobbes with a Gemini API key. No license needed.
+- **The Fleet is free.** Watch your Claude Code sessions from Settings → Fleet → Connect Claude Code. The planner's agent lane and the weekly review's Agent leverage figure come with it.
+- **No license box.** Settings → About no longer asks for a key. If you already added one, it stays stored and is still shown there.
+
+## ✨ New in v0.14
+
+- **Talk to Hobbes.** Tap the voice hotkey to talk hands-free, or hold it to push-to-talk. Hobbes answers out loud, you can interrupt it, and it hands real work to its full chat and tells you the result when it's ready. 30 voices, echo cancellation on macOS, and a mic and speaker test.
+- **One Hobbes tab.** Heartbeat, voice and your own messages share one chat, marked with the pixel tiger. It starts fresh when it grows large, carrying a summary forward, and can read your other tabs when you ask.
+- **Every tab can use all your Composio profiles.** A tab acts in its home profile unless the work belongs in another. Hobbes asks before content read in one profile is sent or written into another, and you can allow it once, for the chat, or always for that pair.
+- **Safer unattended and spoken work.** On voice turns and turns nobody is watching, Hobbes holds commands that would delete, overwrite or force-push, and shows why. Typed chat is unchanged.
+- **Heartbeat on your schedule.** Set workdays, briefing times and days off.
+- **New models.** Gemini 4 Carbon with a 1M-token context, and the GPT-6.1 models.
+- **A backup before each upgrade.** The first launch of a new version copies your chat database before changing anything.
+
+The full v0.14.0 list, including its fixes and security updates, is in the [v0.14.0 release](https://github.com/dustmoo/cai-hobbes/releases/tag/v0.14.0).
+
+## 🐛 Fixed since v0.14.0
+
+- **The app is called Hobbes.** Direct downloads and Windows builds showed "Hobbes Pro" in the window title, menu, Dock and About.
+- **Voice messages point to the right place,** Settings → Hobbes.
+
 # Hobbes v0.14.1 — Voice, one Hobbes tab, and clearer Pro
 
 v0.14 brings voice conversations, a single Hobbes tab, and work across all your Composio profiles. v0.14.1 adds fixes to how Pro features show before a license is added. If you are coming from v0.13, everything below is new.

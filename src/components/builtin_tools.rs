@@ -113,7 +113,7 @@ fn resolve_linked_sessions(
 }
 
 /// Whether a tool belongs to the fleet family — gated on
-/// `fleet_enabled && pro_active()` both at dispatch and when withholding
+/// `fleet_enabled && fleet_available()` both at dispatch and when withholding
 /// definitions from the prompt (system_context.rs).
 pub fn is_fleet_tool(name: &str) -> bool {
     name == "HOBBES_FLEET_STATUS"
@@ -732,7 +732,7 @@ pub async fn dispatch_builtin_tool(
         "HOBBES_FLEET_STATUS" => {
             // Belt + braces with the prompt-side withholding: a stale prompt
             // can still emit the call after the fleet is switched off.
-            if !(deps.settings.read().fleet_enabled && crate::entitlement::pro_active()) {
+            if !(deps.settings.read().fleet_enabled && crate::fleet::fleet_available()) {
                 return Some(BuiltinOutcome {
                     status: ToolCallStatus::Error,
                     response: "Fleet observation is disabled in Settings.".to_string(),

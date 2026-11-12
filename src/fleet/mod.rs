@@ -53,6 +53,15 @@ pub mod store;
 pub mod terminal_focus;
 pub mod transcript;
 
+/// Single Pro-gating switch for the Fleet and the planner figures built on
+/// it (mirrors `VOICE_PRO_ONLY`). Off since v0.14.2: free for everyone.
+pub const FLEET_PRO_ONLY: bool = false;
+
+/// Whether the Fleet can be offered at all in this build/licence.
+pub fn fleet_available() -> bool {
+    !FLEET_PRO_ONLY || crate::entitlement::pro_active()
+}
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
