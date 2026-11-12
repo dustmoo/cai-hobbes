@@ -188,6 +188,7 @@ impl SecretManagerTrait for SecretManager {
         for index_key in [
             secret_types::LLM_KEYS_INDEX_KEY,
             secret_types::CAL_KEYS_INDEX_KEY,
+            secret_types::MCP_SECRET_KEYS_INDEX_KEY,
         ] {
             if let Ok(entry) = Entry::new(SERVICE_NAME, index_key) {
                 if let Ok(index_csv) = entry.get_password() {

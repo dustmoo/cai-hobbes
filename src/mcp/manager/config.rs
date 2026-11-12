@@ -3,6 +3,32 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
+/// Keep `mcp_servers.json` readable by its owner only: env values in it can
+/// be API keys. Best effort; a no-op off Unix.
+pub fn restrict_to_owner(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::metadata(path) {
+            Ok(meta) if meta.permissions().mode() & 0o777 != 0o600 => {
+                if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!("Could not restrict mcp_servers.json to its owner: {}", e);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// Write `mcp_servers.json` and keep it owner-only. Blocking.
+pub fn write_private(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    fs::write(path, content)?;
+    restrict_to_owner(path);
+    Ok(())
+}
+
 impl McpManager {
     pub(super) async fn load_configs(&self, config_path: PathBuf) -> Vec<McpServerConfig> {
         if !config_path.exists() {
@@ -14,11 +40,12 @@ impl McpManager {
                 }
             }
             // Use a valid default JSON structure
-            if let Err(e) = fs::write(&config_path, r#"{ "mcpServers": {} }"#) {
+            if let Err(e) = write_private(&config_path, r#"{ "mcpServers": {} }"#) {
                 tracing::error!("Failed to write default mcp_servers.json: {}", e);
             }
         }
 
+        restrict_to_owner(&config_path);
         match fs::read_to_string(&config_path) {
             Ok(content) => {
                 let mut wrapper: McpServersWrapper =
@@ -108,7 +135,7 @@ impl McpManager {
             .map_err(|e| format!("Failed to serialize MCP servers: {}", e))?;
 
         let path = config_path.to_path_buf();
-        tokio::task::spawn_blocking(move || fs::write(path, content))
+        tokio::task::spawn_blocking(move || write_private(&path, &content))
             .await
             .map_err(|e| format!("Save task panicked: {}", e))?
             .map_err(|e| format!("Failed to write to mcp_servers.json: {}", e))
