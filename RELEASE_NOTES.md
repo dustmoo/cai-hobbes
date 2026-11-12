@@ -1,12 +1,26 @@
-# Hobbes v0.14.1 — Clearer Pro
+# Hobbes v0.14.1 — Voice, one Hobbes tab, and clearer Pro
 
-## 🐛 Fixes
+v0.14 brings voice conversations, a single Hobbes tab, and work across all your Composio profiles. v0.14.1 adds fixes to how Pro features show before a license is added. If you are coming from v0.13, everything below is new.
+
+## ✨ New in v0.14
+
+- **Talk to Hobbes (Pro).** Tap the voice hotkey to talk hands-free, or hold it to push-to-talk. Hobbes answers out loud, you can interrupt it, and it hands real work to its full chat and tells you the result when it's ready. 30 voices, echo cancellation on macOS, and a mic and speaker test. Set it up in Settings → Hobbes with a Gemini API key.
+- **One Hobbes tab.** Heartbeat, voice and your own messages share one chat, marked with the pixel tiger. It starts fresh when it grows large, carrying a summary forward, and can read your other tabs when you ask.
+- **Every tab can use all your Composio profiles.** A tab acts in its home profile unless the work belongs in another. Hobbes asks before content read in one profile is sent or written into another, and you can allow it once, for the chat, or always for that pair.
+- **Safer unattended and spoken work.** On voice turns and turns nobody is watching, Hobbes holds commands that would delete, overwrite or force-push, and shows why. Typed chat is unchanged.
+- **Heartbeat on your schedule.** Set workdays, briefing times and days off.
+- **New models.** Gemini 4 Carbon with a 1M-token context, and the GPT-6.1 models.
+- **A backup before each upgrade.** The first launch of a new version copies your chat database before changing anything.
+
+The full v0.14.0 list, including its fixes and security updates, is in the [v0.14.0 release](https://github.com/dustmoo/cai-hobbes/releases/tag/v0.14.0).
+
+## 🐛 Fixed in v0.14.1
 
 - **The app is called Hobbes.** Direct downloads and Windows builds showed "Hobbes Pro" in the window title, menu, Dock and About before any license was added. The name is now Hobbes everywhere, and your license shows under Settings → About.
 - **Voice says when it needs a license.** Without one, Settings → Hobbes now shows a Voice card that points you to About, where it was hidden before. The "Voice" box on a model profile is switched off with the same note, where it could be ticked and did nothing.
 - **Fleet and the weekly review say so too.** The Fleet view and the review's Agent leverage panel now name the license where they used to ask you to turn the Fleet on.
 - **Disconnect stays available.** If a license is removed while Claude Code is connected, Settings → Fleet still offers Disconnect, so Hobbes's hook entries can be taken out of Claude Code's settings.
-- **The voice hotkey follows your license at once.** It now starts working as soon as a key is activated, and stops when one is removed, without a restart.
+- **The voice hotkey follows your license at once.** It starts working as soon as a key is activated, and stops when one is removed, without a restart.
 - **A stored key that stops verifying is reported** under Settings → About, where the license box used to look as if no key had been entered.
 - **Voice messages point to the right place,** Settings → Hobbes.
 
