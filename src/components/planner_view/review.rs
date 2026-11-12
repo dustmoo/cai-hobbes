@@ -858,6 +858,8 @@ pub(crate) fn WeeklyReview() -> Element {
                                     }
                                 }
                             }
+                        } else if !crate::entitlement::pro_active() {
+                            p { class: "{SUB}", {crate::entitlement::pro_note("Agent leverage")} }
                         } else {
                             p { class: "{SUB}", "Needs fleet time this week to measure." }
                         }

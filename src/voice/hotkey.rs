@@ -201,7 +201,7 @@ pub fn use_voice_hotkey() {
             Err(e) => {
                 tracing::warn!("voice: hotkey {hotkey_str} unavailable: {e:?}");
                 controller::VOICE_UI.write().error = Some(format!(
-                    "{HOTKEY_ERROR_PREFIX} {hotkey_str} is taken by another app. Pick another in Settings → Voice."
+                    "{HOTKEY_ERROR_PREFIX} {hotkey_str} is taken by another app. Pick another in Settings → Hobbes."
                 ));
             }
         }

@@ -208,7 +208,16 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
     let mut live_models_loading = use_signal(|| false);
     let mut live_models_error = use_signal(|| Option::<String>::None);
     if !crate::voice::voice_available() {
-        return rsx! {};
+        return rsx! {
+            div {
+                class: CARD,
+                div {
+                    class: "p-4 bg-section rounded-lg",
+                    h3 { class: "{CARD_TITLE} mb-1", "Voice" }
+                    p { class: "text-sm text-fg-muted", {crate::entitlement::pro_note("Voice")} }
+                }
+            }
+        };
     }
     let s = local_settings.read().clone();
     let voice_profiles: Vec<(String, String)> = s
@@ -789,7 +798,7 @@ fn VoiceCard(ctx: SettingsCtx) -> Element {
     }
 }
 
-/// The Heartbeat card (Pro-gated via `heartbeat_available`).
+/// The Heartbeat card (shown when `heartbeat_available`; not Pro-gated today).
 #[component]
 fn HeartbeatCard(ctx: SettingsCtx) -> Element {
     let mut local_settings = ctx.local_settings;

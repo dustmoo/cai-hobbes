@@ -143,7 +143,23 @@ pub(super) fn FleetSection() -> Element {
                 if !pro {
                     p {
                         class: "text-sm text-fg-muted",
-                        "Fleet observation is a Hobbes Pro feature. Add a license key under About to unlock it."
+                        {crate::entitlement::pro_note("Fleet observation")}
+                    }
+                    // Hooks left from a licensed period point at a listener
+                    // that no longer runs: keep the way to remove them.
+                    if hooks_registered {
+                        p {
+                            class: "text-xs text-fg-muted mt-3 mb-2",
+                            "Hobbes's hook entries are still in ~/.claude/settings.json, and nothing is listening for them. Disconnect removes them."
+                        }
+                        button {
+                            class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
+                            onclick: on_disconnect,
+                            "Disconnect"
+                        }
+                        if let Some(err) = fleet_error() {
+                            p { class: "text-sm text-red-400 mt-2", "{err}" }
+                        }
                     }
                 } else {
                     div {

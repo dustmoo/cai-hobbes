@@ -12,7 +12,7 @@ use dioxus::prelude::*;
 /// other static secrets.
 #[component]
 pub(super) fn LicenseSection() -> Element {
-    let settings = use_context::<Signal<Settings>>();
+    let mut settings = use_context::<Signal<Settings>>();
     let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
 
     let mut key_input = use_signal(String::new);
@@ -44,6 +44,10 @@ pub(super) fn LicenseSection() -> Element {
                             key,
                         );
                         crate::entitlement::activate(info);
+                        // The license lives outside the signal graph: mark
+                        // settings changed so whatever follows it (the voice
+                        // hotkey, the Fleet view) re-reads it now.
+                        drop(settings.write());
                         key_input.set(String::new());
                         license_error.set(None);
                         license_rev += 1;
@@ -66,6 +70,7 @@ pub(super) fn LicenseSection() -> Element {
             tracing::warn!("Failed to delete license key from keychain: {}", e);
         }
         crate::entitlement::clear();
+        drop(settings.write());
         license_error.set(None);
         license_rev += 1;
     };
@@ -76,7 +81,7 @@ pub(super) fn LicenseSection() -> Element {
             div {
                 class: "p-4 bg-section rounded-lg",
                 h3 { class: "text-[11px] uppercase tracking-[0.08em] text-primary-300 font-medium", "License" }
-                p { class: "text-sm text-fg-muted mb-3", "Unlock Fleet and other Pro features with a license key." }
+                p { class: "text-sm text-fg-muted mb-3", "Unlock Voice, Fleet and other Pro features with a license key." }
 
                 if let Some(info) = current {
                     div {
@@ -90,6 +95,12 @@ pub(super) fn LicenseSection() -> Element {
                         "Remove license key"
                     }
                 } else {
+                    if crate::entitlement::stored_key_invalid() {
+                        p {
+                            class: "text-sm text-yellow-400 mb-3",
+                            "The license key stored on this Mac or PC is no longer valid, so Pro features are off. Paste a current key to turn them back on."
+                        }
+                    }
                     label { class: "block text-sm text-fg mb-1", "License Key" }
                     input {
                         class: INPUT,

@@ -27,6 +27,7 @@ pub(in super::super) fn ConnectorRoles(ctx: SettingsCtx) -> Element {
         inst.roles.chat && (is_default || chat_count <= 1)
     };
     let capable = realtime_capable(&inst);
+    let voice_ok = crate::voice::voice_available();
     let (chat_id, voice_id) = (id.clone(), id.clone());
 
     rsx! {
@@ -58,6 +59,7 @@ pub(in super::super) fn ConnectorRoles(ctx: SettingsCtx) -> Element {
                         r#type: "checkbox",
                         class: "text-primary-600 focus:ring-primary-500 rounded border-faint bg-input",
                         checked: "{inst.roles.voice}",
+                        disabled: !voice_ok,
                         onchange: move |e| {
                             let on = e.value() == "true";
                             if let Some(c) = local_settings.write().connector_by_id_mut(&voice_id) {
@@ -67,7 +69,7 @@ pub(in super::super) fn ConnectorRoles(ctx: SettingsCtx) -> Element {
                     }
                     "Voice"
                 }
-                if inst.roles.voice {
+                if voice_ok && inst.roles.voice {
                     button {
                         class: "text-xs text-primary-300 hover:text-primary-200 hover:underline",
                         onclick: move |_| {
@@ -80,7 +82,9 @@ pub(in super::super) fn ConnectorRoles(ctx: SettingsCtx) -> Element {
                     }
                 }
             }
-            if inst.roles.voice && !capable {
+            if !voice_ok {
+                p { class: "text-xs text-fg-muted mt-2", {crate::entitlement::pro_note("Voice")} }
+            } else if inst.roles.voice && !capable {
                 p { class: "text-xs text-yellow-400 mt-2", "{VOICE_NEEDS_REALTIME}" }
             }
         }

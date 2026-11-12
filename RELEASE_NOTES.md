@@ -1,3 +1,15 @@
+# Hobbes v0.14.1 — Clearer Pro
+
+## 🐛 Fixes
+
+- **The app is called Hobbes.** Direct downloads and Windows builds showed "Hobbes Pro" in the window title, menu, Dock and About before any license was added. The name is now Hobbes everywhere, and your license shows under Settings → About.
+- **Voice says when it needs a license.** Without one, Settings → Hobbes now shows a Voice card that points you to About, where it was hidden before. The "Voice" box on a model profile is switched off with the same note, where it could be ticked and did nothing.
+- **Fleet and the weekly review say so too.** The Fleet view and the review's Agent leverage panel now name the license where they used to ask you to turn the Fleet on.
+- **Disconnect stays available.** If a license is removed while Claude Code is connected, Settings → Fleet still offers Disconnect, so Hobbes's hook entries can be taken out of Claude Code's settings.
+- **The voice hotkey follows your license at once.** It now starts working as soon as a key is activated, and stops when one is removed, without a restart.
+- **A stored key that stops verifying is reported** under Settings → About, where the license box used to look as if no key had been entered.
+- **Voice messages point to the right place,** Settings → Hobbes.
+
 # Hobbes v0.14.0 — Voice
 
 ## ✨ New Features
