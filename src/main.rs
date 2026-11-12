@@ -1148,7 +1148,7 @@ fn app() -> Element {
             let mut server: Option<fleet::server::FleetServer> = None;
             let mut hydrated = false;
             loop {
-                let want = settings.peek().fleet_enabled && crate::entitlement::pro_active();
+                let want = settings.peek().fleet_enabled && crate::fleet::fleet_available();
                 // Hobbes tabs report through the bridge under the same
                 // condition as the listener (which also keeps the staleness
                 // sweep running whenever Hobbes rows are live).
@@ -1225,7 +1225,7 @@ fn app() -> Element {
                 let s = settings.peek().clone();
                 if !(s.fleet_enabled
                     && s.fleet_briefs_enabled
-                    && crate::entitlement::pro_active())
+                    && crate::fleet::fleet_available())
                 {
                     continue;
                 }

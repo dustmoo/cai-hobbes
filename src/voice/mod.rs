@@ -30,7 +30,8 @@ pub mod transcript;
 use crate::settings::Settings;
 
 /// Single Pro-gating switch for voice (mirrors `HEARTBEAT_PRO_ONLY`).
-pub const VOICE_PRO_ONLY: bool = true;
+/// Off since v0.14.2: voice is free for everyone.
+pub const VOICE_PRO_ONLY: bool = false;
 
 /// Whether voice can be offered at all in this build/licence.
 pub fn voice_available() -> bool {

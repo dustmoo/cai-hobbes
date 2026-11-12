@@ -136,6 +136,12 @@ pub fn pro_note(feature: &str) -> String {
     format!("{feature} is a Hobbes Pro feature. Add a license key under About to unlock it.")
 }
 
+/// Whether any feature needs a license in this build. When none does, the
+/// About tab stops asking for a key.
+pub fn anything_gated() -> bool {
+    crate::voice::VOICE_PRO_ONLY || crate::fleet::FLEET_PRO_ONLY || crate::heartbeat::HEARTBEAT_PRO_ONLY
+}
+
 /// Whether the key stored from an earlier run no longer verifies, so the
 /// About tab can say so instead of looking as if no key was ever entered.
 pub fn stored_key_invalid() -> bool {

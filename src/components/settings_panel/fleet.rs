@@ -30,7 +30,7 @@ pub(super) fn FleetSection() -> Element {
         }
     });
 
-    let pro = crate::entitlement::pro_active();
+    let pro = crate::fleet::fleet_available();
     let hooks_path = crate::fleet::hooks_config::claude_settings_path();
     let connected_port = hooks_path
         .as_ref()

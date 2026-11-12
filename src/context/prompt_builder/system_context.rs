@@ -642,7 +642,7 @@ impl<'a> PromptBuilder<'a> {
         }
 
         // Fleet tools follow the fleet's own gate (not the planner's).
-        if !(self.settings.fleet_enabled && crate::entitlement::pro_active()) {
+        if !(self.settings.fleet_enabled && crate::fleet::fleet_available()) {
             tools.retain(|t| !crate::components::builtin_tools::is_fleet_tool(&t.name));
         }
 

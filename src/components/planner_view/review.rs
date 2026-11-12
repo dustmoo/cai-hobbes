@@ -397,7 +397,7 @@ pub(crate) fn WeeklyReview() -> Element {
     // changes, not on every fleet poke.
     let leverage = use_memo(move || {
         let start = week_of();
-        if !crate::entitlement::pro_active() {
+        if !crate::fleet::fleet_available() {
             return None;
         }
         let fleet = fleet_state.peek();
@@ -858,7 +858,7 @@ pub(crate) fn WeeklyReview() -> Element {
                                     }
                                 }
                             }
-                        } else if !crate::entitlement::pro_active() {
+                        } else if !crate::fleet::fleet_available() {
                             p { class: "{SUB}", {crate::entitlement::pro_note("Agent leverage")} }
                         } else {
                             p { class: "{SUB}", "Needs fleet time this week to measure." }
