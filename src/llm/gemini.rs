@@ -175,29 +175,55 @@ pub struct UsageMetadata {
     pub cached_content_token_count: Option<i32>,
 }
 
+/// Model ids Google has shut down (ai.google.dev/gemini-api/docs/deprecations,
+/// checked 2026-11-20). They no longer answer, so they carry no pricing or
+/// capability entry: a session or log that still names one resolves to
+/// [`GeminiModel::Unknown`], which keeps its label readable.
+fn retired(s: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "gemini-1.",
+        "gemini-2.0-",
+        "gemini-3-pro",
+        "gemini-3.0-pro",
+        "gemini-2.5-computer-use",
+        "gemini-2.5-pro-preview-0",
+        "gemini-2.5-flash-preview-0",
+        "gemini-2.5-flash-lite-preview",
+        "gemini-experimental",
+        "gemini-robotics-er-1.",
+        "deep-research-pro-preview",
+    ];
+    const EXACT: &[&str] = &[
+        "gemini-pro",
+        "gemini-3.1-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-2.5-flash-preview-sep-2025",
+    ];
+    EXACT.contains(&s) || PREFIXES.iter().any(|p| s.starts_with(p))
+}
+
 /// Supported Gemini Models for Pricing
 #[derive(Debug, PartialEq, Clone)]
 pub enum GeminiModel {
     Gemini4Carbon,
+    Gemini4Neon,
+    Gemini4Hydrogen,
     Gemini4Argon,
     Gemini3_8Flash,
+    /// Deprecated 2026-10-08; Google routes it to 3.8 Flash.
     Gemini3_7Flash,
     Gemini3_6Flash,
-    Gemini3_5Pro,
+    /// Deprecated 2026-10-08; Google routes it to 3.6 Flash.
     Gemini3_5Flash,
     Gemini3_5FlashLite,
     Gemini3_1ProPreview,
-    Gemini3_1FlashPreview,
-    Gemini3_1FlashLitePreview,
-    Gemini3_0ProPreview,
+    Gemini3_1FlashLite,
     Gemini3_0FlashPreview,
+    /// Deprecated 2026-11-02; routed to 3.8 Flash from 2026-12-01.
     Gemini2_5Pro,
+    /// Deprecated 2026-11-02; routed to 3.5 Flash Lite from 2026-12-01.
     Gemini2_5Flash,
     Gemini2_5FlashLite,
-    Gemini2_5ComputerUsePreview,
-    Gemini2_0Flash,
-    Gemini2_0FlashLite,
-    Gemini2_0FlashThinking,
 
     Gemma3,
     NanoBanana,
@@ -211,9 +237,14 @@ impl GeminiModel {
         let s = slug.strip_prefix("models/").unwrap_or(slug);
 
         match s {
-            // Gemini 4 Series - HIGHEST PRIORITY (Carbon GA 2026-11-10,
-            // Argon GA 2026-10-13)
+            _ if retired(s) => GeminiModel::Unknown(s.to_string()),
+
+            // Gemini 4 Series - HIGHEST PRIORITY (Neon GA 2026-11-18,
+            // Hydrogen GA 2026-11-12, Carbon GA 2026-11-10, Argon GA
+            // 2026-10-13)
             _ if s.starts_with("gemini-4-carbon") => GeminiModel::Gemini4Carbon,
+            _ if s.starts_with("gemini-4-neon") => GeminiModel::Gemini4Neon,
+            _ if s.starts_with("gemini-4-hydrogen") => GeminiModel::Gemini4Hydrogen,
             _ if s.starts_with("gemini-4-argon") => GeminiModel::Gemini4Argon,
 
             // Gemini 3.8 Series (GA 2026-09-02)
@@ -226,56 +257,24 @@ impl GeminiModel {
             _ if s.starts_with("gemini-3.6-flash") => GeminiModel::Gemini3_6Flash,
 
             // Gemini 3.5 Series (flash-lite must match before the flash prefix)
-            _ if s.starts_with("gemini-3.5-pro") => GeminiModel::Gemini3_5Pro,
             _ if s.starts_with("gemini-3.5-flash-lite") => GeminiModel::Gemini3_5FlashLite,
             _ if s.starts_with("gemini-3.5-flash") => GeminiModel::Gemini3_5Flash,
 
             // Gemini 3.x Series - STRICT PREFIX MATCHING
             _ if s.starts_with("gemini-3.1-pro") => GeminiModel::Gemini3_1ProPreview,
-            _ if s.starts_with("gemini-3.1-flash-lite") => GeminiModel::Gemini3_1FlashLitePreview,
-            _ if s.starts_with("gemini-3.1-flash") => GeminiModel::Gemini3_1FlashPreview,
-            _ if s.starts_with("gemini-3.0-pro") || s.starts_with("gemini-3-pro") => {
-                GeminiModel::Gemini3_0ProPreview
-            }
+            _ if s.starts_with("gemini-3.1-flash-lite") => GeminiModel::Gemini3_1FlashLite,
             _ if s.starts_with("gemini-3.0-flash") || s.starts_with("gemini-3-flash") => {
                 GeminiModel::Gemini3_0FlashPreview
             }
-            "deep-research-pro-preview-dec-12-2025" => GeminiModel::Gemini3_0ProPreview,
 
-            // Gemini 2.5 Series
-            "gemini-2.5-pro" | "gemini-2.5-pro-preview-tts" => GeminiModel::Gemini2_5Pro,
-            "gemini-2.5-flash"
-            | "gemini-2.5-flash-preview-sep-2025"
-            | "gemini-2.5-flash-preview-tts" => GeminiModel::Gemini2_5Flash,
-            "gemini-2.5-flash-lite" | "gemini-2.5-flash-lite-preview-sep-2025" => {
-                GeminiModel::Gemini2_5FlashLite
-            }
-            "gemini-2.5-computer-use-preview-10-2025" => GeminiModel::Gemini2_5ComputerUsePreview,
+            // Gemini 2.5 Series (flash-lite must match before the flash prefix)
+            _ if s.starts_with("gemini-2.5-pro") => GeminiModel::Gemini2_5Pro,
+            _ if s.starts_with("gemini-2.5-flash-lite") => GeminiModel::Gemini2_5FlashLite,
+            _ if s.starts_with("gemini-2.5-flash") => GeminiModel::Gemini2_5Flash,
 
-            // Gemini 2.0 Series
-            "gemini-2.0-flash"
-            | "gemini-2.0-flash-001"
-            | "gemini-2.0-flash-experimental"
-            | "gemini-2.0-flash-image-generation-experimental"
-            | "gemini-experimental-1206" => GeminiModel::Gemini2_0Flash,
-            "gemini-2.0-flash-lite"
-            | "gemini-2.0-flash-lite-001"
-            | "gemini-2.0-flash-lite-preview"
-            | "gemini-2.0-flash-lite-preview-02-05" => GeminiModel::Gemini2_0FlashLite,
-            "gemini-2.0-flash-thinking-exp-01-21" | "gemini-2.0-flash-thinking-exp" => {
-                GeminiModel::Gemini2_0FlashThinking
-            }
-
-            // Gemini 1.5 Series (DEPRECATED: Map to 2.x equivalents)
-            "gemini-pro-latest"
-            | "gemini-1.5-pro"
-            | "gemini-1.5-pro-latest"
-            | "gemini-robotics-er-1.5-preview" => GeminiModel::Gemini2_5Pro,
             // gemini-flash-latest points at 3.5 Flash since May 2026
             "gemini-flash-latest" => GeminiModel::Gemini3_5Flash,
             "gemini-flash-lite-latest" => GeminiModel::Gemini3_5FlashLite,
-            "gemini-1.5-flash" | "gemini-1.5-flash-latest" => GeminiModel::Gemini2_0Flash,
-            "gemini-1.5-flash-8b" => GeminiModel::Gemini2_0FlashLite,
 
             // Nano & Gemma
             "nano-banana" => GeminiModel::NanoBanana,
@@ -284,29 +283,38 @@ impl GeminiModel {
             // Strict match for Gemma3 variants
             _ if s.starts_with("gemma-3") || s.starts_with("gemma-3n") => GeminiModel::Gemma3,
 
-            // Legacy Prefix matching (Priority is strictly below Gemini 3 specific checks)
-            _ if s.starts_with("gemini-2.5-pro") => GeminiModel::Gemini2_5Pro,
-            _ if s.starts_with("gemini-2.5-flash") => GeminiModel::Gemini2_5Flash,
-
             // Fallback Heuristics for Unknown/New Models
-            _ if s.contains("thinking") => GeminiModel::Gemini2_0FlashThinking,
             _ if s.contains("nano") => GeminiModel::NanoBanana,
             _ if s.contains("gemma") => GeminiModel::Gemma3,
             _ if s.contains("flash-lite") => GeminiModel::Gemini3_5FlashLite, // 3.5 is current lite gen
             _ if s.contains("flash") => GeminiModel::Gemini3_8Flash,          // assume latest gen
-            // May 2026: default pro fallback to 3.5 Pro (upcoming June 2026)
-            _ if s.contains("pro") => GeminiModel::Gemini3_5Pro,
+            _ if s.contains("pro") => GeminiModel::Gemini3_1ProPreview,
 
             _ => {
-                tracing::warn!("Unknown Gemini model slug encountered: '{}'. Defaulting to Gemini 2.0 Flash pricing.", s);
+                tracing::warn!("Unknown Gemini model slug encountered: '{}'. Using the default pricing.", s);
                 GeminiModel::Unknown(s.to_string())
             }
         }
     }
 
+    /// The Gemini 4 line: implicit caching only (cached input at 5% of the
+    /// input rate), no `minimal` thinking level.
+    fn gemini_4(&self) -> bool {
+        matches!(
+            self,
+            GeminiModel::Gemini4Carbon
+                | GeminiModel::Gemini4Neon
+                | GeminiModel::Gemini4Hydrogen
+                | GeminiModel::Gemini4Argon
+        )
+    }
+
     /// Per-1M-token (input, output) USD rates. Manually maintained and subject
     /// to drift — re-verify against ai.google.dev/gemini-api/docs/pricing
-    /// (see SYSTEM_PATTERNS P-013). 2026-11-10: added Gemini 4 Carbon (GA
+    /// (see SYSTEM_PATTERNS P-013). 2026-11-20: added Gemini 4 Neon
+    /// ($3.00/$15.00, paid tier only) and 4 Hydrogen ($1.50/$7.50, has a free
+    /// tier); dropped the models Google has shut down (see [`retired`]).
+    /// 2026-11-10: added Gemini 4 Carbon (GA
     /// that day, paid tier only, same rates and dates as 4 Argon, implicit
     /// caching only). Before that, last verified 2026-10-15 — added Gemini
     /// 4 Argon (GA 2026-10-13, intro pricing through 2026-11-30, doubling
@@ -333,6 +341,11 @@ impl GeminiModel {
                 }
             }
 
+            // Gemini 4 Neon (GA 2026-11-18) and 4 Hydrogen (GA 2026-11-12):
+            // no intro pricing, no >200K prompt tier.
+            GeminiModel::Gemini4Neon => (3.00, 15.00),
+            GeminiModel::Gemini4Hydrogen => (1.50, 7.50),
+
             // Gemini 3.8 (GA 2026-09-02), 3.7 (GA 2026-08-13) & 3.6
             // (GA 2026-07-21) Flash: intro $0.75/$3.75 through 2026-12-31,
             // then $1.50/$7.50
@@ -350,25 +363,17 @@ impl GeminiModel {
             // Gemini 3.5 Series
             GeminiModel::Gemini3_5Flash => (1.50, 9.00),
             GeminiModel::Gemini3_5FlashLite => (0.30, 2.50),
-            // 3.5 Pro: not yet released (June 2026); using 3.1 Pro rates as placeholder
-            GeminiModel::Gemini3_5Pro => {
-                if prompt_tokens > 200_000 {
-                    (4.00, 18.00)
-                } else {
-                    (2.00, 12.00)
-                }
-            }
 
             // Gemini 3.x Series
-            GeminiModel::Gemini3_1ProPreview | GeminiModel::Gemini3_0ProPreview => {
+            GeminiModel::Gemini3_1ProPreview => {
                 if prompt_tokens > 200_000 {
                     (4.00, 18.00)
                 } else {
                     (2.00, 12.00)
                 }
             }
-            GeminiModel::Gemini3_0FlashPreview | GeminiModel::Gemini3_1FlashPreview => (0.50, 3.00),
-            GeminiModel::Gemini3_1FlashLitePreview => (0.25, 1.50),
+            GeminiModel::Gemini3_0FlashPreview => (0.50, 3.00),
+            GeminiModel::Gemini3_1FlashLite => (0.25, 1.50),
 
             GeminiModel::Gemini2_5Pro => {
                 if prompt_tokens > 200_000 {
@@ -379,42 +384,33 @@ impl GeminiModel {
             }
             GeminiModel::Gemini2_5Flash => (0.30, 2.50),
             GeminiModel::Gemini2_5FlashLite => (0.10, 0.40),
-            GeminiModel::Gemini2_5ComputerUsePreview => {
-                if prompt_tokens > 200_000 {
-                    (2.50, 15.00)
-                } else {
-                    (1.25, 10.00)
-                }
-            }
-
-            GeminiModel::Gemini2_0Flash | GeminiModel::Gemini2_0FlashThinking => (0.10, 0.40),
-            GeminiModel::Gemini2_0FlashLite => (0.075, 0.30),
 
             GeminiModel::Gemma3 | GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => {
                 (0.00, 0.00)
             }
 
             GeminiModel::Unknown(_) => {
-                // Safety Default: Gemini 2.0 Flash (1.5 deprecated Jan 2026)
+                // Safety default for ids with no entry: a low Flash-class rate
                 (0.10, 0.40)
             }
         }
     }
 
     /// Cached input is billed as a fraction of the standard input rate:
-    /// 5% on 4 Argon ($0.10 vs $2.00), 10% elsewhere (e.g. 3.6 Flash: $0.15
+    /// 5% on the Gemini 4 line (e.g. Argon $0.10 vs $2.00), 10% elsewhere (e.g. 3.6 Flash: $0.15
     /// vs $1.50; 3.1 Pro: $0.20 vs $2.00; 2.5 Pro: $0.125 vs $1.25).
     pub fn cached_input_multiplier(&self) -> f64 {
-        match self {
-            GeminiModel::Gemini4Carbon | GeminiModel::Gemini4Argon => 0.05,
-            _ => 0.10,
+        if self.gemini_4() {
+            0.05
+        } else {
+            0.10
         }
     }
 
-    /// Whether the model accepts explicit `cachedContents`. 4 Argon only does
+    /// Whether the model accepts explicit `cachedContents`. Gemini 4 only does
     /// implicit caching, so creating a cache for it would fail every turn.
     pub fn supports_explicit_caching(&self) -> bool {
-        !matches!(self, GeminiModel::Gemini4Carbon | GeminiModel::Gemini4Argon)
+        !self.gemini_4()
     }
 }
 
@@ -945,25 +941,23 @@ impl GeminiModel {
     /// Returns the thinking config style for this model
     pub fn thinking_config_style(&self) -> ThinkingConfigStyle {
         match self {
-            // 4 Carbon / 4 Argon: thinkingLevel low|medium|high, same as the Pro line
+            // Gemini 4: thinkingLevel without `minimal`, like the Pro line
+            // (Neon and Hydrogen add `xhigh`, see `valid_thinking_levels`).
             GeminiModel::Gemini4Carbon
+            | GeminiModel::Gemini4Neon
+            | GeminiModel::Gemini4Hydrogen
             | GeminiModel::Gemini4Argon
-            | GeminiModel::Gemini3_5Pro
-            | GeminiModel::Gemini3_1ProPreview
-            | GeminiModel::Gemini3_0ProPreview => ThinkingConfigStyle::LevelPro,
+            | GeminiModel::Gemini3_1ProPreview => ThinkingConfigStyle::LevelPro,
             GeminiModel::Gemini3_8Flash
             | GeminiModel::Gemini3_7Flash
             | GeminiModel::Gemini3_6Flash
             | GeminiModel::Gemini3_5Flash
             | GeminiModel::Gemini3_5FlashLite
-            | GeminiModel::Gemini3_1FlashPreview
-            | GeminiModel::Gemini3_1FlashLitePreview
-            | GeminiModel::Gemini3_0FlashPreview
-            | GeminiModel::Gemini2_0FlashThinking => ThinkingConfigStyle::LevelFlash,
+            | GeminiModel::Gemini3_1FlashLite
+            | GeminiModel::Gemini3_0FlashPreview => ThinkingConfigStyle::LevelFlash,
             GeminiModel::Gemini2_5Pro
             | GeminiModel::Gemini2_5Flash
-            | GeminiModel::Gemini2_5FlashLite
-            | GeminiModel::Gemini2_5ComputerUsePreview => ThinkingConfigStyle::Budget,
+            | GeminiModel::Gemini2_5FlashLite => ThinkingConfigStyle::Budget,
             _ => ThinkingConfigStyle::None,
         }
     }
@@ -972,25 +966,20 @@ impl GeminiModel {
     pub fn display_name(&self) -> String {
         match self {
             GeminiModel::Gemini4Carbon => "Gemini 4 Carbon".to_string(),
+            GeminiModel::Gemini4Neon => "Gemini 4 Neon".to_string(),
+            GeminiModel::Gemini4Hydrogen => "Gemini 4 Hydrogen".to_string(),
             GeminiModel::Gemini4Argon => "Gemini 4 Argon".to_string(),
             GeminiModel::Gemini3_8Flash => "Gemini 3.8 Flash".to_string(),
             GeminiModel::Gemini3_7Flash => "Gemini 3.7 Flash".to_string(),
             GeminiModel::Gemini3_6Flash => "Gemini 3.6 Flash".to_string(),
-            GeminiModel::Gemini3_5Pro => "Gemini 3.5 Pro".to_string(),
             GeminiModel::Gemini3_5Flash => "Gemini 3.5 Flash".to_string(),
             GeminiModel::Gemini3_5FlashLite => "Gemini 3.5 Flash Lite".to_string(),
             GeminiModel::Gemini3_1ProPreview => "Gemini 3.1 Pro".to_string(),
-            GeminiModel::Gemini3_1FlashPreview => "Gemini 3.1 Flash".to_string(),
-            GeminiModel::Gemini3_1FlashLitePreview => "Gemini 3.1 Flash Lite".to_string(),
-            GeminiModel::Gemini3_0ProPreview => "Gemini 3 Pro".to_string(),
+            GeminiModel::Gemini3_1FlashLite => "Gemini 3.1 Flash Lite".to_string(),
             GeminiModel::Gemini3_0FlashPreview => "Gemini 3 Flash".to_string(),
             GeminiModel::Gemini2_5Pro => "Gemini 2.5 Pro".to_string(),
             GeminiModel::Gemini2_5Flash => "Gemini 2.5 Flash".to_string(),
             GeminiModel::Gemini2_5FlashLite => "Gemini 2.5 Flash Lite".to_string(),
-            GeminiModel::Gemini2_0Flash => "Gemini 2.0 Flash".to_string(),
-            GeminiModel::Gemini2_0FlashLite => "Gemini 2.0 Flash Lite".to_string(),
-            GeminiModel::Gemini2_0FlashThinking => "Gemini 2.0 Flash Thinking".to_string(),
-            GeminiModel::Gemini2_5ComputerUsePreview => "Gemini 2.5 Computer Use".to_string(),
             GeminiModel::NanoBanana => "Nano Banana (Image · Planned)".to_string(),
             GeminiModel::NanoBananaPro => "Nano Banana Pro (Image · Planned)".to_string(),
             GeminiModel::Gemma3 => "Gemma 3".to_string(),
@@ -1017,8 +1006,12 @@ impl GeminiModel {
         }
     }
 
-    /// Valid thinking levels for Flash 3 (Pro only supports low/high)
+    /// Valid thinking levels: the Flash line has `minimal`, the Pro line and
+    /// Gemini 4 don't, and 4 Neon / 4 Hydrogen add `xhigh`.
     pub fn valid_thinking_levels(&self) -> &'static [&'static str] {
+        if matches!(self, GeminiModel::Gemini4Neon | GeminiModel::Gemini4Hydrogen) {
+            return &["low", "medium", "high", "xhigh"];
+        }
         match self.thinking_config_style() {
             ThinkingConfigStyle::LevelPro => &["low", "medium", "high"],
             ThinkingConfigStyle::LevelFlash => &["minimal", "low", "medium", "high"],
@@ -1031,25 +1024,20 @@ impl GeminiModel {
     pub fn canonical_slug(&self) -> &str {
         match self {
             GeminiModel::Gemini4Carbon => "gemini-4-carbon",
+            GeminiModel::Gemini4Neon => "gemini-4-neon",
+            GeminiModel::Gemini4Hydrogen => "gemini-4-hydrogen",
             GeminiModel::Gemini4Argon => "gemini-4-argon",
             GeminiModel::Gemini3_8Flash => "gemini-3.8-flash",
             GeminiModel::Gemini3_7Flash => "gemini-3.7-flash",
             GeminiModel::Gemini3_6Flash => "gemini-3.6-flash",
-            GeminiModel::Gemini3_5Pro => "gemini-3.5-pro",
             GeminiModel::Gemini3_5Flash => "gemini-3.5-flash",
             GeminiModel::Gemini3_5FlashLite => "gemini-3.5-flash-lite",
             GeminiModel::Gemini3_1ProPreview => "gemini-3.1-pro-preview",
-            GeminiModel::Gemini3_1FlashPreview => "gemini-3.1-flash-preview",
-            GeminiModel::Gemini3_1FlashLitePreview => "gemini-3.1-flash-lite-preview",
-            GeminiModel::Gemini3_0ProPreview => "gemini-3-pro-preview",
+            GeminiModel::Gemini3_1FlashLite => "gemini-3.1-flash-lite",
             GeminiModel::Gemini3_0FlashPreview => "gemini-3-flash-preview",
             GeminiModel::Gemini2_5Pro => "gemini-2.5-pro",
             GeminiModel::Gemini2_5Flash => "gemini-2.5-flash",
             GeminiModel::Gemini2_5FlashLite => "gemini-2.5-flash-lite",
-            GeminiModel::Gemini2_5ComputerUsePreview => "gemini-2.5-computer-use-preview-10-2025",
-            GeminiModel::Gemini2_0Flash => "gemini-2.0-flash",
-            GeminiModel::Gemini2_0FlashLite => "gemini-2.0-flash-lite",
-            GeminiModel::Gemini2_0FlashThinking => "gemini-2.0-flash-thinking-exp",
             GeminiModel::Gemma3 => "gemma-3",
             GeminiModel::NanoBanana => "nano-banana",
             GeminiModel::NanoBananaPro => "nano-banana-pro",
@@ -1061,35 +1049,12 @@ impl GeminiModel {
     /// Source: https://ai.google.dev/gemini-api/docs/models
     pub fn context_window_tokens(&self) -> usize {
         match self {
-            // Gemini 3.5/3.6/3.7/3.8, 4 Argon and 4 Carbon: 1M context
-            GeminiModel::Gemini4Carbon
-            | GeminiModel::Gemini4Argon
-            | GeminiModel::Gemini3_8Flash
-            | GeminiModel::Gemini3_7Flash
-            | GeminiModel::Gemini3_6Flash
-            | GeminiModel::Gemini3_5Pro
-            | GeminiModel::Gemini3_5Flash
-            | GeminiModel::Gemini3_5FlashLite => 1_000_000,
-            // Gemini 3.x: 1M context
-            GeminiModel::Gemini3_1ProPreview
-            | GeminiModel::Gemini3_1FlashPreview
-            | GeminiModel::Gemini3_1FlashLitePreview
-            | GeminiModel::Gemini3_0ProPreview
-            | GeminiModel::Gemini3_0FlashPreview => 1_000_000,
-            // Gemini 2.5: 1M context
-            GeminiModel::Gemini2_5Pro
-            | GeminiModel::Gemini2_5Flash
-            | GeminiModel::Gemini2_5FlashLite
-            | GeminiModel::Gemini2_5ComputerUsePreview => 1_000_000,
-            // Gemini 2.0: 1M context
-            GeminiModel::Gemini2_0Flash
-            | GeminiModel::Gemini2_0FlashThinking
-            | GeminiModel::Gemini2_0FlashLite => 1_000_000,
             // Gemma/Nano: smaller windows
             GeminiModel::Gemma3 => 128_000,
             GeminiModel::NanoBanana | GeminiModel::NanoBananaPro => 32_000,
-            // Unknown: conservative default
-            GeminiModel::Unknown(_) => 1_000_000,
+            // Every current Gemini text model has a 1M window (Gemini 4:
+            // 1,048,576 shared by input, thinking and output).
+            _ => 1_000_000,
         }
     }
 
@@ -2679,47 +2644,26 @@ mod tests {
 
     #[test]
     fn test_supports_thinking() {
+        assert!(GeminiModel::Gemini4Neon.supports_thinking());
+        assert!(GeminiModel::Gemini4Hydrogen.supports_thinking());
         assert!(GeminiModel::Gemini3_8Flash.supports_thinking());
-        assert!(GeminiModel::Gemini3_5Pro.supports_thinking());
         assert!(GeminiModel::Gemini3_5Flash.supports_thinking());
         assert!(GeminiModel::Gemini3_1ProPreview.supports_thinking());
-        assert!(GeminiModel::Gemini3_1FlashPreview.supports_thinking());
-        assert!(GeminiModel::Gemini3_1FlashLitePreview.supports_thinking());
-        assert!(GeminiModel::Gemini3_0ProPreview.supports_thinking());
+        assert!(GeminiModel::Gemini3_1FlashLite.supports_thinking());
         assert!(GeminiModel::Gemini3_0FlashPreview.supports_thinking());
         assert!(GeminiModel::Gemini2_5Pro.supports_thinking());
         assert!(GeminiModel::Gemini2_5Flash.supports_thinking());
-        assert!(GeminiModel::Gemini2_0FlashThinking.supports_thinking());
-        assert!(!GeminiModel::Gemini2_0Flash.supports_thinking());
         assert!(!GeminiModel::Gemma3.supports_thinking());
+        assert!(!GeminiModel::Unknown("x".into()).supports_thinking());
     }
 
     #[test]
     fn test_thinking_config_style() {
         use ThinkingConfigStyle::*;
-        assert_eq!(
-            GeminiModel::Gemini3_1ProPreview.thinking_config_style(),
-            LevelPro
-        );
-        assert_eq!(
-            GeminiModel::Gemini3_0ProPreview.thinking_config_style(),
-            LevelPro
-        );
-        assert_eq!(
-            GeminiModel::Gemini3_1FlashLitePreview.thinking_config_style(),
-            LevelFlash
-        );
-        assert_eq!(
-            GeminiModel::Gemini3_0FlashPreview.thinking_config_style(),
-            LevelFlash
-        );
-        // Experimental Flash Thinking 2.0 uses LevelFlash (minimal/low/medium/high)
-        assert_eq!(
-            GeminiModel::Gemini2_0FlashThinking.thinking_config_style(),
-            LevelFlash
-        );
+        assert_eq!(GeminiModel::Gemini3_1ProPreview.thinking_config_style(), LevelPro);
+        assert_eq!(GeminiModel::Gemini3_1FlashLite.thinking_config_style(), LevelFlash);
+        assert_eq!(GeminiModel::Gemini3_0FlashPreview.thinking_config_style(), LevelFlash);
         assert_eq!(GeminiModel::Gemini2_5Flash.thinking_config_style(), Budget);
-        assert_eq!(GeminiModel::Gemini2_0Flash.thinking_config_style(), None);
         assert_eq!(GeminiModel::Gemma3.thinking_config_style(), None);
     }
 
@@ -2730,90 +2674,106 @@ mod tests {
             &["low", "medium", "high"]
         );
         assert_eq!(
-            GeminiModel::Gemini3_0ProPreview.valid_thinking_levels(),
-            &["low", "medium", "high"]
-        );
-        assert_eq!(
             GeminiModel::Gemini3_0FlashPreview.valid_thinking_levels(),
             &["minimal", "low", "medium", "high"]
         );
         assert_eq!(
-            GeminiModel::Gemini3_1FlashLitePreview.valid_thinking_levels(),
+            GeminiModel::Gemini3_1FlashLite.valid_thinking_levels(),
             &["minimal", "low", "medium", "high"]
         );
-        assert!(GeminiModel::Gemini2_0Flash
-            .valid_thinking_levels()
-            .is_empty());
+        assert!(GeminiModel::Gemini2_5Flash.valid_thinking_levels().is_empty());
         assert!(GeminiModel::Gemma3.valid_thinking_levels().is_empty());
     }
 
     #[test]
     fn test_from_slug_versioned_models() {
-        // Gemini 3 versioned slugs should map correctly
-        // Test Official API style (gemini-3.1-pro and gemini-3-pro)
         assert_eq!(
             GeminiModel::from_slug("gemini-3.1-pro-preview"),
             GeminiModel::Gemini3_1ProPreview
         );
         assert_eq!(
-            GeminiModel::from_slug("gemini-3.1-flash-lite-preview"),
-            GeminiModel::Gemini3_1FlashLitePreview
-        );
-        assert_eq!(
-            GeminiModel::from_slug("gemini-3-pro-preview"),
-            GeminiModel::Gemini3_0ProPreview
+            GeminiModel::from_slug("gemini-3.1-flash-lite"),
+            GeminiModel::Gemini3_1FlashLite
         );
         assert_eq!(
             GeminiModel::from_slug("gemini-3-flash-preview"),
             GeminiModel::Gemini3_0FlashPreview
         );
 
-        let model = GeminiModel::from_slug("gemini-3.0-pro-preview-02-05");
-        assert_eq!(model, GeminiModel::Gemini3_0ProPreview);
-        assert!(model.supports_thinking());
-        assert_eq!(model.thinking_config_style(), ThinkingConfigStyle::LevelPro);
-
-        // With models/ prefix
-        let model2 = GeminiModel::from_slug("models/gemini-3.0-pro-preview-02-05");
-        assert_eq!(model2, GeminiModel::Gemini3_0ProPreview);
-
         // Flash versioned
         let flash = GeminiModel::from_slug("gemini-3.0-flash-preview-01-21");
         assert_eq!(flash, GeminiModel::Gemini3_0FlashPreview);
-        assert_eq!(
-            flash.thinking_config_style(),
-            ThinkingConfigStyle::LevelFlash
-        );
+        assert_eq!(flash.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
 
-        // Gemini 2.0 Flash Thinking
-        let ft = GeminiModel::from_slug("gemini-2.0-flash-thinking-exp-01-21");
-        assert_eq!(ft, GeminiModel::Gemini2_0FlashThinking);
-        assert!(ft.supports_thinking());
-        assert_eq!(ft.thinking_config_style(), ThinkingConfigStyle::LevelFlash);
+        // 2.5: flash-lite is not swallowed by the flash prefix
+        assert_eq!(GeminiModel::from_slug("gemini-2.5-flash-lite"), GeminiModel::Gemini2_5FlashLite);
+        assert_eq!(GeminiModel::from_slug("gemini-2.5-flash"), GeminiModel::Gemini2_5Flash);
+        assert_eq!(GeminiModel::from_slug("gemini-2.5-pro-preview-tts"), GeminiModel::Gemini2_5Pro);
 
-        // Pro heuristic now maps to 3.5 Pro
+        // An id with no entry falls back by family name.
         let pro_unknown = GeminiModel::from_slug("some-new-pro-model");
-        assert_eq!(pro_unknown, GeminiModel::Gemini3_5Pro);
-        assert!(pro_unknown.supports_thinking());
+        assert_eq!(pro_unknown, GeminiModel::Gemini3_1ProPreview);
+        assert_eq!(GeminiModel::from_slug("some-new-flash-model"), GeminiModel::Gemini3_8Flash);
 
         // Gemini 3.5 Flash slugs
-        assert_eq!(
-            GeminiModel::from_slug("gemini-3.5-flash"),
-            GeminiModel::Gemini3_5Flash
-        );
-        assert_eq!(
-            GeminiModel::from_slug("gemini-3.5-pro"),
-            GeminiModel::Gemini3_5Pro
-        );
-        // With preview suffix (future-proofing)
+        assert_eq!(GeminiModel::from_slug("gemini-3.5-flash"), GeminiModel::Gemini3_5Flash);
         assert_eq!(
             GeminiModel::from_slug("gemini-3.5-flash-preview"),
             GeminiModel::Gemini3_5Flash
         );
-        assert_eq!(
-            GeminiModel::from_slug("gemini-3.5-pro-preview"),
-            GeminiModel::Gemini3_5Pro
-        );
+    }
+
+    #[test]
+    fn shut_down_models_resolve_to_unknown_with_a_readable_label() {
+        for slug in [
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite-001",
+            "gemini-2.0-flash-thinking-exp-01-21",
+            "gemini-1.5-flash-latest",
+            "gemini-1.5-pro",
+            "gemini-3-pro-preview",
+            "models/gemini-3.0-pro-preview-02-05",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-2.5-computer-use-preview-10-2025",
+            "gemini-2.5-flash-preview-09-2025",
+            "gemini-2.5-pro-preview-06-05",
+        ] {
+            let bare = slug.trim_start_matches("models/");
+            assert_eq!(GeminiModel::from_slug(slug), GeminiModel::Unknown(bare.to_string()), "{slug}");
+        }
+        let old = GeminiModel::from_slug("gemini-2.0-flash");
+        assert_eq!(old.display_name(), "Gemini 2.0 Flash");
+        assert_eq!(old.canonical_slug(), "gemini-2.0-flash");
+        assert!(!old.supports_thinking());
+        // The live ids next to them are untouched.
+        assert_eq!(GeminiModel::from_slug("gemini-2.5-pro"), GeminiModel::Gemini2_5Pro);
+        assert_eq!(GeminiModel::from_slug("gemini-2.5-flash-lite"), GeminiModel::Gemini2_5FlashLite);
+        assert_eq!(GeminiModel::from_slug("gemini-3-flash-preview"), GeminiModel::Gemini3_0FlashPreview);
+    }
+
+    #[test]
+    fn test_gemini_4_neon_and_hydrogen() {
+        for (slug, model, name, rates) in [
+            ("gemini-4-neon", GeminiModel::Gemini4Neon, "Gemini 4 Neon", (3.00, 15.00)),
+            ("gemini-4-hydrogen", GeminiModel::Gemini4Hydrogen, "Gemini 4 Hydrogen", (1.50, 7.50)),
+        ] {
+            assert_eq!(GeminiModel::from_slug(slug), model);
+            assert_eq!(GeminiModel::from_slug(&format!("models/{slug}")), model);
+            assert_eq!(model.canonical_slug(), slug);
+            assert_eq!(model.display_name(), name);
+            assert_eq!(model.context_window_tokens(), 1_000_000);
+            assert_eq!(model.thinking_config_style(), ThinkingConfigStyle::LevelPro);
+            assert_eq!(model.valid_thinking_levels(), &["low", "medium", "high", "xhigh"]);
+            // Implicit caching only; cached input is 5% of the input rate.
+            assert!(!model.supports_explicit_caching());
+            assert_eq!(model.cached_input_multiplier(), 0.05);
+            // Flat pricing: no intro period, no >200K tier.
+            for day in [(2026, 11, 20), (2027, 1, 1)] {
+                let day = chrono::NaiveDate::from_ymd_opt(day.0, day.1, day.2).unwrap();
+                assert_eq!(model.get_rates_at(0, day), rates);
+                assert_eq!(model.get_rates_at(500_000, day), rates);
+            }
+        }
     }
 
     #[test]
@@ -2992,7 +2952,7 @@ mod tests {
     #[test]
     fn test_gemini_3_1_flash_lite_pricing() {
         assert_eq!(
-            GeminiModel::Gemini3_1FlashLitePreview.get_rates(0),
+            GeminiModel::Gemini3_1FlashLite.get_rates(0),
             (0.25, 1.50)
         );
     }
@@ -3002,23 +2962,20 @@ mod tests {
         // Ensure canonical slugs resolve back to the correct model
         let models = [
             GeminiModel::Gemini4Carbon,
+            GeminiModel::Gemini4Neon,
+            GeminiModel::Gemini4Hydrogen,
             GeminiModel::Gemini4Argon,
             GeminiModel::Gemini3_8Flash,
             GeminiModel::Gemini3_7Flash,
             GeminiModel::Gemini3_6Flash,
-            GeminiModel::Gemini3_5Pro,
             GeminiModel::Gemini3_5Flash,
+            GeminiModel::Gemini3_5FlashLite,
             GeminiModel::Gemini3_1ProPreview,
-            GeminiModel::Gemini3_1FlashPreview,
-            GeminiModel::Gemini3_1FlashLitePreview,
-            GeminiModel::Gemini3_0ProPreview,
+            GeminiModel::Gemini3_1FlashLite,
             GeminiModel::Gemini3_0FlashPreview,
             GeminiModel::Gemini2_5Pro,
             GeminiModel::Gemini2_5Flash,
             GeminiModel::Gemini2_5FlashLite,
-            GeminiModel::Gemini2_0Flash,
-            GeminiModel::Gemini2_0FlashLite,
-            GeminiModel::Gemini2_0FlashThinking,
         ];
         for model in &models {
             let slug = model.canonical_slug();
@@ -3075,9 +3032,8 @@ mod tests {
     #[test]
     fn test_api_version() {
         // All known models currently use v1beta
-        assert_eq!(GeminiModel::Gemini3_0ProPreview.api_version(), "v1beta");
+        assert_eq!(GeminiModel::Gemini4Neon.api_version(), "v1beta");
         assert_eq!(GeminiModel::Gemini2_5Flash.api_version(), "v1beta");
-        assert_eq!(GeminiModel::Gemini2_0Flash.api_version(), "v1beta");
     }
 
     // ── Foreign thought-signature guard ──────────────────────────────────

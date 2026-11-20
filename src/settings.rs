@@ -641,6 +641,9 @@ pub struct Settings {
     /// (`seed_gemini_4_carbon_slot`). One-time, so removing it later sticks.
     #[serde(default)]
     pub gemini_4_carbon_slot_seeded: bool,
+    /// Same, for Gemini 4 Hydrogen and Neon (`seed_gemini_4_nov_slots`).
+    #[serde(default)]
+    pub gemini_4_nov_slots_seeded: bool,
     #[serde(default)]
     pub hobbes_rotate_daily: bool,
     /// The local time of day ("HH:MM") the daily rotation is due. It runs at
@@ -812,7 +815,7 @@ fn default_daily_capacity_minutes() -> u32 {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct ImageGenerationConfig {
-    /// The Gemini model slug used for image generation (e.g. "gemini-2.0-flash-exp-image-generation")
+    /// The Gemini model slug used for image generation (e.g. "gemini-nano-banana-2.1")
     pub model: String,
 }
 
@@ -1435,6 +1438,7 @@ impl Default for Settings {
             hobbes_read_tabs: false,
             // Fresh installs get it from `default_model_slots`.
             gemini_4_carbon_slot_seeded: true,
+            gemini_4_nov_slots_seeded: true,
             hobbes_rotate_daily: false,
             hobbes_rotate_at: default_hobbes_rotate_at(),
             voice: VoiceSettings::default(),
@@ -1946,13 +1950,34 @@ impl Settings {
             return false;
         }
         self.gemini_4_carbon_slot_seeded = true;
-        let carbon = crate::llm::gemini::GeminiModel::Gemini4Carbon.canonical_slug();
+        self.offer_gemini_slots(&[crate::llm::gemini::GeminiModel::Gemini4Carbon]);
+        true
+    }
+
+    /// The same one-time offer for Gemini 4 Hydrogen and Neon (GA 2026-11).
+    pub fn seed_gemini_4_nov_slots(&mut self) -> bool {
+        if self.gemini_4_nov_slots_seeded {
+            return false;
+        }
+        self.gemini_4_nov_slots_seeded = true;
+        use crate::llm::gemini::GeminiModel::{Gemini4Hydrogen, Gemini4Neon};
+        self.offer_gemini_slots(&[Gemini4Hydrogen, Gemini4Neon]);
+        true
+    }
+
+    /// Put each model in the first empty quick-switch slot of every Gemini
+    /// connector (and the legacy Gemini buffer) that doesn't list it yet.
+    /// Nothing is replaced: with no empty slot the model is not added.
+    fn offer_gemini_slots(&mut self, models: &[crate::llm::gemini::GeminiModel]) {
         let seed = |slots: &mut Vec<String>| {
-            if slots.iter().any(|m| m.trim().trim_start_matches("models/") == carbon) {
-                return;
-            }
-            if let Some(empty) = slots.iter_mut().find(|m| m.trim().is_empty()) {
-                *empty = carbon.to_string();
+            for model in models {
+                let slug = model.canonical_slug();
+                if slots.iter().any(|m| m.trim().trim_start_matches("models/") == slug) {
+                    continue;
+                }
+                if let Some(empty) = slots.iter_mut().find(|m| m.trim().is_empty()) {
+                    *empty = slug.to_string();
+                }
             }
         };
         seed(&mut self.gemini_config.model_slots);
@@ -1961,7 +1986,6 @@ impl Settings {
                 seed(&mut c.model_slots);
             }
         }
-        true
     }
 
     /// One-time migration: convert the legacy `planner_calendar_profile` stub
@@ -2692,7 +2716,7 @@ impl SettingsManager {
             let migrated_llm = settings.migrate_legacy_llm_config();
             let migrated_calendar = settings.migrate_legacy_calendar_profile();
             // After the connector migration, so every Gemini connector exists.
-            let seeded_carbon = settings.seed_gemini_4_carbon_slot();
+            let seeded_carbon = settings.seed_gemini_4_carbon_slot() | settings.seed_gemini_4_nov_slots();
             let dropped_flow_rules = settings.drop_legacy_flow_trust_rules();
             if (migrated_llm || migrated_calendar || seeded_carbon || dropped_flow_rules) && self.save(&settings).is_err() {
                 tracing::error!("Failed to persist migrated settings.");
@@ -2801,12 +2825,13 @@ impl SettingsManager {
                 settings.composio_user_id = Some(uid.to_string());
             }
 
-            // AUTO-MIGRATION: Deprecated Model Check (Jan 2026)
-            // If the summary model is still the old default "gemini-1.5-flash-latest",
-            // automatically upgrade it to "gemini-2.5-flash".
+            // AUTO-MIGRATION: the summary model's first default,
+            // "gemini-1.5-flash-latest", was shut down; move it to the
+            // current default.
             if settings.gemini_config.summary_model == "gemini-1.5-flash-latest" {
-                tracing::info!("Migrating deprecated summary_model to gemini-2.5-flash");
-                settings.gemini_config.summary_model = "gemini-2.5-flash".to_string();
+                let current = crate::llm::config::GeminiConfig::default().summary_model;
+                tracing::info!("Migrating shut-down summary_model to {current}");
+                settings.gemini_config.summary_model = current;
             }
         }
 
@@ -3925,6 +3950,30 @@ mod tests {
         assert!(Settings::default().gemini_4_carbon_slot_seeded);
         let old: Settings = serde_json::from_str("{}").unwrap_or_default();
         let _ = old;
+    }
+
+    #[test]
+    fn gemini_4_hydrogen_and_neon_are_offered_slots_once() {
+        let mut settings = Settings { gemini_4_nov_slots_seeded: false, ..Settings::default() };
+        settings.gemini_config.model_slots =
+            vec!["gemini-3.7-flash".into(), String::new(), "gemini-4-carbon".into(), String::new()];
+        assert!(settings.seed_gemini_4_nov_slots());
+        assert_eq!(
+            settings.gemini_config.model_slots,
+            ["gemini-3.7-flash", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-neon"]
+        );
+        // Once only: removing one afterwards sticks.
+        settings.gemini_config.model_slots[3].clear();
+        assert!(!settings.seed_gemini_4_nov_slots());
+        assert_eq!(settings.gemini_config.model_slots[3], "");
+
+        // One empty slot: the first model takes it, nothing is replaced.
+        let mut tight = Settings { gemini_4_nov_slots_seeded: false, ..Settings::default() };
+        tight.gemini_config.model_slots = vec!["a".into(), String::new()];
+        tight.seed_gemini_4_nov_slots();
+        assert_eq!(tight.gemini_config.model_slots, ["a", "gemini-4-hydrogen"]);
+
+        assert!(Settings::default().gemini_4_nov_slots_seeded);
     }
 
     #[test]

@@ -37,12 +37,8 @@ impl Default for GeminiConfig {
     fn default() -> Self {
         Self {
             api_key: None,
-            chat_model: GeminiModel::Gemini3_7Flash
-                .canonical_slug()
-                .to_string(),
-            summary_model: GeminiModel::Gemini3_7Flash
-                .canonical_slug()
-                .to_string(),
+            chat_model: GeminiModel::Gemini3_8Flash.canonical_slug().to_string(),
+            summary_model: GeminiModel::Gemini3_8Flash.canonical_slug().to_string(),
             thinking_enabled: false,
             thinking_level: default_thinking_level(),
             thinking_budget: None,
@@ -63,29 +59,24 @@ pub fn default_cache_ttl() -> u32 {
 }
 
 pub fn default_model_slots() -> Vec<String> {
-    vec![
-        GeminiModel::Gemini3_7Flash
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini3_6Flash
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini3_5Flash
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini3_1ProPreview
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini3_5FlashLite
-            .canonical_slug()
-            .to_string(),
-        GeminiModel::Gemini2_5Flash.canonical_slug().to_string(),
-        // Paid tier only, so it sits after the defaults rather than in slot 0
-        GeminiModel::Gemini4Argon.canonical_slug().to_string(),
-        GeminiModel::Gemini4Carbon.canonical_slug().to_string(),
-        "".to_string(), // Slot 9
-        "".to_string(), // Slot 10
+    use GeminiModel::*;
+    // Slot 0 is the default chat model. Models with a free tier come first;
+    // the paid-only Gemini 4 models follow.
+    let mut slots: Vec<String> = [
+        Gemini3_8Flash,
+        Gemini4Hydrogen,
+        Gemini3_6Flash,
+        Gemini3_5FlashLite,
+        Gemini3_1ProPreview,
+        Gemini4Argon,
+        Gemini4Carbon,
+        Gemini4Neon,
     ]
+    .iter()
+    .map(|m| m.canonical_slug().to_string())
+    .collect();
+    slots.resize(10, String::new());
+    slots
 }
 
 fn default_empty_model_slots() -> Vec<String> {
@@ -484,12 +475,17 @@ mod tests {
         let slots = default_model_slots();
         assert_eq!(slots.len(), 10);
         // First 8 should be non-empty Gemini slugs, latest-gen Flash first
-        assert_eq!(slots[0], "gemini-3.7-flash");
+        assert_eq!(slots[0], "gemini-3.8-flash");
+        assert_eq!(slots[0], GeminiConfig::default().chat_model);
         for i in 0..8 {
             assert!(slots[i].contains("gemini"), "Slot {} should be a Gemini model", i);
         }
-        assert_eq!(slots[6], "gemini-4-argon");
-        assert_eq!(slots[7], "gemini-4-carbon");
+        assert_eq!(slots[1], "gemini-4-hydrogen");
+        assert_eq!(slots[5..8], ["gemini-4-argon", "gemini-4-carbon", "gemini-4-neon"]);
+        // Nothing Google has shut down or deprecated is offered by default.
+        for gone in ["gemini-3.7-flash", "gemini-3.5-flash", "gemini-2.5-flash"] {
+            assert!(!slots.iter().any(|s| s == gone), "{gone} should not be a default slot");
+        }
         // Last 2 should be empty
         for i in 8..10 {
             assert!(slots[i].is_empty(), "Slot {} should be empty", i);
