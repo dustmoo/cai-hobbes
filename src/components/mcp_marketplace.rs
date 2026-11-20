@@ -605,7 +605,9 @@ pub fn McpMarketplace() -> Element {
                 // Clone new_content for the blocking task
                 let content_for_write = new_content.clone();
                 let write_result =
-                    tokio::task::spawn_blocking(move || std::fs::write(&path, &content_for_write))
+                    tokio::task::spawn_blocking(move || {
+                        crate::mcp::manager::config::write_private(&path, &content_for_write)
+                    })
                         .await
                         .unwrap();
 
@@ -942,6 +944,8 @@ pub fn McpMarketplace() -> Element {
                                     },
                                 }
                             }
+
+                            McpSecrets {}
 
                             div {
                                 class: "mt-4 flex justify-end gap-2",
@@ -2586,6 +2590,113 @@ fn McpServerCard(
                             icon: dioxus_free_icons::icons::fi_icons::FiExternalLink
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The Secrets box under the config editor: store a value in the keychain
+/// under a name, then refer to it in the config as `${keychain:NAME}` so
+/// the file holds no keys (see `mcp::manager::secret_refs`).
+#[component]
+fn McpSecrets() -> Element {
+    use crate::mcp::manager::secret_refs;
+    let mut secret_manager = use_context::<Signal<crate::secret_manager::SecretManager>>();
+    let settings = use_context::<Signal<Settings>>();
+    let mut name = use_signal(String::new);
+    let mut value = use_signal(String::new);
+    // (is_error, text)
+    let mut note = use_signal(|| Option::<(bool, String)>::None);
+
+    let names = secret_manager.read().mcp_secret_names();
+
+    let on_store = move |_| {
+        let n = name.peek().trim().to_string();
+        let v = value.peek().trim().to_string();
+        if !secret_refs::valid_name(&n) {
+            note.set(Some((true, "Name it with letters, digits, _ - or . (up to 64).".into())));
+            return;
+        }
+        if v.is_empty() {
+            note.set(Some((true, "Paste the value to store.".into())));
+            return;
+        }
+        let biometric = settings.peek().use_biometric_storage();
+        let result = secret_manager.write().set_mcp_secret(&n, v, biometric);
+        match result {
+            Ok(()) => {
+                note.set(Some((
+                    false,
+                    format!("Stored. Use {} in the config, then Save Configuration.", secret_refs::reference(&n)),
+                )));
+                name.set(String::new());
+                value.set(String::new());
+            }
+            Err(e) => {
+                tracing::error!("Failed to store an MCP config secret: {}", e);
+                note.set(Some((true, e)));
+            }
+        }
+    };
+
+    rsx! {
+        div {
+            class: "mt-3 p-3 bg-section rounded-md border border-faint",
+            div { class: "text-sm font-medium text-fg", "Secrets" }
+            p {
+                class: "text-xs text-fg-muted mt-1 mb-2",
+                "Keep keys out of this file. Store a value in your keychain under a name, then write "
+                span { class: "font-mono", "${{keychain:NAME}}" }
+                " where the key would go (an env value, an argument or the URL). It is filled in when the server starts."
+            }
+            for n in names {
+                div {
+                    key: "{n}",
+                    class: "flex items-center gap-2 py-1",
+                    span { class: "font-mono text-xs text-fg flex-1", {secret_refs::reference(&n)} }
+                    button {
+                        class: "text-xs text-red-400 hover:underline",
+                        onclick: {
+                            let n = n.clone();
+                            move |_| {
+                                let result = secret_manager.write().delete_mcp_secret(&n);
+                                match result {
+                                    Ok(()) => note.set(Some((false, format!("Removed \"{n}\". Servers that refer to it won't start.")))),
+                                    Err(e) => note.set(Some((true, e))),
+                                }
+                            }
+                        },
+                        "Remove"
+                    }
+                }
+            }
+            div {
+                class: "flex items-center gap-2 mt-2",
+                input {
+                    class: "w-40 h-8 bg-app border border-faint rounded px-2.5 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-primary-500",
+                    placeholder: "name",
+                    spellcheck: false,
+                    value: "{name}",
+                    oninput: move |e| name.set(e.value()),
+                }
+                input {
+                    class: "flex-1 h-8 bg-app border border-faint rounded px-2.5 text-sm text-fg focus:outline-none focus:ring-2 focus:ring-primary-500",
+                    r#type: "password",
+                    placeholder: "value",
+                    value: "{value}",
+                    oninput: move |e| value.set(e.value()),
+                }
+                button {
+                    class: "border border-faint text-fg rounded px-3 py-1.5 text-sm hover:bg-card",
+                    onclick: on_store,
+                    "Store"
+                }
+            }
+            if let Some((is_error, text)) = note() {
+                p {
+                    class: if is_error { "text-xs text-red-400 mt-2" } else { "text-xs text-fg-muted mt-2" },
+                    "{text}"
                 }
             }
         }

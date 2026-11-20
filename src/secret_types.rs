@@ -52,6 +52,19 @@ pub fn cal_url_key_name(subscription_id: &str) -> String {
 /// Needed so `load_all_from_keychain` can discover dynamically-named keys.
 pub const CAL_KEYS_INDEX_KEY: &str = "cal_keys_index";
 
+/// Prefix for secrets referenced from `mcp_servers.json` as
+/// `${keychain:NAME}` (e.g. "mcp_secret_github").
+pub const MCP_SECRET_PREFIX: &str = "mcp_secret_";
+
+/// Build the full keychain key for an MCP config secret.
+pub fn mcp_secret_key_name(name: &str) -> String {
+    format!("{}{}", MCP_SECRET_PREFIX, name)
+}
+
+/// Key name for the CSV index of all MCP config secrets.
+/// Needed so `load_all_from_keychain` can discover dynamically-named keys.
+pub const MCP_SECRET_KEYS_INDEX_KEY: &str = "mcp_secret_keys_index";
+
 /// Prefix for custom tool credentials (e.g., "composio_tool_slack__api_key")
 pub const CUSTOM_TOOL_PREFIX: &str = "composio_tool_";
 
@@ -370,6 +383,55 @@ pub trait SecretManagerTrait {
             // Same as set_llm_key: the index must never carry a biometric ACL.
             self.set_with_protection(LLM_KEYS_INDEX_KEY, new_index, false)?;
             tracing::info!("Removed LLM connector key from index: {}", key);
+        }
+        Ok(())
+    }
+
+    /// The value of an MCP config secret (`${keychain:NAME}`).
+    fn get_mcp_secret(&self, name: &str) -> Option<&String> {
+        self.get(&mcp_secret_key_name(name))
+    }
+
+    /// Names of the stored MCP config secrets, sorted.
+    fn mcp_secret_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .secrets_ref()
+            .keys()
+            .filter_map(|k| k.strip_prefix(MCP_SECRET_PREFIX))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Store an MCP config secret and keep the discovery index current so
+    /// `load_all_from_keychain` finds it on next launch. As with the other
+    /// indexes, the index itself is always written unprotected.
+    fn set_mcp_secret(&mut self, name: &str, value: String, biometric: bool) -> Result<(), String> {
+        let key = mcp_secret_key_name(name);
+        self.set_with_protection(&key, value, biometric)?;
+
+        let current_index = self
+            .get_named_index_from_keychain(MCP_SECRET_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        let new_index = add_to_index_csv(&current_index, &key);
+        if new_index != current_index {
+            self.set_with_protection(MCP_SECRET_KEYS_INDEX_KEY, new_index, false)?;
+        }
+        Ok(())
+    }
+
+    /// Delete an MCP config secret and update the index.
+    fn delete_mcp_secret(&mut self, name: &str) -> Result<(), String> {
+        let key = mcp_secret_key_name(name);
+        self.delete(&key)?;
+
+        let current_index = self
+            .get_named_index_from_keychain(MCP_SECRET_KEYS_INDEX_KEY)
+            .unwrap_or_default();
+        if !current_index.is_empty() {
+            let new_index = remove_from_index_csv(&current_index, &key);
+            self.set_with_protection(MCP_SECRET_KEYS_INDEX_KEY, new_index, false)?;
         }
         Ok(())
     }
