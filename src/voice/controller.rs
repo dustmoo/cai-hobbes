@@ -62,7 +62,7 @@ use crate::voice::brain::{self, BrainHandle, BrainOutcome};
 use crate::voice::realtime::{
     RealtimeControl, RealtimeEvent, RealtimeSetup, RealtimeVoice, Scheduling,
 };
-use crate::voice::transcript::{PendingLine, Utterance};
+use crate::voice::transcript::{MarkerFilter, PendingLine, Utterance};
 use crate::voice::{session, tools};
 
 /// What the voice is doing (drives the indicator).
@@ -812,6 +812,8 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
     // when it was said, not when it is written (see transcript.rs).
     let mut heard = Utterance::new(true);
     let mut spoke = Utterance::new(false);
+    // Drops "<no speech>"-style markers from what the voice is said to say.
+    let mut spoke_markers = MarkerFilter::default();
     let mut pending_lines: Vec<PendingLine> = Vec::new();
     let mut brain_cancel: HashMap<String, BrainHandle> = HashMap::new();
     let mut abandoned: HashSet<String> = HashSet::new();
@@ -940,19 +942,24 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         ui.phase = Phase::Listening;
                     }
                     RealtimeEvent::OutputTranscript(t) => {
-                        floor_state.model_active(Instant::now());
-                        if std::mem::take(&mut after_tool_call) {
-                            model_turn_seq += 1;
-                        }
-                        // Not while muting a talked-over turn: those words
-                        // were never played (its line already ends in "—").
-                        if !model_turn.muting() {
-                            if let Some(c) = confirm.as_mut() {
-                                c.model_output();
+                        // A turn with nothing to say is transcribed as a
+                        // marker ("<no speech>{pause}"): that is not speech,
+                        // so it leaves no line and changes nothing here.
+                        if let Some(t) = spoke_markers.feed(&t) {
+                            floor_state.model_active(Instant::now());
+                            if std::mem::take(&mut after_tool_call) {
+                                model_turn_seq += 1;
                             }
-                            last_spoke = Some(Instant::now());
-                            stats.spoke_fragments += 1;
-                            spoke.push(&t);
+                            // Not while muting a talked-over turn: those words
+                            // were never played (its line already ends in "—").
+                            if !model_turn.muting() {
+                                if let Some(c) = confirm.as_mut() {
+                                    c.model_output();
+                                }
+                                last_spoke = Some(Instant::now());
+                                stats.spoke_fragments += 1;
+                                spoke.push(&t);
+                            }
                         }
                     }
                     RealtimeEvent::Interrupted => {
@@ -964,6 +971,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         model_turn_seq += 1;
                         after_tool_call = false;
                         audio_io.flush();
+                        if let Some(rest) = spoke_markers.finish() {
+                            spoke.push(&rest);
+                        }
                         spoke.finish_into(true, &mut pending_lines);
                         ui.phase = Phase::Listening;
                         last_activity = Instant::now();
@@ -977,6 +987,9 @@ async fn run_session(ctx: BuiltinToolCtx, rx: &mut mpsc::UnboundedReceiver<Voice
                         model_turn_seq += 1;
                         after_tool_call = false;
                         stats.turns += 1;
+                        if let Some(rest) = spoke_markers.finish() {
+                            spoke.push(&rest);
+                        }
                         finish_in_order(&mut heard, &mut spoke, &mut pending_lines);
                         ui.heard.clear();
                         last_activity = Instant::now();

@@ -212,7 +212,8 @@ For deeper documentation on specific subsystems:
 | `tool_call.rs` | Tool execution: `use_mcp_tool`, `process_tool_output`, `try_auth_recovery`, `get_local_meta_tools`, `score_tool_relevance`, `GEMINI_TOOL_LIMIT`. |
 | `composio.rs` | Composio key resolution and purge helpers (`composio_server_key`, `resolve_composio_key`, `ComposioKeyLookup`, `purge_composio_profile_state`, + their tests) and the profile/client methods: native client init/reinit, `find_composio_client`, `composio_client_for_profile`, `get_composio_toolkits`, `recreate_composio_server`, `initiate_composio_auth`. |
 | `composio_toolkits.rs` | Per-toolkit tool operations: `connect_toolkit`, `remove_toolkit`, `reload_composio_tools`, `set_composio_toolkit_tools`, `rollback_partial_connect`, `clear_dynamic_tools_for_toolkit`, `get_composio_toolkit_tool_state`. |
-| `config.rs` | `mcp_servers.json` persistence: `load_configs`, `save_configs`, `add_or_update_mcp_server`. |
+| `config.rs` | `mcp_servers.json` persistence: `load_configs`, `save_configs`, `add_or_update_mcp_server`. Every write goes through `write_private`, which keeps the file `0600`; `load_configs` tightens an older file. |
+| `secret_refs.rs` | `${keychain:NAME}` references in a server's `env` values, `args` and `uri`. Values live in the keychain as `mcp_secret_<NAME>` (index `mcp_secret_keys_index`, stored from the MCP config editor's Secrets box) and are filled in on the in-memory copy when a server starts (`resolve_secret_refs` in `lifecycle.rs`). A server whose secret isn't stored is not started. Never write a resolved config back to disk. |
 | `oauth.rs` | `start_oauth_flow`, `complete_oauth_flow`. |
 | `status.rs` | `get_mcp_context`, `get_all_server_statuses`, `invalidate_status_cache(_async)`. |
 

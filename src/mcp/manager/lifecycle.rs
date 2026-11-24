@@ -120,6 +120,14 @@ impl McpManager {
     }
 
     /// Check if an error message indicates authentication is required
+    /// Fill in the `${keychain:NAME}` references in `config` from the
+    /// secrets cache (see `secret_refs`). `Err` is the message to show.
+    fn resolve_secret_refs(&self, config: &mut McpServerConfig) -> Result<(), String> {
+        use crate::SecretManagerTrait;
+        let secrets = self.secret_manager.peek();
+        super::secret_refs::resolve(config, &|name| secrets.get_mcp_secret(name).cloned())
+    }
+
     fn is_auth_error(error_msg: &str) -> bool {
         let lower_msg = error_msg.to_lowercase();
         lower_msg.contains("401")
@@ -425,6 +433,20 @@ impl McpManager {
             .filter(|sc| !sc.disabled && sc.name != COMPOSIO_NATIVE_PREFIX)
         {
             let mut server_config_clone = server_config.clone();
+            // Fill in `${keychain:NAME}` references. A server whose secret
+            // isn't stored is not started; the file's own (unresolved)
+            // config is what the failure records.
+            if let Err(msg) = self.resolve_secret_refs(&mut server_config_clone) {
+                tracing::warn!(
+                    "MCP server '{}' not started: a secret its config refers to isn't stored",
+                    server_config.name
+                );
+                self.failed_servers
+                    .lock()
+                    .await
+                    .insert(server_config.name.clone(), (server_config.clone(), msg));
+                continue;
+            }
             if let Some(key) = &settings.smithery_api_key {
                 server_config_clone
                     .env
@@ -973,6 +995,8 @@ impl McpManager {
             .into_iter()
             .find(|c| c.name == server_name)
             .ok_or_else(|| format!("Server '{}' not found in config", server_name))?;
+
+        self.resolve_secret_refs(&mut server_config)?;
 
         if let Some(key) = &settings.smithery_api_key {
             server_config

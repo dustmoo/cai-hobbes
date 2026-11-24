@@ -13,12 +13,13 @@ use tokio::sync::Mutex;
 
 mod composio;
 mod composio_toolkits;
-mod config;
+pub mod config;
 mod lifecycle;
 mod oauth;
 mod profile_scope;
 pub mod profile_flow;
 pub mod profile_reach;
+pub mod secret_refs;
 mod status;
 mod tool_call;
 

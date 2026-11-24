@@ -19,7 +19,10 @@
 //!    arguments that are all ids, times and short enum values); any other
 //!    Act whose arguments hold free text is a Carry. `COMPOSIO_EXECUTE_TOOL`
 //!    is judged by exactly what the dispatcher runs ([`execute_target`]).
-//!    Anything unrecognised is a Carry (fail closed). The agent-time scope
+//!    A name with no listed verb is a Read when it asks who the account is
+//!    (`…_WHO_AM_I`), an Act when its arguments are all content-free (there
+//!    is nothing in the call to carry), and otherwise a Carry (fail
+//!    closed). The agent-time scope
 //!    keeps its own, stricter test (`todo::agent_time::agent_time_scope`).
 //! 2. **Is it held?** [`flow_hold`]: only calls into a Composio profile are
 //!    judged (terminal, files, browser, other MCP servers, dispatch and
@@ -305,6 +308,11 @@ fn marker_read(body: &[String]) -> bool {
         && before.iter().all(|t| t.len() > 2 && t.ends_with('s') && !t.ends_with("ss"))
 }
 
+/// `…_WHO_AM_I`: asks which account is connected. A read.
+fn who_am_i(body: &[String]) -> bool {
+    matches!(body, [a, b, c] if a == "who" && b == "am" && c == "i")
+}
+
 /// **Classify a call** by what it does with content (see the module doc).
 /// `args` should already be without `hobbes_profile`
 /// (`profile_reach::strip_profile_arg`).
@@ -338,7 +346,16 @@ fn classify_at(tool_name: &str, args: &Value, depth: u8) -> FlowClass {
     let tokens = name_tokens(tool_name);
     let body: &[String] = if tokens.len() > 1 { &tokens[1..] } else { &tokens };
     let Some(at) = body.iter().enumerate().position(|(i, t)| is_candidate(t, i)) else {
-        return if marker_read(body) { FlowClass::Read } else { FlowClass::Carry };
+        // No listed verb. Content needs somewhere to ride: with nothing
+        // but ids, times and short enum values in the arguments (or none
+        // at all) the call can change state at most, so it is an Act.
+        return if marker_read(body) || who_am_i(body) {
+            FlowClass::Read
+        } else if content_free_args(args) {
+            FlowClass::Act
+        } else {
+            FlowClass::Carry
+        };
     };
     match verb_class(body, at, args) {
         FlowClass::Read => {
@@ -680,10 +697,18 @@ mod tests {
             (EXECUTE_TOOL, json!({"tool_slug": "GMAIL_SEND_EMAIL", "arguments": {}}), Carry),
             // A meta tool Hobbes doesn't offer is judged by its name.
             ("COMPOSIO_MULTI_EXECUTE_TOOL", json!({"tools": [{"tool_slug": "GMAIL_FETCH_EMAILS"}]}), Carry),
-            ("COMPOSIO_REMOTE_WORKBENCH", json!({}), Carry),
-            // Unknown verbs fail closed.
-            ("ACME_FROBNICATE_WIDGET", json!({}), Carry),
-            ("FROBNICATE", json!({}), Carry),
+            ("COMPOSIO_REMOTE_WORKBENCH", json!({"code_to_execute": "print(1)"}), Carry),
+            // Asking who the account is reads.
+            ("GMAIL_WHO_AM_I", json!({}), Read),
+            (EXECUTE_TOOL, json!({"tool_name": "GMAIL_WHO_AM_I", "arguments": {}}), Read),
+            // Unknown verbs fail closed when the call could carry content …
+            ("ACME_FROBNICATE_WIDGET", json!({"name": "Puget plan"}), Carry),
+            ("ACME_FROBNICATE_WIDGET", json!({"note": "x"}), Carry),
+            ("FROBNICATE", json!({"widget_id": "w", "body": "hi"}), Carry),
+            // … and are an Act when it has nothing to carry.
+            ("ACME_FROBNICATE_WIDGET", json!({}), Act),
+            ("ACME_FROBNICATE_WIDGET", json!({"widget_id": "w1", "status": "done"}), Act),
+            ("FROBNICATE", json!({}), Act),
         ];
         for (name, args, want) in rows {
             assert_eq!(classify_flow(name, args), *want, "{name} {args}");
@@ -702,18 +727,19 @@ mod tests {
         assert_eq!(classify_flow("ACME_GET_OR_CREATE_CONTACT", &json!({})), Carry);
         assert_eq!(classify_flow("ACME_SEARCH_AND_DELETE", &json!({"ids": ["1"]})), Act);
         // Noun markers: a read only as the last word, after plural nouns and no verb.
-        assert_eq!(classify_flow("ACME_LOG_CALL_DETAILS", &json!({})), Carry);
-        assert_eq!(classify_flow("ACME_OPEN_A_VIEW", &json!({})), Carry);
-        assert_eq!(classify_flow("ACME_SYNC_HISTORY", &json!({})), Carry);
+        assert_eq!(classify_flow("ACME_LOG_CALL_DETAILS", &json!({"notes": "x"})), Carry);
+        assert_eq!(classify_flow("ACME_OPEN_A_VIEW", &json!({"name": "x"})), Carry);
+        assert_eq!(classify_flow("ACME_SYNC_HISTORY", &json!({"name": "x"})), Carry);
+        assert_eq!(classify_flow("ACME_SYNC_HISTORY", &json!({})), Act, "never a read");
         assert_eq!(classify_flow("ACME_HISTORY_EXPORT_SYNC", &json!({})), Read, "export is a read verb");
         assert_eq!(classify_flow("SLACK_USERS_INFO", &json!({})), Read);
-        assert_eq!(classify_flow("ACME_ADDRESS_INFO", &json!({})), Carry, "-ss is no plural");
+        assert_eq!(classify_flow("ACME_ADDRESS_INFO", &json!({})), Act, "-ss is no plural: not a read");
         // Weak read verbs only right after the prefix.
         assert_eq!(classify_flow("GITHUB_VIEW_REPO", &json!({})), Read);
         assert_eq!(classify_flow("ACME_SAVE_VIEW", &json!({})), Carry);
         // Markers that existed only for local tools are gone.
-        assert_eq!(classify_flow("browser_snapshot", &json!({})), Carry);
-        assert_eq!(classify_flow("directory_tree", &json!({})), Carry);
+        assert_eq!(classify_flow("browser_snapshot", &json!({})), Act);
+        assert_eq!(classify_flow("directory_tree", &json!({"path": "/x"})), Carry);
     }
 
     #[test]

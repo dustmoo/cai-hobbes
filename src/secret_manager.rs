@@ -133,6 +133,7 @@ impl SecretManager {
         for index_key in [
             secret_types::LLM_KEYS_INDEX_KEY,
             secret_types::CAL_KEYS_INDEX_KEY,
+            secret_types::MCP_SECRET_KEYS_INDEX_KEY,
         ] {
             match keychain_ffi::find_generic_password_with_context(index_key, context) {
                 Ok(index_csv) => {
@@ -284,6 +285,7 @@ impl SecretManagerTrait for SecretManager {
         for index_key in [
             secret_types::LLM_KEYS_INDEX_KEY,
             secret_types::CAL_KEYS_INDEX_KEY,
+            secret_types::MCP_SECRET_KEYS_INDEX_KEY,
         ] {
             match keychain_ffi::find_generic_password(index_key) {
                 Ok(index_csv) => {

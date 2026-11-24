@@ -102,6 +102,68 @@ impl Utterance {
     }
 }
 
+/// The longest marker body [`MarkerFilter`] recognises, in chars.
+const MARKER_MAX_CHARS: usize = 32;
+
+/// Drops the non-speech markers a realtime model's output transcription
+/// carries when the model had nothing to say: `<no speech>`, `{pause}`,
+/// `<no speech detected>`. They are not words anyone heard, so they must not
+/// become a "🔊" line or count as the voice having spoken.
+///
+/// A marker is `<…>` or `{…}` around a short run of letters, spaces, `_` and
+/// `-`. Transcripts arrive in fragments, so an opener with no close yet is
+/// held until the next fragment settles it.
+#[derive(Debug, Default)]
+pub struct MarkerFilter {
+    held: String,
+}
+
+impl MarkerFilter {
+    /// The speech in `fragment` (with what was held before it), or `None`
+    /// when it was nothing but markers or is being held.
+    pub fn feed(&mut self, fragment: &str) -> Option<String> {
+        let text = std::mem::take(&mut self.held) + fragment;
+        let mut out = String::with_capacity(text.len());
+        let mut dropped = false;
+        let mut rest = text.as_str();
+        while let Some(open) = rest.find(['<', '{']) {
+            out.push_str(&rest[..open]);
+            let close = if rest[open..].starts_with('<') { '>' } else { '}' };
+            let body = &rest[open + 1..];
+            let marker_char = |c: char| c.is_alphabetic() || matches!(c, ' ' | '_' | '-');
+            let end = body.find(|c: char| !marker_char(c));
+            let len = body[..end.unwrap_or(body.len())].chars().count();
+            match end {
+                Some(end) if body[end..].starts_with(close) && (1..=MARKER_MAX_CHARS).contains(&len) => {
+                    dropped = true;
+                    rest = &body[end + 1..];
+                }
+                // Still open and short enough to be one: wait for more.
+                None if len <= MARKER_MAX_CHARS => {
+                    self.held = rest[open..].to_string();
+                    rest = "";
+                }
+                // Not a marker: the bracket is text.
+                _ => {
+                    out.push_str(&rest[open..open + 1]);
+                    rest = body;
+                }
+            }
+        }
+        out.push_str(rest);
+        if out.trim().is_empty() && (dropped || !self.held.is_empty()) {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// The turn ended: an opener that never closed was text after all.
+    pub fn finish(&mut self) -> Option<String> {
+        let held = std::mem::take(&mut self.held);
+        (!held.trim().is_empty()).then_some(held)
+    }
+}
+
 /// A Hobbes-authored message that stands alone rather than being part of a
 /// turn's machinery: a spoken transcript line.
 fn standalone(m: &Message) -> bool {
@@ -336,6 +398,42 @@ pub fn write_lines(mut session_state: Signal<SessionState>, session_id: &str, li
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marker_only_transcripts_are_not_speech() {
+        for marker in ["<no speech>{pause}", "<no speech detected>", "<no speech>{pause}<no speech>", " {pause} "] {
+            assert_eq!(MarkerFilter::default().feed(marker), None, "{marker}");
+        }
+        // Split across fragments, wherever the split falls.
+        let whole = "<no speech>{pause}";
+        for cut in 1..whole.len() {
+            let mut f = MarkerFilter::default();
+            assert_eq!(f.feed(&whole[..cut]), None, "first half at {cut}");
+            assert_eq!(f.feed(&whole[cut..]), None, "second half at {cut}");
+            assert_eq!(f.finish(), None);
+        }
+    }
+
+    #[test]
+    fn speech_passes_through_the_marker_filter() {
+        let mut f = MarkerFilter::default();
+        assert_eq!(f.feed("I'll get those tabs running.").as_deref(), Some("I'll get those tabs running."));
+        // Spacing fragments are kept as they were.
+        assert_eq!(f.feed(" ").as_deref(), Some(" "));
+        // A marker inside speech goes; the words stay.
+        assert_eq!(f.feed("One moment. {pause}Done.").as_deref(), Some("One moment. Done."));
+        // Brackets that aren't markers are text.
+        assert_eq!(f.feed("if 3 < 5 and x > 2").as_deref(), Some("if 3 < 5 and x > 2"));
+        assert_eq!(f.feed("<a href=\"x\">").as_deref(), Some("<a href=\"x\">"));
+        assert_eq!(f.feed("{}").as_deref(), Some("{}"));
+        // An opener held at the end of a fragment comes back with the rest…
+        assert_eq!(f.feed("it is <"), Some("it is ".into()));
+        assert_eq!(f.feed("3 or so").as_deref(), Some("<3 or so"));
+        // …or at the end of the turn, when nothing ever closed it.
+        assert_eq!(f.feed("less than <ten"), Some("less than ".into()));
+        assert_eq!(f.finish().as_deref(), Some("<ten"));
+        assert_eq!(f.finish(), None);
+    }
     use crate::components::shared::ToolCall;
 
     #[test]

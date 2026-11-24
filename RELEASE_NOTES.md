@@ -1,3 +1,33 @@
+# Hobbes v0.14.3 — Gemini 4 Neon and Hydrogen, keychain secrets for MCP servers
+
+Two new Gemini 4 models, a way to keep API keys out of your MCP server config, and fixes to voice and dispatched tabs. If you are coming from v0.13, everything below is new.
+
+## ✨ New in v0.14.3
+
+- **Gemini 4 Neon and Gemini 4 Hydrogen.** Both have a 1M-token context and a new "xhigh" thinking level. Hydrogen works on Google's free tier; Neon needs a paid key. They appear in your Gemini quick-switch slots if you have empty ones.
+- **Keep keys out of your MCP config.** Write `${keychain:NAME}` in a server's `env`, `args` or URL, and store the value in the Secrets box under the MCP config editor. The value lives in your keychain and is filled in when the server starts. A server whose secret is missing is listed as failed with the name it needs.
+- **A private MCP config file.** On macOS, `mcp_servers.json` is now readable only by you, and Hobbes keeps it that way each time it loads or saves it.
+- **Gemini 3.8 Flash is the default** for new Gemini connectors.
+
+## 🐛 Fixed in v0.14.3
+
+- **No more "<no speech>" lines.** When the voice had nothing to add, the Hobbes tab showed a spoken line reading `<no speech>{pause}`. Those are gone.
+- **Dispatched tabs ask less.** A tab started for you no longer stops for permission on a call that carries nothing with it, such as checking which account is connected.
+- **Retired Gemini models are gone from the list.** Gemini 2.0 Flash, 3 Pro preview and others Google has shut down are removed. Chats that used them keep their history and labels.
+
+## ✨ New in v0.14
+
+- **Talk to Hobbes.** Tap the voice hotkey to talk hands-free, or hold it to push-to-talk. Hobbes answers out loud, you can interrupt it, and it hands real work to its full chat and tells you the result when it's ready. 30 voices, echo cancellation on macOS, and a mic and speaker test. Free since v0.14.2, with a Gemini API key.
+- **The Fleet is free.** Watch your Claude Code sessions from Settings → Fleet → Connect Claude Code.
+- **One Hobbes tab.** Heartbeat, voice and your own messages share one chat, marked with the pixel tiger. It starts fresh when it grows large, carrying a summary forward, and can read your other tabs when you ask.
+- **Every tab can use all your Composio profiles.** A tab acts in its home profile unless the work belongs in another. Hobbes asks before content read in one profile is sent or written into another, and you can allow it once, for the chat, or always for that pair.
+- **Safer unattended and spoken work.** On voice turns and turns nobody is watching, Hobbes holds commands that would delete, overwrite or force-push, and shows why. Typed chat is unchanged.
+- **Heartbeat on your schedule.** Set workdays, briefing times and days off.
+- **New models.** Gemini 4 Carbon with a 1M-token context, and the GPT-6.1 models.
+- **A backup before each upgrade.** The first launch of a new version copies your chat database before changing anything.
+
+The full v0.14.0 list, including its fixes and security updates, is in the [v0.14.0 release](https://github.com/dustmoo/cai-hobbes/releases/tag/v0.14.0).
+
 # Hobbes v0.14.2 — Voice and Fleet for everyone
 
 Voice and the Fleet no longer need a license. Everything in Hobbes now works without a key. If you are coming from v0.13, everything below is new.
