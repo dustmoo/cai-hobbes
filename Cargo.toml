@@ -16,7 +16,7 @@ members = [
 ]
 # The license mint helper is a standalone tool (own lockfile, never shipped);
 # it must not build with the app.
-exclude = ["scripts/mint_license"]
+exclude = ["scripts/mint_license", "vendor/ashpd-0.8.1"]
 
 [workspace.dependencies]
 dioxus = { version = "0.6.3", features = ["router", "desktop"] }
@@ -159,3 +159,11 @@ wiremock = "0.6.5"
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 keyring = "2"
+
+# ashpd 0.8.1 (Linux-only, via dioxus-desktop 0.6 -> rfd 0.14) stopped compiling
+# on rustc 1.100 (never-type fallback, rust-lang/rust#148922): clipboard.rs
+# `call("SetSelection", ..)` needs an explicit `::<()>`. No 0.8.x fix exists and
+# rfd 0.14 is pinned by dioxus-desktop. Vendored with that one-line change;
+# drop this on the Dioxus 0.7 upgrade.
+[patch.crates-io]
+ashpd = { path = "vendor/ashpd-0.8.1" }
